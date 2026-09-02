@@ -1,0 +1,37 @@
+name: Cargo Format
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  format:
+    name: Cargo Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+        with:
+          path: PeerDiscoveryCenter
+
+      - name: Checkout PandaNetOS 标准库
+        uses: actions/checkout@v4
+        with:
+          repository: PandaNetOS/PandaNetOS
+          path: PandaNetOS
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            PeerDiscoveryCenter
+
+      - name: 检查代码格式
+        run: cd PeerDiscoveryCenter && cargo fmt --all -- --check
