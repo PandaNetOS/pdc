@@ -10,6 +10,7 @@
 //! - Tracker 健康检查和自动淘汰
 
 pub mod client;
+pub mod udp;
 
 pub use client::{TrackerConfig, TrackerDiscoverer};
 

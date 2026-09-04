@@ -1,18 +1,23 @@
 //! Peer 发现聚合器
 //!
-//! 统一管理所有 peer 发现机制（Tracker、DHT、PEX），
-//! 并发调用，合并结果，去重，排序。
+//! 统一管理所有 peer 发现机制，并发调用，合并结果，去重，排序，缓存。
+//!
+//! 终极形态改造：
+//! - 发现器从 DiscovererRegistry 获取（插件化）
+//! - 发现完成后发布 PeerDiscovered 事件到事件总线
+//! - 保留原有的并发调度、缓存、去重、排序逻辑
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::cache::PeerCache;
+use crate::discoverers::DiscovererRegistry;
+use crate::event_bus::EventBus;
 use crate::traits::{AnnounceEvent, DiscovererStats, PeerDiscoverer};
-use crate::types::{DiscoveryResult, Infohash, PeerInfo, PeerSource};
+use crate::types::{DiscoveryResult, Event, Infohash, PeerInfo, PeerSource};
 
 /// Peer 发现配置
 #[derive(Debug, Clone)]
@@ -25,12 +30,6 @@ pub struct PeerDiscoveryConfig {
     pub discovery_timeout: Duration,
     /// 并发发现器数量限制
     pub max_concurrent_discoverers: usize,
-    /// 是否启用 Tracker
-    pub enable_tracker: bool,
-    /// 是否启用 DHT
-    pub enable_dht: bool,
-    /// 是否启用 PEX
-    pub enable_pex: bool,
     /// 每次发现的最大 peer 数
     pub max_peers_per_discovery: usize,
 }
@@ -39,12 +38,9 @@ impl Default for PeerDiscoveryConfig {
     fn default() -> Self {
         Self {
             max_cached_peers: 10000,
-            peer_ttl: Duration::from_secs(86400), // 24 小时
+            peer_ttl: Duration::from_secs(86400),
             discovery_timeout: Duration::from_secs(30),
             max_concurrent_discoverers: 10,
-            enable_tracker: true,
-            enable_dht: true,
-            enable_pex: true,
             max_peers_per_discovery: 200,
         }
     }
@@ -53,195 +49,153 @@ impl Default for PeerDiscoveryConfig {
 /// Peer 发现聚合器
 ///
 /// 统一管理所有 peer 发现机制，对外提供统一接口。
-///
-/// # 示例
-/// ```text
-/// use PeerDiscoveryCenter::aggregator::{PeerDiscoveryAggregator, PeerDiscoveryConfig};
-///
-/// // 1. 创建聚合器
-/// let config = PeerDiscoveryConfig::default();
-/// let aggregator = PeerDiscoveryAggregator::new(config);
-///
-/// // 2. 添加发现器（Tracker、DHT、PEX）
-/// // aggregator.add_discoverer(Box::new(tracker_discoverer));
-///
-/// // 3. 发现 peer
-/// let infohash = [0u8; 20];
-/// let result = aggregator.discover_peers(&infohash, 100).await?;
-///
-/// // 4. 处理结果（result.peers 包含发现的 peer 列表）
-/// ```
+/// 发现器从 DiscovererRegistry 获取，发现结果发布到 EventBus。
 pub struct PeerDiscoveryAggregator {
-    /// 所有发现器
-    discoverers: RwLock<Vec<Arc<dyn PeerDiscoverer>>>,
+    /// 发现器注册表
+    registry: Arc<DiscovererRegistry>,
     /// Peer 缓存
     cache: Arc<PeerCache>,
+    /// 事件总线
+    event_bus: EventBus,
     /// 全局配置
     config: PeerDiscoveryConfig,
 }
 
 impl PeerDiscoveryAggregator {
     /// 创建新的聚合器
-    pub fn new(config: PeerDiscoveryConfig) -> Self {
+    pub fn new(
+        config: PeerDiscoveryConfig,
+        registry: Arc<DiscovererRegistry>,
+        event_bus: EventBus,
+    ) -> Self {
         let cache = Arc::new(PeerCache::new(config.max_cached_peers, config.peer_ttl));
         Self {
-            discoverers: RwLock::new(vec![]),
+            registry,
             cache,
+            event_bus,
             config,
         }
     }
 
-    /// 添加发现器
-    pub fn add_discoverer(&self, discoverer: Box<dyn PeerDiscoverer>) {
-        let mut discoverers = self.discoverers.write();
-        info!(
-            "[peer_discovery] 添加发现器: {} (类型: {:?})",
-            discoverer.name(),
-            discoverer.discoverer_type()
-        );
-        discoverers.push(Arc::from(discoverer));
-    }
-
-    /// 移除发现器
-    pub fn remove_discoverer(&self, name: &str) {
-        let mut discoverers = self.discoverers.write();
-        discoverers.retain(|d| d.name() != name);
-        info!("[peer_discovery] 移除发现器: {}", name);
+    /// 使用已有缓存创建聚合器
+    pub fn with_cache(
+        config: PeerDiscoveryConfig,
+        registry: Arc<DiscovererRegistry>,
+        event_bus: EventBus,
+        cache: Arc<PeerCache>,
+    ) -> Self {
+        Self {
+            registry,
+            cache,
+            event_bus,
+            config,
+        }
     }
 
     /// 获取所有发现器
     pub fn discoverers(&self) -> Vec<Arc<dyn PeerDiscoverer>> {
-        self.discoverers.read().clone()
+        self.registry.all()
     }
 
     /// 获取发现器数量
     pub fn discoverer_count(&self) -> usize {
-        self.discoverers.read().len()
+        self.registry.len()
     }
 
     /// 发现 peer（核心方法）
     ///
-    /// 并发调用所有启用的发现器，合并结果，去重，排序，缓存。
+    /// 并发调用所有启用的发现器，合并结果，去重，排序，缓存，发布事件。
     pub async fn discover_peers(
         &self,
         infohash: &Infohash,
         limit: usize,
     ) -> anyhow::Result<DiscoveryResult> {
         let start = Instant::now();
-        let discoverers = self.discoverers.read().clone();
 
         // 1. 先从缓存获取
         let cached_peers = self.cache.get_peers(infohash, limit);
         if !cached_peers.is_empty() {
-            debug!("[peer_discovery] 缓存命中 {} 个 peer", cached_peers.len());
+            debug!("[aggregator] 缓存命中 {} 个 peer", cached_peers.len());
         }
 
-        // 2. 过滤启用的发现器
-        let active_discoverers: Vec<Arc<dyn PeerDiscoverer>> = discoverers
-            .into_iter()
-            .filter(|d| {
-                if !d.is_enabled() {
-                    return false;
-                }
-                match d.discoverer_type() {
-                    crate::traits::DiscovererType::Tracker => self.config.enable_tracker,
-                    crate::traits::DiscovererType::Dht => self.config.enable_dht,
-                    crate::traits::DiscovererType::Pex => self.config.enable_pex,
-                }
-            })
-            .collect();
+        // 2. 从注册表获取启用的发现器，并发调用
+        let results = self
+            .registry
+            .discover_all(
+                infohash,
+                limit,
+                self.config.max_concurrent_discoverers,
+                self.config.discovery_timeout,
+            )
+            .await;
 
-        if active_discoverers.is_empty() {
-            warn!("[peer_discovery] 没有启用的发现器，仅返回缓存结果");
+        if results.is_empty() && cached_peers.is_empty() {
+            warn!("[aggregator] 没有启用的发现器，且缓存为空");
             return Ok(DiscoveryResult {
-                peers: cached_peers,
+                peers: vec![],
                 source_stats: HashMap::new(),
                 total_duration: start.elapsed(),
                 discoverer_durations: HashMap::new(),
             });
         }
 
-        // 3. 并发调用所有发现器
-        let mut tasks = vec![];
-        for discoverer in active_discoverers
-            .iter()
-            .take(self.config.max_concurrent_discoverers)
-        {
-            let discoverer = discoverer.clone();
-            let infohash = *infohash;
-            let timeout = self.config.discovery_timeout;
-
-            tasks.push(tokio::spawn(async move {
-                let name = discoverer.name().to_string();
-                let start = Instant::now();
-
-                let result =
-                    tokio::time::timeout(timeout, discoverer.discover_peers(&infohash, limit))
-                        .await;
-
-                let duration = start.elapsed();
-
-                match result {
-                    Ok(Ok(peers)) => {
-                        debug!(
-                            "[peer_discovery] {} 返回 {} 个 peer ({:?})",
-                            name,
-                            peers.len(),
-                            duration
-                        );
-                        (name, Ok(peers), duration)
-                    }
-                    Ok(Err(e)) => {
-                        warn!("[peer_discovery] {} 失败: {} ({:?})", name, e, duration);
-                        (name, Err(e), duration)
-                    }
-                    Err(_) => {
-                        warn!("[peer_discovery] {} 超时 ({:?})", name, duration);
-                        (name, Err(anyhow::anyhow!("timeout")), duration)
-                    }
-                }
-            }));
-        }
-
-        // 4. 等待所有任务完成，合并结果
+        // 3. 合并结果
         let mut all_peers: Vec<PeerInfo> = cached_peers;
         let mut source_stats: HashMap<PeerSource, usize> = HashMap::new();
         let mut discoverer_durations: HashMap<String, Duration> = HashMap::new();
 
-        for task in tasks {
-            if let Ok((name, result, duration)) = task.await {
-                discoverer_durations.insert(name, duration);
-                if let Ok(peers) = result {
+        for (name, result, duration) in results {
+            discoverer_durations.insert(name.clone(), duration);
+            match result {
+                Ok(peers) => {
+                    debug!(
+                        "[aggregator] {} 返回 {} 个 peer ({:?})",
+                        name,
+                        peers.len(),
+                        duration
+                    );
                     for peer in peers {
                         *source_stats.entry(peer.source).or_insert(0) += 1;
                         all_peers.push(peer);
                     }
                 }
+                Err(e) => {
+                    warn!("[aggregator] {} 失败: {} ({:?})", name, e, duration);
+                }
             }
         }
 
-        // 5. 去重（按 IP:端口）
+        // 4. 去重（按 IP:端口）
         all_peers.sort_by_key(|a| a.addr);
         all_peers.dedup_by(|a, b| a.addr == b.addr);
 
-        // 6. 计算优先级并排序
+        // 5. 计算优先级并排序
         for peer in all_peers.iter_mut() {
             peer.calculate_priority();
         }
         all_peers.sort_by_key(|a| std::cmp::Reverse(a.priority_score));
 
-        // 7. 限制数量
+        // 6. 限制数量
         if all_peers.len() > limit {
             all_peers.truncate(limit);
         }
 
-        // 8. 更新缓存
+        // 7. 更新缓存
         self.cache.add_peers(infohash, &all_peers);
 
         let total_duration = start.elapsed();
 
+        // 8. 发布发现事件
+        if !all_peers.is_empty() {
+            self.event_bus.publish(Event::PeerDiscovered {
+                infohash: *infohash,
+                peers: all_peers.clone(),
+                source: "aggregator".to_string(),
+            });
+        }
+
         info!(
-            "[peer_discovery] 发现完成: {} 个 peer (tracker={}, dht={}, pex={}), 耗时 {:?}",
+            "[aggregator] 发现完成: {} 个 peer (tracker={}, dht={}, pex={}), 耗时 {:?}",
             all_peers.len(),
             source_stats.get(&PeerSource::Tracker).unwrap_or(&0),
             source_stats.get(&PeerSource::Dht).unwrap_or(&0),
@@ -259,22 +213,15 @@ impl PeerDiscoveryAggregator {
 
     /// 宣告自己正在下载/做种
     pub async fn announce(&self, infohash: &Infohash, port: u16, event: AnnounceEvent) {
-        let discoverers = self.discoverers.read().clone();
+        let discoverers = self.registry.enabled();
         let mut tasks = vec![];
 
         for discoverer in discoverers.iter() {
-            if !discoverer.is_enabled() {
-                continue;
-            }
             let discoverer = discoverer.clone();
             let infohash = *infohash;
             tasks.push(tokio::spawn(async move {
                 if let Err(e) = discoverer.announce(&infohash, port, event).await {
-                    warn!(
-                        "[peer_discovery] {} announce 失败: {}",
-                        discoverer.name(),
-                        e
-                    );
+                    warn!("[aggregator] {} announce 失败: {}", discoverer.name(), e);
                 }
             }));
         }
@@ -294,18 +241,27 @@ impl PeerDiscoveryAggregator {
         &self.config
     }
 
+    /// 获取发现器注册表引用
+    pub fn registry(&self) -> Arc<DiscovererRegistry> {
+        self.registry.clone()
+    }
+
+    /// 获取事件总线引用
+    pub fn event_bus(&self) -> EventBus {
+        self.event_bus.clone()
+    }
+
     /// 获取聚合统计
     pub fn aggregate_stats(&self) -> AggregateStats {
-        let discoverers = self.discoverers.read();
+        let raw_stats = self.registry.aggregate_stats();
         let mut stats = AggregateStats::default();
 
-        for d in discoverers.iter() {
-            let s = d.stats();
+        for (name, s) in raw_stats {
             stats.total_requests += s.total_requests;
             stats.success_requests += s.success_requests;
             stats.failed_requests += s.failed_requests;
             stats.total_peers_discovered += s.total_peers_discovered;
-            stats.discoverer_stats.insert(d.name().to_string(), s);
+            stats.discoverer_stats.insert(name, s);
         }
 
         stats.cached_peers = self.cache.len();
@@ -337,6 +293,7 @@ impl AggregateStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::DiscovererType;
     use async_trait::async_trait;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -350,8 +307,8 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        fn discoverer_type(&self) -> crate::traits::DiscovererType {
-            crate::traits::DiscovererType::Tracker
+        fn discoverer_type(&self) -> DiscovererType {
+            DiscovererType::Tracker
         }
         fn is_enabled(&self) -> bool {
             true
@@ -386,14 +343,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_peers() {
+        let registry = Arc::new(DiscovererRegistry::new());
+        let bus = EventBus::default();
         let config = PeerDiscoveryConfig::default();
-        let aggregator = PeerDiscoveryAggregator::new(config);
+        let aggregator = PeerDiscoveryAggregator::new(config, registry.clone(), bus);
 
         let discoverer = MockDiscoverer {
             name: "mock".to_string(),
             peers: vec![make_peer(6881), make_peer(6882)],
         };
-        aggregator.add_discoverer(Box::new(discoverer));
+        registry.register(Box::new(discoverer));
 
         let infohash = [0u8; 20];
         let result = aggregator.discover_peers(&infohash, 100).await.unwrap();
@@ -404,8 +363,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dedup_across_discoverers() {
+        let registry = Arc::new(DiscovererRegistry::new());
+        let bus = EventBus::default();
         let config = PeerDiscoveryConfig::default();
-        let aggregator = PeerDiscoveryAggregator::new(config);
+        let aggregator = PeerDiscoveryAggregator::new(config, registry.clone(), bus);
 
         let d1 = MockDiscoverer {
             name: "d1".to_string(),
@@ -416,12 +377,34 @@ mod tests {
             peers: vec![make_peer(6881)], // 相同地址
         };
 
-        aggregator.add_discoverer(Box::new(d1));
-        aggregator.add_discoverer(Box::new(d2));
+        registry.register(Box::new(d1));
+        registry.register(Box::new(d2));
 
         let infohash = [0u8; 20];
         let result = aggregator.discover_peers(&infohash, 100).await.unwrap();
 
         assert_eq!(result.peers.len(), 1); // 去重后只有 1 个
+    }
+
+    #[tokio::test]
+    async fn test_event_published() {
+        let registry = Arc::new(DiscovererRegistry::new());
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
+        let config = PeerDiscoveryConfig::default();
+        let aggregator = PeerDiscoveryAggregator::new(config, registry.clone(), bus);
+
+        let discoverer = MockDiscoverer {
+            name: "mock".to_string(),
+            peers: vec![make_peer(6881)],
+        };
+        registry.register(Box::new(discoverer));
+
+        let infohash = [0u8; 20];
+        let _ = aggregator.discover_peers(&infohash, 100).await.unwrap();
+
+        // 应该收到 PeerDiscovered 事件
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, Event::PeerDiscovered { .. }));
     }
 }

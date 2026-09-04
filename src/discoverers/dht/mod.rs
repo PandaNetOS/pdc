@@ -10,6 +10,7 @@
 //! - 节点健康检查和自动淘汰
 
 pub mod client;
+pub mod message;
 
 pub use client::{DhtConfig, DhtDiscoverer};
 

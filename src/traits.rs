@@ -1,17 +1,20 @@
 //! 统一 trait 定义
 //!
-//! 所有 peer 发现机制（Tracker、DHT、PEX）都实现 `PeerDiscoverer` trait，
-//! 聚合器可以统一调度，屏蔽底层差异。
+//! 所有 peer 发现机制（Tracker、DHT、PEX、LPD、WebSeed）都实现 `PeerDiscoverer` trait，
+//! 聚合器和插件注册表可以统一调度，屏蔽底层差异。
+
+use std::time::SystemTime;
 
 use async_trait::async_trait;
-use std::time::SystemTime;
 
 use crate::types::{Infohash, PeerInfo};
 
-/// Peer 发现器统一接口
+/// Peer 发现器统一接口（插件接口）
+///
+/// 所有发现器必须实现此 trait，通过 DiscovererRegistry 注册后由聚合器统一调度。
 #[async_trait]
 pub trait PeerDiscoverer: Send + Sync {
-    /// 发现器名称（用于日志和统计）
+    /// 发现器名称（用于日志和统计，唯一标识）
     fn name(&self) -> &str;
 
     /// 发现器类型
@@ -57,6 +60,12 @@ pub enum DiscovererType {
     Tracker,
     Dht,
     Pex,
+    /// 局域网多播发现（BEP 标准）
+    Lpd,
+    /// HTTP/Web Seed（BEP 19/17）
+    WebSeed,
+    /// 自定义发现器（第三方插件）
+    Custom,
 }
 
 impl DiscovererType {
@@ -65,6 +74,9 @@ impl DiscovererType {
             DiscovererType::Tracker => "tracker",
             DiscovererType::Dht => "dht",
             DiscovererType::Pex => "pex",
+            DiscovererType::Lpd => "lpd",
+            DiscovererType::WebSeed => "webseed",
+            DiscovererType::Custom => "custom",
         }
     }
 }

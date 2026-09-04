@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rand::Rng;
@@ -17,6 +17,8 @@ use url::Url;
 
 use crate::traits::{AnnounceEvent, DiscovererStats, DiscovererType, PeerDiscoverer};
 use crate::types::{Infohash, PeerInfo, PeerSource};
+
+use super::udp::UdpTrackerClient;
 
 /// Tracker 配置
 #[derive(Debug, Clone)]
@@ -57,13 +59,13 @@ impl Default for TrackerConfig {
         peer_id[1] = b'D';
         peer_id[2] = b'-';
         peer_id[3] = b'0';
-        peer_id[4] = b'1';
+        peer_id[4] = b'2';
         peer_id[5] = b'0';
         peer_id[6] = b'0';
         peer_id[7] = b'-';
 
         Self {
-            trackers: crate::tracker::PUBLIC_TRACKERS
+            trackers: crate::discoverers::tracker::PUBLIC_TRACKERS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -76,7 +78,7 @@ impl Default for TrackerConfig {
             downloaded: 0,
             left: 0,
             peer_id,
-            user_agent: "PeerDiscoveryCenter/0.1.0".to_string(),
+            user_agent: "PeerDiscoveryCenter/0.2.0".to_string(),
         }
     }
 }
@@ -149,8 +151,6 @@ impl TrackerDiscoverer {
 
     /// 从 HTTP Tracker 响应解析 peer 列表
     fn parse_http_peers(body: &[u8]) -> Result<Vec<SocketAddr>> {
-        // 简单的 bencode 解析（只处理 peers 字段）
-        // 实际项目中应该用完整的 bencode 库
         let body_str = String::from_utf8_lossy(body);
 
         // 尝试解析 compact peers（二进制格式）
@@ -167,12 +167,6 @@ impl TrackerDiscoverer {
             }
         }
 
-        // 尝试解析字典格式的 peers
-        if let Some(_peers_start) = body_str.find("5:peersl") {
-            // 字典列表格式，简化处理
-            return Ok(vec![]);
-        }
-
         Ok(vec![])
     }
 
@@ -186,61 +180,6 @@ impl TrackerDiscoverer {
             peers.push(SocketAddr::new(std::net::IpAddr::V4(ip), port));
         }
         peers
-    }
-
-    /// 向单个 HTTP Tracker 请求 peer
-    #[allow(dead_code)]
-    async fn request_http_tracker(
-        &self,
-        tracker_url: &str,
-        infohash: &Infohash,
-    ) -> Result<Vec<SocketAddr>> {
-        let url = Url::parse(tracker_url)?;
-
-        // 构建查询参数
-        let infohash_hex = hex::encode(infohash);
-        let peer_id_hex = hex::encode(self.config.peer_id);
-
-        let mut request_url = url.clone();
-        request_url
-            .query_pairs_mut()
-            .append_pair("info_hash", &infohash_hex)
-            .append_pair("peer_id", &peer_id_hex)
-            .append_pair("port", &self.config.listen_port.to_string())
-            .append_pair("uploaded", &self.config.uploaded.to_string())
-            .append_pair("downloaded", &self.config.downloaded.to_string())
-            .append_pair("left", &self.config.left.to_string())
-            .append_pair("event", "started")
-            .append_pair("compact", "1")
-            .append_pair("numwant", "100");
-
-        debug!("[tracker] 请求 HTTP Tracker: {}", tracker_url);
-
-        let response = self
-            .client
-            .get(request_url.as_str())
-            .send()
-            .await
-            .with_context(|| format!("HTTP Tracker 请求失败: {}", tracker_url))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "HTTP Tracker 返回错误状态码: {} ({})",
-                response.status(),
-                tracker_url
-            ));
-        }
-
-        let body = response.bytes().await?;
-        let peers = Self::parse_http_peers(&body)?;
-
-        debug!(
-            "[tracker] HTTP Tracker {} 返回 {} 个 peer",
-            tracker_url,
-            peers.len()
-        );
-
-        Ok(peers)
     }
 
     /// 记录请求结果
@@ -311,7 +250,6 @@ impl PeerDiscoverer for TrackerDiscoverer {
         infohash: &Infohash,
         limit: usize,
     ) -> anyhow::Result<Vec<PeerInfo>> {
-        // 恢复冷却期结束的 Tracker
         self.recover_cooldown_trackers();
 
         let active_trackers = self.active_trackers();
@@ -325,7 +263,6 @@ impl PeerDiscoverer for TrackerDiscoverer {
             active_trackers.len()
         );
 
-        // 并发请求所有 Tracker
         let mut tasks = vec![];
         for tracker_url in active_trackers
             .iter()
@@ -339,15 +276,13 @@ impl PeerDiscoverer for TrackerDiscoverer {
             tasks.push(tokio::spawn(async move {
                 let start = Instant::now();
 
-                // 简化实现：只处理 HTTP/HTTPS Tracker
-                // UDP Tracker 需要单独实现
                 if tracker_url.starts_with("http://") || tracker_url.starts_with("https://") {
                     let result = async {
                         let url = Url::parse(&tracker_url)?;
                         let infohash_hex = hex::encode(infohash);
                         let peer_id_hex = hex::encode(config.peer_id);
 
-                        let mut request_url = url.clone();
+                        let mut request_url = url;
                         request_url
                             .query_pairs_mut()
                             .append_pair("info_hash", &infohash_hex)
@@ -373,14 +308,27 @@ impl PeerDiscoverer for TrackerDiscoverer {
                     .await;
 
                     (tracker_url, result, start.elapsed())
+                } else if tracker_url.starts_with("udp://") {
+                    // UDP Tracker（BEP 15）
+                    let result = UdpTrackerClient::announce(
+                        &tracker_url,
+                        &infohash,
+                        &config.peer_id,
+                        config.listen_port,
+                        config.timeout,
+                    )
+                    .await;
+                    (tracker_url, result, start.elapsed())
                 } else {
-                    // UDP Tracker 暂未实现，跳过
-                    (tracker_url, Ok(vec![]), start.elapsed())
+                    (
+                        tracker_url,
+                        Err(anyhow!("unsupported tracker protocol")),
+                        start.elapsed(),
+                    )
                 }
             }));
         }
 
-        // 收集结果
         let mut all_peers = vec![];
         for task in tasks {
             if let Ok((tracker_url, result, duration)) = task.await {
@@ -397,11 +345,9 @@ impl PeerDiscoverer for TrackerDiscoverer {
             }
         }
 
-        // 去重
         all_peers.sort();
         all_peers.dedup();
 
-        // 转换为 PeerInfo
         let peer_infos: Vec<PeerInfo> = all_peers
             .iter()
             .take(limit)
@@ -419,7 +365,6 @@ impl PeerDiscoverer for TrackerDiscoverer {
         port: u16,
         event: AnnounceEvent,
     ) -> anyhow::Result<()> {
-        // 向所有活跃 Tracker 发送 announce
         let active_trackers = self.active_trackers();
         let mut tasks = vec![];
 
@@ -487,7 +432,6 @@ mod tests {
 
     #[test]
     fn test_parse_compact_peers() {
-        // 127.0.0.1:6881
         let data = [127, 0, 0, 1, 0x1A, 0xE1];
         let peers = TrackerDiscoverer::parse_compact_peers(&data);
         assert_eq!(peers.len(), 1);
