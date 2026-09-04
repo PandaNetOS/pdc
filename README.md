@@ -31,6 +31,42 @@ PandaNetOS 标准库提供：
 - 统一的配置管理（`pandanetos::config`）
 - 统一的日志规范（`pandanetos::logging`）
 
+## 生态定位
+
+PeerDiscoveryCenter 位于 PandaNetOS 架构的**多 Agent 连接层**，与 spde Agent 并列，作为 **Peer 发现 Agent** 接入 pk 主控台：
+
+```
+用户 / 第三方系统
+        │  HTTP API / WebSocket
+   ┌────▼──────────────────────────────────────┐
+   │            pk（主控台）                    │
+   └────┬──────────────────────────────────────┘
+        │  多 Agent 连接（统一接入协议）
+   ┌────┴──────────────────┐
+   ▼                       ▼
+spde Agent ×N      PeerDiscoveryCenter Agent ×N
+（下载执行）        （Peer 发现：Tracker + DHT + PEX）
+```
+
+### 接入 pk 的方式
+
+与 spde 使用**完全相同**的接入协议，pk 侧无需改造：
+
+| 阶段 | 接口 | 说明 |
+|------|------|------|
+| 注册 | `POST /api/v1/agent/register` | 上报能力清单：peer 发现机制、缓存策略、健康检查状态、并发与超时参数 |
+| 长连接 | `WS /api/v1/agent/ws` | 实时状态与 peer 查询通道 |
+| 心跳 | `POST /api/v1/agent/heartbeat` | 保活，并领取待处理的发现任务 |
+| 上报 | `POST /api/v1/agent/report` | 回写发现结果、成功率、响应时间等统计 |
+
+未指定 master 时，Agent 会自动扫描局域网发现主控。
+
+### 与 spde 的协作
+
+- spde 执行 BT / 磁力下载时，向 PeerDiscoveryCenter 查询 peer 列表
+- PeerDiscoveryCenter 内部并发调度 Tracker / DHT / PEX 三种发现器，合并去重后按优先级返回
+- 支持两种部署形态：作为 spde 的本地依赖同机部署，或独立部署为共享的 peer 发现服务
+
 ## 快速开始
 
 ### 环境要求
@@ -244,6 +280,11 @@ bash ../PandaNetOS/scripts/check_compliance.sh .
 5. 开启 Pull Request
 
 ## 变更日志
+
+### 规划中（unreleased）
+
+- 作为 Agent 接入 pk 主控台（register / ws / heartbeat / report）
+- 能力清单上报（`--manifest`），符合 PandaNetOS 自描述能力清单标准
 
 ### v0.1.0 (2026-09-02)
 
