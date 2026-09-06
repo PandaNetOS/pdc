@@ -148,9 +148,21 @@ impl PeerCache {
         self.len() == 0
     }
 
+    /// 获取缓存统计 (infohash 数量, peer 总数)
+    pub fn stats(&self) -> (usize, usize) {
+        let infohash_count = self.peers.len();
+        let peer_count: usize = self.peers.iter().map(|m| m.value().len()).sum();
+        (infohash_count, peer_count)
+    }
+
     /// 获取指定 infohash 的缓存数
     pub fn len_for_infohash(&self, infohash: &Infohash) -> usize {
         self.peers.get(infohash).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// 获取指定 infohash 的 peer 数（别名）
+    pub fn peer_count(&self, infohash: &Infohash) -> usize {
+        self.len_for_infohash(infohash)
     }
 
     /// 获取所有 infohash
@@ -233,5 +245,25 @@ mod tests {
             cache.mark_connection_failure(&infohash, &addr);
         }
         assert_eq!(cache.len_for_infohash(&infohash), 0);
+    }
+
+    #[test]
+    fn test_stats() {
+        let cache = PeerCache::default();
+        let infohash1 = [0u8; 20];
+        let infohash2 = [1u8; 20];
+
+        cache.add_peers(&infohash1, &[make_peer(6881, PeerSource::Tracker)]);
+        cache.add_peers(
+            &infohash2,
+            &[
+                make_peer(6882, PeerSource::Dht),
+                make_peer(6883, PeerSource::Pex),
+            ],
+        );
+
+        let (ih_count, peer_count) = cache.stats();
+        assert_eq!(ih_count, 2);
+        assert_eq!(peer_count, 3);
     }
 }
