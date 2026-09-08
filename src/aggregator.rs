@@ -170,10 +170,7 @@ impl PeerDiscoveryAggregator {
         all_peers.sort_by_key(|a| a.addr);
         all_peers.dedup_by(|a, b| a.addr == b.addr);
 
-        // 5. 计算优先级并排序
-        for peer in all_peers.iter_mut() {
-            peer.calculate_priority();
-        }
+        // 5. 按初始评分排序（评分由 ScoreMaintainer 统一维护，aggregator 不具备算分权限）
         all_peers.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
 
         // 6. 限制数量

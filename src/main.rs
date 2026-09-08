@@ -117,10 +117,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 6.5 创建 NAT 管理器，UPnP 端口映射异步后台初始化（不阻塞 HTTP 服务启动）
-    let nat = Arc::new(NatManager::new(
-        config.nat.enabled,
-        config.nat.lease_duration,
-    ));
+    let nat_config = PeerDiscoveryCenter::nat::NatConfig {
+        enabled: config.nat.enabled,
+        lease_duration: config.nat.lease_duration,
+        ..Default::default()
+    };
+    let nat = Arc::new(NatManager::new(nat_config));
     let udp_port = config.super_tracker.udp_port.unwrap_or(config.server.port);
     let crawler_port = if config.crawler.enabled {
         config.crawler.listen_port
@@ -132,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         let nat_clone = nat.clone();
         let http_port = config.server.port;
         tokio::spawn(async move {
-            match nat_clone.init(http_port, udp_port, crawler_port).await {
+            match nat_clone.init(http_port, udp_port, crawler_port, 6881, 6883, 6884).await {
                 Err(e) => {
                     warn!("[main] NAT/UPnP 初始化失败: {}", e);
                     warn!("[main] 如果处于 NAT 网络后，请手动配置端口转发或启用路由器 UPnP");
@@ -250,6 +252,11 @@ async fn main() -> anyhow::Result<()> {
         fetcher: fetcher_ref,
         dht_probe: dht_probe_ref,
         rate_limiter,
+        hole_punch_signaling: Arc::new(PeerDiscoveryCenter::data_plane::hole_punch_signaling::HolePunchSignaling::new()),
+        utp_server: None,
+        pex_receiver: None,
+        tcp_pex_server: None,
+        active_pex: None,
     };
 
     // 8. 启动健康检查任务

@@ -74,6 +74,41 @@ impl DhtNode {
         }
         nodes
     }
+
+    /// 序列化为 compact node info（26字节：20字节ID + 4字节IP + 2字节端口）
+    pub fn to_compact(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(26);
+        buf.extend_from_slice(&self.id);
+        if let IpAddr::V4(ipv4) = self.addr.ip() {
+            buf.extend_from_slice(&ipv4.octets());
+        } else {
+            // IPv6 降级为 0.0.0.0（compact node info 只支持 IPv4）
+            buf.extend_from_slice(&[0u8; 4]);
+        }
+        buf.extend_from_slice(&self.addr.port().to_be_bytes());
+        buf
+    }
+
+    /// 序列化多个节点为 compact nodes 字符串
+    pub fn nodes_to_compact(nodes: &[DhtNode]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(nodes.len() * 26);
+        for node in nodes {
+            buf.extend_from_slice(&node.to_compact());
+        }
+        buf
+    }
+
+    /// 序列化多个 peer 为 compact peers 字符串（每6字节：4字节IP + 2字节端口）
+    pub fn peers_to_compact(peers: &[SocketAddr]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(peers.len() * 6);
+        for peer in peers {
+            if let IpAddr::V4(ipv4) = peer.ip() {
+                buf.extend_from_slice(&ipv4.octets());
+                buf.extend_from_slice(&peer.port().to_be_bytes());
+            }
+        }
+        buf
+    }
 }
 
 /// 解析 compact peers（每 6 字节：4字节IP + 2字节端口）
@@ -359,6 +394,26 @@ impl DhtMessage {
         buf
     }
 
+    /// 构建 find_node 响应（返回指定节点列表）
+    pub fn build_find_node_response_with_nodes(
+        transaction_id: &[u8],
+        node_id: &[u8; 20],
+        nodes: &[DhtNode],
+    ) -> Vec<u8> {
+        let compact_nodes = DhtNode::nodes_to_compact(nodes);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d1:rd2:id20:");
+        buf.extend_from_slice(node_id);
+        buf.extend_from_slice(b"5:nodes");
+        buf.extend_from_slice(format!("{}:", compact_nodes.len()).as_bytes());
+        buf.extend_from_slice(&compact_nodes);
+        buf.extend_from_slice(b"e1:t");
+        buf.extend_from_slice(format!("{}:", transaction_id.len()).as_bytes());
+        buf.extend_from_slice(transaction_id);
+        buf.extend_from_slice(b"1:y1:re");
+        buf
+    }
+
     /// 构建 get_peers 响应（返回空节点列表，无 peers）
     pub fn build_get_peers_response(
         transaction_id: &[u8],
@@ -371,6 +426,43 @@ impl DhtMessage {
         buf.extend_from_slice(b"5:nodes0:e5:token");
         buf.extend_from_slice(format!("{}:", token.len()).as_bytes());
         buf.extend_from_slice(token);
+        buf.extend_from_slice(b"e1:t");
+        buf.extend_from_slice(format!("{}:", transaction_id.len()).as_bytes());
+        buf.extend_from_slice(transaction_id);
+        buf.extend_from_slice(b"1:y1:re");
+        buf
+    }
+
+    /// 构建完整 get_peers 响应（返回 peers + 节点列表）
+    pub fn build_get_peers_response_full(
+        transaction_id: &[u8],
+        node_id: &[u8; 20],
+        token: &[u8],
+        peers: &[SocketAddr],
+        nodes: &[DhtNode],
+    ) -> Vec<u8> {
+        let compact_peers = DhtNode::peers_to_compact(peers);
+        let compact_nodes = DhtNode::nodes_to_compact(nodes);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d1:rd2:id20:");
+        buf.extend_from_slice(node_id);
+        // 如果有 peers，返回 values；否则返回 nodes
+        if !peers.is_empty() {
+            buf.extend_from_slice(b"5:token");
+            buf.extend_from_slice(format!("{}:", token.len()).as_bytes());
+            buf.extend_from_slice(token);
+            buf.extend_from_slice(b"6:valuesl");
+            buf.extend_from_slice(format!("{}:", compact_peers.len()).as_bytes());
+            buf.extend_from_slice(&compact_peers);
+            buf.extend_from_slice(b"e");
+        } else {
+            buf.extend_from_slice(b"5:nodes");
+            buf.extend_from_slice(format!("{}:", compact_nodes.len()).as_bytes());
+            buf.extend_from_slice(&compact_nodes);
+            buf.extend_from_slice(b"5:token");
+            buf.extend_from_slice(format!("{}:", token.len()).as_bytes());
+            buf.extend_from_slice(token);
+        }
         buf.extend_from_slice(b"e1:t");
         buf.extend_from_slice(format!("{}:", transaction_id.len()).as_bytes());
         buf.extend_from_slice(transaction_id);

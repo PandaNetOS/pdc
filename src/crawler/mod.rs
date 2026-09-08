@@ -5,7 +5,11 @@
 //!
 //! 注意：当前为接口定义 + 空实现，实际 DHT 爬行逻辑待后续填充。
 
+pub mod active_pex;
 pub mod engine;
+pub mod pex_receiver;
+pub mod tcp_pex_server;
+pub mod utp_server;
 
 pub use crate::config::CrawlerConfig;
 pub use engine::{CrawlerEngine, CrawlerState};

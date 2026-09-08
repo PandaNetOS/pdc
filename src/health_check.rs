@@ -70,92 +70,6 @@ impl SystemHealth {
     }
 }
 
-/// 计算系统综合健康度（独立函数，供 API 和健康检查任务共用）
-pub fn calculate_system_health(
-    registry: &DiscovererRegistry,
-    cache: &PeerRepoImpl,
-    node_repo: Option<&crate::storage::NodeRepoImpl>,
-) -> SystemHealth {
-    let discoverers = registry.all();
-
-    // Tracker 层健康度
-    let (tracker_score, active_trackers, total_trackers, avg_tracker_score) = discoverers
-        .iter()
-        .find(|d| d.name() == "tracker")
-        .and_then(|d| d.tracker_scores())
-        .map(|scores| {
-            let total = scores.len();
-            let active = scores.iter().filter(|(_, _, disabled)| !disabled).count();
-            let avg = if total > 0 {
-                scores.iter().map(|(_, s, _)| s).sum::<f64>() / total as f64
-            } else {
-                0.0
-            };
-            let active_ratio = if total > 0 { active as f64 / total as f64 } else { 0.0 };
-            let score = active_ratio * 50.0 + (avg / 100.0) * 50.0;
-            (score, active, total, avg)
-        })
-        .unwrap_or((0.0, 0, 0, 0.0));
-
-    // DHT 层健康度（基于 NodeRepo 实际数据，不再硬编码）
-    let dht_healthy = if let Some(repo) = node_repo {
-        let stats = repo.stats_sync();
-        let total_nodes = stats.total;
-
-        // 1. 节点池丰富度（35%）：≥10000 节点满分，线性插值
-        let richness_score = if total_nodes >= 10000 {
-            100.0
-        } else {
-            total_nodes as f64 / 10000.0 * 100.0
-        };
-
-        // 2. 节点平均质量（35%）：所有节点平均评分（0-100）
-        let avg_node_score = stats.avg_score;
-
-        // 3. 活跃节点比例（30%）：有查询记录的节点比例
-        let active_ratio = if total_nodes > 0 {
-            stats.active as f64 / total_nodes as f64
-        } else {
-            0.0
-        };
-        let activity_score = active_ratio * 100.0;
-
-        richness_score * 0.35 + avg_node_score * 0.35 + activity_score * 0.30
-    } else {
-        // 没有 NodeRepo 时回退到旧逻辑：DHT 发现器存在给 50 分
-        discoverers
-            .iter()
-            .find(|d| d.name() == "dht")
-            .map(|_| 50.0)
-            .unwrap_or(0.0)
-    };
-
-    // 缓存层健康度（infohash覆盖度40% + peer丰富度40% + 基础分20%）
-    let cache_stats = cache.stats();
-    let (cache_ih, cache_peers) = cache_stats;
-    // infohash 覆盖度：>50 个 infohash 满分
-    let ih_score = if cache_ih >= 50 { 100.0 } else { cache_ih as f64 * 2.0 };
-    // peer 丰富度：>500 个 peer 满分
-    let peer_score = if cache_peers >= 500 { 100.0 } else { cache_peers as f64 * 0.2 };
-    // 基础分：缓存系统正常运行给 20 分
-    let base_score = 20.0;
-    let cache_score = ih_score * 0.4 + peer_score * 0.4 + base_score;
-
-    let overall = tracker_score * 0.4 + dht_healthy * 0.3 + cache_score * 0.3;
-    let status = SystemHealth::from_score(overall);
-
-    SystemHealth {
-        overall_score: overall,
-        status,
-        tracker_layer_score: tracker_score,
-        dht_layer_score: dht_healthy,
-        peer_layer_score: cache_score,
-        active_trackers,
-        total_trackers,
-        avg_tracker_score,
-    }
-}
-
 /// 健康检查配置
 #[derive(Debug, Clone)]
 pub struct HealthCheckConfig {
@@ -293,9 +207,9 @@ impl HealthCheckTask {
         }
     }
 
-    /// 计算系统综合健康度（使用 HealthScorer 统一入口）
+    /// 计算系统综合健康度（使用 HealthScorer 统一入口，唯一计算路径）
+    /// 评分统一收口：所有 per-entity 评分由 ScoreMaintainer 维护，HealthChecker 只做聚合
     pub async fn calculate_health(&self) -> SystemHealth {
-        // 如果四个 Repo 都可用，使用 HealthScorer 统一计算
         if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) =
             (&self.node_repo, &self.tracker_repo, &self.infohash_repo)
         {
@@ -319,8 +233,17 @@ impl HealthCheckTask {
             };
         }
 
-        // 回退：使用旧的 calculate_system_health（仅当 Repo 不可用时）
-        calculate_system_health(&self.registry, &self.cache, self.node_repo.as_deref())
+        // Repo 不可用时返回默认健康度（不应发生，所有 Repo 都已注入）
+        SystemHealth {
+            overall_score: 0.0,
+            status: HealthStatus::Unhealthy,
+            tracker_layer_score: 0.0,
+            dht_layer_score: 0.0,
+            peer_layer_score: 0.0,
+            active_trackers: 0,
+            total_trackers: 0,
+            avg_tracker_score: 0.0,
+        }
     }
 
     /// 输出统计信息

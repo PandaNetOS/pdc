@@ -65,6 +65,20 @@ pub struct CrawlerState {
     pub messages_received: u64,
     /// 主动发送的请求数
     pub requests_sent: u64,
+    /// 入站 ping 请求数（被动打洞指标）
+    pub inbound_ping: u64,
+    /// 入站 find_node 请求数（被动打洞指标）
+    pub inbound_find_node: u64,
+    /// 入站 get_peers 请求数（被动打洞指标）
+    pub inbound_get_peers: u64,
+    /// 入站 announce_peer 请求数（被动打洞指标）
+    pub inbound_announce_peer: u64,
+    /// 入站 sample_infohashes 请求数
+    pub inbound_sample_infohashes: u64,
+    /// 入站请求总数（其他节点主动连接我们的次数）
+    pub inbound_total: u64,
+    /// 入站请求唯一来源节点数（被动打洞效果指标）
+    pub inbound_unique_sources: usize,
 }
 
 /// 待响应的请求记录
@@ -85,6 +99,8 @@ pub struct CrawlerEngine {
     shutdown: Arc<tokio::sync::Notify>,
     /// 已收集的 infohash（去重）
     seen_infohashes: Arc<RwLock<HashSet<Infohash>>>,
+    /// 入站请求来源节点集合（被动打洞效果分析）
+    inbound_sources: Arc<RwLock<HashSet<std::net::SocketAddr>>>,
     /// Kademlia 路由表
     known_nodes: Arc<RwLock<RoutingTable>>,
     /// 待响应的请求（transaction_id -> PendingRequest）
@@ -131,6 +147,7 @@ impl CrawlerEngine {
             event_bus,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             seen_infohashes: Arc::new(RwLock::new(HashSet::new())),
+            inbound_sources: Arc::new(RwLock::new(HashSet::new())),
             known_nodes: Arc::new(RwLock::new(RoutingTable::new(node_id))),
             pending: Arc::new(RwLock::new(HashMap::new())),
             peer_repo: None,
@@ -921,6 +938,28 @@ impl CrawlerEngine {
     ) -> Option<Infohash> {
         let (tid, method, infohash) = DhtMessage::parse_query(data)?;
 
+        // 统计入站请求（被动打洞指标：其他节点主动连接我们的次数）
+        {
+            let mut state = self.state.write();
+            state.inbound_total += 1;
+            match method {
+                QueryMethod::Ping => state.inbound_ping += 1,
+                QueryMethod::FindNode => state.inbound_find_node += 1,
+                QueryMethod::GetPeers => state.inbound_get_peers += 1,
+                QueryMethod::AnnouncePeer => state.inbound_announce_peer += 1,
+                QueryMethod::SampleInfohashes => state.inbound_sample_infohashes += 1,
+                QueryMethod::Scrape => {}
+            }
+        }
+
+        // 入站来源节点统计（被动打洞效果分析）
+        {
+            let mut sources = self.inbound_sources.write();
+            sources.insert(from);
+            let mut state = self.state.write();
+            state.inbound_unique_sources = sources.len();
+        }
+
         // 被动收集节点：任何发送 DHT 查询的节点都是 DHT 节点，加入路由表 + NodeRepo
         if let Some(node_id) = DhtMessage::extract_query_node_id(data) {
             let mut known = self.known_nodes.write();
@@ -939,12 +978,41 @@ impl CrawlerEngine {
                 let _ = socket.send_to(&resp, from).await;
             }
             QueryMethod::FindNode => {
-                let resp = DhtMessage::build_find_node_response(&tid, &self.node_id);
+                // 完善响应：返回路由表中最接近目标的 K 个节点
+                let target = infohash.unwrap_or([0u8; 20]);
+                let closest_nodes: Vec<DhtNode> = {
+                    let known = self.known_nodes.read();
+                    known.find_closest(&target, 8)
+                        .into_iter()
+                        .map(|e| DhtNode { id: e.id, addr: e.addr })
+                        .collect()
+                };
+                let resp = DhtMessage::build_find_node_response_with_nodes(&tid, &self.node_id, &closest_nodes);
                 let _ = socket.send_to(&resp, from).await;
             }
             QueryMethod::GetPeers => {
                 let token = rand::thread_rng().gen::<[u8; 4]>();
-                let resp = DhtMessage::build_get_peers_response(&tid, &self.node_id, &token);
+                // 完善响应：如果 PeerRepo 中有这个 infohash 的 peer，返回它们
+                let peers_for_ih: Vec<SocketAddr> = if let Some(ih) = infohash {
+                    if let Some(peer_repo) = &self.peer_repo {
+                        peer_repo.get_peers_sync(&ih, 20)
+                            .into_iter()
+                            .map(|p| p.addr)
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+                let closest_nodes: Vec<DhtNode> = {
+                    let known = self.known_nodes.read();
+                    known.find_closest(&infohash.unwrap_or([0u8; 20]), 8)
+                        .into_iter()
+                        .map(|e| DhtNode { id: e.id, addr: e.addr })
+                        .collect()
+                };
+                let resp = DhtMessage::build_get_peers_response_full(&tid, &self.node_id, &token, &peers_for_ih, &closest_nodes);
                 let _ = socket.send_to(&resp, from).await;
 
                 // 同时主动发 get_peers 回去，收集这个 infohash 的 peer
@@ -1063,7 +1131,9 @@ impl CrawlerEngine {
         let mut last_active_scrape = Instant::now();
         let mut last_cleanup = Instant::now();
         let mut last_bucket_refresh = Instant::now();
+        let mut last_keepalive = Instant::now();
         let bootstrap_interval = Duration::from_secs(120); // 每 2 分钟重新 bootstrap
+        let keepalive_interval = Duration::from_secs(60); // 每 60 秒向高评分节点发 ping 保持活跃度
         let crawl_interval = Duration::from_millis(self.config.crawl_interval_secs * 1000 / 2); // 主动爬行间隔
         let get_peers_interval = Duration::from_secs(10); // 主动 get_peers 间隔（加速节点传播）
         let sample_infohashes_interval = Duration::from_secs(15); // 主动 sample_infohashes 间隔（BEP 51）
@@ -1194,11 +1264,43 @@ impl CrawlerEngine {
                         self.refresh_buckets(&socket).await;
                         last_bucket_refresh = Instant::now();
                     }
+
+                    // 定期节点活跃度维护（向高评分节点发 ping，保持我们在其他节点路由表中的活跃度）
+                    if last_keepalive.elapsed() >= keepalive_interval {
+                        self.active_keepalive(&socket).await;
+                        last_keepalive = Instant::now();
+                    }
                 }
             }
         }
 
         info!("[crawler] 爬虫引擎已停止");
+    }
+
+    /// 节点活跃度维护：向 top 20 高评分节点发送 ping
+    ///
+    /// 目的：保持我们的节点在其他节点路由表中的活跃度，
+    /// 让其他节点更频繁地向我们发送请求（被动打洞正循环）。
+    async fn active_keepalive(&self, socket: &UdpSocket) {
+        let top_nodes: Vec<std::net::SocketAddr> = {
+            let table = self.known_nodes.read();
+            table.top_nodes_by_score(20)
+                .into_iter()
+                .map(|n| n.addr)
+                .collect()
+        };
+        if top_nodes.is_empty() { return; }
+        let mut sent = 0;
+        for addr in &top_nodes {
+            let tid = rand::random::<[u8; 2]>();
+            let msg = DhtMessage::build_ping(&tid, &self.node_id);
+            if socket.send_to(&msg, addr).await.is_ok() { sent += 1; }
+        }
+        {
+            let mut state = self.state.write();
+            state.requests_sent += sent;
+        }
+        debug!("[crawler] 活跃度维护: 向 {}/{} 个高评分节点发送了 ping", sent, top_nodes.len());
     }
 }
 
@@ -1295,6 +1397,7 @@ impl CrawlerEngine {
             event_bus: self.event_bus.clone(),
             shutdown: self.shutdown.clone(),
             seen_infohashes: self.seen_infohashes.clone(),
+            inbound_sources: self.inbound_sources.clone(),
             known_nodes: self.known_nodes.clone(),
             pending: self.pending.clone(),
             peer_repo: self.peer_repo.clone(),

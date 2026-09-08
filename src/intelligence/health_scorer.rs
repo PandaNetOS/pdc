@@ -33,7 +33,12 @@ impl HealthScorer for HealthScorerImpl {
         peers: &dyn PeerRepository,
         _infohashes: &dyn InfohashRepository,
     ) -> HealthReport {
+        // 评分统一收口原则：HealthChecker 只做聚合，不做重复评分
+        // 所有 per-entity 评分由 ScoreMaintainer 统一维护，HealthChecker 直接取平均值
+
         // ---- Tracker 层健康度（40%）----
+        // 四维度加权：数量丰富度(25%) + 活跃比例(25%) + 平均评分(30%) + 协议多样性(20%)
+        // 评分统一收口：平均评分由 ScoreMaintainer 维护，其他维度为聚合统计
         let all_trackers = trackers.all_trackers().await;
         let total_trackers = all_trackers.len();
         let active_trackers = all_trackers.iter().filter(|t| !t.disabled).count();
@@ -42,40 +47,59 @@ impl HealthScorer for HealthScorerImpl {
         } else {
             0.0
         };
+
+        // 维度1：数量丰富度（25%）— ≥50 个 tracker 满分，线性插值
+        let richness_score = if total_trackers >= 50 {
+            100.0
+        } else {
+            total_trackers as f64 / 50.0 * 100.0
+        };
+
+        // 维度2：活跃比例（25%）— 未禁用 tracker 占比
         let active_ratio = if total_trackers > 0 {
-            active_trackers as f64 / total_trackers as f64
+            active_trackers as f64 / total_trackers as f64 * 100.0
         } else {
             0.0
         };
-        // 活跃比例 50% + 平均评分 50%
-        let tracker_layer = active_ratio * 50.0 + (avg_tracker_score / 100.0) * 50.0;
+
+        // 维度3：平均评分（30%）— ScoreMaintainer 统一维护
+        let score_dimension = avg_tracker_score;
+
+        // 维度4：协议多样性（20%）— HTTP + UDP 都有 = 满分，只有一种 = 50分
+        let has_http = all_trackers.iter().any(|t| t.url.starts_with("http://") || t.url.starts_with("https://"));
+        let has_udp = all_trackers.iter().any(|t| t.url.starts_with("udp://"));
+        let protocol_diversity = match (has_http, has_udp) {
+            (true, true) => 100.0,
+            (true, false) | (false, true) => 50.0,
+            (false, false) => 0.0,
+        };
+
+        // Tracker 层健康度 = 四维度加权
+        let tracker_layer = richness_score * 0.25
+            + active_ratio * 0.25
+            + score_dimension * 0.30
+            + protocol_diversity * 0.20;
 
         // ---- DHT 层健康度（30%）----
-        // 使用 stats() 替代 all_nodes() 全量克隆，避免大量内存分配
+        // 丰富度（节点数量）+ 平均节点 score（ScoreMaintainer 统一维护）
+        // 不再重复计算"活跃节点比例"，因为节点 score 中已包含活跃度维度
         let node_stats = nodes.stats().await;
         let total_nodes = node_stats.total;
 
-        // 1. 节点池丰富度（35%）：≥10000 节点满分，线性插值
+        // 节点池丰富度（40%）：≥10000 节点满分，线性插值
         let richness_score = if total_nodes >= 10000 {
             100.0
         } else {
             total_nodes as f64 / 10000.0 * 100.0
         };
 
-        // 2. 节点平均质量（35%）：所有节点平均评分（0-100）
+        // 节点平均质量（60%）：直接取 ScoreMaintainer 维护的平均 score
         let avg_node_score = node_stats.avg_score;
 
-        // 3. 活跃节点比例（30%）：有查询记录的节点比例
-        let active_node_ratio = if total_nodes > 0 {
-            node_stats.active as f64 / total_nodes as f64
-        } else {
-            0.0
-        };
-        let activity_score = active_node_ratio * 100.0;
-
-        let dht_layer = richness_score * 0.35 + avg_node_score * 0.35 + activity_score * 0.30;
+        let dht_layer = richness_score * 0.40 + avg_node_score * 0.60;
 
         // ---- Peer 层健康度（30%）----
+        // PeerRepo 目前没有 per-peer score 聚合，保持原有的覆盖度+丰富度计算
         let ih_count = peers.infohash_count().await;
         let peer_count = peers.peer_count().await;
 

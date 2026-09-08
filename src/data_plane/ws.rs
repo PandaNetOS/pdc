@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::intelligence::scorer_traits::HealthScorer;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::response::Response;
@@ -137,7 +138,7 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
 }
 
 /// 收集状态快照
-fn collect_status(state: &AppState) -> serde_json::Value {
+async fn collect_status(state: &AppState) -> serde_json::Value {
     let registry = state.control_plane.registry();
     let cache_stats = state.peer_repo.stats();
     // 计算活跃 peer 数（最近1小时内有活跃的 peer）
@@ -150,7 +151,57 @@ fn collect_status(state: &AppState) -> serde_json::Value {
                 .unwrap_or(false)
         }).count()
     };
-    let health = crate::health_check::calculate_system_health(&registry, &state.peer_repo, state.node_repo.as_deref());
+    // 从 crawler_state 获取入站连通性评分
+    let inbound_score = state.crawler_state.as_ref().map(|cs| {
+        let s = cs.read();
+        let uptime = s.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let inbound_per_min = if uptime > 0 {
+            (s.inbound_total as f64 / uptime as f64) * 60.0
+        } else {
+            0.0
+        };
+        if inbound_per_min >= 10.0 { 100.0 }
+        else if inbound_per_min >= 5.0 { 80.0 }
+        else if inbound_per_min >= 1.0 { 60.0 }
+        else if inbound_per_min >= 0.1 { 40.0 }
+        else if inbound_per_min > 0.0 { 20.0 }
+        else { 0.0 }
+    });
+
+    // 使用 HealthScorerImpl 统一计算健康度（唯一计算路径，评分统一收口）
+    let health_scorer = crate::intelligence::health_scorer::HealthScorerImpl::new();
+    let health = if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) =
+        (state.node_repo.as_ref(), state.tracker_repo.as_ref(), state.infohash_repo.as_ref())
+    {
+        let report = health_scorer.calculate(
+            tracker_repo.as_ref() as &dyn crate::storage::repo_traits::TrackerRepository,
+            node_repo.as_ref() as &dyn crate::storage::repo_traits::NodeRepository,
+            state.peer_repo.as_ref() as &dyn crate::storage::repo_traits::PeerRepository,
+            infohash_repo.as_ref() as &dyn crate::storage::repo_traits::InfohashRepository,
+        ).await;
+        let status = crate::health_check::SystemHealth::from_score(report.overall);
+        crate::health_check::SystemHealth {
+            overall_score: report.overall,
+            status,
+            tracker_layer_score: report.tracker_layer,
+            dht_layer_score: report.dht_layer,
+            peer_layer_score: report.peer_layer,
+            active_trackers: report.active_trackers,
+            total_trackers: report.total_trackers,
+            avg_tracker_score: report.avg_tracker_score,
+        }
+    } else {
+        crate::health_check::SystemHealth {
+            overall_score: 0.0,
+            status: crate::health_check::HealthStatus::Unhealthy,
+            tracker_layer_score: 0.0,
+            dht_layer_score: 0.0,
+            peer_layer_score: 0.0,
+            active_trackers: 0,
+            total_trackers: 0,
+            avg_tracker_score: 0.0,
+        }
+    };
 
     let crawler = state.crawler_state.as_ref().map(|cs| {
         let s = cs.read();
@@ -167,18 +218,16 @@ fn collect_status(state: &AppState) -> serde_json::Value {
         })
     }).unwrap_or_else(|| serde_json::json!({"enabled": false}));
 
-    let tracker_scores: Vec<serde_json::Value> = registry
-        .all()
-        .iter()
-        .find(|d| d.name() == "tracker")
-        .and_then(|d| d.tracker_scores())
-        .map(|scores| {
-            scores
+    // 从 TrackerRepo（数据层）获取 tracker 分数，而不是 registry（控制面）
+    // 评分系统统一维护 TrackerRepo 的分数，其他地方均从数据 repo 调取
+    let tracker_scores: Vec<serde_json::Value> = state.tracker_repo.as_ref()
+        .map(|repo| {
+            repo.all_trackers_sync()
                 .into_iter()
-                .map(|(url, score, disabled)| serde_json::json!({
-                    "url": url,
-                    "score": score,
-                    "disabled": disabled,
+                .map(|t| serde_json::json!({
+                    "url": t.url,
+                    "score": t.score,
+                    "disabled": t.disabled,
                 }))
                 .collect()
         })
@@ -188,6 +237,7 @@ fn collect_status(state: &AppState) -> serde_json::Value {
     let nat_status = state.nat.status();
     let tcp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "TCP" && m.verified).count();
     let udp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.verified).count();
+    let udp_reachable = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.reachable).count();
 
     serde_json::json!({
         "health": {
@@ -237,10 +287,17 @@ fn collect_status(state: &AppState) -> serde_json::Value {
         "nat": {
             "enabled": nat_status.enabled,
             "gateway_found": nat_status.gateway_found,
+            "gateway_healthy": nat_status.gateway_healthy,
+            "gateway_addr": nat_status.gateway_addr,
             "external_ip": nat_status.external_ip,
+            "local_ip": nat_status.local_ip,
+            "nat_type": nat_status.nat_type.as_str(),
             "tcp_mapped": tcp_mapped,
             "udp_mapped": udp_mapped,
+            "udp_reachable": udp_reachable,
             "total_mappings": nat_status.mappings.len(),
+            "reachability_score": nat_status.reachability_score,
+            "metrics": nat_status.metrics,
         },
         // TrackerPeerFetcher
         "fetcher": state.fetcher.as_ref().map(|f| {
@@ -258,6 +315,69 @@ fn collect_status(state: &AppState) -> serde_json::Value {
                 "total_success": p.total_success.load(std::sync::atomic::Ordering::Relaxed),
                 "total_added": p.total_added.load(std::sync::atomic::Ordering::Relaxed),
                 "probed_cache": p.probed.read().len(),
+            })
+        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
+        // uTP 服务端（BEP 29）
+        "utp_server": state.utp_server.as_ref().map(|s| {
+            let stats = s.stats();
+            serde_json::json!({
+                "enabled": true,
+                "port": 6883,
+                "syn_received": stats.syn_received,
+                "connections_established": stats.connections_established,
+                "handshakes_received": stats.handshakes_received,
+                "peers_extracted": stats.peers_extracted,
+                "active_connections": stats.active_connections,
+                "connections_rejected": stats.connections_rejected,
+                "connections_evicted": stats.connections_evicted,
+                "max_connections": 100,
+            })
+        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
+        // PEX 接收器（BEP 11）
+        "pex_receiver": state.pex_receiver.as_ref().map(|r| {
+            let stats = r.stats();
+            serde_json::json!({
+                "enabled": true,
+                "extension_handshakes": stats.extension_handshakes,
+                "pex_supported": stats.pex_supported,
+                "pex_messages": stats.pex_messages,
+                "peers_extracted": stats.peers_extracted,
+                "ipv4_peers": stats.ipv4_peers,
+                "ipv6_peers": stats.ipv6_peers,
+                "utp_peers": stats.utp_peers,
+                "holepunch_peers": stats.holepunch_peers,
+                "dedup_skipped": stats.dedup_skipped,
+                "parse_errors": stats.parse_errors,
+            })
+        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
+        // TCP PEX 服务端（BEP 11，端口 6884）
+        "tcp_pex": state.tcp_pex_server.as_ref().map(|s| {
+            let stats = s.stats();
+            serde_json::json!({
+                "enabled": true,
+                "port": 6884,
+                "connections_accepted": stats.connections_accepted,
+                "handshakes_completed": stats.handshakes_completed,
+                "pex_messages": stats.pex_messages,
+                "peers_extracted": stats.peers_extracted,
+                "active_connections": stats.active_connections,
+            })
+        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
+        // 主动 PEX 请求器（BEP 11）
+        "active_pex": state.active_pex.as_ref().map(|s| {
+            let stats = s.stats();
+            serde_json::json!({
+                "enabled": true,
+                "connection_attempts": stats.connection_attempts,
+                "connections_succeeded": stats.connections_succeeded,
+                "connections_failed": stats.connections_failed,
+                "handshakes_completed": stats.handshakes_completed,
+                "extension_handshakes": stats.extension_handshakes,
+                "pex_supported": stats.pex_supported,
+                "pex_messages": stats.pex_messages,
+                "peers_extracted": stats.peers_extracted,
+                "timeouts": stats.timeouts,
+                "errors": stats.errors,
             })
         }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
     })
@@ -287,7 +407,7 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
     }
 
     // 立即推送一次状态
-    let status_json = build_message("status", collect_status(&state));
+    let status_json = build_message("status", collect_status(&state).await);
     let _ = sender.send(Message::Text(status_json)).await;
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -351,7 +471,7 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
 
             // 每秒推送状态
             _ = status_ticker.tick() => {
-                let json = build_message("status", collect_status(&state));
+                let json = build_message("status", collect_status(&state).await);
                 if sender.send(Message::Text(json)).await.is_err() {
                     debug!("[ws] 发送状态失败，客户端断开");
                     break;

@@ -7,6 +7,7 @@
 //! - GET /api/v1/discoverers - 发现器列表
 //! - GET /api/v1/cache/{infohash} - 查询缓存
 
+use crate::intelligence::scorer_traits::HealthScorer;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -212,6 +213,8 @@ pub fn routes(state: AppState) -> Router {
         .route("/api/v1/peer-feedback", post(peer_feedback_handler))
         .route("/api/v1/nat/status", get(nat_status_handler))
         .route("/api/v1/crawler", get(crawler_handler))
+        .route("/api/v1/utp", get(utp_handler))
+        .route("/api/v1/pex", get(pex_handler))
         .route("/api/v1/history/peers/{infohash}", get(peer_history_handler))
         .route("/api/v1/history/stats/{metric}", get(stats_history_handler))
         .route("/metrics", get(crate::data_plane::metrics::metrics_handler))
@@ -228,7 +231,54 @@ pub fn routes(state: AppState) -> Router {
 async fn health_handler(State(state): State<AppState>) -> Response {
     let registry = state.control_plane.registry();
     let cache_stats = state.peer_repo.stats();
-    let system_health = crate::health_check::calculate_system_health(&registry, &state.peer_repo, state.node_repo.as_deref());
+    // 从 crawler_state 获取入站连通性评分
+    let inbound_score = state.crawler_state.as_ref().map(|cs| {
+        let s = cs.read();
+        let uptime = s.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let inbound_per_min = if uptime > 0 {
+            (s.inbound_total as f64 / uptime as f64) * 60.0
+        } else { 0.0 };
+        if inbound_per_min >= 10.0 { 100.0 }
+        else if inbound_per_min >= 5.0 { 80.0 }
+        else if inbound_per_min >= 1.0 { 60.0 }
+        else if inbound_per_min >= 0.1 { 40.0 }
+        else if inbound_per_min > 0.0 { 20.0 }
+        else { 0.0 }
+    });
+    // 使用 HealthScorerImpl 统一计算健康度（唯一计算路径，评分统一收口）
+    let health_scorer = crate::intelligence::health_scorer::HealthScorerImpl::new();
+    let system_health = if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) =
+        (state.node_repo.as_ref(), state.tracker_repo.as_ref(), state.infohash_repo.as_ref())
+    {
+        let report = health_scorer.calculate(
+            tracker_repo.as_ref() as &dyn crate::storage::repo_traits::TrackerRepository,
+            node_repo.as_ref() as &dyn crate::storage::repo_traits::NodeRepository,
+            state.peer_repo.as_ref() as &dyn crate::storage::repo_traits::PeerRepository,
+            infohash_repo.as_ref() as &dyn crate::storage::repo_traits::InfohashRepository,
+        ).await;
+        let status = crate::health_check::SystemHealth::from_score(report.overall);
+        crate::health_check::SystemHealth {
+            overall_score: report.overall,
+            status,
+            tracker_layer_score: report.tracker_layer,
+            dht_layer_score: report.dht_layer,
+            peer_layer_score: report.peer_layer,
+            active_trackers: report.active_trackers,
+            total_trackers: report.total_trackers,
+            avg_tracker_score: report.avg_tracker_score,
+        }
+    } else {
+        crate::health_check::SystemHealth {
+            overall_score: 0.0,
+            status: crate::health_check::HealthStatus::Unhealthy,
+            tracker_layer_score: 0.0,
+            dht_layer_score: 0.0,
+            peer_layer_score: 0.0,
+            active_trackers: 0,
+            total_trackers: 0,
+            avg_tracker_score: 0.0,
+        }
+    };
 
     let resp = HealthResponse {
         status: "ok".to_string(),
@@ -676,5 +726,53 @@ mod tests {
     fn test_parse_infohash_invalid_hex() {
         let result = parse_infohash(&"g".repeat(40));
         assert!(result.is_err());
+    }
+}
+
+
+/// uTP 服务端统计 handler
+async fn utp_handler(State(state): State<AppState>) -> Response {
+    match &state.utp_server {
+        Some(server) => {
+            let stats = server.stats();
+            Json(serde_json::json!({
+                "enabled": true,
+                "port": 6883,
+                "syn_received": stats.syn_received,
+                "connections_established": stats.connections_established,
+                "handshakes_received": stats.handshakes_received,
+                "peers_extracted": stats.peers_extracted,
+                "resets_received": stats.resets_received,
+                "timeouts": stats.timeouts,
+                "errors": stats.errors,
+                "active_connections": stats.active_connections,
+                "connections_rejected": stats.connections_rejected,
+                "connections_evicted": stats.connections_evicted,
+                "max_connections": 100,
+            })).into_response()
+        }
+        None => Json(serde_json::json!({ "enabled": false, "port": 6883 })).into_response(),
+    }
+}
+
+/// PEX 接收器统计 handler
+async fn pex_handler(State(state): State<AppState>) -> Response {
+    match &state.pex_receiver {
+        Some(receiver) => {
+            let stats = receiver.stats();
+            Json(serde_json::json!({
+                "enabled": true,
+                "extension_handshakes": stats.extension_handshakes,
+                "pex_supported": stats.pex_supported,
+                "pex_messages": stats.pex_messages,
+                "peers_extracted": stats.peers_extracted,
+                "ipv4_peers": stats.ipv4_peers,
+                "ipv6_peers": stats.ipv6_peers,
+                "utp_peers": stats.utp_peers,
+                "holepunch_peers": stats.holepunch_peers,
+                "parse_errors": stats.parse_errors,
+            })).into_response()
+        }
+        None => Json(serde_json::json!({ "enabled": false })).into_response(),
     }
 }

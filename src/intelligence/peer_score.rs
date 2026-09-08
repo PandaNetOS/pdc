@@ -44,6 +44,7 @@ impl PeerScorer for PeerScorerImpl {
             PeerSource::Dht => 70.0,
             PeerSource::Pex => 50.0,
             PeerSource::Manual => 40.0,
+            PeerSource::Utp => 65.0,
         };
 
         // 2. TCP 可达性 30%

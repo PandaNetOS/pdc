@@ -97,10 +97,6 @@ struct TrackerState {
     stats: DiscovererStats,
     /// 累计响应时间（毫秒）
     total_response_time_ms: f64,
-    /// 综合评分（0-100）
-    score: f64,
-    /// 最后一次评分时间
-    last_score_at: Option<Instant>,
 }
 
 impl Default for TrackerState {
@@ -111,8 +107,6 @@ impl Default for TrackerState {
             disabled: false,
             stats: DiscovererStats::default(),
             total_response_time_ms: 0.0,
-            score: 0.0,
-            last_score_at: None,
         }
     }
 }
@@ -145,8 +139,7 @@ impl TrackerDiscoverer {
             states: Arc::new(RwLock::new(states)),
             tracker_repo: None,
         };
-        // 初始化评分（新 tracker 默认 15 分在线率）
-        discoverer.recalculate_scores();
+        // 评分由 ScoreMaintainer 统一维护，discoverer 不具备算分权限
         discoverer
     }
 
@@ -266,49 +259,6 @@ impl TrackerDiscoverer {
         }
     }
 
-    /// 重新计算所有 tracker 的评分
-    pub fn recalculate_scores(&self) {
-        let mut states = self.states.write();
-        let mut scored: Vec<(String, f64)> = Vec::new();
-        for (url, state) in states.iter_mut() {
-            let tracker_stats = crate::intelligence::TrackerStats {
-                total_requests: state.stats.total_requests,
-                success_requests: state.stats.success_requests,
-                failed_requests: state.stats.failed_requests,
-                total_peers_discovered: state.stats.total_peers_discovered,
-                total_response_time_ms: state.total_response_time_ms,
-                consecutive_failures: state.consecutive_failures,
-                disabled: state.disabled,
-            };
-            let score = tracker_stats.calculate_score();
-            state.score = score.total;
-            state.last_score_at = Some(Instant::now());
-            scored.push((url.clone(), score.total));
-            debug!("[tracker] {} 评分: {:.1}", url, score.total);
-        }
-
-        // 同步评分到 TrackerRepo
-        if let Some(repo) = &self.tracker_repo {
-            let repo = repo.clone();
-            tokio::spawn(async move {
-                for (url, score) in &scored {
-                    repo.update_score(url, *score).await;
-                }
-            });
-        }
-    }
-
-    /// 获取所有 tracker 的评分列表
-    pub fn get_tracker_scores(&self) -> Vec<(String, f64, bool)> {
-        let states = self.states.read();
-        let mut scores: Vec<(String, f64, bool)> = states
-            .iter()
-            .map(|(url, s)| (url.clone(), s.score, s.disabled))
-            .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores
-    }
-
     /// 动态添加 tracker 到池
     pub fn add_tracker(&self, url: &str) -> bool {
         let mut states = self.states.write();
@@ -350,28 +300,51 @@ impl TrackerDiscoverer {
         removed
     }
 
-    /// 淘汰低评分 tracker（score < threshold 且有足够请求样本）
-    pub fn prune_low_score(&self, threshold: f64, min_requests: u64) -> usize {
-        let mut states = self.states.write();
-        let before = states.len();
-        states.retain(|url, s| {
-            let keep = s.stats.total_requests < min_requests || s.score >= threshold;
-            if !keep {
-                info!("[tracker] 淘汰低评分 tracker: {} (score={:.1})", url, s.score);
-            }
-            keep
-        });
-        before - states.len()
-    }
-
-    /// 获取按评分排序的活跃 tracker 列表
+    /// 获取活跃 tracker 列表（按评分降序，只返回超过平均分的 tracker）
+    /// 评分由 ScoreMaintainer 统一维护，存储在 TrackerRepo 中
+    /// 决策原则：所有涉及评分的决策必须以评分系统的分数为准
     fn active_trackers_sorted(&self) -> Vec<String> {
-        let scores = self.get_tracker_scores();
-        scores
-            .into_iter()
-            .filter(|(_, _, disabled)| !disabled)
-            .map(|(url, _, _)| url)
-            .collect()
+        // 优先从 TrackerRepo 获取按评分排序的 tracker
+        if let Some(repo) = &self.tracker_repo {
+            let trackers = repo.all_trackers_sync();
+            if trackers.is_empty() {
+                return vec![];
+            }
+
+            // 计算平均分
+            let avg_score: f64 = trackers.iter().map(|t| t.score).sum::<f64>() / trackers.len() as f64;
+
+            // 过滤出 score >= 平均分的 tracker，按 score 降序排序
+            let mut high_score_trackers: Vec<(String, f64)> = trackers
+                .into_iter()
+                .filter(|t| !t.disabled && t.score >= avg_score)
+                .map(|t| (t.url, t.score))
+                .collect();
+            high_score_trackers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // 如果过滤后为空（所有 tracker 都低于平均分），则返回分数最高的前 5 个作为保底
+            if high_score_trackers.is_empty() {
+                let mut all_trackers: Vec<(String, f64)> = self.states.read()
+                    .iter()
+                    .filter(|(_, s)| !s.disabled)
+                    .map(|(url, _)| (url.clone(), 0.0))
+                    .collect();
+                all_trackers.sort_by(|a, b| a.0.cmp(&b.0));
+                return all_trackers.into_iter().take(5).map(|(url, _)| url).collect();
+            }
+
+            return high_score_trackers.into_iter().map(|(url, _)| url).collect();
+        }
+
+        // 回退：TrackerRepo 不可用时，从自己的 states 获取（不评分，按 url 排序）
+        let states = self.states.read();
+        let mut active: Vec<String> = states
+            .iter()
+            .filter(|(_, s)| !s.disabled)
+            .map(|(url, _)| url.clone())
+            .collect();
+        active.sort();
+        active
     }
 
     /// 恢复冷却期结束的 Tracker
@@ -541,7 +514,7 @@ impl PeerDiscoverer for TrackerDiscoverer {
         limit: usize,
     ) -> anyhow::Result<Vec<PeerInfo>> {
         self.recover_cooldown_trackers();
-        self.recalculate_scores();
+        // 评分由 ScoreMaintainer 统一维护
 
         let active_trackers = self.active_trackers_sorted();
         if active_trackers.is_empty() {
@@ -717,7 +690,13 @@ impl PeerDiscoverer for TrackerDiscoverer {
     }
 
     fn tracker_scores(&self) -> Option<Vec<(String, f64, bool)>> {
-        Some(self.get_tracker_scores())
+        // 评分由 ScoreMaintainer 统一维护，存储在 TrackerRepo 中
+        self.tracker_repo.as_ref().map(|repo| {
+            repo.all_trackers_sync()
+                .into_iter()
+                .map(|t| (t.url, t.score, t.disabled))
+                .collect()
+        })
     }
 }
 

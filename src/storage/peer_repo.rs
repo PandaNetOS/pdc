@@ -60,9 +60,7 @@ impl PeerRepoImpl {
             let addr = peer.addr;
             if let Some(existing) = cache.global.get_mut(&addr) {
                 existing.last_active = peer.last_active;
-                if peer.source.base_score() > existing.source.base_score() {
-                    existing.source = peer.source;
-                }
+                existing.source = peer.source;  // 直接更新来源（数据层不做评分决策）
                 if peer.peer_id.is_some() {
                     existing.peer_id = peer.peer_id;
                 }
@@ -126,7 +124,6 @@ impl PeerRepoImpl {
             peer.connection_attempts += 1;
             peer.connection_successes += 1;
             peer.last_active = SystemTime::now();
-            peer.calculate_priority();
         }
         let _ = infohash; // 兼容接口
     }
@@ -135,7 +132,6 @@ impl PeerRepoImpl {
         let mut cache = self.cache.write();
         if let Some(peer) = cache.global.get_mut(addr) {
             peer.connection_attempts += 1;
-            peer.calculate_priority();
         }
         let _ = infohash;
     }
@@ -324,7 +320,6 @@ impl PeerRepository for PeerRepoImpl {
                 peer.connection_successes += 1;
                 peer.last_active = SystemTime::now();
             }
-            peer.calculate_priority();
         }
     }
 

@@ -12,6 +12,8 @@ pub mod metrics;
 pub mod rest_api;
 pub mod udp_tracker;
 pub mod rate_limiter;
+pub mod relay;
+pub mod hole_punch_signaling;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -64,6 +66,16 @@ pub struct AppState {
     pub dht_probe: Option<Arc<crate::dht::DhtProbe>>,
     /// 限流器（P2优化：QPS监控+单IP限流+异常封禁）
     pub rate_limiter: Arc<crate::data_plane::rate_limiter::RateLimiter>,
+    /// UDP打洞信令服务器（协调NAT后节点交换公网地址）
+    pub hole_punch_signaling: Arc<crate::data_plane::hole_punch_signaling::HolePunchSignaling>,
+    /// uTP 服务端（BEP 29，接收 BT 客户端主动连接）
+    pub utp_server: Option<Arc<crate::crawler::utp_server::UtpServer>>,
+    /// PEX 接收器（BEP 11，被动接收 peer 交换消息）
+    pub pex_receiver: Option<Arc<crate::crawler::pex_receiver::PexReceiver>>,
+    /// TCP PEX 服务端（BEP 11，标准 TCP BT 连接被动接收 PEX）
+    pub tcp_pex_server: Option<Arc<crate::crawler::tcp_pex_server::TcpPexServer>>,
+    /// 主动 PEX 请求器（BEP 11，主动连接 peer 请求 PEX 消息）
+    pub active_pex: Option<Arc<crate::crawler::active_pex::ActivePexRequester>>,
 }
 
 /// 数据面

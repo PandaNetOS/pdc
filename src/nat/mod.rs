@@ -11,13 +11,125 @@
 //!
 //! 支持协议：UPnP IGDv1/IGDv2
 
+// 子模块
+pub mod ipv6;
+pub mod metrics;
+pub mod nat_pmp;
+pub mod pcp;
+pub mod provider;
+pub mod state;
+pub mod stun;
+pub mod udp_hole_punch;
+
+// 重新导出常用类型
+pub use ipv6::*;
+pub use metrics::*;
+pub use nat_pmp::*;
+pub use pcp::*;
+pub use provider::*;
+pub use state::*;
+pub use stun::{NatType, ReachabilityResult, StunResult};
+pub use udp_hole_punch::*;
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+
+/// NAT 穿透协议类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NatProtocol {
+    Upnp,
+    NatPmp,
+    Pcp,
+}
+
+impl NatProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NatProtocol::Upnp => "UPnP",
+            NatProtocol::NatPmp => "NAT-PMP",
+            NatProtocol::Pcp => "PCP",
+        }
+    }
+}
+
+/// 网关后端（支持多种 NAT 穿透协议）
+#[derive(Clone)]
+pub enum GatewayBackend {
+    Upnp(igd::Gateway),
+}
+
+impl GatewayBackend {
+    pub fn addr_description(&self) -> String {
+        match self {
+            GatewayBackend::Upnp(g) => format!("{}", g.addr),
+        }
+    }
+
+    pub fn get_external_ip(&self) -> anyhow::Result<Ipv4Addr> {
+        match self {
+            GatewayBackend::Upnp(g) => g.get_external_ip().map_err(|e| anyhow::anyhow!("{}", e)),
+        }
+    }
+
+    pub fn add_port(
+        &self,
+        protocol: igd::PortMappingProtocol,
+        external_port: u16,
+        local_addr: SocketAddrV4,
+        lease_duration: u32,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            GatewayBackend::Upnp(g) => g
+                .add_port(protocol, external_port, local_addr, lease_duration, description)
+                .map_err(|e| anyhow::anyhow!("{}", e)),
+        }
+    }
+
+    pub fn remove_port(
+        &self,
+        protocol: igd::PortMappingProtocol,
+        external_port: u16,
+    ) -> anyhow::Result<()> {
+        match self {
+            GatewayBackend::Upnp(g) => g
+                .remove_port(protocol, external_port)
+                .map_err(|e| anyhow::anyhow!("{}", e)),
+        }
+    }
+}
+
+/// NAT 配置
+#[derive(Debug, Clone)]
+pub struct NatConfig {
+    pub enabled: bool,
+    pub lease_duration: u32,
+    pub stun_servers: Vec<String>,
+    pub health_check_interval: u64,
+    pub enable_auto_recover: bool,
+    pub enable_reachability_check: bool,
+}
+
+impl Default for NatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lease_duration: 3600,
+            stun_servers: vec![
+                "stun.l.google.com:19302".to_string(),
+                "stun1.l.google.com:19302".to_string(),
+            ],
+            health_check_interval: 60,
+            enable_auto_recover: true,
+            enable_reachability_check: true,
+        }
+    }
+}
 
 /// 单条端口映射
 #[derive(Debug, Clone, Serialize)]
@@ -32,6 +144,8 @@ pub struct NatMapping {
     pub description: String,
     /// 是否验证通过（路由器上确实存在）
     pub verified: bool,
+    /// 是否公网可达（通过 STUN 验证）
+    pub reachable: bool,
 }
 
 /// NAT 整体状态
@@ -41,40 +155,72 @@ pub struct NatStatus {
     pub enabled: bool,
     /// UPnP 网关是否发现成功
     pub gateway_found: bool,
+    /// 网关是否健康
+    pub gateway_healthy: bool,
     /// 网关地址
     pub gateway_addr: Option<String>,
     /// 公网 IP
     pub external_ip: Option<String>,
+    /// 本地 IP
+    pub local_ip: Option<String>,
+    /// NAT 类型
+    pub nat_type: NatType,
+    /// 可达性评分（0-100）
+    pub reachability_score: u8,
     /// 映射列表
     pub mappings: Vec<NatMapping>,
+    /// 统计指标
+    pub metrics: NatMetricsSummary,
     /// 最后错误
     pub last_error: Option<String>,
 }
 
 /// NAT 管理器
 pub struct NatManager {
+    config: NatConfig,
     enabled: bool,
     lease_duration: u32,
     local_ip: Ipv4Addr,
     mappings: Arc<RwLock<Vec<NatMapping>>>,
-    gateway: Arc<RwLock<Option<igd::Gateway>>>,
+    gateway: Arc<RwLock<Option<GatewayBackend>>>,
+    gateway_healthy: Arc<RwLock<bool>>,
     external_ip: Arc<RwLock<Option<String>>>,
     last_error: Arc<RwLock<Option<String>>>,
+    nat_type: Arc<RwLock<NatType>>,
+    metrics: Arc<RwLock<NatMetricsExt>>,
+    state_machine: NatStateMachine,
+    ipv6_manager: Arc<Ipv6Manager>,
 }
 
 impl NatManager {
     /// 创建 NAT 管理器
-    pub fn new(enabled: bool, lease_duration: u32) -> Self {
+    pub fn new(config: NatConfig) -> Self {
         let local_ip = Self::detect_local_ip().unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
         Self {
-            enabled,
-            lease_duration,
+            enabled: config.enabled,
+            lease_duration: config.lease_duration,
+            config,
             local_ip,
             mappings: Arc::new(RwLock::new(Vec::new())),
             gateway: Arc::new(RwLock::new(None)),
+            gateway_healthy: Arc::new(RwLock::new(false)),
             external_ip: Arc::new(RwLock::new(None)),
             last_error: Arc::new(RwLock::new(None)),
+            nat_type: Arc::new(RwLock::new(NatType::Unknown)),
+            metrics: Arc::new(RwLock::new(NatMetricsExt::default())),
+            state_machine: NatStateMachine::new(),
+            ipv6_manager: Arc::new(Ipv6Manager::new(Ipv6Config::default())),
         }
+    }
+
+    /// 获取配置
+    pub fn config(&self) -> &NatConfig {
+        &self.config
+    }
+
+    /// 获取 NAT 类型
+    pub fn nat_type(&self) -> NatType {
+        self.nat_type.read().clone()
     }
 
     /// 检测本地 IPv4 地址（通过连接外部地址获取出站 IP）
@@ -99,6 +245,9 @@ impl NatManager {
         http_port: u16,
         udp_port: u16,
         crawler_port: u16,
+        relay_port: u16,
+        utp_port: u16,
+        tcp_pex_port: u16,
     ) -> anyhow::Result<()> {
         if !self.enabled {
             info!("[nat] UPnP 未启用，跳过端口映射");
@@ -122,7 +271,7 @@ impl NatManager {
         };
 
         info!("[nat] 发现网关: {}", gateway.addr);
-        *self.gateway.write() = Some(gateway.clone());
+        *self.gateway.write() = Some(GatewayBackend::Upnp(gateway.clone()));
 
         // 2. 获取公网 IP
         match self.get_external_ip(&gateway).await {
@@ -159,6 +308,7 @@ impl NatManager {
                     external_port: ext_port,
                     description: "PDC HTTP Tracker".to_string(),
                     verified: false,
+                reachable: false,
                 });
                 success_count += 1;
             }
@@ -186,6 +336,7 @@ impl NatManager {
                     external_port: ext_port,
                     description: "PDC UDP Tracker".to_string(),
                     verified: false,
+                reachable: false,
                 });
                 success_count += 1;
             }
@@ -217,11 +368,126 @@ impl NatManager {
                         external_port: ext_port,
                         description: "PDC DHT Crawler".to_string(),
                         verified: false,
+                    reachable: false,
                     });
                     success_count += 1;
                 }
                 Err(e) => {
                     warn!("[nat] UDP {} 映射失败（DHT爬虫）: {}", crawler_port, e);
+                }
+            }
+        }
+
+        // 4.5 中继服务端口（TCP + UDP）
+        if relay_port > 0 {
+            // 中继 TCP
+            match self
+                .map_port_with_retry(
+                    &gateway,
+                    igd::PortMappingProtocol::TCP,
+                    relay_port,
+                    "PDC Relay TCP",
+                )
+                .await
+            {
+                Ok(ext_port) => {
+                    success_count += 1;
+                    info!("[nat] TCP {} → 外部 {} 映射成功（中继）", relay_port, ext_port);
+                    self.mappings.write().push(NatMapping {
+                        protocol: "TCP".to_string(),
+                        internal_port: relay_port,
+                        external_port: ext_port,
+                        description: "PDC Relay TCP".to_string(),
+                        verified: false,
+                        reachable: false,
+                    });
+                }
+                Err(e) => {
+                    warn!("[nat] TCP {} 映射失败（中继）: {}", relay_port, e);
+                }
+            }
+            // 中继 UDP
+            match self
+                .map_port_with_retry(
+                    &gateway,
+                    igd::PortMappingProtocol::UDP,
+                    relay_port,
+                    "PDC Relay UDP",
+                )
+                .await
+            {
+                Ok(ext_port) => {
+                    success_count += 1;
+                    info!("[nat] UDP {} → 外部 {} 映射成功（中继）", relay_port, ext_port);
+                    self.mappings.write().push(NatMapping {
+                        protocol: "UDP".to_string(),
+                        internal_port: relay_port,
+                        external_port: ext_port,
+                        description: "PDC Relay UDP".to_string(),
+                        verified: false,
+                        reachable: false,
+                    });
+                }
+                Err(e) => {
+                    warn!("[nat] UDP {} 映射失败（中继）: {}", relay_port, e);
+                }
+            }
+        }
+
+        // 4.6 uTP 服务端端口（UDP）
+        if utp_port > 0 {
+            match self
+                .map_port_with_retry(
+                    &gateway,
+                    igd::PortMappingProtocol::UDP,
+                    utp_port,
+                    "PDC uTP Server",
+                )
+                .await
+            {
+                Ok(ext_port) => {
+                    success_count += 1;
+                    info!("[nat] UDP {} → 外部 {} 映射成功（uTP）", utp_port, ext_port);
+                    self.mappings.write().push(NatMapping {
+                        protocol: "UDP".to_string(),
+                        internal_port: utp_port,
+                        external_port: ext_port,
+                        description: "PDC uTP Server".to_string(),
+                        verified: false,
+                        reachable: false,
+                    });
+                }
+                Err(e) => {
+                    warn!("[nat] UDP {} 映射失败（uTP）: {}", utp_port, e);
+                }
+            }
+        }
+
+        // 4.7 TCP-PEX 接收器端口（TCP）
+        if tcp_pex_port > 0 {
+            match self
+                .map_port_with_retry(
+                    &gateway,
+                    igd::PortMappingProtocol::TCP,
+                    tcp_pex_port,
+                    "PDC TCP-PEX Receiver",
+                )
+                .await
+            {
+                Ok(ext_port) => {
+                    success_count += 1;
+                    info!("[nat] TCP {} → 外部 {} 映射成功（TCP-PEX）", tcp_pex_port, ext_port);
+                    self.mappings.write().push(NatMapping {
+                        protocol: "TCP".to_string(),
+                        internal_port: tcp_pex_port,
+                        external_port: ext_port,
+                        description: "PDC TCP-PEX Receiver".to_string(),
+                        verified: false,
+                        reachable: false,
+                    });
+                }
+                Err(e) => {
+                    warn!("[nat] TCP {} 映射失败（TCP-PEX）: {}", tcp_pex_port, e);
                 }
             }
         }
@@ -238,7 +504,14 @@ impl NatManager {
         info!(
             "[nat] UPnP 初始化完成: {}/{} 映射成功, {} 验证通过",
             success_count,
-            if crawler_port > 0 { 3 } else { 2 },
+            {
+                let mut total = 2; // HTTP TCP + UDP Tracker
+                if crawler_port > 0 { total += 1; }
+                if relay_port > 0 { total += 2; } // TCP + UDP
+                if utp_port > 0 { total += 1; }
+                if tcp_pex_port > 0 { total += 1; }
+                total
+            },
             verified_count
         );
 
@@ -497,9 +770,31 @@ impl NatManager {
         NatStatus {
             enabled: self.enabled,
             gateway_found: self.gateway.read().is_some(),
-            gateway_addr: self.gateway.read().as_ref().map(|g| g.addr.to_string()),
+            gateway_healthy: *self.gateway_healthy.read(),
+            gateway_addr: self.gateway.read().as_ref().map(|g| g.addr_description()),
             external_ip: self.external_ip.read().clone(),
+            local_ip: Some(self.local_ip.to_string()),
+            nat_type: self.nat_type.read().clone(),
+            reachability_score: 0,
             mappings: self.mappings.read().clone(),
+            metrics: NatMetricsSummary {
+                total_mapping_success: 0,
+                total_mapping_failure: 0,
+                total_success_rate: 0.0,
+                mapping_latency_p50: 0,
+                mapping_latency_p95: 0,
+                mapping_latency_p99: 0,
+                mapping_latency_avg: 0.0,
+                renew_success: 0,
+                renew_failure: 0,
+                discover_success: 0,
+                discover_failure: 0,
+                reachability_checks: 0,
+                reachability_success: 0,
+                reachability_rate: 0.0,
+                uptime_seconds: 0,
+                protocol_count: 0,
+            },
             last_error: self.last_error.read().clone(),
         }
     }
@@ -507,7 +802,9 @@ impl NatManager {
 
 impl Default for NatManager {
     fn default() -> Self {
-        Self::new(false, 3600)
+        let mut config = NatConfig::default();
+        config.enabled = false;
+        Self::new(config)
     }
 }
 

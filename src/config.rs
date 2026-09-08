@@ -467,19 +467,86 @@ pub struct CrawlerConfig {
     pub bootstrap_nodes: Vec<(String, u16)>,
 }
 
+/// NAT 穿透协议类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NatProtocol {
+    /// UPnP IGDv1/v2
+    Upnp,
+    /// NAT-PMP（Apple/企业路由器）
+    #[serde(rename = "natpmp")]
+    NatPmp,
+    /// PCP（端口控制协议，NAT-PMP 继任者）
+    Pcp,
+}
+
+impl NatProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NatProtocol::Upnp => "upnp",
+            NatProtocol::NatPmp => "natpmp",
+            NatProtocol::Pcp => "pcp",
+        }
+    }
+}
+
 /// NAT 穿透配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatConfig {
-    /// 是否启用 UPnP 自动端口映射
-    #[serde(default)]
+    /// 是否启用 NAT 自动端口映射
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 映射租期（秒，0=永久，建议 3600）
     #[serde(default = "default_nat_lease")]
     pub lease_duration: u32,
+    /// 协议优先级（按顺序尝试，第一个成功的为准）
+    #[serde(default = "default_nat_protocols")]
+    pub protocols: Vec<NatProtocol>,
+    /// 指定绑定网卡名称（为空自动选择有默认路由的网卡）
+    #[serde(default)]
+    pub bind_interface: Option<String>,
+    /// 指定绑定 IP（为空自动检测）
+    #[serde(default)]
+    pub bind_ip: Option<String>,
+    /// STUN 服务器列表（用于公网可达性自检和 NAT 类型检测）
+    #[serde(default = "default_stun_servers")]
+    pub stun_servers: Vec<String>,
+    /// 是否启用公网可达性自检
+    #[serde(default = "default_true")]
+    pub enable_reachability_check: bool,
+    /// 是否启用网关自动重连和映射恢复
+    #[serde(default = "default_true")]
+    pub enable_auto_recover: bool,
+    /// 网关健康检查间隔（秒）
+    #[serde(default = "default_nat_health_check_interval")]
+    pub health_check_interval: u64,
+    /// 映射失败时最大重试次数
+    #[serde(default = "default_nat_max_retries")]
+    pub max_retries: u32,
 }
 
 fn default_nat_lease() -> u32 {
     3600
+}
+
+fn default_nat_protocols() -> Vec<NatProtocol> {
+    vec![NatProtocol::Upnp, NatProtocol::NatPmp, NatProtocol::Pcp]
+}
+
+fn default_stun_servers() -> Vec<String> {
+    vec![
+        "stun.l.google.com:19302".to_string(),
+        "stun1.l.google.com:19302".to_string(),
+        "stun.ekiga.net:3478".to_string(),
+    ]
+}
+
+fn default_nat_health_check_interval() -> u64 {
+    300 // 5 分钟
+}
+
+fn default_nat_max_retries() -> u32 {
+    10
 }
 
 impl Default for NatConfig {
@@ -487,6 +554,14 @@ impl Default for NatConfig {
         Self {
             enabled: true,
             lease_duration: default_nat_lease(),
+            protocols: default_nat_protocols(),
+            bind_interface: None,
+            bind_ip: None,
+            stun_servers: default_stun_servers(),
+            enable_reachability_check: true,
+            enable_auto_recover: true,
+            health_check_interval: default_nat_health_check_interval(),
+            max_retries: default_nat_max_retries(),
         }
     }
 }

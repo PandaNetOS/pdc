@@ -64,7 +64,7 @@ impl ScoreMaintainer {
         self
     }
 
-    /// 增量重算：只重算脏节点（统计数据有变化的节点）
+    /// 增量重算：NodeRepo 只重算脏节点，PeerRepo/TrackerRepo 全量重算（数据量小）
     pub async fn rescore_incremental(&self) -> usize {
         let mut total_rescored = 0;
         if let Some(repo) = &self.node_repo {
@@ -74,6 +74,16 @@ impl ScoreMaintainer {
             let count = self.node_scorer.rescore_dirty(repo.as_ref()).await;
             total_rescored += count;
             debug!("[score_maintainer] NodeRepo 增量重算: {} 个脏节点", count);
+        }
+        if let Some(repo) = &self.peer_repo {
+            // PeerRepo 全量重算（数据量小，通常几千个）
+            self.peer_scorer.rescore_all(repo.as_ref()).await;
+            debug!("[score_maintainer] PeerRepo 增量重算完成（全量）");
+        }
+        if let Some(repo) = &self.tracker_repo {
+            // TrackerRepo 全量重算（数据量很小，通常几十个）
+            self.tracker_scorer.rescore_all(repo.as_ref()).await;
+            debug!("[score_maintainer] TrackerRepo 增量重算完成（全量）");
         }
         total_rescored
     }
@@ -124,8 +134,8 @@ impl ScoreMaintainer {
         {
             let maintainer = self.clone();
             tokio::spawn(async move {
-                // 延迟一个全量周期再开始，避免启动时和增量任务竞争
-                tokio::time::sleep(full_interval).await;
+                // 延迟 60 秒开始第一次全量重算，避免启动时和增量任务竞争
+                tokio::time::sleep(Duration::from_secs(60)).await;
                 loop {
                     maintainer.rescore_all().await;
                     tokio::time::sleep(full_interval).await;

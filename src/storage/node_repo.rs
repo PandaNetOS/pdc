@@ -14,7 +14,6 @@ use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dht::kbucket::{KBucketEntry, NodeState};
-use crate::intelligence::calculate_node_score;
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::{NodeId, NodeRepository};
 
@@ -61,8 +60,8 @@ impl NodeRepoImpl {
             false
         } else {
             let mut entry = KBucketEntry::new(id, addr);
-            // 新节点立即计算初始评分（无查询记录给中性分45）
-            entry.score = calculate_node_score(&entry);
+            // 新节点初始评分 45.0（中性分），后续由 ScoreMaintainer 统一更新
+            entry.score = 45.0;
             nodes.insert(addr, entry);
             // 新节点标记 dirty（需要增量持久化）
             drop(nodes);
@@ -162,16 +161,6 @@ impl NodeRepoImpl {
         let mut nodes = self.nodes.write();
         for entry in nodes.values_mut() {
             entry.refresh_state();
-        }
-    }
-
-    pub fn rescore_all_sync(&self) {
-        let nodes: Vec<KBucketEntry> = self.nodes.read().values().cloned().collect();
-        let mut write = self.nodes.write();
-        for node in &nodes {
-            if let Some(entry) = write.get_mut(&node.addr) {
-                entry.score = calculate_node_score(entry);
-            }
         }
     }
 
@@ -322,7 +311,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn rescore_all(&self) {
-        self.rescore_all_sync();
+        // 评分由 ScoreMaintainer 统一维护，Repo 不具备算分权限
     }
 
     async fn save_all(&self) -> anyhow::Result<()> {

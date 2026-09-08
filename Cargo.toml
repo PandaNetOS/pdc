@@ -14,6 +14,7 @@ name = "PeerDiscoveryCenter"
 path = "src/lib.rs"
 
 [dependencies]
+uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

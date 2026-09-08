@@ -51,46 +51,12 @@ impl PeerInfo {
             source,
             first_seen: now,
             last_active: now,
-            priority_score: source.base_score(),
+            priority_score: 45.0,  // 中性初始分，等待 ScoreMaintainer 重算（评分唯一性原则）
             connection_attempts: 0,
             connection_successes: 0,
             is_ipv6: addr.is_ipv6(),
             metadata: Default::default(),
         }
-    }
-
-    /// 计算优先级评分
-    pub fn calculate_priority(&mut self) {
-        let mut score = self.source.base_score();
-
-        // IPv4 优先
-        if !self.is_ipv6 {
-            score += 50.0;
-        }
-
-        // 常见 BT 端口优先（更可能是长期做种的）
-        match self.addr.port() {
-            6881..=6889 => score += 30.0,
-            51413 => score += 20.0,
-            _ => {}
-        }
-
-        // 连接成功率高的优先
-        if self.connection_attempts > 0 {
-            let success_rate = self.connection_successes as f64 / self.connection_attempts as f64;
-            score += success_rate * 100.0;
-        }
-
-        // 最近活跃的优先
-        if let Ok(elapsed) = self.last_active.elapsed() {
-            if elapsed < Duration::from_secs(300) {
-                score += 40.0;
-            } else if elapsed < Duration::from_secs(1800) {
-                score += 20.0;
-            }
-        }
-
-        self.priority_score = score;
     }
 
     /// 是否过期（超过 24 小时没活跃）
@@ -116,22 +82,11 @@ pub enum PeerSource {
     SuperTracker,
     /// 手动添加
     Manual,
+    /// uTP 协议连接发现（BEP 29）
+    Utp,
 }
 
 impl PeerSource {
-    /// 基础优先级评分
-    pub fn base_score(&self) -> f64 {
-        match self {
-            PeerSource::Tracker => 100.0,
-            PeerSource::SuperTracker => 95.0,
-            PeerSource::Dht => 80.0,
-            PeerSource::Pex => 60.0,
-            PeerSource::Lpd => 90.0,
-            PeerSource::WebSeed => 85.0,
-            PeerSource::Manual => 50.0,
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             PeerSource::Tracker => "tracker",
@@ -141,6 +96,7 @@ impl PeerSource {
             PeerSource::WebSeed => "webseed",
             PeerSource::SuperTracker => "super_tracker",
             PeerSource::Manual => "manual",
+            PeerSource::Utp => "utp",
         }
     }
 }
