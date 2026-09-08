@@ -25,43 +25,57 @@ PDC 是 PandaNetOS 生态中的**节点发现 Agent**，负责通过 DHT、Track
 > 四层架构：业务服务通过智能层进行决策，通过数据层访问数据，最终持久化到存储层。
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif', 'primaryColor':'#e3f2fd', 'primaryBorderColor':'#1565c0', 'lineColor':'#1565c0'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80, 'htmlLabels': true, 'curve':'basis'}}}%%
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80, 'htmlLabels': true, 'curve':'basis'}}}%%
 graph LR
+    %% 样式定义：四层四色
+    classDef service fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef intelligence fill:#bfb,stroke:#333,stroke-width:2px;
+    classDef repo fill:#fbb,stroke:#333,stroke-width:1px;
+    classDef storage fill:#ffb,stroke:#333,stroke-width:1px;
+
     subgraph L1 ["业务服务层 Services"]
         direction TB
-        S1["Discover 发现服务"]
-        S2["Crawler 爬虫服务"]
-        S3["Tracker 服务"]
-        S4["Probe 探测服务"]
-        S5["Pex PEX服务"]
-        S6["Nat NAT穿透"]
+        S1["🔍 Discover 发现服务"]
+        S2["🕷️ Crawler 爬虫服务"]
+        S3["📡 Tracker 服务"]
+        S4["🔬 Probe 探测服务"]
+        S5["🔄 Pex PEX服务"]
+        S6["🌐 Nat NAT穿透"]
     end
 
     subgraph L2 ["智能层 Intelligence"]
         direction TB
-        I1["ScoreSystem 评分系统"]
-        I2["TierSystem 冷热分层"]
-        I3["SelectSystem 节点选择"]
-        I4["HealthScorer 健康度"]
+        I1["📊 ScoreSystem 评分"]
+        I2["🎚️ TierSystem 冷热分层"]
+        I3["🎯 SelectSystem 节点选择"]
+        I4["💚 HealthScorer 健康度"]
     end
 
     subgraph L3 ["数据层 Repositories"]
         direction TB
-        R1["NodeRepo DHT节点"]
-        R2["PeerRepo BT Peer"]
-        R3["TrackerRepo Tracker"]
-        R4["InfohashRepo Infohash"]
+        R1["📍 NodeRepo DHT节点"]
+        R2["👥 PeerRepo BT Peer"]
+        R3["📋 TrackerRepo Tracker"]
+        R4["🔑 InfohashRepo Infohash"]
     end
 
     subgraph L4 ["存储层 Storage"]
         direction TB
-        DB[("SQLite WAL 持久化")]
-        MEM["内存缓存 parking_lot::RwLock"]
+        DB[("💾 SQLite WAL 持久化")]
+        MEM["⚡ 内存缓存 parking_lot"]
     end
 
+    %% 层间调用
     L1 ==>|"调用智能决策"| L2
     L2 ==>|"读写数据"| L3
     L3 ==>|"持久化+缓存"| L4
+    L1 -.->|"直接数据访问"| L3
+
+    %% 应用样式
+    class S1,S2,S3,S4,S5,S6 service;
+    class I1,I2,I3,I4 intelligence;
+    class R1,R2,R3,R4 repo;
+    class DB,MEM storage;
 ```
 
 ### 核心数据流
@@ -69,57 +83,70 @@ graph LR
 > 关键依赖路径：实线表示强依赖调用，业务服务可通过 trait 直接访问数据层。
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif', 'primaryColor':'#fff3e0', 'primaryBorderColor':'#e65100', 'lineColor':'#e65100'}, 'flowchart': {'nodeSpacing': 60, 'rankSpacing': 90, 'htmlLabels': true, 'curve':'basis'}}}%%
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80, 'htmlLabels': true, 'curve':'basis'}}}%%
 graph LR
+    %% 样式定义
+    classDef service fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef intelligence fill:#bfb,stroke:#333,stroke-width:2px;
+    classDef repo fill:#fbb,stroke:#333,stroke-width:1px;
+
     subgraph SV ["业务服务层"]
-        Crawler["Crawler 爬虫"]
-        Discover["Discover 发现"]
-        Tracker["Tracker 服务"]
+        direction TB
+        Crawler["🕷️ Crawler 爬虫"]
+        Discover["🔍 Discover 发现"]
+        Tracker["📡 Tracker 服务"]
     end
 
     subgraph INT ["智能层"]
-        SelectSystem["SelectSystem 节点选择"]
-        ScoreSystem["ScoreSystem 评分系统"]
-        TierSystem["TierSystem 冷热分层"]
-        HealthScorer["HealthScorer 健康度"]
+        direction TB
+        SelectSystem["🎯 SelectSystem 选择"]
+        ScoreSystem["📊 ScoreSystem 评分"]
+        TierSystem["🎚️ TierSystem 冷热"]
+        HealthScorer["💚 HealthScorer 健康"]
     end
 
     subgraph REPO ["数据层"]
-        NodeRepo["NodeRepo DHT节点"]
-        PeerRepo["PeerRepo BT Peer"]
-        TrackerRepo["TrackerRepo Tracker"]
-        InfohashRepo["InfohashRepo Infohash"]
+        direction TB
+        NodeRepo["📍 NodeRepo"]
+        PeerRepo["👥 PeerRepo"]
+        TrackerRepo["📋 TrackerRepo"]
+        InfohashRepo["🔑 InfohashRepo"]
     end
 
-    %% 路径1：爬虫选择优质节点 → 爬取 → 存储节点
-    Crawler --> SelectSystem
-    SelectSystem --> NodeRepo
-    Crawler --> NodeRepo
+    %% 路径1：爬虫选择优质节点 → 爬取 → 存储
+    Crawler -->|"选择节点"| SelectSystem
+    SelectSystem -->|"返回候选"| NodeRepo
+    Crawler -->|"存储节点"| NodeRepo
 
     %% 路径2：发现服务 → 选择节点 → 存储Peer
-    Discover --> SelectSystem
-    Discover --> PeerRepo
+    Discover -->|"选择节点"| SelectSystem
+    Discover -->|"存储Peer"| PeerRepo
 
-    %% 路径3：评分维护 → 多维度评分更新
-    ScoreSystem --> NodeRepo
-    ScoreSystem --> PeerRepo
-    ScoreSystem --> TrackerRepo
+    %% 路径3：评分维护 → 多维度评分
+    ScoreSystem -->|"更新评分"| NodeRepo
+    ScoreSystem -->|"更新评分"| PeerRepo
+    ScoreSystem -->|"更新评分"| TrackerRepo
 
     %% 路径4：冷热分层 → 统一温度判定
-    TierSystem --> NodeRepo
-    TierSystem --> PeerRepo
-    TierSystem --> TrackerRepo
-    TierSystem --> InfohashRepo
+    TierSystem -->|"温度判定"| NodeRepo
+    TierSystem -->|"温度判定"| PeerRepo
+    TierSystem -->|"温度判定"| TrackerRepo
+    TierSystem -->|"温度判定"| InfohashRepo
 
     %% 路径5：健康度计算（只读）
-    HealthScorer --> NodeRepo
-    HealthScorer --> PeerRepo
-    HealthScorer --> TrackerRepo
+    HealthScorer -->|"只读统计"| NodeRepo
+    HealthScorer -->|"只读统计"| PeerRepo
+    HealthScorer -->|"只读统计"| TrackerRepo
 
     %% 路径6：Tracker 直接数据访问
-    Tracker --> TrackerRepo
-    Tracker --> InfohashRepo
-    Tracker --> PeerRepo
+    Tracker -->|"读写"| TrackerRepo
+    Tracker -->|"读写"| InfohashRepo
+    Tracker -->|"读写"| PeerRepo
+
+    %% 应用样式
+    class Crawler,Discover,Tracker service;
+    class SelectSystem,ScoreSystem,TierSystem,HealthScorer intelligence;
+    class NodeRepo,PeerRepo,TrackerRepo,InfohashRepo repo;
 ```
 
 ## 设计原则
