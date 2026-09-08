@@ -20,40 +20,106 @@ PDC 是 PandaNetOS 生态中的**节点发现 Agent**，负责通过 DHT、Track
 
 ## 架构分层
 
+### 分层架构总览
+
+> 四层架构：业务服务通过智能层进行决策，通过数据层访问数据，最终持久化到存储层。
+
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 60, 'rankSpacing': 100}}}%%
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif', 'primaryColor':'#e3f2fd', 'primaryBorderColor':'#1565c0', 'lineColor':'#1565c0'}, 'flowchart': {'nodeSpacing': 70, 'rankSpacing': 110, 'htmlLabels': true, 'curve':'basis'}}}%%
 graph TB
-    subgraph "业务服务层 Services"
-        S1[Discover 发现服务]
-        S2[Crawler 爬虫服务]
-        S3[Tracker Tracker服务]
-        S4[Probe 探测服务]
-        S5[Pex PEX服务]
-        S6[Nat NAT穿透]
+    subgraph L1 ["业务服务层 Services"]
+        direction LR
+        S1["Discover 发现服务"]
+        S2["Crawler 爬虫服务"]
+        S3["Tracker 服务"]
+        S4["Probe 探测服务"]
+        S5["Pex PEX服务"]
+        S6["Nat NAT穿透"]
     end
 
-    subgraph "智能层 Intelligence"
-        I1[ScoreSystem 评分系统]
-        I2[TierSystem 冷热分层]
-        I3[SelectSystem 节点选择]
-        I4[HealthScorer 健康度]
+    subgraph L2 ["智能层 Intelligence"]
+        direction LR
+        I1["ScoreSystem 评分系统"]
+        I2["TierSystem 冷热分层"]
+        I3["SelectSystem 节点选择"]
+        I4["HealthScorer 健康度"]
     end
 
-    subgraph "数据层 Repositories"
-        R1[NodeRepo DHT节点]
-        R2[PeerRepo BT Peer]
-        R3[TrackerRepo Tracker]
-        R4[InfohashRepo Infohash]
+    subgraph L3 ["数据层 Repositories"]
+        direction LR
+        R1["NodeRepo DHT节点"]
+        R2["PeerRepo BT Peer"]
+        R3["TrackerRepo Tracker"]
+        R4["InfohashRepo Infohash"]
     end
 
-    subgraph "存储层 Storage"
-        DB[(SQLite WAL)]
-        MEM[内存缓存 parking_lot::RwLock]
+    subgraph L4 ["存储层 Storage"]
+        direction LR
+        DB[("SQLite WAL 持久化")]
+        MEM["内存缓存 parking_lot::RwLock"]
     end
 
-    S1 & S2 & S3 & S4 & S5 & S6 --> I1 & I2 & I3
-    I1 & I2 & I3 & I4 --> R1 & R2 & R3 & R4
-    R1 & R2 & R3 & R4 --> MEM & DB
+    L1 ==>|"调用智能决策（评分/选择/冷热）"| L2
+    L2 ==>|"读写数据（通过 trait 接口）"| L3
+    L3 ==>|"持久化 + 内存缓存"| L4
+```
+
+### 核心数据流
+
+> 关键依赖路径：实线表示强依赖调用，业务服务可通过 trait 直接访问数据层。
+
+```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif', 'primaryColor':'#fff3e0', 'primaryBorderColor':'#e65100', 'lineColor':'#e65100'}, 'flowchart': {'nodeSpacing': 60, 'rankSpacing': 90, 'htmlLabels': true, 'curve':'basis'}}}%%
+graph LR
+    subgraph SV ["业务服务层"]
+        Crawler["Crawler 爬虫"]
+        Discover["Discover 发现"]
+        Tracker["Tracker 服务"]
+    end
+
+    subgraph INT ["智能层"]
+        SelectSystem["SelectSystem 节点选择"]
+        ScoreSystem["ScoreSystem 评分系统"]
+        TierSystem["TierSystem 冷热分层"]
+        HealthScorer["HealthScorer 健康度"]
+    end
+
+    subgraph REPO ["数据层"]
+        NodeRepo["NodeRepo DHT节点"]
+        PeerRepo["PeerRepo BT Peer"]
+        TrackerRepo["TrackerRepo Tracker"]
+        InfohashRepo["InfohashRepo Infohash"]
+    end
+
+    %% 路径1：爬虫选择优质节点 → 爬取 → 存储节点
+    Crawler --> SelectSystem
+    SelectSystem --> NodeRepo
+    Crawler --> NodeRepo
+
+    %% 路径2：发现服务 → 选择节点 → 存储Peer
+    Discover --> SelectSystem
+    Discover --> PeerRepo
+
+    %% 路径3：评分维护 → 多维度评分更新
+    ScoreSystem --> NodeRepo
+    ScoreSystem --> PeerRepo
+    ScoreSystem --> TrackerRepo
+
+    %% 路径4：冷热分层 → 统一温度判定
+    TierSystem --> NodeRepo
+    TierSystem --> PeerRepo
+    TierSystem --> TrackerRepo
+    TierSystem --> InfohashRepo
+
+    %% 路径5：健康度计算（只读）
+    HealthScorer --> NodeRepo
+    HealthScorer --> PeerRepo
+    HealthScorer --> TrackerRepo
+
+    %% 路径6：Tracker 直接数据访问
+    Tracker --> TrackerRepo
+    Tracker --> InfohashRepo
+    Tracker --> PeerRepo
 ```
 
 ## 设计原则
