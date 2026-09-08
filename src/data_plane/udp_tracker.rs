@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::cache::PeerCache;
+use crate::storage::PeerRepoImpl;
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::http_tracker::SuperTrackerState;
 use crate::types::AnnounceEvent;
@@ -44,7 +44,9 @@ pub struct UdpTrackerServer {
     /// 超级 Tracker 状态（共享）
     super_tracker: Arc<SuperTrackerState>,
     /// Peer 缓存（共享）
-    cache: Arc<PeerCache>,
+    cache: Arc<PeerRepoImpl>,
+    /// Infohash 仓库（可选，统一数据归口）
+    infohash_repo: Option<Arc<crate::storage::InfohashRepoImpl>>,
     /// 配置
     config: SuperTrackerConfig,
     /// connection_id 映射
@@ -56,16 +58,23 @@ impl UdpTrackerServer {
     pub fn new(
         listen_addr: SocketAddr,
         super_tracker: Arc<SuperTrackerState>,
-        cache: Arc<PeerCache>,
+        cache: Arc<PeerRepoImpl>,
         config: SuperTrackerConfig,
     ) -> Self {
         Self {
             listen_addr,
             super_tracker,
             cache,
+            infohash_repo: None,
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// 设置 Infohash 仓库
+    pub fn with_infohash_repo(mut self, repo: Arc<crate::storage::InfohashRepoImpl>) -> Self {
+        self.infohash_repo = Some(repo);
+        self
     }
 
     /// 启动 UDP Tracker 服务端（后台运行）
@@ -78,6 +87,7 @@ impl UdpTrackerServer {
 
         let super_tracker = self.super_tracker.clone();
         let cache = self.cache.clone();
+        let infohash_repo = self.infohash_repo.clone();
         let config = self.config.clone();
         let connections = self.connections.clone();
         let interval = config.interval.max(0) as u32;
@@ -105,6 +115,7 @@ impl UdpTrackerServer {
                     let socket = socket.clone();
                     let super_tracker = super_tracker.clone();
                     let cache = cache.clone();
+                    let infohash_repo = infohash_repo.clone();
                     let connections = connections.clone();
 
                     tokio::spawn(async move {
@@ -113,6 +124,7 @@ impl UdpTrackerServer {
                             from,
                             &super_tracker,
                             &cache,
+                            infohash_repo.as_ref(),
                             &connections,
                             interval,
                         )
@@ -136,7 +148,8 @@ impl UdpTrackerServer {
         data: &[u8],
         from: SocketAddr,
         super_tracker: &SuperTrackerState,
-        cache: &PeerCache,
+        cache: &PeerRepoImpl,
+        infohash_repo: Option<&Arc<crate::storage::InfohashRepoImpl>>,
         connections: &RwLock<HashMap<u64, ConnectionEntry>>,
         interval: u32,
     ) -> Option<Vec<u8>> {
@@ -159,6 +172,7 @@ impl UdpTrackerServer {
                     from,
                     super_tracker,
                     cache,
+                    infohash_repo,
                     connections,
                     interval,
                 )
@@ -216,7 +230,8 @@ impl UdpTrackerServer {
         transaction_id: u32,
         from: SocketAddr,
         super_tracker: &SuperTrackerState,
-        cache: &PeerCache,
+        cache: &PeerRepoImpl,
+        infohash_repo: Option<&Arc<crate::storage::InfohashRepoImpl>>,
         connections: &RwLock<HashMap<u64, ConnectionEntry>>,
         interval: u32,
     ) -> Option<Vec<u8>> {
@@ -277,6 +292,11 @@ impl UdpTrackerServer {
                 infohash, peer_id, port, from, uploaded, downloaded, left, event, cache,
             )
             .await;
+
+        // 统一数据归口：announce 的 infohash 注册到 InfohashRepo
+        if let Some(repo) = infohash_repo {
+            repo.register_sync(infohash, "udp_announce");
+        }
 
         // 限制 numwant
         let num_want = if !(0..=100).contains(&num_want) {

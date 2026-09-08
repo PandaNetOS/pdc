@@ -253,10 +253,21 @@ impl NatManager {
 
     /// 发现 UPnP 网关
     async fn discover_gateway(&self) -> anyhow::Result<igd::Gateway> {
-        tokio::task::spawn_blocking(|| igd::search_gateway(igd::SearchOptions::default()))
-            .await
-            .map_err(|e| anyhow::anyhow!("网关发现任务失败: {}", e))?
-            .map_err(|e| anyhow::anyhow!("{}", e))
+        let local_ip = self.local_ip;
+        tokio::task::spawn_blocking(move || {
+            let options = igd::SearchOptions {
+                timeout: Some(Duration::from_secs(15)),
+                bind_addr: std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(local_ip),
+                    0,
+                ),
+                ..Default::default()
+            };
+            igd::search_gateway(options)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("网关发现任务失败: {}", e))?
+        .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     /// 获取公网 IP

@@ -399,7 +399,7 @@ impl PeerDiscoverer for PexDiscoverer {
         let known = self.known_peers.read();
         let mut peers: Vec<PeerInfo> = known.values().cloned().collect();
 
-        peers.sort_by_key(|a| std::cmp::Reverse(a.priority_score));
+        peers.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
 
         if peers.len() > limit {
             peers.truncate(limit);
@@ -437,6 +437,10 @@ impl PeerDiscoverer for PexDiscoverer {
 
     fn stats(&self) -> DiscovererStats {
         self.stats.read().clone()
+    }
+
+    fn add_peer_for_pex(&self, addr: std::net::SocketAddr) {
+        self.add_connected_peer(addr, None);
     }
 }
 

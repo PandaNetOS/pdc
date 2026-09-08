@@ -21,11 +21,12 @@ use dashmap::DashMap;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::cache::PeerCache;
+use crate::storage::PeerRepoImpl;
+use crate::storage::repo_traits::PeerRepository;
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::AppState;
 use crate::types::{
-    AnnounceEvent, Infohash, PeerInfo, ScrapeEntry, TrackerAnnounceRequest,
+    AnnounceEvent, Infohash, PeerInfo, PeerSource, ScrapeEntry, TrackerAnnounceRequest,
     TrackerAnnounceResponse, TrackerScrapeResponse,
 };
 
@@ -50,11 +51,14 @@ struct AnnouncedPeer {
 ///
 /// 存储所有 announce 上来的 peer，按 infohash 分组。
 /// 带过期自动清理。
+/// 同时双写到 PeerRepo（统一数据归口）。
 pub struct SuperTrackerState {
     /// infohash -> (peer_addr -> AnnouncedPeer)
     peers: Arc<DashMap<Infohash, HashMap<SocketAddr, AnnouncedPeer>>>,
     /// 配置
     config: Arc<tokio::sync::RwLock<SuperTrackerConfig>>,
+    /// 统一 PeerRepo（双写）
+    peer_repo: Option<Arc<PeerRepoImpl>>,
 }
 
 impl SuperTrackerState {
@@ -63,9 +67,16 @@ impl SuperTrackerState {
         let state = Self {
             peers: Arc::new(DashMap::new()),
             config: Arc::new(tokio::sync::RwLock::new(config)),
+            peer_repo: None,
         };
         state.spawn_cleanup_task();
         state
+    }
+
+    /// 注入 PeerRepo（announce peer 双写到统一归口）
+    pub fn with_peer_repo(mut self, repo: Arc<PeerRepoImpl>) -> Self {
+        self.peer_repo = Some(repo);
+        self
     }
 
     /// 更新配置
@@ -77,7 +88,7 @@ impl SuperTrackerState {
     pub async fn handle_announce(
         &self,
         req: TrackerAnnounceRequest,
-        cache: &PeerCache,
+        cache: &PeerRepoImpl,
         trigger_backend: bool,
     ) -> TrackerAnnounceResponse {
         let config = self.config.read().await.clone();
@@ -89,7 +100,7 @@ impl SuperTrackerState {
         let mut peers = self.get_peers_for_infohash(&req.info_hash, &req.remote_addr);
 
         // 从缓存补充
-        let cached = cache.get_peers(&req.info_hash, config.max_numwant);
+        let cached = cache.get_peers_sync(&req.info_hash, config.max_numwant);
         for peer in cached {
             if !peers.contains(&peer.addr) && peer.addr != req.remote_addr {
                 peers.push(peer.addr);
@@ -172,6 +183,13 @@ impl SuperTrackerState {
             req.remote_addr,
             hex::encode(&req.info_hash[..4])
         );
+
+        // 双写到 PeerRepo（统一数据归口）
+        if let Some(repo) = &self.peer_repo {
+            let mut peer_info = PeerInfo::new(req.remote_addr, PeerSource::SuperTracker);
+            peer_info.peer_id = Some(req.peer_id);
+            repo.add_peer(req.info_hash, peer_info).await;
+        }
     }
 
     /// 获取指定 infohash 的 peer 列表（排除请求方）
@@ -257,7 +275,7 @@ impl SuperTrackerState {
         downloaded: u64,
         left: u64,
         event: AnnounceEvent,
-        cache: &PeerCache,
+        cache: &PeerRepoImpl,
     ) -> (Vec<SocketAddr>, i64, i64) {
         let config = self.config.read().await.clone();
 
@@ -283,11 +301,18 @@ impl SuperTrackerState {
             }
         }
 
+        // 双写到 PeerRepo（统一数据归口）
+        if event != AnnounceEvent::Stopped {
+            let mut peer_info = crate::types::PeerInfo::new(peer_addr, crate::types::PeerSource::SuperTracker);
+            peer_info.peer_id = Some(peer_id);
+            cache.add_peers_sync(&infohash, &[peer_info]);
+        }
+
         // 收集 peer
         let mut peers = self.get_peers_for_infohash(&infohash, &peer_addr);
 
         // 从缓存补充
-        let cached = cache.get_peers(&infohash, config.max_numwant);
+        let cached = cache.get_peers_sync(&infohash, config.max_numwant);
         for peer in cached {
             if !peers.contains(&peer.addr) && peer.addr != peer_addr {
                 peers.push(peer.addr);
@@ -390,20 +415,27 @@ async fn announce_handler(
         .super_tracker
         .handle_announce(
             req,
-            &state.cache,
+            &state.peer_repo,
             config.super_tracker.trigger_backend_discovery,
         )
         .await;
 
+    // 统一数据归口：announce 的 infohash 注册到 InfohashRepo
+    if let Some(ref repo) = state.infohash_repo {
+        repo.register_sync(info_hash, "http_announce");
+    }
+
     // 如果 peer 不足，异步触发后端发现（不阻塞响应）
     if response.peers.len() < 10 && config.super_tracker.trigger_backend_discovery {
         let cp = state.control_plane.clone();
-        let cache = state.cache.clone();
+        let cache = state.peer_repo.clone();
         let bus = state.event_bus.clone();
         tokio::spawn(async move {
             trigger_backend_discovery(cp, cache, bus, info_hash).await;
         });
     }
+
+    // announce 的 peer 已存入 PeerRepo（见上方 cache.add_peers），DhtProbe 会统一从 PeerRepo 拉取探测
 
     let body = response.to_bencode_compact();
     (StatusCode::OK, [("content-type", "text/plain")], body).into_response()
@@ -423,6 +455,13 @@ async fn scrape_handler(
 
     if info_hashes.is_empty() {
         return error_response("no info_hash provided");
+    }
+
+    // 统一数据归口：scrape 的 infohash 注册到 InfohashRepo
+    if let Some(ref repo) = state.infohash_repo {
+        for ih in &info_hashes {
+            repo.register_sync(*ih, "http_scrape");
+        }
     }
 
     let response = state.super_tracker.handle_scrape(&info_hashes);
@@ -503,7 +542,7 @@ fn error_response(reason: &str) -> Response {
 /// 异步触发后端发现器
 async fn trigger_backend_discovery(
     control_plane: crate::control_plane::ControlPlane,
-    cache: Arc<PeerCache>,
+    cache: Arc<PeerRepoImpl>,
     event_bus: crate::event_bus::EventBus,
     infohash: Infohash,
 ) {
@@ -538,7 +577,7 @@ async fn trigger_backend_discovery(
         all_peers.sort_by_key(|p| p.addr);
         all_peers.dedup_by_key(|p| p.addr);
 
-        cache.add_peers(&infohash, &all_peers);
+        cache.add_peers_sync(&infohash, &all_peers);
         event_bus.publish(Event::PeerDiscovered {
             infohash,
             peers: all_peers.clone(),
@@ -593,7 +632,8 @@ mod tests {
     async fn test_super_tracker_store_and_get() {
         let config = SuperTrackerConfig::default();
         let state = SuperTrackerState::new(config);
-        let cache = PeerCache::default();
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let cache = PeerRepoImpl::new(storage);
 
         let infohash = [0u8; 20];
         let addr = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 6881);

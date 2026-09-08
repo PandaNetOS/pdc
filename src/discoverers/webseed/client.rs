@@ -85,7 +85,7 @@ impl WebSeedDiscoverer {
         let mut info = PeerInfo::new(virtual_addr, PeerSource::WebSeed);
         info.metadata
             .insert("webseed_url".to_string(), url.to_string());
-        info.priority_score = 200; // WebSeed 通常速度快，高优先级
+        info.priority_score = 200.0; // WebSeed 通常速度快，高优先级
         info
     }
 
@@ -204,7 +204,7 @@ mod tests {
             peers[0].metadata.get("webseed_url").unwrap(),
             "http://example.com/file1"
         );
-        assert_eq!(peers[0].priority_score, 200);
+        assert_eq!(peers[0].priority_score, 200.0);
     }
 
     #[tokio::test]

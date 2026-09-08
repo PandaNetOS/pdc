@@ -30,7 +30,7 @@ pub struct PeerInfo {
     /// 最后一次活跃时间
     pub last_active: SystemTime,
     /// 优先级评分（越高越优先连接）
-    pub priority_score: u32,
+    pub priority_score: f64,
     /// 连接尝试次数
     pub connection_attempts: u32,
     /// 连接成功次数
@@ -65,28 +65,28 @@ impl PeerInfo {
 
         // IPv4 优先
         if !self.is_ipv6 {
-            score += 50;
+            score += 50.0;
         }
 
         // 常见 BT 端口优先（更可能是长期做种的）
         match self.addr.port() {
-            6881..=6889 => score += 30,
-            51413 => score += 20,
+            6881..=6889 => score += 30.0,
+            51413 => score += 20.0,
             _ => {}
         }
 
         // 连接成功率高的优先
         if self.connection_attempts > 0 {
             let success_rate = self.connection_successes as f64 / self.connection_attempts as f64;
-            score += (success_rate * 100.0) as u32;
+            score += success_rate * 100.0;
         }
 
         // 最近活跃的优先
         if let Ok(elapsed) = self.last_active.elapsed() {
             if elapsed < Duration::from_secs(300) {
-                score += 40;
+                score += 40.0;
             } else if elapsed < Duration::from_secs(1800) {
-                score += 20;
+                score += 20.0;
             }
         }
 
@@ -120,15 +120,15 @@ pub enum PeerSource {
 
 impl PeerSource {
     /// 基础优先级评分
-    pub fn base_score(&self) -> u32 {
+    pub fn base_score(&self) -> f64 {
         match self {
-            PeerSource::Tracker => 100,
-            PeerSource::SuperTracker => 95,
-            PeerSource::Dht => 80,
-            PeerSource::Pex => 60,
-            PeerSource::Lpd => 90,
-            PeerSource::WebSeed => 85,
-            PeerSource::Manual => 50,
+            PeerSource::Tracker => 100.0,
+            PeerSource::SuperTracker => 95.0,
+            PeerSource::Dht => 80.0,
+            PeerSource::Pex => 60.0,
+            PeerSource::Lpd => 90.0,
+            PeerSource::WebSeed => 85.0,
+            PeerSource::Manual => 50.0,
         }
     }
 
@@ -166,7 +166,7 @@ pub type Infohash = [u8; 20];
 // ---------------------------------------------------------------------------
 
 /// 事件总线事件
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum Event {
     /// 发现了新的 peer
     PeerDiscovered {
@@ -418,7 +418,7 @@ impl TrackerScrapeResponse {
 }
 
 /// 宣告事件
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum AnnounceEvent {
     Started,
     Stopped,

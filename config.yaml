@@ -1,0 +1,15 @@
+crawler:
+  enabled: true
+  crawl_interval_secs: 30
+  max_nodes: 1000
+  max_infohashes: 100000
+  listen_port: 6882
+  persistence_path: "target/dht_routing_table.json"
+
+storage:
+  path: "target/data/pdc.db"
+  enabled: true
+
+nat:
+  enabled: true
+  lease_duration: 3600

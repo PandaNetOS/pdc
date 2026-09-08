@@ -7,7 +7,7 @@
 //! - GET /api/v1/discoverers - 发现器列表
 //! - GET /api/v1/cache/{infohash} - 查询缓存
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use tracing::debug;
 
 use crate::data_plane::AppState;
+use crate::discoverers::tracker::PUBLIC_TRACKERS;
 use crate::types::{Infohash, PeerInfo};
 
 // ---------------------------------------------------------------------------
@@ -34,14 +35,34 @@ pub struct HealthResponse {
     pub super_tracker_infohashes: usize,
     pub super_tracker_peers: usize,
     pub uptime_seconds: u64,
+    pub system_health: crate::health_check::SystemHealth,
 }
 
 /// 统计响应
+#[derive(Debug, Serialize)]
+pub struct TrackerScoreInfo {
+    pub url: String,
+    pub score: f64,
+    pub disabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {
     pub discoverer_stats: Vec<DiscovererStat>,
     pub cache_stats: CacheStats,
     pub super_tracker_stats: SuperTrackerStats,
+    #[serde(default)]
+    pub tracker_scores: Vec<TrackerScoreInfo>,
+    #[serde(default)]
+    pub fetcher_stats: Option<FetcherStats>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FetcherStats {
+    pub total_rounds: u64,
+    pub last_round_peers: u64,
+    pub total_peers_fetched: u64,
+    pub infohash_repo_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,6 +76,8 @@ pub struct DiscovererStat {
     pub total_peers_discovered: u64,
     pub success_rate: f64,
     pub avg_response_time_ms: f64,
+    #[serde(default)]
+    pub tracker_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,12 +170,39 @@ pub struct PeerFeedbackResponse {
     pub updated: bool,
 }
 
+/// 爬虫状态响应
+#[derive(Debug, Serialize)]
+pub struct NodeInfo {
+    pub addr: String,
+    pub score: f64,
+    pub state: String,
+    pub query_count: u64,
+    pub success_rate: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CrawlerStatsResponse {
+    pub enabled: bool,
+    pub running: bool,
+    pub nodes_crawled: u64,
+    pub infohashes_collected: u64,
+    pub peers_collected: u64,
+    pub known_nodes: usize,
+    pub messages_received: u64,
+    pub requests_sent: u64,
+    pub errors: u64,
+    pub uptime_seconds: u64,
+    #[serde(default)]
+    pub top_nodes: Vec<NodeInfo>,
+}
+
 // ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
 
 /// 构建 REST API 路由
 pub fn routes(state: AppState) -> Router {
+    let event_bus = state.event_bus.clone();
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/stats", get(stats_handler))
@@ -161,7 +211,13 @@ pub fn routes(state: AppState) -> Router {
         .route("/api/v1/cache/{infohash}", get(cache_query_handler))
         .route("/api/v1/peer-feedback", post(peer_feedback_handler))
         .route("/api/v1/nat/status", get(nat_status_handler))
+        .route("/api/v1/crawler", get(crawler_handler))
+        .route("/api/v1/history/peers/{infohash}", get(peer_history_handler))
+        .route("/api/v1/history/stats/{metric}", get(stats_history_handler))
+        .route("/metrics", get(crate::data_plane::metrics::metrics_handler))
+        .route("/ws", get(crate::data_plane::ws::ws_handler))
         .with_state(state)
+        .layer(Extension(event_bus))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +227,8 @@ pub fn routes(state: AppState) -> Router {
 /// 健康检查
 async fn health_handler(State(state): State<AppState>) -> Response {
     let registry = state.control_plane.registry();
-    let cache_stats = state.cache.stats();
+    let cache_stats = state.peer_repo.stats();
+    let system_health = crate::health_check::calculate_system_health(&registry, &state.peer_repo, state.node_repo.as_deref());
 
     let resp = HealthResponse {
         status: "ok".to_string(),
@@ -181,7 +238,8 @@ async fn health_handler(State(state): State<AppState>) -> Response {
         cached_peers: cache_stats.1,
         super_tracker_infohashes: state.super_tracker.infohash_count(),
         super_tracker_peers: state.super_tracker.peer_count(),
-        uptime_seconds: 0, // TODO: 记录启动时间
+        uptime_seconds: 0,
+        system_health,
     };
 
     Json(resp).into_response()
@@ -190,12 +248,20 @@ async fn health_handler(State(state): State<AppState>) -> Response {
 /// 统计信息
 async fn stats_handler(State(state): State<AppState>) -> Response {
     let registry = state.control_plane.registry();
+    let config = state.config.read();
+    let custom_trackers = &config.discoverers.custom_trackers;
+    let total_tracker_count = if custom_trackers.is_empty() {
+        PUBLIC_TRACKERS.len()
+    } else {
+        custom_trackers.len()
+    };
 
     let discoverer_stats: Vec<DiscovererStat> = registry
         .all()
         .iter()
         .map(|d| {
             let stats = d.stats();
+            let is_tracker = d.name() == "tracker";
             DiscovererStat {
                 name: d.name().to_string(),
                 discoverer_type: d.discoverer_type().as_str().to_string(),
@@ -206,11 +272,27 @@ async fn stats_handler(State(state): State<AppState>) -> Response {
                 total_peers_discovered: stats.total_peers_discovered,
                 success_rate: stats.success_rate(),
                 avg_response_time_ms: stats.avg_response_time_ms,
+                tracker_count: if is_tracker { total_tracker_count } else { 0 },
             }
         })
         .collect();
 
-    let cache_stats_raw = state.cache.stats();
+    let cache_stats_raw = state.peer_repo.stats();
+
+    // 收集 tracker 评分
+    let tracker_scores: Vec<TrackerScoreInfo> = registry
+        .all()
+        .iter()
+        .find(|d| d.name() == "tracker")
+        .and_then(|d| d.tracker_scores())
+        .map(|scores| {
+            scores
+                .into_iter()
+                .map(|(url, score, disabled)| TrackerScoreInfo { url, score, disabled })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let resp = StatsResponse {
         discoverer_stats,
         cache_stats: CacheStats {
@@ -221,6 +303,13 @@ async fn stats_handler(State(state): State<AppState>) -> Response {
             total_infohashes: state.super_tracker.infohash_count(),
             total_peers: state.super_tracker.peer_count(),
         },
+        tracker_scores,
+        fetcher_stats: state.fetcher.as_ref().map(|f| FetcherStats {
+            total_rounds: f.total_rounds.load(std::sync::atomic::Ordering::Relaxed),
+            last_round_peers: f.last_round_peers.load(std::sync::atomic::Ordering::Relaxed),
+            total_peers_fetched: f.total_peers_fetched.load(std::sync::atomic::Ordering::Relaxed),
+            infohash_repo_count: f.infohash_count(),
+        }),
     };
 
     Json(resp).into_response()
@@ -243,13 +332,13 @@ async fn discover_handler(
 
     // 检查缓存
     if !req.force_refresh {
-        let cached = state.cache.get_peers(&infohash, req.limit);
+        let cached = state.peer_repo.get_peers_sync(&infohash, req.limit);
         if !cached.is_empty() {
             debug!("[rest_api] 缓存命中: {} 个 peer", cached.len());
             let resp = DiscoverResponse {
                 infohash: req.infohash,
                 peers: cached,
-                total: state.cache.peer_count(&infohash),
+                total: state.peer_repo.peer_count_for_infohash(&infohash),
                 from_cache: true,
                 duration_ms: start.elapsed().as_millis() as u64,
             };
@@ -263,6 +352,11 @@ async fn discover_handler(
     let results = registry
         .discover_all(&infohash, req.limit, policy.max_concurrent, policy.timeout)
         .await;
+
+    // 统一数据归口：discover 的 infohash 注册到 InfohashRepo
+    if let Some(ref repo) = state.infohash_repo {
+        repo.register_sync(infohash, "rest_discover");
+    }
 
     let mut all_peers: Vec<PeerInfo> = vec![];
     for (name, result, _duration) in results {
@@ -283,7 +377,17 @@ async fn discover_handler(
 
     // 存入缓存
     if !all_peers.is_empty() {
-        state.cache.add_peers(&infohash, &all_peers);
+        state.peer_repo.add_peers_sync(&infohash, &all_peers);
+    }
+
+    // peer 已存入 PeerRepo，DhtProbe 会统一从 PeerRepo 拉取探测
+
+    // 把发现的 peer 加入 PEX 连接池（PEX 二次扩散获取更多 peer）
+    if let Some(pex) = registry.all().iter().find(|d| d.name() == "pex") {
+        for peer in &all_peers {
+            pex.add_peer_for_pex(peer.addr);
+        }
+        debug!("[rest_api] 已提交 {} 个 peer 到 PEX 连接池", all_peers.len());
     }
 
     if all_peers.len() > req.limit {
@@ -293,7 +397,7 @@ async fn discover_handler(
     let resp = DiscoverResponse {
         infohash: req.infohash,
         peers: all_peers,
-        total: state.cache.peer_count(&infohash),
+        total: state.peer_repo.peer_count_for_infohash(&infohash),
         from_cache: false,
         duration_ms: start.elapsed().as_millis() as u64,
     };
@@ -329,7 +433,7 @@ async fn cache_query_handler(
         }
     };
 
-    let peers = state.cache.get_peers(&infohash, usize::MAX);
+    let peers = state.peer_repo.get_peers_sync(&infohash, usize::MAX);
     let count = peers.len();
 
     Json(CacheQueryResponse {
@@ -369,12 +473,12 @@ async fn peer_feedback_handler(
     };
 
     let updated = if req.success {
-        state.cache.mark_connection_success(&infohash, &addr);
+        state.peer_repo.mark_connection_success_sync(&infohash, &addr);
         true
     } else {
-        state.cache.mark_connection_failure(&infohash, &addr);
+        state.peer_repo.mark_connection_failure_sync(&infohash, &addr);
         // 检查是否被移除
-        state.cache.len_for_infohash(&infohash) > 0
+        state.peer_repo.len_for_infohash(&infohash) > 0
     };
 
     debug!(
@@ -414,6 +518,140 @@ fn parse_infohash(s: &str) -> Result<Infohash, String> {
     let mut arr = [0u8; 20];
     arr.copy_from_slice(&bytes);
     Ok(arr)
+}
+
+/// 爬虫状态
+async fn crawler_handler(State(state): State<AppState>) -> Response {
+    let resp = match &state.crawler_state {
+        Some(cs) => {
+            let s = cs.read();
+            let uptime = s
+                .started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+
+            // 获取 top 10 节点
+            let top_nodes = state
+                .crawler_routing_table
+                .as_ref()
+                .map(|rt| {
+                    let table = rt.read();
+                    table
+                        .top_nodes_by_score(10)
+                        .into_iter()
+                        .map(|n| NodeInfo {
+                            addr: n.addr.to_string(),
+                            score: n.score,
+                            state: format!("{:?}", n.state),
+                            query_count: n.query_count,
+                            success_rate: n.success_rate(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            CrawlerStatsResponse {
+                enabled: true,
+                running: s.running,
+                nodes_crawled: s.nodes_crawled,
+                infohashes_collected: s.infohashes_collected,
+                peers_collected: s.peers_collected,
+                known_nodes: s.known_nodes,
+                messages_received: s.messages_received,
+                requests_sent: s.requests_sent,
+                errors: s.errors,
+                uptime_seconds: uptime,
+                top_nodes,
+            }
+        }
+        None => CrawlerStatsResponse {
+            enabled: false,
+            running: false,
+            nodes_crawled: 0,
+            infohashes_collected: 0,
+            peers_collected: 0,
+            known_nodes: 0,
+            messages_received: 0,
+            requests_sent: 0,
+            errors: 0,
+            uptime_seconds: 0,
+            top_nodes: vec![],
+        },
+    };
+
+    Json(resp).into_response()
+}
+
+/// Peer 历史查询
+async fn peer_history_handler(
+    State(state): State<AppState>,
+    Path(infohash_hex): Path<String>,
+) -> Response {
+    let infohash = match parse_infohash(&infohash_hex) {
+        Ok(ih) => ih,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    match state.storage.query_peer_history(&infohash, 100) {
+        Ok(history) => {
+            #[derive(Serialize)]
+            struct PeerHistoryItem {
+                ip: String,
+                port: u16,
+                source: String,
+                score: f64,
+                discovered_at: i64,
+            }
+            let items: Vec<PeerHistoryItem> = history
+                .into_iter()
+                .map(|h| PeerHistoryItem {
+                    ip: h.ip,
+                    port: h.port,
+                    source: h.source,
+                    score: h.score,
+                    discovered_at: h.discovered_at,
+                })
+                .collect();
+            Json(serde_json::json!({
+                "infohash": infohash_hex,
+                "count": items.len(),
+                "peers": items,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// 统计历史查询
+async fn stats_history_handler(
+    State(state): State<AppState>,
+    Path(metric): Path<String>,
+) -> Response {
+    match state.storage.query_stats_history(&metric, 24) {
+        Ok(points) => {
+            #[derive(Serialize)]
+            struct StatsPoint {
+                timestamp: i64,
+                value: f64,
+            }
+            let items: Vec<StatsPoint> = points
+                .into_iter()
+                .map(|(ts, val)| StatsPoint {
+                    timestamp: ts,
+                    value: val,
+                })
+                .collect();
+            Json(serde_json::json!({
+                "metric": metric,
+                "hours": 24,
+                "count": items.len(),
+                "points": items,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[cfg(test)]

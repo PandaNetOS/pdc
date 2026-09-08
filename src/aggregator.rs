@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::cache::PeerCache;
 use crate::discoverers::DiscovererRegistry;
+use crate::storage::PeerRepoImpl;
 use crate::event_bus::EventBus;
 use crate::traits::{AnnounceEvent, DiscovererStats, PeerDiscoverer};
 use crate::types::{DiscoveryResult, Event, Infohash, PeerInfo, PeerSource};
@@ -53,8 +53,8 @@ impl Default for PeerDiscoveryConfig {
 pub struct PeerDiscoveryAggregator {
     /// 发现器注册表
     registry: Arc<DiscovererRegistry>,
-    /// Peer 缓存
-    cache: Arc<PeerCache>,
+    /// Peer 仓库（统一归口 PeerRepoImpl）
+    peer_repo: Arc<PeerRepoImpl>,
     /// 事件总线
     event_bus: EventBus,
     /// 全局配置
@@ -68,25 +68,26 @@ impl PeerDiscoveryAggregator {
         registry: Arc<DiscovererRegistry>,
         event_bus: EventBus,
     ) -> Self {
-        let cache = Arc::new(PeerCache::new(config.max_cached_peers, config.peer_ttl));
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let peer_repo = Arc::new(PeerRepoImpl::new(storage));
         Self {
             registry,
-            cache,
+            peer_repo,
             event_bus,
             config,
         }
     }
 
-    /// 使用已有缓存创建聚合器
-    pub fn with_cache(
+    /// 使用已有 Peer 仓库创建聚合器
+    pub fn with_peer_repo(
         config: PeerDiscoveryConfig,
         registry: Arc<DiscovererRegistry>,
         event_bus: EventBus,
-        cache: Arc<PeerCache>,
+        peer_repo: Arc<PeerRepoImpl>,
     ) -> Self {
         Self {
             registry,
-            cache,
+            peer_repo,
             event_bus,
             config,
         }
@@ -113,7 +114,7 @@ impl PeerDiscoveryAggregator {
         let start = Instant::now();
 
         // 1. 先从缓存获取
-        let cached_peers = self.cache.get_peers(infohash, limit);
+        let cached_peers = self.peer_repo.get_peers_sync(infohash, limit);
         if !cached_peers.is_empty() {
             debug!("[aggregator] 缓存命中 {} 个 peer", cached_peers.len());
         }
@@ -173,7 +174,7 @@ impl PeerDiscoveryAggregator {
         for peer in all_peers.iter_mut() {
             peer.calculate_priority();
         }
-        all_peers.sort_by_key(|a| std::cmp::Reverse(a.priority_score));
+        all_peers.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
 
         // 6. 限制数量
         if all_peers.len() > limit {
@@ -181,7 +182,7 @@ impl PeerDiscoveryAggregator {
         }
 
         // 7. 更新缓存
-        self.cache.add_peers(infohash, &all_peers);
+        self.peer_repo.add_peers_sync(infohash, &all_peers);
 
         let total_duration = start.elapsed();
 
@@ -231,9 +232,9 @@ impl PeerDiscoveryAggregator {
         }
     }
 
-    /// 获取缓存引用
-    pub fn cache(&self) -> Arc<PeerCache> {
-        self.cache.clone()
+    /// 获取 Peer 仓库引用
+    pub fn peer_repo(&self) -> Arc<PeerRepoImpl> {
+        self.peer_repo.clone()
     }
 
     /// 获取配置引用
@@ -264,7 +265,7 @@ impl PeerDiscoveryAggregator {
             stats.discoverer_stats.insert(name, s);
         }
 
-        stats.cached_peers = self.cache.len();
+        stats.cached_peers = self.peer_repo.len();
         stats
     }
 }
@@ -358,7 +359,7 @@ mod tests {
         let result = aggregator.discover_peers(&infohash, 100).await.unwrap();
 
         assert_eq!(result.peers.len(), 2);
-        assert_eq!(aggregator.cache().len_for_infohash(&infohash), 2);
+        assert_eq!(aggregator.peer_repo().len_for_infohash(&infohash), 2);
     }
 
     #[tokio::test]

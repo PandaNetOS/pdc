@@ -17,6 +17,7 @@ use url::Url;
 
 use crate::traits::{AnnounceEvent, DiscovererStats, DiscovererType, PeerDiscoverer};
 use crate::types::{Infohash, PeerInfo, PeerSource};
+use crate::storage::repo_traits::TrackerRepository;
 
 use super::udp::UdpTrackerClient;
 
@@ -84,7 +85,7 @@ impl Default for TrackerConfig {
 }
 
 /// Tracker 状态
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct TrackerState {
     /// 连续失败次数
     consecutive_failures: u32,
@@ -94,6 +95,26 @@ struct TrackerState {
     disabled: bool,
     /// 统计
     stats: DiscovererStats,
+    /// 累计响应时间（毫秒）
+    total_response_time_ms: f64,
+    /// 综合评分（0-100）
+    score: f64,
+    /// 最后一次评分时间
+    last_score_at: Option<Instant>,
+}
+
+impl Default for TrackerState {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_failure_at: None,
+            disabled: false,
+            stats: DiscovererStats::default(),
+            total_response_time_ms: 0.0,
+            score: 0.0,
+            last_score_at: None,
+        }
+    }
 }
 
 /// Tracker 发现器
@@ -101,6 +122,7 @@ pub struct TrackerDiscoverer {
     config: TrackerConfig,
     client: Client,
     states: Arc<RwLock<HashMap<String, TrackerState>>>,
+    tracker_repo: Option<Arc<crate::storage::TrackerRepoImpl>>,
 }
 
 impl TrackerDiscoverer {
@@ -117,11 +139,29 @@ impl TrackerDiscoverer {
             states.insert(tracker.clone(), TrackerState::default());
         }
 
-        Self {
+        let discoverer = Self {
             config,
             client,
             states: Arc::new(RwLock::new(states)),
-        }
+            tracker_repo: None,
+        };
+        // 初始化评分（新 tracker 默认 15 分在线率）
+        discoverer.recalculate_scores();
+        discoverer
+    }
+
+    /// 注入 TrackerRepo（统一数据归口 + 持久化）
+    pub fn with_tracker_repo(mut self, repo: Arc<crate::storage::TrackerRepoImpl>) -> Self {
+        self.tracker_repo = Some(repo);
+        // 将所有内置 tracker 同步到 repo
+        let trackers: Vec<String> = self.config.trackers.clone();
+        let repo_clone = self.tracker_repo.clone().unwrap();
+        tokio::spawn(async move {
+            for url in &trackers {
+                repo_clone.add_tracker(url.clone()).await;
+            }
+        });
+        self
     }
 
     /// 创建默认配置的 Tracker 发现器
@@ -195,6 +235,7 @@ impl TrackerDiscoverer {
             if success {
                 state.consecutive_failures = 0;
                 state.disabled = false;
+                state.total_response_time_ms += duration.as_millis() as f64;
                 state
                     .stats
                     .record_success(peers_count, duration.as_millis() as f64);
@@ -212,22 +253,271 @@ impl TrackerDiscoverer {
                 }
             }
         }
+
+        // 同步到 TrackerRepo（统一数据归口）
+        if let Some(repo) = &self.tracker_repo {
+            let url = tracker_url.to_string();
+            let repo = repo.clone();
+            let peers = peers_count as u64;
+            let latency = duration.as_millis() as u64;
+            tokio::spawn(async move {
+                repo.record_request(&url, success, peers, latency).await;
+            });
+        }
+    }
+
+    /// 重新计算所有 tracker 的评分
+    pub fn recalculate_scores(&self) {
+        let mut states = self.states.write();
+        let mut scored: Vec<(String, f64)> = Vec::new();
+        for (url, state) in states.iter_mut() {
+            let tracker_stats = crate::intelligence::TrackerStats {
+                total_requests: state.stats.total_requests,
+                success_requests: state.stats.success_requests,
+                failed_requests: state.stats.failed_requests,
+                total_peers_discovered: state.stats.total_peers_discovered,
+                total_response_time_ms: state.total_response_time_ms,
+                consecutive_failures: state.consecutive_failures,
+                disabled: state.disabled,
+            };
+            let score = tracker_stats.calculate_score();
+            state.score = score.total;
+            state.last_score_at = Some(Instant::now());
+            scored.push((url.clone(), score.total));
+            debug!("[tracker] {} 评分: {:.1}", url, score.total);
+        }
+
+        // 同步评分到 TrackerRepo
+        if let Some(repo) = &self.tracker_repo {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                for (url, score) in &scored {
+                    repo.update_score(url, *score).await;
+                }
+            });
+        }
+    }
+
+    /// 获取所有 tracker 的评分列表
+    pub fn get_tracker_scores(&self) -> Vec<(String, f64, bool)> {
+        let states = self.states.read();
+        let mut scores: Vec<(String, f64, bool)> = states
+            .iter()
+            .map(|(url, s)| (url.clone(), s.score, s.disabled))
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores
+    }
+
+    /// 动态添加 tracker 到池
+    pub fn add_tracker(&self, url: &str) -> bool {
+        let mut states = self.states.write();
+        if states.contains_key(url) {
+            return false;
+        }
+        states.insert(url.to_string(), TrackerState::default());
+        info!("[tracker] 动态添加 tracker: {}", url);
+
+        // 同步到 TrackerRepo
+        if let Some(repo) = &self.tracker_repo {
+            let repo = repo.clone();
+            let url = url.to_string();
+            tokio::spawn(async move {
+                repo.add_tracker(url).await;
+            });
+        }
+        true
+    }
+
+    /// 动态移除 tracker
+    pub fn remove_tracker(&self, url: &str) -> bool {
+        let mut states = self.states.write();
+        let removed = states.remove(url).is_some();
+        if removed {
+            info!("[tracker] 动态移除 tracker: {}", url);
+        }
+
+        // 同步到 TrackerRepo
+        if removed {
+            if let Some(repo) = &self.tracker_repo {
+                let repo = repo.clone();
+                let url = url.to_string();
+                tokio::spawn(async move {
+                    repo.remove_tracker(&url).await;
+                });
+            }
+        }
+        removed
+    }
+
+    /// 淘汰低评分 tracker（score < threshold 且有足够请求样本）
+    pub fn prune_low_score(&self, threshold: f64, min_requests: u64) -> usize {
+        let mut states = self.states.write();
+        let before = states.len();
+        states.retain(|url, s| {
+            let keep = s.stats.total_requests < min_requests || s.score >= threshold;
+            if !keep {
+                info!("[tracker] 淘汰低评分 tracker: {} (score={:.1})", url, s.score);
+            }
+            keep
+        });
+        before - states.len()
+    }
+
+    /// 获取按评分排序的活跃 tracker 列表
+    fn active_trackers_sorted(&self) -> Vec<String> {
+        let scores = self.get_tracker_scores();
+        scores
+            .into_iter()
+            .filter(|(_, _, disabled)| !disabled)
+            .map(|(url, _, _)| url)
+            .collect()
     }
 
     /// 恢复冷却期结束的 Tracker
     fn recover_cooldown_trackers(&self) {
+        let mut recovered: Vec<String> = Vec::new();
         let mut states = self.states.write();
-        for state in states.values_mut() {
+        for (url, state) in states.iter_mut() {
             if state.disabled {
                 if let Some(last_failure) = state.last_failure_at {
                     if last_failure.elapsed() >= self.config.cooldown_duration {
                         state.disabled = false;
                         state.consecutive_failures = 0;
+                        recovered.push(url.clone());
                         debug!("[tracker] Tracker 冷却期结束，已恢复");
                     }
                 }
             }
         }
+
+        // 同步恢复状态到 TrackerRepo
+        if !recovered.is_empty() {
+            if let Some(repo) = &self.tracker_repo {
+                let repo = repo.clone();
+                tokio::spawn(async move {
+                    for url in &recovered {
+                        repo.set_disabled(url, false).await;
+                    }
+                });
+            }
+        }
+    }
+
+    /// 向 tracker 发送 scrape 请求，获取 infohash 的种子/下载统计
+    /// 返回 (infohash, complete, incomplete, downloaded) 列表
+    pub async fn scrape(&self, infohashes: &[Infohash]) -> Vec<(Infohash, i64, i64, i64)> {
+        if infohashes.is_empty() {
+            return vec![];
+        }
+
+        let active_trackers = self.active_trackers_sorted();
+        if active_trackers.is_empty() {
+            return vec![];
+        }
+
+        let mut results = vec![];
+        let mut tasks = vec![];
+
+        for tracker_url in active_trackers.iter().take(self.config.max_concurrent_requests) {
+            if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
+                continue;
+            }
+
+            let tracker_url = tracker_url.clone();
+            let infohashes = infohashes.to_vec();
+            let client = self.client.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let mut url = match Url::parse(&tracker_url) {
+                    Ok(u) => u,
+                    Err(_) => return vec![],
+                };
+
+                url.path_segments_mut().unwrap().push("scrape");
+                {
+                    let mut query = url.query_pairs_mut();
+                    for ih in &infohashes {
+                        let ih_hex = hex::encode(ih);
+                        query.append_pair("info_hash", &ih_hex);
+                    }
+                }
+
+                let resp = match client.get(url.as_str()).send().await {
+                    Ok(r) => r,
+                    Err(_) => return vec![],
+                };
+
+                let body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(_) => return vec![],
+                };
+
+                let value: serde_bencode::value::Value = match serde_bencode::from_bytes(&body) {
+                    Ok(v) => v,
+                    Err(_) => return vec![],
+                };
+
+                let dict = match value {
+                    serde_bencode::value::Value::Dict(d) => d,
+                    _ => return vec![],
+                };
+
+                let files = match dict.get(&b"files".to_vec()) {
+                    Some(f) => f,
+                    None => return vec![],
+                };
+
+                let files_dict = match files {
+                    serde_bencode::value::Value::Dict(d) => d,
+                    _ => return vec![],
+                };
+
+                let mut result = vec![];
+                for (key, value) in files_dict {
+                    let mut ih = [0u8; 20];
+                    if key.len() == 20 {
+                        ih.copy_from_slice(&key);
+                    } else if key.len() == 40 {
+                        if hex::decode_to_slice(&key, &mut ih).is_err() {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+
+                    let file_dict = match value {
+                        serde_bencode::value::Value::Dict(d) => d,
+                        _ => continue,
+                    };
+
+                    let complete = file_dict.get(&b"complete".to_vec()).and_then(|v| match v {
+                        serde_bencode::value::Value::Int(i) => Some(*i),
+                        _ => None,
+                    }).unwrap_or(0);
+                    let incomplete = file_dict.get(&b"incomplete".to_vec()).and_then(|v| match v {
+                        serde_bencode::value::Value::Int(i) => Some(*i),
+                        _ => None,
+                    }).unwrap_or(0);
+                    let downloaded = file_dict.get(&b"downloaded".to_vec()).and_then(|v| match v {
+                        serde_bencode::value::Value::Int(i) => Some(*i),
+                        _ => None,
+                    }).unwrap_or(0);
+
+                    result.push((ih, complete, incomplete, downloaded));
+                }
+
+                result
+            }));
+        }
+
+        for task in tasks {
+            if let Ok(result) = task.await {
+                results.extend(result);
+            }
+        }
+
+        results
     }
 }
 
@@ -251,8 +541,9 @@ impl PeerDiscoverer for TrackerDiscoverer {
         limit: usize,
     ) -> anyhow::Result<Vec<PeerInfo>> {
         self.recover_cooldown_trackers();
+        self.recalculate_scores();
 
-        let active_trackers = self.active_trackers();
+        let active_trackers = self.active_trackers_sorted();
         if active_trackers.is_empty() {
             warn!("[tracker] 没有活跃的 Tracker");
             return Ok(vec![]);
@@ -423,6 +714,10 @@ impl PeerDiscoverer for TrackerDiscoverer {
             aggregated.total_peers_discovered += state.stats.total_peers_discovered;
         }
         aggregated
+    }
+
+    fn tracker_scores(&self) -> Option<Vec<(String, f64, bool)>> {
+        Some(self.get_tracker_scores())
     }
 }
 

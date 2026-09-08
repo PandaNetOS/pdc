@@ -8,22 +8,27 @@
 //! 数据面可以水平扩展（多实例无状态），状态存储在共享缓存中。
 
 pub mod http_tracker;
+pub mod metrics;
 pub mod rest_api;
 pub mod udp_tracker;
+pub mod ws;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use parking_lot::RwLock;
+use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::cache::PeerCache;
 use crate::config::PdcConfig;
 use crate::control_plane::ControlPlane;
+use crate::crawler::CrawlerState;
 use crate::data_plane::http_tracker::SuperTrackerState;
 use crate::data_plane::udp_tracker::UdpTrackerServer;
 use crate::event_bus::EventBus;
 use crate::nat::NatManager;
+use crate::storage::PeerRepoImpl;
 
 /// 数据面共享状态
 #[derive(Clone)]
@@ -32,14 +37,30 @@ pub struct AppState {
     pub control_plane: ControlPlane,
     /// 超级 Tracker 状态（announce 上来的 peer 存储）
     pub super_tracker: Arc<SuperTrackerState>,
-    /// Peer 缓存
-    pub cache: Arc<PeerCache>,
+    /// Peer 仓库（统一归口 PeerRepoImpl）
+    pub peer_repo: Arc<PeerRepoImpl>,
     /// 事件总线
     pub event_bus: EventBus,
     /// 配置
     pub config: Arc<RwLock<PdcConfig>>,
     /// NAT 管理器
     pub nat: Arc<NatManager>,
+    /// 爬虫状态（可选，未启用爬虫时为 None）
+    pub crawler_state: Option<Arc<RwLock<CrawlerState>>>,
+    /// 爬虫路由表（可选）
+    pub crawler_routing_table: Option<Arc<RwLock<crate::dht::routing_table::RoutingTable>>>,
+    /// DHT 探测发送端（可选，用于把 tracker peer 加入探测队列）
+    pub probe_sender: Option<mpsc::UnboundedSender<SocketAddr>>,
+    /// 持久化存储
+    pub storage: Arc<crate::storage::Storage>,
+    /// 数据层 Repo（统一归口）
+    pub node_repo: Option<Arc<crate::storage::NodeRepoImpl>>,
+    pub infohash_repo: Option<Arc<crate::storage::InfohashRepoImpl>>,
+    pub tracker_repo: Option<Arc<crate::storage::TrackerRepoImpl>>,
+    /// TrackerPeerFetcher 统计（可选）
+    pub fetcher: Option<Arc<crate::services::TrackerPeerFetcher>>,
+    /// DHT 探测器统计（可选）
+    pub dht_probe: Option<Arc<crate::dht::DhtProbe>>,
 }
 
 /// 数据面
@@ -76,12 +97,15 @@ impl DataPlane {
         let udp_port = config.super_tracker.udp_port.unwrap_or(config.server.port);
         let listen_addr = format!("{}:{}", config.server.listen, udp_port).parse()?;
 
-        let server = UdpTrackerServer::new(
+        let mut server = UdpTrackerServer::new(
             listen_addr,
             state.super_tracker.clone(),
-            state.cache.clone(),
+            state.peer_repo.clone(),
             config.super_tracker,
         );
+        if let Some(ref repo) = state.infohash_repo {
+            server = server.with_infohash_repo(repo.clone());
+        }
 
         server.start().await
     }

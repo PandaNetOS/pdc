@@ -23,6 +23,8 @@ pub enum QueryMethod {
     FindNode,
     GetPeers,
     AnnouncePeer,
+    SampleInfohashes, // BEP 51: DHT Infohash Indexing
+    Scrape,            // BEP 33: DHT Scrapes
 }
 
 impl QueryMethod {
@@ -32,12 +34,14 @@ impl QueryMethod {
             QueryMethod::FindNode => "find_node",
             QueryMethod::GetPeers => "get_peers",
             QueryMethod::AnnouncePeer => "announce_peer",
+            QueryMethod::SampleInfohashes => "sample_infohashes",
+            QueryMethod::Scrape => "scrape",
         }
     }
 }
 
 /// DHT 节点信息（compact node info: 20字节ID + 4字节IP + 2字节端口）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DhtNode {
     pub id: [u8; 20],
     pub addr: SocketAddr,
@@ -102,6 +106,38 @@ pub struct GetPeersResponse {
 /// DHT 消息编解码工具
 pub struct DhtMessage;
 
+/// BEP 51 sample_infohashes 响应结果
+#[derive(Debug, Clone)]
+pub struct SampleInfohashesResponse {
+    pub node_id: [u8; 20],
+    /// 节点跟踪的 infohash 总数
+    pub num: i64,
+    /// 返回的 infohash 样本（20字节每个）
+    pub samples: Vec<Infohash>,
+    /// 重新计算采样的间隔（秒，可选）
+    pub interval: Option<i64>,
+}
+
+/// BEP 33 scrape 单个 infohash 的统计结果
+#[derive(Debug, Clone)]
+pub struct ScrapeFileStats {
+    pub infohash: Infohash,
+    /// 做种者数量（seeder）
+    pub complete: i64,
+    /// 下载者数量（leecher）
+    pub incomplete: i64,
+    /// 累计下载次数
+    pub downloaded: i64,
+}
+
+/// BEP 33 scrape 响应结果
+#[derive(Debug, Clone)]
+pub struct ScrapeResponse {
+    pub node_id: [u8; 20],
+    /// 每个 infohash 的统计结果
+    pub files: Vec<ScrapeFileStats>,
+}
+
 impl DhtMessage {
     /// 构建 get_peers 查询
     ///
@@ -124,6 +160,69 @@ impl DhtMessage {
         buf.extend_from_slice(b"e1:q9:get_peers1:t2:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
+        buf
+    }
+
+    /// 构建 sample_infohashes 查询（BEP 51: DHT Infohash Indexing）
+    ///
+    /// 向远程节点请求它已知的 infohash 列表（随机采样子集）
+    /// 请求格式: d1:ad2:id20:<node_id>e1:q19:sample_infohashes1:t2:<tid>1:y1:qe
+    pub fn build_sample_infohashes(
+        transaction_id: &[u8; 2],
+        node_id: &[u8; 20],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d1:ad2:id20:");
+        buf.extend_from_slice(node_id);
+        buf.extend_from_slice(b"e1:q19:sample_infohashes1:t2:");
+        buf.extend_from_slice(transaction_id);
+        buf.extend_from_slice(b"1:y1:qe");
+        buf
+    }
+
+    /// 构建 scrape 查询（BEP 33: DHT Scrapes）
+    ///
+    /// 向远程节点查询特定 infohash 的 seeder/leecher 统计
+    /// 请求格式: d1:ad2:id20:<node_id>9:info_hash20:<infohash>e1:q6:scrape1:t2:<tid>1:y1:qe
+    pub fn build_scrape(
+        transaction_id: &[u8; 2],
+        node_id: &[u8; 20],
+        info_hash: &Infohash,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d1:ad2:id20:");
+        buf.extend_from_slice(node_id);
+        buf.extend_from_slice(b"9:info_hash20:");
+        buf.extend_from_slice(info_hash);
+        buf.extend_from_slice(b"e1:q6:scrape1:t2:");
+        buf.extend_from_slice(transaction_id);
+        buf.extend_from_slice(b"1:y1:qe");
+        buf
+    }
+
+    /// 构建 sample_infohashes 响应（BEP 51）
+    ///
+    /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t2:<tid>1:y1:re
+    pub fn build_sample_infohashes_response(
+        transaction_id: &[u8],
+        node_id: &[u8; 20],
+        total_count: i64,
+        samples: &[Infohash],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d1:rd2:id20:");
+        buf.extend_from_slice(node_id);
+        buf.extend_from_slice(b"5:num");
+        buf.extend_from_slice(total_count.to_string().as_bytes());
+        buf.extend_from_slice(b"i7:samples");
+        buf.extend_from_slice((samples.len() * 20).to_string().as_bytes());
+        buf.extend_from_slice(b":");
+        for ih in samples {
+            buf.extend_from_slice(ih);
+        }
+        buf.extend_from_slice(b"e1:t2:");
+        buf.extend_from_slice(transaction_id);
+        buf.extend_from_slice(b"1:y1:re");
         buf
     }
 
@@ -200,6 +299,21 @@ impl DhtMessage {
         Some((tid, method, infohash))
     }
 
+    /// 从 DHT 查询消息中提取请求方的 node_id（a.id 字段）
+    pub fn extract_query_node_id(data: &[u8]) -> Option<[u8; 20]> {
+        let value: BencodeValue = from_bytes(data).ok()?;
+        let dict = value.as_dict()?;
+        let args = dict.get(b"a".as_slice())?.as_dict()?;
+        let id_bytes = args.get(b"id".as_slice())?.as_bytes()?;
+        if id_bytes.len() == 20 {
+            let mut id = [0u8; 20];
+            id.copy_from_slice(id_bytes);
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     /// 构建 ping 响应
     pub fn build_ping_response(transaction_id: &[u8], node_id: &[u8; 20]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -210,6 +324,27 @@ impl DhtMessage {
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:re");
         buf
+    }
+
+    /// 解析 ping 响应，返回 (transaction_id, responder_node_id)
+    pub fn parse_ping_response(data: &[u8]) -> Option<(Vec<u8>, [u8; 20])> {
+        let value: BencodeValue = from_bytes(data).ok()?;
+        let dict = value.as_dict()?;
+
+        let y = dict.get(b"y".as_slice())?.as_bytes()?;
+        if y != b"r" {
+            return None;
+        }
+
+        let tid = dict.get(b"t".as_slice())?.as_bytes()?.clone();
+        let r = dict.get(b"r".as_slice())?.as_dict()?;
+        let id_bytes = r.get(b"id".as_slice())?.as_bytes()?;
+        if id_bytes.len() != 20 {
+            return None;
+        }
+        let mut node_id = [0u8; 20];
+        node_id.copy_from_slice(id_bytes);
+        Some((tid, node_id))
     }
 
     /// 构建 find_node 响应（返回空节点列表）
@@ -361,6 +496,118 @@ impl DhtMessage {
             .unwrap_or_default();
 
         Some((tid, nodes))
+    }
+
+    /// 解析 sample_infohashes 响应（BEP 51: DHT Infohash Indexing）
+    ///
+    /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t2:<tid>1:y1:re
+    pub fn parse_sample_infohashes_response(data: &[u8]) -> Option<([u8; 2], SampleInfohashesResponse)> {
+        let value: BencodeValue = from_bytes(data).ok()?;
+        let dict = value.as_dict()?;
+
+        let y = dict.get(b"y".as_slice())?.as_bytes()?;
+        if y != b"r" {
+            return None;
+        }
+
+        let t = dict.get(b"t".as_slice())?.as_bytes()?;
+        let mut tid = [0u8; 2];
+        if t.len() >= 2 {
+            tid.copy_from_slice(&t[0..2]);
+        }
+
+        let r = dict.get(b"r".as_slice())?.as_dict()?;
+
+        // node_id
+        let mut node_id = [0u8; 20];
+        if let Some(id_bytes) = r.get(b"id".as_slice()).and_then(|v| v.as_bytes()) {
+            if id_bytes.len() == 20 {
+                node_id.copy_from_slice(id_bytes);
+            }
+        }
+
+        // num（节点跟踪的 infohash 总数）
+        let num = r.get(b"num".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
+
+        // samples（多个 20 字节 infohash 拼接）
+        let mut samples = vec![];
+        if let Some(samples_bytes) = r.get(b"samples".as_slice()).and_then(|v| v.as_bytes()) {
+            let (chunks, _) = samples_bytes.as_chunks::<20>();
+            for chunk in chunks {
+                let mut ih = [0u8; 20];
+                ih.copy_from_slice(chunk);
+                samples.push(ih);
+            }
+        }
+
+        // interval（重新计算采样的间隔，可选）
+        let interval = r.get(b"interval".as_slice()).and_then(|v| v.as_int());
+
+        Some((tid, SampleInfohashesResponse {
+            node_id,
+            num,
+            samples,
+            interval,
+        }))
+    }
+
+    /// 解析 scrape 响应（BEP 33: DHT Scrapes）
+    ///
+    /// 响应格式: d1:rd2:id20:<node_id>5:filesd20:<ih>d8:completei<N>e10:incompletei<N>e10:downloadedi<N>eeee1:t2:<tid>1:y1:re
+    pub fn parse_scrape_response(data: &[u8]) -> Option<([u8; 2], ScrapeResponse)> {
+        let value: BencodeValue = from_bytes(data).ok()?;
+        let dict = value.as_dict()?;
+
+        let y = dict.get(b"y".as_slice())?.as_bytes()?;
+        if y != b"r" {
+            return None;
+        }
+
+        let t = dict.get(b"t".as_slice())?.as_bytes()?;
+        let mut tid = [0u8; 2];
+        if t.len() >= 2 {
+            tid.copy_from_slice(&t[0..2]);
+        }
+
+        let r = dict.get(b"r".as_slice())?.as_dict()?;
+
+        // node_id
+        let mut node_id = [0u8; 20];
+        if let Some(id_bytes) = r.get(b"id".as_slice()).and_then(|v| v.as_bytes()) {
+            if id_bytes.len() == 20 {
+                node_id.copy_from_slice(id_bytes);
+            }
+        }
+
+        // files 字典
+        let mut files = vec![];
+        if let Some(files_dict) = r.get(b"files".as_slice()).and_then(|v| v.as_dict()) {
+            for (key, value) in files_dict {
+                if key.len() != 20 {
+                    continue;
+                }
+                let mut ih = [0u8; 20];
+                ih.copy_from_slice(key);
+
+                let file_dict = match value {
+                    BencodeValue::Dict(d) => d,
+                    _ => continue,
+                };
+
+                let complete = file_dict.get(b"complete".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
+                let incomplete = file_dict.get(b"incomplete".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
+                let downloaded = file_dict.get(b"downloaded".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
+
+                files.push(ScrapeFileStats {
+                    infohash: ih,
+                    complete,
+                    incomplete,
+                    downloaded,
+                });
+            }
+        }
+
+        Some((tid, ScrapeResponse { node_id, files }))
     }
 
     /// 计算两个 20 字节 ID 的 XOR 距离
