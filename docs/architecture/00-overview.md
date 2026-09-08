@@ -25,10 +25,10 @@ PDC 是 PandaNetOS 生态中的**节点发现 Agent**，负责通过 DHT、Track
 > 四层架构：业务服务通过智能层进行决策，通过数据层访问数据，最终持久化到存储层。
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif', 'primaryColor':'#e3f2fd', 'primaryBorderColor':'#1565c0', 'lineColor':'#1565c0'}, 'flowchart': {'nodeSpacing': 70, 'rankSpacing': 110, 'htmlLabels': true, 'curve':'basis'}}}%%
-graph TB
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'18px', 'fontFamily':'Segoe UI, Arial, sans-serif', 'primaryColor':'#e3f2fd', 'primaryBorderColor':'#1565c0', 'lineColor':'#1565c0'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80, 'htmlLabels': true, 'curve':'basis'}}}%%
+graph LR
     subgraph L1 ["业务服务层 Services"]
-        direction LR
+        direction TB
         S1["Discover 发现服务"]
         S2["Crawler 爬虫服务"]
         S3["Tracker 服务"]
@@ -38,7 +38,7 @@ graph TB
     end
 
     subgraph L2 ["智能层 Intelligence"]
-        direction LR
+        direction TB
         I1["ScoreSystem 评分系统"]
         I2["TierSystem 冷热分层"]
         I3["SelectSystem 节点选择"]
@@ -46,7 +46,7 @@ graph TB
     end
 
     subgraph L3 ["数据层 Repositories"]
-        direction LR
+        direction TB
         R1["NodeRepo DHT节点"]
         R2["PeerRepo BT Peer"]
         R3["TrackerRepo Tracker"]
@@ -54,14 +54,14 @@ graph TB
     end
 
     subgraph L4 ["存储层 Storage"]
-        direction LR
+        direction TB
         DB[("SQLite WAL 持久化")]
         MEM["内存缓存 parking_lot::RwLock"]
     end
 
-    L1 ==>|"调用智能决策（评分/选择/冷热）"| L2
-    L2 ==>|"读写数据（通过 trait 接口）"| L3
-    L3 ==>|"持久化 + 内存缓存"| L4
+    L1 ==>|"调用智能决策"| L2
+    L2 ==>|"读写数据"| L3
+    L3 ==>|"持久化+缓存"| L4
 ```
 
 ### 核心数据流
