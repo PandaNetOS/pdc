@@ -199,12 +199,64 @@ async fn main() -> anyhow::Result<()> {
             PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::with_default_config()
                 .with_tracker_repo(tracker_repo.clone()),
         );
-        let fetcher = PeerDiscoveryCenter::services::TrackerPeerFetcher::new(tracker_discoverer)
+        let fetcher = PeerDiscoveryCenter::services::TrackerPeerFetcher::new(tracker_discoverer.clone())
             .with_peer_repo(peer_repo.clone())
             .with_infohash_repo(infohash_repo.clone());
         let fetcher = Arc::new(fetcher);
         fetcher.start();
         info!("[main] TrackerPeerFetcher 已启动（主动拉取 peer → 存入 PeerRepo）");
+
+        // 远程 Tracker 列表自动拉取
+        if config.discoverers.enable_remote_tracker {
+            let remote_url = config.discoverers.remote_tracker_url.clone();
+            let refresh_secs = config.discoverers.remote_tracker_refresh_secs;
+            let discoverer_clone = tracker_discoverer.clone();
+            let tracker_repo_clone = tracker_repo.clone();
+
+            tokio::spawn(async move {
+                // 启动时立即拉取一次
+                info!("[main] 开始从远程拉取 Tracker 列表: {}", remote_url);
+                match PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::fetch_remote_trackers(&remote_url).await {
+                    Ok(trackers) => {
+                        discoverer_clone.update_trackers(trackers.clone());
+                        // 同步到 TrackerRepo
+                        for url in &trackers {
+                            tracker_repo_clone.add_tracker(url.clone()).await;
+                        }
+                        info!("[main] 远程 Tracker 列表拉取成功，共 {} 个", trackers.len());
+                    }
+                    Err(e) => {
+                        warn!("[main] 远程 Tracker 列表拉取失败，使用内置默认列表: {}", e);
+                    }
+                }
+
+                // 定时刷新（跳过第一次立即触发）
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+                let mut first_tick = true;
+                loop {
+                    interval.tick().await;
+                    if first_tick {
+                        first_tick = false;
+                        continue;
+                    }
+                    info!("[main] 定时刷新远程 Tracker 列表: {}", remote_url);
+                    match PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::fetch_remote_trackers(&remote_url).await {
+                        Ok(trackers) => {
+                            discoverer_clone.update_trackers(trackers.clone());
+                            for url in &trackers {
+                                tracker_repo_clone.add_tracker(url.clone()).await;
+                            }
+                            info!("[main] 远程 Tracker 列表刷新成功，共 {} 个", trackers.len());
+                        }
+                        Err(e) => {
+                            warn!("[main] 远程 Tracker 列表刷新失败，保持当前列表: {}", e);
+                        }
+                    }
+                }
+            });
+            info!("[main] 远程 Tracker 列表自动拉取已启用（间隔 {} 秒）", refresh_secs);
+        }
+
         Some(fetcher)
     };
 

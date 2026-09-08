@@ -171,6 +171,43 @@ impl TrackerDiscoverer {
         Self::new(config)
     }
 
+    /// 动态更新 Tracker 列表（保留已有状态，新增 tracker 初始化状态）
+    pub fn update_trackers(&self, new_trackers: Vec<String>) {
+        let mut states = self.states.write();
+        // 保留已有 tracker 的状态，新增 tracker 初始化
+        for url in &new_trackers {
+            if !states.contains_key(url) {
+                states.insert(url.clone(), TrackerState::default());
+            }
+        }
+        // 移除不在新列表中的 tracker（可选，这里保留以防回退）
+        // 更新 config 中的 tracker 列表
+        // 注意：config 是不可变的，需要用内部可变性或直接更新 states
+        info!("[tracker] Tracker 列表已更新，当前 {} 个 tracker", new_trackers.len());
+    }
+
+    /// 获取当前 Tracker 列表
+    pub fn get_trackers(&self) -> Vec<String> {
+        self.states.read().keys().cloned().collect()
+    }
+
+    /// 从远程 URL 拉取 Tracker 列表
+    pub async fn fetch_remote_trackers(url: &str) -> anyhow::Result<Vec<String>> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("PDC-TrackerFetcher/1.0")
+            .build()?;
+        let resp = client.get(url).send().await?;
+        let text = resp.text().await?;
+        let trackers: Vec<String> = text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && (l.starts_with("http://") || l.starts_with("https://") || l.starts_with("udp://") || l.starts_with("wss://")))
+            .collect();
+        info!("[tracker] 从远程拉取到 {} 个 tracker", trackers.len());
+        Ok(trackers)
+    }
+
     /// 获取活跃的 Tracker 列表（未被禁用的）
     fn active_trackers(&self) -> Vec<String> {
         let states = self.states.read();
@@ -407,7 +444,16 @@ impl TrackerDiscoverer {
                     Err(_) => return vec![],
                 };
 
-                url.path_segments_mut().unwrap().push("scrape");
+                // 把路径中的 announce 替换成 scrape
+                let path = url.path().to_string();
+                if path.ends_with("/announce") {
+                    url.set_path(&path.replace("/announce", "/scrape"));
+                } else if path.ends_with("announce") {
+                    url.set_path(&path.replace("announce", "scrape"));
+                } else {
+                    // 如果路径中没有 announce，直接追加 scrape
+                    url.path_segments_mut().unwrap().push("scrape");
+                }
                 {
                     let mut query = url.query_pairs_mut();
                     for ih in &infohashes {
@@ -418,12 +464,18 @@ impl TrackerDiscoverer {
 
                 let resp = match client.get(url.as_str()).send().await {
                     Ok(r) => r,
-                    Err(_) => return vec![],
+                    Err(e) => {
+                        warn!("[tracker] HTTP 请求失败 {}: {:?}", url, e);
+                        return vec![];
+                    }
                 };
 
                 let body = match resp.bytes().await {
                     Ok(b) => b,
-                    Err(_) => return vec![],
+                    Err(e) => {
+                        warn!("[tracker] 读取响应体失败 {}: {:?}", url, e);
+                        return vec![];
+                    }
                 };
 
                 let value: serde_bencode::value::Value = match serde_bencode::from_bytes(&body) {

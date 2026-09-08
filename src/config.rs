@@ -332,6 +332,15 @@ pub struct DiscoverersConfig {
     /// 自定义 Tracker 列表（为空则使用内置公共 Tracker）
     #[serde(default)]
     pub custom_trackers: Vec<String>,
+    /// 是否启用远程 Tracker 列表自动拉取
+    #[serde(default = "default_true")]
+    pub enable_remote_tracker: bool,
+    /// 远程 Tracker 列表 URL
+    #[serde(default = "default_remote_tracker_url")]
+    pub remote_tracker_url: String,
+    /// 远程 Tracker 列表刷新间隔（秒）
+    #[serde(default = "default_remote_tracker_refresh")]
+    pub remote_tracker_refresh_secs: u64,
     /// DHT 监听端口
     #[serde(default = "default_dht_port")]
     pub dht_listen_port: u16,
@@ -349,6 +358,12 @@ fn default_max_concurrent() -> usize {
 fn default_dht_port() -> u16 {
     6881
 }
+fn default_remote_tracker_url() -> String {
+    "https://cdn.jsdelivr.net/gh/adysec/tracker@main/trackers_best.txt".to_string()
+}
+fn default_remote_tracker_refresh() -> u64 {
+    3600  // 每小时刷新一次
+}
 
 impl Default for DiscoverersConfig {
     fn default() -> Self {
@@ -361,6 +376,9 @@ impl Default for DiscoverersConfig {
             discovery_timeout_secs: default_discovery_timeout(),
             max_concurrent: default_max_concurrent(),
             custom_trackers: vec![],
+            enable_remote_tracker: default_true(),
+            remote_tracker_url: default_remote_tracker_url(),
+            remote_tracker_refresh_secs: default_remote_tracker_refresh(),
             dht_listen_port: default_dht_port(),
             discovery_timeout: Duration::from_secs(default_discovery_timeout()),
         }
