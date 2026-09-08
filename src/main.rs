@@ -228,6 +228,10 @@ async fn main() -> anyhow::Result<()> {
     });
     info!("[main] KeywordSearchService 已启动（DHT 关键词搜索 BEP 44 → InfohashRepo）");
 
+    // 7.5.1 创建限流器（P2优化：QPS监控+单IP限流+异常封禁）
+    let rate_limiter = Arc::new(PeerDiscoveryCenter::data_plane::rate_limiter::RateLimiter::new(100.0, 200.0));
+    info!("[main] 限流器已创建（单IP 100 QPS，突发 200）");
+
     // 7.6 创建 AppState
     let app_state = AppState {
         control_plane: control_plane.clone(),
@@ -245,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         tracker_repo: Some(tracker_repo.clone()),
         fetcher: fetcher_ref,
         dht_probe: dht_probe_ref,
+        rate_limiter,
     };
 
     // 8. 启动健康检查任务

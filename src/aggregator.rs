@@ -7,7 +7,7 @@
 //! - 发现完成后发布 PeerDiscovered 事件到事件总线
 //! - 保留原有的并发调度、缓存、去重、排序逻辑
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -134,16 +134,16 @@ impl PeerDiscoveryAggregator {
             warn!("[aggregator] 没有启用的发现器，且缓存为空");
             return Ok(DiscoveryResult {
                 peers: vec![],
-                source_stats: HashMap::new(),
+                source_stats: FxHashMap::default(),
                 total_duration: start.elapsed(),
-                discoverer_durations: HashMap::new(),
+                discoverer_durations: FxHashMap::default(),
             });
         }
 
         // 3. 合并结果
         let mut all_peers: Vec<PeerInfo> = cached_peers;
-        let mut source_stats: HashMap<PeerSource, usize> = HashMap::new();
-        let mut discoverer_durations: HashMap<String, Duration> = HashMap::new();
+        let mut source_stats: FxHashMap<PeerSource, usize> = FxHashMap::default();
+        let mut discoverer_durations: FxHashMap<String, Duration> = FxHashMap::default();
 
         for (name, result, duration) in results {
             discoverer_durations.insert(name.clone(), duration);
@@ -278,7 +278,7 @@ pub struct AggregateStats {
     pub failed_requests: u64,
     pub total_peers_discovered: u64,
     pub cached_peers: usize,
-    pub discoverer_stats: HashMap<String, DiscovererStats>,
+    pub discoverer_stats: FxHashMap<String, DiscovererStats>,
 }
 
 impl AggregateStats {

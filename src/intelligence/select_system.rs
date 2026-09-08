@@ -6,7 +6,7 @@
 //! 【优化】选择过程中遍历引用不克隆，只在最后返回选中节点时克隆，
 //! 避免全量克隆 60000+ 节点造成的内存分配和 CPU 开销。
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -47,7 +47,7 @@ impl SelectSystem {
         }
 
         // 2. 按 ID 高 4 位分桶（16 桶）
-        let mut buckets: HashMap<u8, Vec<KBucketEntry>> = HashMap::new();
+        let mut buckets: FxHashMap<u8, Vec<KBucketEntry>> = FxHashMap::default();
         for node in candidates {
             let bucket_key = node.id[0] >> 4; // 高4位 → 0-15
             buckets.entry(bucket_key).or_default().push(node);
@@ -55,8 +55,8 @@ impl SelectSystem {
 
         // 3. 轮询各桶选取，IP /24 去重
         let mut result: Vec<KBucketEntry> = Vec::with_capacity(count);
-        let mut subnet_count: HashMap<[u8; 3], usize> = HashMap::new();
-        let mut bucket_indices: HashMap<u8, usize> = HashMap::new();
+        let mut subnet_count: FxHashMap<[u8; 3], usize> = FxHashMap::default();
+        let mut bucket_indices: FxHashMap<u8, usize> = FxHashMap::default();
         let bucket_keys: Vec<u8> = buckets.keys().copied().collect();
 
         'outer: loop {

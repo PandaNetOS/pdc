@@ -2,15 +2,16 @@
 //!
 //! 独立的 DHT 节点存储（无容量限制），作为爬虫候选池的唯一归口。
 //! 路由表只负责 DHT 路由响应，NodeRepo 负责爬虫候选节点的存储和评分。
-//! 内存 HashMap + SQLite 持久化双写。
+//! 内存 FxHashMap + SQLite 增量持久化。
+//! 千万级性能优化：FxHashMap 替代 std::HashMap，增量持久化只保存 dirty 节点。
 
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dht::kbucket::{KBucketEntry, NodeState};
 use crate::intelligence::calculate_node_score;
@@ -29,18 +30,18 @@ pub struct NodeStats {
 }
 
 pub struct NodeRepoImpl {
-    /// 独立节点存储（无容量限制，按 addr 去重）
-    nodes: RwLock<HashMap<SocketAddr, KBucketEntry>>,
-    /// 脏节点集合（统计数据已变化，需要重算评分）
-    dirty: RwLock<HashSet<SocketAddr>>,
+    /// 独立节点存储（无容量限制，按 addr 去重）— FxHashMap 高性能
+    nodes: RwLock<FxHashMap<SocketAddr, KBucketEntry>>,
+    /// 脏节点集合（统计数据已变化，需要重算评分 + 增量持久化）
+    dirty: RwLock<FxHashSet<SocketAddr>>,
     storage: Arc<Storage>,
 }
 
 impl NodeRepoImpl {
     pub fn new(storage: Arc<Storage>) -> Self {
         Self {
-            nodes: RwLock::new(HashMap::new()),
-            dirty: RwLock::new(HashSet::new()),
+            nodes: RwLock::new(FxHashMap::default()),
+            dirty: RwLock::new(FxHashSet::default()),
             storage,
         }
     }
@@ -63,6 +64,9 @@ impl NodeRepoImpl {
             // 新节点立即计算初始评分（无查询记录给中性分45）
             entry.score = calculate_node_score(&entry);
             nodes.insert(addr, entry);
+            // 新节点标记 dirty（需要增量持久化）
+            drop(nodes);
+            self.dirty.write().insert(addr);
             true
         }
     }
@@ -129,7 +133,7 @@ impl NodeRepoImpl {
                     entry.state = NodeState::Bad;
                 }
             }
-            // 标记为脏：统计数据已变化，需要重算评分
+            // 标记为脏：统计数据已变化，需要重算评分 + 增量持久化
             drop(nodes);
             self.dirty.write().insert(addr);
         }
@@ -147,7 +151,7 @@ impl NodeRepoImpl {
             entry.last_query_time = Some(Instant::now());
             entry.state = NodeState::Good;
             entry.consecutive_failures = 0;
-            // 标记为脏：统计数据已变化，需要重算评分
+            // 标记为脏
             drop(nodes);
             self.dirty.write().insert(addr);
         }
@@ -171,7 +175,7 @@ impl NodeRepoImpl {
         }
     }
 
-    // ── 脏标记同步方法（用于增量评分）──
+    // ── 脏标记同步方法（用于增量评分 + 增量持久化）──
 
     pub fn mark_dirty_sync(&self, addr: SocketAddr) {
         self.dirty.write().insert(addr);
@@ -187,6 +191,19 @@ impl NodeRepoImpl {
 
     pub fn clear_all_dirty_sync(&self) {
         self.dirty.write().clear();
+    }
+
+    /// 取出所有 dirty 节点并清空（原子操作，用于增量持久化）
+    pub fn take_dirty_sync(&self) -> Vec<SocketAddr> {
+        let mut dirty = self.dirty.write();
+        let addrs: Vec<SocketAddr> = dirty.iter().cloned().collect();
+        dirty.clear();
+        addrs
+    }
+
+    /// dirty 节点数量
+    pub fn dirty_count_sync(&self) -> usize {
+        self.dirty.read().len()
     }
 
     /// 批量更新评分（一次写锁，避免逐个更新的锁竞争）
@@ -207,7 +224,11 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn remove_node(&self, addr: &SocketAddr) -> bool {
-        self.nodes.write().remove(addr).is_some()
+        let removed = self.nodes.write().remove(addr).is_some();
+        if removed {
+            self.dirty.write().insert(*addr);
+        }
+        removed
     }
 
     async fn get_node(&self, addr: &SocketAddr) -> Option<KBucketEntry> {
@@ -305,34 +326,48 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn save_all(&self) -> anyhow::Result<()> {
-        let nodes = self.all_nodes_sync();
-        // 注意：冷热判定统一由 intelligence 层的 TierSystem 负责
-        // 这里全量保存所有节点（定期每5分钟一次，数据量可接受）
-        // 构建批量行数据
-        let batch: Vec<crate::storage::db::DhtNodeRow> = nodes
-            .iter()
-            .map(|node| {
-                let state_str = match node.state {
-                    NodeState::Good => "Good",
-                    NodeState::Questionable => "Questionable",
-                    NodeState::Bad => "Bad",
-                };
-                crate::storage::db::DhtNodeRow {
-                    id: node.id,
-                    ip: node.addr.ip().to_string(),
-                    port: node.addr.port(),
-                    score: node.score,
-                    state: state_str.to_string(),
-                    query_count: node.query_count,
-                    success_count: node.success_count,
-                    total_latency_ms: node.total_latency_ms,
-                    consecutive_failures: node.consecutive_failures,
-                    nodes_returned: node.nodes_returned,
-                    last_query_time: node.last_query_time.map(|t| t.elapsed().as_secs() as i64),
-                }
-            })
-            .collect();
+        // 【增量持久化】只保存 dirty 节点，避免全量保存千万级数据
+        let dirty_addrs = self.take_dirty_sync();
+        if dirty_addrs.is_empty() {
+            return Ok(());
+        }
+
+        // 用独立作用域构建 batch，确保 read guard 在作用域结束时释放
+        let batch: Vec<crate::storage::db::DhtNodeRow> = {
+            let nodes = self.nodes.read();
+            dirty_addrs
+                .iter()
+                .filter_map(|addr| nodes.get(addr))
+                .map(|node| {
+                    let state_str = match node.state {
+                        NodeState::Good => "Good",
+                        NodeState::Questionable => "Questionable",
+                        NodeState::Bad => "Bad",
+                    };
+                    crate::storage::db::DhtNodeRow {
+                        id: node.id,
+                        ip: node.addr.ip().to_string(),
+                        port: node.addr.port(),
+                        score: node.score,
+                        state: state_str.to_string(),
+                        query_count: node.query_count,
+                        success_count: node.success_count,
+                        total_latency_ms: node.total_latency_ms,
+                        consecutive_failures: node.consecutive_failures,
+                        nodes_returned: node.nodes_returned,
+                        last_query_time: node.last_query_time.map(|t| t.elapsed().as_secs() as i64),
+                    }
+                })
+                .collect()
+        };
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
         let storage = self.storage.clone();
+        let count = batch.len();
+        tracing::debug!("[node_repo] 增量保存 {} 个 dirty 节点", count);
         // 用 spawn_blocking 包装数据库操作，避免阻塞 tokio 工作线程
         tokio::task::spawn_blocking(move || storage.save_dht_nodes_batch(&batch)).await??;
         Ok(())

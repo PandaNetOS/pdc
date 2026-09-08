@@ -1,13 +1,14 @@
 //! InfohashRepository 实现
 //!
 //! 合并 seen_infohashes + 引用计数，自动清理零引用。
-//! 内存 HashMap + SQLite 持久化双写。
+//! 内存 FxHashMap + SQLite 增量持久化。
+//! 千万级性能优化：FxHashMap 替代 std::HashMap，新 infohash 批量写入。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::InfohashRepository;
@@ -15,13 +16,13 @@ use crate::types::Infohash;
 
 struct InfohashCacheInner {
     /// infohash -> (引用计数, 首次发现来源)
-    entries: HashMap<Infohash, (u32, String)>,
+    entries: FxHashMap<Infohash, (u32, String)>,
 }
 
 impl InfohashCacheInner {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 }
@@ -52,7 +53,7 @@ impl InfohashRepoImpl {
         self.cache.read().entries.keys().cloned().collect()
     }
 
-    /// 同步注册 infohash（引用计数+1），同时异步持久化
+    /// 同步注册 infohash（引用计数+1），新 infohash 写入 pending 缓冲区批量持久化
     pub fn register_sync(&self, infohash: Infohash, source: &str) {
         let is_new = {
             let mut cache = self.cache.write();
@@ -64,18 +65,45 @@ impl InfohashRepoImpl {
             entry.0 == 1
         };
 
-        // 新 infohash 立即持久化；已有 infohash 由定期 save_all 覆盖
+        // 新 infohash 写入 pending 缓冲区，由 flush_pending 批量写入 SQLite
         if is_new {
-            let storage = self.storage.clone();
-            let src = source.to_string();
-            tokio::spawn(async move {
-                let _ = storage.save_infohash(&infohash, 1, &src);
-            });
+            self.pending.write().push((infohash, source.to_string()));
         }
     }
 
-    /// 全量保存到 SQLite
+    /// 批量 flush pending 缓冲区到 SQLite
+    pub async fn flush_pending(&self) -> anyhow::Result<usize> {
+        let pending = {
+            let mut p = self.pending.write();
+            if p.is_empty() {
+                return Ok(0);
+            }
+            std::mem::take(&mut *p)
+        };
+
+        let count = pending.len();
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            for (infohash, source) in &pending {
+                storage.save_infohash(infohash, 1, source)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await??;
+
+        tracing::debug!("[infohash_repo] flush_pending 批量写入 {} 个新 infohash", count);
+        Ok(count)
+    }
+
+    /// pending 缓冲区大小
+    pub fn pending_count(&self) -> usize {
+        self.pending.read().len()
+    }
+
+    /// 全量保存到 SQLite（先 flush pending，再全量更新引用计数）
     pub async fn save_all(&self) -> anyhow::Result<()> {
+        // 先 flush pending 新 infohash
+        self.flush_pending().await?;
+
         let entries: Vec<(Infohash, u32, String)> = self
             .cache
             .read()
@@ -173,5 +201,17 @@ mod tests {
         let loaded = repo2.load_all().await.unwrap();
         assert_eq!(loaded, 1);
         assert_eq!(repo2.ref_count(&ih).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_pending_batch() {
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo = InfohashRepoImpl::new(storage);
+        repo.register([1u8; 20], "dht").await;
+        repo.register([2u8; 20], "tracker").await;
+        assert_eq!(repo.pending_count(), 2);
+        let flushed = repo.flush_pending().await.unwrap();
+        assert_eq!(flushed, 2);
+        assert_eq!(repo.pending_count(), 0);
     }
 }

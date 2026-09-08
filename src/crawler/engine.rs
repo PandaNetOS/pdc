@@ -312,7 +312,7 @@ impl CrawlerEngine {
         // 从 NodeRepo 多样性选取高评分节点（高评分 + ID空间多样性 + IP网段多样性）
         // 评分由 ScoreMaintainer 统一维护，爬虫不自行重算
         let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(32, 3) // 选32个，同一/24网段最多3个
+            self.select_diverse_nodes(64, 3) // 选64个（P2优化：并发翻倍），同一/24网段最多3个
         } else {
             // 兼容：没有 NodeRepo 时从路由表选
             let mut known = self.known_nodes.write();
@@ -330,7 +330,7 @@ impl CrawlerEngine {
         }
 
         // target ID 多样化：生成 8 个不同 target（从4提升到8），覆盖更广的 ID 空间
-        let num_targets = 8;
+        let num_targets = 16; // P2优化：target多样化翻倍，覆盖更广ID空间
         let targets: Vec<[u8; 20]> = (0..num_targets).map(|_| self.random_target()).collect();
         let per_target = (nodes.len() + num_targets - 1) / num_targets;
 
@@ -449,7 +449,7 @@ impl CrawlerEngine {
     async fn active_sample_infohashes(&self, socket: &UdpSocket) {
         // 从 NodeRepo 多样性选取高评分节点
         let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(32, 3) // 选32个，同一/24网段最多3个
+            self.select_diverse_nodes(64, 3) // 选64个（P2优化：并发翻倍），同一/24网段最多3个
         } else {
             let known = self.known_nodes.read();
             if known.is_empty() { return; }
@@ -658,7 +658,7 @@ impl CrawlerEngine {
     /// 清理超时的 pending 请求，并记录失败统计到 NodeRepo
     fn cleanup_pending(&self) {
         let mut pending = self.pending.write();
-        let timeout = Duration::from_secs(30);
+        let timeout = Duration::from_secs(15); // P2优化：超时缩短，加速节点轮换
 
         // 收集超时请求的地址，用于记录失败统计
         let expired_addrs: Vec<SocketAddr> = pending
@@ -1055,7 +1055,7 @@ impl CrawlerEngine {
             bootstrap_count
         );
 
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 8192]; // P2优化：接收缓冲区翻倍，减少丢包
         let mut last_bootstrap = Instant::now();
         let mut last_active_crawl = Instant::now();
         let mut last_active_get_peers = Instant::now();

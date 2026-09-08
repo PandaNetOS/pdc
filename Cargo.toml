@@ -14,7 +14,6 @@ name = "PeerDiscoveryCenter"
 path = "src/lib.rs"
 
 [dependencies]
-pandanetos = { path = "../PandaNetOS/crates/pandanetos" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -41,6 +40,8 @@ igd = "0.12"
 prometheus = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }
 hickory-resolver = "0.24"
+rustc-hash = "2"
+crossbeam = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"

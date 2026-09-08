@@ -1,26 +1,27 @@
 //! TrackerRepository 实现
 //!
-//! 封装 tracker 状态 HashMap + SQLite 持久化。
+//! 封装 tracker 状态 FxHashMap + SQLite 持久化。
 //! 使用 parking_lot::RwLock（同步），与 NodeRepo/PeerRepo 一致。
+//! 千万级性能优化：FxHashMap 替代 std::HashMap。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::{TrackerEntry, TrackerRepository};
 
 struct TrackerCacheInner {
     /// url -> TrackerEntry
-    entries: HashMap<String, TrackerEntry>,
+    entries: FxHashMap<String, TrackerEntry>,
 }
 
 impl TrackerCacheInner {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 }

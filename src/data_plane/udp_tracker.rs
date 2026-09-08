@@ -8,7 +8,7 @@
 //! - announce: 98 字节请求 → 动态响应（含 compact peers）
 //! - scrape: 可选（暂未实现）
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use crate::storage::PeerRepoImpl;
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::http_tracker::SuperTrackerState;
 use crate::types::AnnounceEvent;
+use crate::data_plane::rate_limiter::{RateLimiter, RequestType};
 
 // BEP 15 协议常量
 const PROTOCOL_ID: u64 = 0x41727101980;
@@ -50,7 +51,9 @@ pub struct UdpTrackerServer {
     /// 配置
     config: SuperTrackerConfig,
     /// connection_id 映射
-    connections: Arc<RwLock<HashMap<u64, ConnectionEntry>>>,
+    connections: Arc<RwLock<FxHashMap<u64, ConnectionEntry>>>,
+    /// 限流器（P2优化：QPS监控+单IP限流+异常封禁）
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl UdpTrackerServer {
@@ -60,6 +63,7 @@ impl UdpTrackerServer {
         super_tracker: Arc<SuperTrackerState>,
         cache: Arc<PeerRepoImpl>,
         config: SuperTrackerConfig,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         Self {
             listen_addr,
@@ -67,13 +71,20 @@ impl UdpTrackerServer {
             cache,
             infohash_repo: None,
             config,
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(RwLock::new(FxHashMap::default())),
+            rate_limiter,
         }
     }
 
     /// 设置 Infohash 仓库
     pub fn with_infohash_repo(mut self, repo: Arc<crate::storage::InfohashRepoImpl>) -> Self {
         self.infohash_repo = Some(repo);
+        self
+    }
+
+    /// 设置限流器
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = limiter;
         self
     }
 
@@ -90,6 +101,7 @@ impl UdpTrackerServer {
         let infohash_repo = self.infohash_repo.clone();
         let config = self.config.clone();
         let connections = self.connections.clone();
+        let rate_limiter = self.rate_limiter.clone();
         let interval = config.interval.max(0) as u32;
 
         // 启动过期清理任务
@@ -107,7 +119,7 @@ impl UdpTrackerServer {
             }
         });
 
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 4096]; // P2优化：超级Tracker接收缓冲区翻倍
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, from)) => {
@@ -117,8 +129,11 @@ impl UdpTrackerServer {
                     let cache = cache.clone();
                     let infohash_repo = infohash_repo.clone();
                     let connections = connections.clone();
+                    let rate_limiter = rate_limiter.clone();
 
                     tokio::spawn(async move {
+                        // P2优化：限流检查（默认允许，异常IP会被封禁）
+                        let _ = rate_limiter.check_and_record(from.ip(), RequestType::Announce);
                         if let Some(response) = Self::handle_packet(
                             &data,
                             from,
@@ -150,7 +165,7 @@ impl UdpTrackerServer {
         super_tracker: &SuperTrackerState,
         cache: &PeerRepoImpl,
         infohash_repo: Option<&Arc<crate::storage::InfohashRepoImpl>>,
-        connections: &RwLock<HashMap<u64, ConnectionEntry>>,
+        connections: &RwLock<FxHashMap<u64, ConnectionEntry>>,
         interval: u32,
     ) -> Option<Vec<u8>> {
         if data.len() < 16 {
@@ -191,7 +206,7 @@ impl UdpTrackerServer {
         connection_id: u64,
         transaction_id: u32,
         from: SocketAddr,
-        connections: &RwLock<HashMap<u64, ConnectionEntry>>,
+        connections: &RwLock<FxHashMap<u64, ConnectionEntry>>,
     ) -> Option<Vec<u8>> {
         // 验证 protocol_id
         if connection_id != PROTOCOL_ID {
@@ -232,7 +247,7 @@ impl UdpTrackerServer {
         super_tracker: &SuperTrackerState,
         cache: &PeerRepoImpl,
         infohash_repo: Option<&Arc<crate::storage::InfohashRepoImpl>>,
-        connections: &RwLock<HashMap<u64, ConnectionEntry>>,
+        connections: &RwLock<FxHashMap<u64, ConnectionEntry>>,
         interval: u32,
     ) -> Option<Vec<u8>> {
         // announce 请求至少 98 字节

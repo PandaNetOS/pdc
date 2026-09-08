@@ -11,6 +11,7 @@ pub mod http_tracker;
 pub mod metrics;
 pub mod rest_api;
 pub mod udp_tracker;
+pub mod rate_limiter;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -61,6 +62,8 @@ pub struct AppState {
     pub fetcher: Option<Arc<crate::services::TrackerPeerFetcher>>,
     /// DHT 探测器统计（可选）
     pub dht_probe: Option<Arc<crate::dht::DhtProbe>>,
+    /// 限流器（P2优化：QPS监控+单IP限流+异常封禁）
+    pub rate_limiter: Arc<crate::data_plane::rate_limiter::RateLimiter>,
 }
 
 /// 数据面
@@ -102,6 +105,7 @@ impl DataPlane {
             state.super_tracker.clone(),
             state.peer_repo.clone(),
             config.super_tracker,
+            state.rate_limiter.clone(),
         );
         if let Some(ref repo) = state.infohash_repo {
             server = server.with_infohash_repo(repo.clone());

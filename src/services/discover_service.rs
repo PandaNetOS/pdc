@@ -1,6 +1,6 @@
 //! DiscoverService — Peer 发现业务层
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,8 +35,8 @@ impl DiscoverService {
             .await;
 
         let mut all_peers: Vec<PeerInfo> = Vec::new();
-        let mut source_stats: HashMap<PeerSource, usize> = HashMap::new();
-        let mut discoverer_durations: HashMap<String, Duration> = HashMap::new();
+        let mut source_stats: FxHashMap<PeerSource, usize> = FxHashMap::default();
+        let mut discoverer_durations: FxHashMap<String, Duration> = FxHashMap::default();
         let start = std::time::Instant::now();
 
         for (name, result, duration) in raw {

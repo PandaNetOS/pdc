@@ -210,6 +210,12 @@ fn collect_status(state: &AppState) -> serde_json::Value {
             "infohashes": state.super_tracker.infohash_count(),
             "peers": state.super_tracker.peer_count(),
         },
+        "rate_limiter": {
+            "qps": state.rate_limiter.current_qps(),
+            "total_requests": state.rate_limiter.stats().total_requests,
+            "blocked_requests": state.rate_limiter.stats().blocked_requests,
+            "banned_ips": state.rate_limiter.banned_count(),
+        },
         "tracker_scores": tracker_scores,
         // InfohashRepo
         "infohash_repo": {

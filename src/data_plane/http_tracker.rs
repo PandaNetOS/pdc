@@ -7,7 +7,7 @@
 //!
 //! qBittorrent 只需配置一个 tracker 地址：`http://pdc-host:port/announce`
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,7 +54,7 @@ struct AnnouncedPeer {
 /// 同时双写到 PeerRepo（统一数据归口）。
 pub struct SuperTrackerState {
     /// infohash -> (peer_addr -> AnnouncedPeer)
-    peers: Arc<DashMap<Infohash, HashMap<SocketAddr, AnnouncedPeer>>>,
+    peers: Arc<DashMap<Infohash, FxHashMap<SocketAddr, AnnouncedPeer>>>,
     /// 配置
     config: Arc<tokio::sync::RwLock<SuperTrackerConfig>>,
     /// 统一 PeerRepo（双写）
@@ -138,7 +138,7 @@ impl SuperTrackerState {
 
     /// 处理 scrape 请求
     pub fn handle_scrape(&self, info_hashes: &[Infohash]) -> TrackerScrapeResponse {
-        let mut files = HashMap::new();
+        let mut files = FxHashMap::default();
         for ih in info_hashes {
             let (complete, incomplete) = self.count_seeders_leechers(ih);
             files.insert(

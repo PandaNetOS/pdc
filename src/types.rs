@@ -5,7 +5,7 @@
 //! - 事件总线事件类型
 //! - HTTP Tracker 协议类型（announce/scrape）
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
@@ -38,7 +38,7 @@ pub struct PeerInfo {
     /// 是否为 IPv6
     pub is_ipv6: bool,
     /// 元数据（扩展字段）
-    pub metadata: HashMap<String, String>,
+    pub metadata: FxHashMap<String, String>,
 }
 
 impl PeerInfo {
@@ -151,11 +151,11 @@ pub struct DiscoveryResult {
     /// 发现的 peer 列表
     pub peers: Vec<PeerInfo>,
     /// 各来源统计
-    pub source_stats: HashMap<PeerSource, usize>,
+    pub source_stats: FxHashMap<PeerSource, usize>,
     /// 总耗时
     pub total_duration: Duration,
     /// 各发现器耗时
-    pub discoverer_durations: HashMap<String, Duration>,
+    pub discoverer_durations: FxHashMap<String, Duration>,
 }
 
 /// Infohash（20 字节）
@@ -352,7 +352,7 @@ pub struct ScrapeEntry {
 /// Tracker scrape 响应
 #[derive(Debug, Clone, Default)]
 pub struct TrackerScrapeResponse {
-    pub files: HashMap<Infohash, ScrapeEntry>,
+    pub files: FxHashMap<Infohash, ScrapeEntry>,
     pub failure_reason: Option<String>,
 }
 
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_scrape_response_bencode() {
-        let mut files = HashMap::new();
+        let mut files = FxHashMap::default();
         files.insert(
             [0u8; 20],
             ScrapeEntry {

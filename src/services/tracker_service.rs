@@ -1,6 +1,7 @@
 //! TrackerService — 超级 Tracker 业务层
 
 use std::sync::Arc;
+use rustc_hash::FxHashMap;
 
 use crate::storage::repo_traits::{InfohashRepository, PeerRepository, TrackerRepository};
 use crate::storage::{InfohashRepoImpl, PeerRepoImpl, TrackerRepoImpl};
@@ -56,7 +57,7 @@ impl TrackerService {
     }
 
     pub async fn scrape(&self, req: TrackerScrapeRequest) -> TrackerScrapeResponse {
-        let mut files = std::collections::HashMap::new();
+        let mut files = FxHashMap::default();
         for ih in &req.info_hashes {
             let peers = PeerRepository::get_peers(&*self.peer_repo, ih, 1000).await;
             files.insert(
