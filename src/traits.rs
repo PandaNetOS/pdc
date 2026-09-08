@@ -52,6 +52,16 @@ pub trait PeerDiscoverer: Send + Sync {
 
     /// 获取统计信息
     fn stats(&self) -> DiscovererStats;
+
+    /// 获取 tracker 评分列表（仅 Tracker 发现器实现）
+    /// 返回 (tracker_url, score, disabled) 列表，按评分降序
+    fn tracker_scores(&self) -> Option<Vec<(String, f64, bool)>> {
+        None
+    }
+
+    /// 添加 peer 到 PEX 连接池（仅 PEX 发现器实现）
+    /// Tracker 发现的 peer 通过此方法喂给 PEX，实现 PEX 二次扩散
+    fn add_peer_for_pex(&self, _addr: std::net::SocketAddr) {}
 }
 
 /// 发现器类型

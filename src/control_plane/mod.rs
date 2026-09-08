@@ -34,6 +34,8 @@ pub struct ControlPlane {
     registry: Arc<DiscovererRegistry>,
     /// 事件总线
     event_bus: EventBus,
+    /// TrackerRepo（可选，注入到 TrackerDiscoverer 实现统一数据归口）
+    tracker_repo: Option<Arc<crate::storage::TrackerRepoImpl>>,
 }
 
 impl ControlPlane {
@@ -43,7 +45,14 @@ impl ControlPlane {
             config: Arc::new(RwLock::new(config)),
             registry,
             event_bus,
+            tracker_repo: None,
         }
+    }
+
+    /// 注入 TrackerRepo（统一数据归口 + 持久化）
+    pub fn with_tracker_repo(mut self, repo: Arc<crate::storage::TrackerRepoImpl>) -> Self {
+        self.tracker_repo = Some(repo);
+        self
     }
 
     /// 获取配置快照
@@ -97,6 +106,12 @@ impl ControlPlane {
                 crate::discoverers::tracker::TrackerDiscoverer::with_trackers(
                     config.discoverers.custom_trackers.clone(),
                 )
+            };
+            // 注入 TrackerRepo（统一数据归口 + 持久化）
+            let tracker = if let Some(ref repo) = self.tracker_repo {
+                tracker.with_tracker_repo(repo.clone())
+            } else {
+                tracker
             };
             self.registry.register(Box::new(tracker));
         }

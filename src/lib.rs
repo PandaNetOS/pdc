@@ -48,7 +48,6 @@
 //! ## 模块结构
 //!
 //! - [`aggregator`] - 核心聚合器，统一调度所有发现器
-//! - [`cache`] - Peer 缓存，支持去重、优先级排序、过期清理
 //! - [`config`] - 配置管理（YAML 文件 + 环境变量）
 //! - [`control_plane`] - 控制面（策略管理、配置热更新、发现器生命周期）
 //! - [`crawler`] - 爬虫引擎（主动爬行 DHT 网络）
@@ -62,21 +61,24 @@
 #![allow(non_snake_case)]
 
 pub mod aggregator;
-pub mod cache;
 pub mod config;
 pub mod control_plane;
 pub mod crawler;
 pub mod data_plane;
+pub mod dht;
 pub mod discoverers;
+pub mod dns_pool;
 pub mod event_bus;
 pub mod health_check;
+pub mod intelligence;
 pub mod nat;
+pub mod services;
+pub mod storage;
 pub mod traits;
 pub mod types;
 
 // 重新导出常用类型
 pub use aggregator::{AggregateStats, PeerDiscoveryAggregator, PeerDiscoveryConfig};
-pub use cache::PeerCache;
 pub use config::PdcConfig;
 pub use control_plane::ControlPlane;
 pub use crawler::{Crawler, CrawlerEngine, CrawlerState};

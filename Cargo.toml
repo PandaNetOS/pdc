@@ -38,6 +38,9 @@ dashmap = "5"
 parking_lot = "0.12"
 futures = "0.3"
 igd = "0.12"
+prometheus = "0.13"
+rusqlite = { version = "0.31", features = ["bundled"] }
+hickory-resolver = "0.24"
 
 [dev-dependencies]
 tokio-test = "0.4"

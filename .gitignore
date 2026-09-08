@@ -1,1 +1,19 @@
 /target
+
+# 运行时日志（防止误提交根目录日志）
+pdc*.log
+pdc*.err
+
+# 运行时数据（防止误提交根目录数据库）
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 路由表导出
+dht_routing_table.json
+
+# 调试截图
+*screenshot*.png
+*screenshot*.jpg

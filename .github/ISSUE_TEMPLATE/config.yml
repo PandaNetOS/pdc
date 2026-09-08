@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 文档
+    url: https://github.com/your-org/PeerDiscoveryCenter/tree/main/docs
+    about: 查看项目文档和架构设计
+  - name: 💬 讨论
+    url: https://github.com/your-org/PeerDiscoveryCenter/discussions
+    about: 在讨论区提问或交流想法
+  - name: 📚 ADR
+    url: https://github.com/your-org/PeerDiscoveryCenter/tree/main/docs/adr
+    about: 查看架构决策记录

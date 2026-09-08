@@ -32,9 +32,101 @@ pub struct PdcConfig {
     /// NAT 穿透配置
     #[serde(default)]
     pub nat: NatConfig,
+    /// 持久化存储配置
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// 持久化优化配置
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+/// 持久化存储配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// 数据库文件路径
+    #[serde(default = "default_storage_path")]
+    pub path: String,
+    /// 是否启用持久化
+    #[serde(default = "default_storage_enabled")]
+    pub enabled: bool,
+}
+
+fn default_storage_path() -> String {
+    "target/data/pdc.db".to_string()
+}
+
+fn default_storage_enabled() -> bool {
+    true
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            path: default_storage_path(),
+            enabled: default_storage_enabled(),
+        }
+    }
+}
+
+/// 持久化优化配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistenceConfig {
+    /// 全量保存间隔（秒）
+    #[serde(default = "default_save_interval")]
+    pub save_interval_secs: u64,
+    /// WAL checkpoint 间隔（秒）
+    #[serde(default = "default_checkpoint_interval")]
+    pub wal_checkpoint_interval_secs: u64,
+    /// WAL 自动 checkpoint 页数
+    #[serde(default = "default_wal_autocheckpoint")]
+    pub wal_autocheckpoint_pages: u32,
+    /// 批量写入大小
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    /// 是否启用增量持久化（变更日志）
+    #[serde(default = "default_false")]
+    pub enable_incremental: bool,
+    /// 冷热分层检查间隔（秒）
+    #[serde(default = "default_tier_check_interval")]
+    pub tier_check_interval_secs: u64,
+    /// 热数据阈值（秒，最近 N 秒内有活跃视为热）
+    #[serde(default = "default_hot_threshold")]
+    pub hot_threshold_secs: u64,
+    /// 温数据阈值（秒，超过则为冷）
+    #[serde(default = "default_warm_threshold")]
+    pub warm_threshold_secs: u64,
+    /// 内存热数据上限
+    #[serde(default = "default_max_hot_in_memory")]
+    pub max_hot_in_memory: usize,
+}
+
+fn default_save_interval() -> u64 { 60 }
+fn default_checkpoint_interval() -> u64 { 600 }
+fn default_wal_autocheckpoint() -> u32 { 2000 }
+fn default_batch_size() -> usize { 500 }
+fn default_false() -> bool { false }
+fn default_tier_check_interval() -> u64 { 300 }
+fn default_hot_threshold() -> u64 { 1800 }
+fn default_warm_threshold() -> u64 { 7200 }
+fn default_max_hot_in_memory() -> usize { 5000 }
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            save_interval_secs: default_save_interval(),
+            wal_checkpoint_interval_secs: default_checkpoint_interval(),
+            wal_autocheckpoint_pages: default_wal_autocheckpoint(),
+            batch_size: default_batch_size(),
+            enable_incremental: default_false(),
+            tier_check_interval_secs: default_tier_check_interval(),
+            hot_threshold_secs: default_hot_threshold(),
+            warm_threshold_secs: default_warm_threshold(),
+            max_hot_in_memory: default_max_hot_in_memory(),
+        }
+    }
 }
 
 fn default_log_level() -> String {
@@ -51,6 +143,8 @@ impl Default for PdcConfig {
             health_check: HealthCheckConfig::default(),
             crawler: CrawlerConfig::default(),
             nat: NatConfig::default(),
+            storage: StorageConfig::default(),
+            persistence: PersistenceConfig::default(),
             log_level: default_log_level(),
         }
     }
@@ -354,7 +448,7 @@ impl Default for HealthCheckConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlerConfig {
     /// 是否启用爬虫引擎
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 爬行间隔（秒）
     #[serde(default = "default_crawl_interval")]
@@ -391,7 +485,7 @@ fn default_nat_lease() -> u32 {
 impl Default for NatConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             lease_duration: default_nat_lease(),
         }
     }
@@ -411,18 +505,27 @@ fn default_crawler_listen_port() -> u16 {
 }
 fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
+        // 主流公共 DHT 路由器
         ("router.bittorrent.com".to_string(), 6881),
         ("dht.transmissionbt.com".to_string(), 6881),
         ("router.utorrent.com".to_string(), 6881),
         ("dht.aelitis.com".to_string(), 6881),
-        ("bootstap.bitcomet.com".to_string(), 6881),
+        ("router.bitcomet.com".to_string(), 6881),
+        ("dht.libtorrent.org".to_string(), 25401),
+        // 额外公共节点
+        ("dht.aria2.net".to_string(), 6881),
+        ("router.magnet2torrent.com".to_string(), 6881),
+        ("dht.download.free.fr".to_string(), 6881),
+        ("dht.cdnbye.com".to_string(), 6881),
+        ("dht.pps001.cn".to_string(), 6881),
+        ("tracker1.itzmx.com".to_string(), 6881),
     ]
 }
 
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             crawl_interval_secs: default_crawl_interval(),
             max_nodes: default_max_crawl_nodes(),
             max_infohashes: default_max_infohashes(),
@@ -444,7 +547,7 @@ mod tests {
         assert_eq!(config.super_tracker.interval, 1800);
         assert!(config.discoverers.enable_tracker);
         assert!(!config.discoverers.enable_lpd);
-        assert!(!config.crawler.enabled);
+        assert!(config.crawler.enabled);
     }
 
     #[test]

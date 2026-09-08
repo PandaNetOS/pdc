@@ -3,12 +3,12 @@
 //! 实现 BitTorrent DHT 协议（BEP 5），通过 Kademlia 分布式哈希表发现 peer。
 //!
 //! 实现了：
-//! - Bootstrap 节点启动和路由表维护
+//! - Bootstrap 节点启动和路由表维护（K-Bucket）
 //! - get_peers 递归查询（迭代式 Kademlia 查找）
 //! - compact node info / compact peer 解析
 //! - 节点健康检查和过期清理
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use rand::Rng;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
+use crate::dht::{kbucket::NodeState, routing_table::RoutingTable};
 use crate::traits::{AnnounceEvent, DiscovererStats, DiscovererType, PeerDiscoverer};
 use crate::types::{Infohash, PeerInfo, PeerSource};
 
@@ -34,8 +35,6 @@ pub struct DhtConfig {
     pub listen_port: u16,
     /// 节点 ID（20 字节）
     pub node_id: [u8; 20],
-    /// 路由表持久化路径
-    pub persistence_path: Option<String>,
     /// 路由表刷新间隔
     pub refresh_interval: Duration,
     /// 节点过期时间
@@ -65,7 +64,6 @@ impl Default for DhtConfig {
                 .collect(),
             listen_port: 6881,
             node_id,
-            persistence_path: None,
             refresh_interval: Duration::from_secs(300),
             node_ttl: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(8),
@@ -73,23 +71,6 @@ impl Default for DhtConfig {
             max_query_rounds: 5,
             enabled: true,
         }
-    }
-}
-
-/// 路由表中的节点
-#[derive(Debug, Clone)]
-struct RoutingNode {
-    id: [u8; 20],
-    addr: SocketAddr,
-    last_active: Instant,
-    consecutive_failures: u32,
-    #[allow(dead_code)]
-    is_bootstrap: bool,
-}
-
-impl RoutingNode {
-    fn is_healthy(&self) -> bool {
-        self.consecutive_failures < 3
     }
 }
 
@@ -103,8 +84,8 @@ struct QueryResult {
 /// DHT 发现器
 pub struct DhtDiscoverer {
     config: DhtConfig,
-    /// 路由表（addr -> RoutingNode）
-    routing_table: Arc<RwLock<HashMap<SocketAddr, RoutingNode>>>,
+    /// Kademlia 路由表
+    routing_table: Arc<RwLock<RoutingTable>>,
     /// 统计
     stats: Arc<RwLock<DiscovererStats>>,
     /// 是否已初始化
@@ -114,9 +95,10 @@ pub struct DhtDiscoverer {
 impl DhtDiscoverer {
     /// 创建新的 DHT 发现器
     pub fn new(config: DhtConfig) -> Self {
+        let routing_table = Arc::new(RwLock::new(RoutingTable::new(config.node_id)));
         Self {
             config,
-            routing_table: Arc::new(RwLock::new(HashMap::new())),
+            routing_table,
             stats: Arc::new(RwLock::new(DiscovererStats::default())),
             initialized: Arc::new(RwLock::new(false)),
         }
@@ -125,6 +107,11 @@ impl DhtDiscoverer {
     /// 创建默认配置的 DHT 发现器
     pub fn with_default_config() -> Self {
         Self::new(DhtConfig::default())
+    }
+
+    /// 路由表引用（供外部访问）
+    pub fn routing_table(&self) -> Arc<RwLock<RoutingTable>> {
+        self.routing_table.clone()
     }
 
     /// 初始化 DHT 节点（解析 bootstrap 节点并加入路由表）
@@ -152,16 +139,7 @@ impl DhtDiscoverer {
             for addr in resolved {
                 let mut node_id = [0u8; 20];
                 rand::thread_rng().fill(&mut node_id);
-                table.insert(
-                    addr,
-                    RoutingNode {
-                        id: node_id,
-                        addr,
-                        last_active: Instant::now(),
-                        consecutive_failures: 0,
-                        is_bootstrap: true,
-                    },
-                );
+                table.add_node(node_id, addr);
             }
         }
 
@@ -175,58 +153,41 @@ impl DhtDiscoverer {
     }
 
     /// 获取健康的节点列表
-    fn healthy_nodes(&self) -> Vec<RoutingNode> {
+    fn healthy_nodes(&self) -> Vec<crate::dht::kbucket::KBucketEntry> {
         self.routing_table
             .read()
-            .values()
-            .filter(|n| n.is_healthy())
-            .cloned()
+            .all_nodes()
+            .into_iter()
+            .filter(|n| n.state != NodeState::Bad)
             .collect()
     }
 
     /// 获取距离目标最近的 N 个节点
-    fn nearest_nodes(&self, target: &[u8; 20], count: usize) -> Vec<RoutingNode> {
-        let mut nodes: Vec<RoutingNode> = self.healthy_nodes();
-        nodes.sort_by(|a, b| {
-            let da = DhtMessage::xor_distance(&a.id, target);
-            let db = DhtMessage::xor_distance(&b.id, target);
-            if DhtMessage::distance_less(&da, &db) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        });
-        nodes.truncate(count);
-        nodes
+    fn nearest_nodes(&self, target: &[u8; 20], count: usize) -> Vec<crate::dht::kbucket::KBucketEntry> {
+        let healthy: HashSet<SocketAddr> = self.healthy_nodes().iter().map(|n| n.addr).collect();
+        let mut closest = self.routing_table.read().find_closest(target, count * 3);
+        closest.retain(|n| healthy.contains(&n.addr));
+        closest.truncate(count);
+        closest
     }
 
     /// 添加节点到路由表
     fn add_node(&self, node: &DhtNode) {
-        let mut table = self.routing_table.write();
-        if table.len() < 1000 {
-            table.entry(node.addr).or_insert(RoutingNode {
-                id: node.id,
-                addr: node.addr,
-                last_active: Instant::now(),
-                consecutive_failures: 0,
-                is_bootstrap: false,
-            });
-        }
+        self.routing_table.write().add_node(node.id, node.addr);
     }
 
     /// 标记节点失败
     fn mark_node_failure(&self, addr: &SocketAddr) {
-        if let Some(node) = self.routing_table.write().get_mut(addr) {
-            node.consecutive_failures += 1;
+        if let Some(entry) = self.routing_table.write().find_by_addr_mut(*addr) {
+            entry.record_failure();
         }
     }
 
     /// 标记节点成功
-    fn mark_node_success(&self, addr: &SocketAddr, id: [u8; 20]) {
-        if let Some(node) = self.routing_table.write().get_mut(addr) {
-            node.id = id;
-            node.last_active = Instant::now();
-            node.consecutive_failures = 0;
+    fn mark_node_success(&self, addr: &SocketAddr, id: [u8; 20], latency_ms: u64) {
+        if let Some(entry) = self.routing_table.write().find_by_addr_mut(*addr) {
+            entry.id = id;
+            entry.record_success(latency_ms);
         }
     }
 
@@ -306,7 +267,7 @@ impl PeerDiscoverer for DhtDiscoverer {
         for round in 0..self.config.max_query_rounds {
             // 获取最近的未查询节点
             let candidates = self.nearest_nodes(infohash, 20);
-            let to_query: Vec<RoutingNode> = candidates
+            let to_query: Vec<_> = candidates
                 .into_iter()
                 .filter(|n| !queried.contains(&n.addr))
                 .take(self.config.max_concurrent_requests)
@@ -383,7 +344,7 @@ impl PeerDiscoverer for DhtDiscoverer {
                                     new_nodes_count += 1;
                                 }
                             }
-                            self.mark_node_success(&node_addr, qr.responder_id);
+                            self.mark_node_success(&node_addr, qr.responder_id, start.elapsed().as_millis() as u64);
                         }
                         Err(e) => {
                             debug!("[dht] 节点 {} 查询失败: {}", node_addr, e);
@@ -564,16 +525,7 @@ mod tests {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
                     6881 + i as u16,
                 );
-                table.insert(
-                    addr,
-                    RoutingNode {
-                        id,
-                        addr,
-                        last_active: Instant::now(),
-                        consecutive_failures: 0,
-                        is_bootstrap: false,
-                    },
-                );
+                table.add_node(id, addr);
             }
         }
 
@@ -607,21 +559,12 @@ mod tests {
         );
         {
             let mut table = discoverer.routing_table.write();
-            table.insert(
-                addr,
-                RoutingNode {
-                    id: [0u8; 20],
-                    addr,
-                    last_active: Instant::now(),
-                    consecutive_failures: 0,
-                    is_bootstrap: false,
-                },
-            );
+            table.add_node([0u8; 20], addr);
         }
         for _ in 0..3 {
             discoverer.mark_node_failure(&addr);
         }
         let nodes = discoverer.healthy_nodes();
-        assert!(nodes.is_empty()); // 连续失败 3 次后不健康
+        assert!(nodes.is_empty()); // 连续失败 3 次后 Bad
     }
 }
