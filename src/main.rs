@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use rand::Rng;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -234,6 +235,80 @@ async fn main() -> anyhow::Result<()> {
     let rate_limiter = Arc::new(PeerDiscoveryCenter::data_plane::rate_limiter::RateLimiter::new(100.0, 200.0));
     info!("[main] 限流器已创建（单IP 100 QPS，突发 200）");
 
+    // 7.5 初始化 PEX/uTP 服务（默认启用）
+    let node_id = {
+        let mut id = [0u8; 20];
+        rand::thread_rng().fill(&mut id);
+        id
+    };
+
+    // PEX 接收器（核心，被其他服务引用）
+    let pex_receiver = Arc::new(
+        PeerDiscoveryCenter::crawler::pex_receiver::PexReceiver::new()
+            .with_peer_repo(peer_repo.clone()),
+    );
+
+    // uTP 服务端（UDP 6883）
+    let utp_server = match tokio::net::UdpSocket::bind("0.0.0.0:6883").await {
+        Ok(socket) => {
+            let server = PeerDiscoveryCenter::crawler::utp_server::UtpServer::new(
+                Arc::new(socket),
+                node_id,
+            )
+            .with_peer_repo(peer_repo.clone())
+            .with_pex_receiver(pex_receiver.clone());
+            let server = Arc::new(server);
+            let s = server.clone();
+            tokio::spawn(async move {
+                s.run().await;
+            });
+            info!("[main] uTP 服务端已启动（UDP 6883）");
+            Some(server)
+        }
+        Err(e) => {
+            warn!("[main] uTP 服务端启动失败（UDP 6883）: {}", e);
+            None
+        }
+    };
+
+    // TCP-PEX 服务端（TCP 6884）
+    let tcp_pex_server = {
+        let listen_addr = "0.0.0.0:6884".parse().unwrap();
+        let server = PeerDiscoveryCenter::crawler::tcp_pex_server::TcpPexServer::new(
+            listen_addr,
+            node_id,
+        )
+        .with_peer_repo(peer_repo.clone())
+        .with_pex_receiver(pex_receiver.clone());
+        let server = Arc::new(server);
+        let s = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = s.run().await {
+                warn!("[main] TCP-PEX 服务端运行错误: {}", e);
+            }
+        });
+        info!("[main] TCP-PEX 服务端已启动（TCP 6884）");
+        Some(server)
+    };
+
+    // 主动 PEX 请求器
+    let active_pex = {
+        let requester = PeerDiscoveryCenter::crawler::active_pex::ActivePexRequester::new(
+            peer_repo.clone(),
+            node_id,
+        )
+        .with_pex_receiver(pex_receiver.clone())
+        .with_interval(std::time::Duration::from_secs(30))
+        .with_batch_size(20);
+        let requester = Arc::new(requester);
+        let r = requester.clone();
+        tokio::spawn(async move {
+            r.run().await;
+        });
+        info!("[main] 主动 PEX 请求器已启动");
+        Some(requester)
+    };
+
     // 7.6 创建 AppState
     let app_state = AppState {
         control_plane: control_plane.clone(),
@@ -253,10 +328,10 @@ async fn main() -> anyhow::Result<()> {
         dht_probe: dht_probe_ref,
         rate_limiter,
         hole_punch_signaling: Arc::new(PeerDiscoveryCenter::data_plane::hole_punch_signaling::HolePunchSignaling::new()),
-        utp_server: None,
-        pex_receiver: None,
-        tcp_pex_server: None,
-        active_pex: None,
+        utp_server,
+        pex_receiver: Some(pex_receiver),
+        tcp_pex_server,
+        active_pex,
     };
 
     // 8. 启动健康检查任务
