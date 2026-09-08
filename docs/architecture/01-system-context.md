@@ -1,138 +1,138 @@
-﻿# 01 鈥?绯荤粺涓婁笅鏂?(C4 Level 1)
+# 01 — 系统上下文 (C4 Level 1)
 
-> PeerDiscoveryCenter 鍦?PandaNetOS 鐢熸€佷腑鐨勪綅缃笌澶栭儴浜や簰
+> PeerDiscoveryCenter 在 PandaNetOS 生态中的位置与外部交互
 
-## 绯荤粺涓婁笅鏂囧浘
+## 系统上下文图
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 graph TB
-    subgraph "PandaNetOS 鐢熸€?
-        PK[pk 涓绘帶鍙?br/>Agent绠＄悊/浠诲姟璋冨害/鐩戞帶]
-        SPDE[spde 涓嬭浇鎵цAgent<br/>BT/纾佸姏/HTTP涓嬭浇]
-        PDC[PeerDiscoveryCenter<br/>鑺傜偣鍙戠幇Agent]
-        PCDN[pcdn-keeper<br/>PCDN甯﹀璋冨害]
+    subgraph "PandaNetOS 生态"
+        PK[pk 主控台<br/>Agent管理/任务调度/监控]
+        SPDE[spde 下载执行Agent<br/>BT/磁力/HTTP下载]
+        PDC[PeerDiscoveryCenter<br/>节点发现Agent]
+        PCDN[pcdn-keeper<br/>PCDN带宽调度]
     end
 
-    subgraph "澶栭儴绯荤粺"
-        DHT[DHT 缃戠粶<br/>Mainline DHT]
-        TRACKER[鍏叡 Tracker<br/>UDP/HTTP]
-        PEX[PEX 缃戠粶<br/>Peer Exchange]
-        LPD[LPD<br/>鏈湴鍙戠幇]
+    subgraph "外部系统"
+        DHT[DHT 网络<br/>Mainline DHT]
+        TRACKER[公共 Tracker<br/>UDP/HTTP]
+        PEX[PEX 网络<br/>Peer Exchange]
+        LPD[LPD<br/>本地发现]
     end
 
-    subgraph "鐢ㄦ埛"
-        USER[鐢ㄦ埛/杩愮淮]
+    subgraph "用户"
+        USER[用户/运维]
     end
 
-    %% 鐢熸€佸唴閮ㄤ氦浜?
+    %% 生态内部交互
     PK -->|register/heartbeat/report| PDC
-    PK -->|浠诲姟涓嬪彂| SPDE
-    SPDE -->|璇锋眰Peer鍒楄〃| PDC
-    PDC -->|杩斿洖楂樿川閲廝eer| SPDE
-    PCDN -->|甯﹀璋冨害| SPDE
+    PK -->|任务下发| SPDE
+    SPDE -->|请求Peer列表| PDC
+    PDC -->|返回高质量Peer| SPDE
+    PCDN -->|带宽调度| SPDE
 
-    %% 澶栭儴缃戠粶浜や簰
+    %% 外部网络交互
     PDC -->|find_node/get_peers| DHT
     PDC -->|announce/scrape| TRACKER
-    PDC -->|PEX鎻℃墜| PEX
-    PDC -->|鏈湴骞挎挱| LPD
+    PDC -->|PEX握手| PEX
+    PDC -->|本地广播| LPD
 
-    %% 鐢ㄦ埛浜や簰
+    %% 用户交互
     USER -->|WebUI| PK
     USER -->|REST API| PDC
-    USER -->|WebSocket鐩戞帶| PDC
+    USER -->|WebSocket监控| PDC
 ```
 
-## 澶栭儴渚濊禆
+## 外部依赖
 
-### 涓婃父渚濊禆锛圥DC 璋冪敤锛?
+### 上游依赖（PDC 调用）
 
-| 绯荤粺 | 鍗忚 | 鐢ㄩ€?| 鍏抽敭鎿嶄綔 |
+| 系统 | 协议 | 用途 | 关键操作 |
 |---|---|---|---|
-| DHT 缃戠粶 | UDP / KRPC | 鍙戠幇 DHT 鑺傜偣鍜?infohash | find_node, get_peers, announce_peer |
-| 鍏叡 Tracker | UDP / HTTP | 鑾峰彇鎸囧畾 infohash 鐨?Peer 鍒楄〃 | announce, scrape |
-| PEX 缃戠粶 | TCP / uTP | Peer 涔嬮棿浜ゆ崲鑺傜偣淇℃伅 | ut_pex 鎵╁睍鍗忚 |
-| LPD | UDP 澶氭挱 | 鏈湴缃戠粶鑺傜偣鍙戠幇 | HTTP 澶氭挱骞挎挱 |
+| DHT 网络 | UDP / KRPC | 发现 DHT 节点和 infohash | find_node, get_peers, announce_peer |
+| 公共 Tracker | UDP / HTTP | 获取指定 infohash 的 Peer 列表 | announce, scrape |
+| PEX 网络 | TCP / uTP | Peer 之间交换节点信息 | ut_pex 扩展协议 |
+| LPD | UDP 多播 | 本地网络节点发现 | HTTP 多播广播 |
 
-### 涓嬫父渚濊禆锛堣皟鐢?PDC锛?
+### 下游依赖（调用 PDC）
 
-| 绯荤粺 | 鎺ュ彛 | 鐢ㄩ€?| 鍏抽敭鎿嶄綔 |
+| 系统 | 接口 | 用途 | 关键操作 |
 |---|---|---|---|
-| pk 涓绘帶鍙?| HTTP REST | Agent 娉ㄥ唽銆佸績璺炽€佺姸鎬佷笂鎶?| register, heartbeat, report |
-| spde 涓嬭浇Agent | HTTP REST | 璇锋眰楂樿川閲?Peer 鍒楄〃 | get_peers, get_top_peers |
-| 鐢ㄦ埛/杩愮淮 | WebSocket | 瀹炴椂鐩戞帶绯荤粺鐘舵€?| status, stats, health |
+| pk 主控台 | HTTP REST | Agent 注册、心跳、状态上报 | register, heartbeat, report |
+| spde 下载Agent | HTTP REST | 请求高质量 Peer 列表 | get_peers, get_top_peers |
+| 用户/运维 | WebSocket | 实时监控系统状态 | status, stats, health |
 
-## 鐢熸€佽鑹插畾浣?
+## 生态角色定位
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 graph LR
-    subgraph "Agent 瑙掕壊"
-        A1[spde<br/>涓嬭浇鎵ц]
-        A2[PDC<br/>鑺傜偣鍙戠幇]
+    subgraph "Agent 角色"
+        A1[spde<br/>下载执行]
+        A2[PDC<br/>节点发现]
     end
 
-    subgraph "搴旂敤鍦烘櫙"
-        B1[pcdn-keeper<br/>甯﹀鍙樼幇]
+    subgraph "应用场景"
+        B1[pcdn-keeper<br/>带宽变现]
     end
 
-    subgraph "鎺у埗骞抽潰"
-        C1[pk 涓绘帶鍙?br/>缁熶竴绠＄悊]
+    subgraph "控制平面"
+        C1[pk 主控台<br/>统一管理]
     end
 
     C1 --> A1 & A2
-    A2 -->|鎻愪緵Peer| A1
-    A1 -->|娑堣€楀甫瀹絴 B1
+    A2 -->|提供Peer| A1
+    A1 -->|消耗带宽| B1
 ```
 
-**PDC 鐨勫畾浣?*锛?
-- 鉁?**鐙珛 Agent**锛氱嫭绔嬭繘绋嬶紝閫氳繃 register/heartbeat/report 鍗忚鎺ュ叆 pk
-- 鉁?**鏁版嵁鐢熶骇鑰?*锛氫负 spde 鎻愪緵楂樿川閲忕殑 Peer 鍜?DHT 鑺傜偣璧勬簮
-- 鉂?**涓嶆槸搴旂敤鍦烘櫙**锛氫笉鐩存帴鍙備笌涓嬭浇鎴栧甫瀹藉彉鐜帮紝鏄熀纭€鑳藉姏鎻愪緵鑰?
+**PDC 的定位**：
+- ✅ **独立 Agent**：独立进程，通过 register/heartbeat/report 协议接入 pk
+- ✅ **数据生产者**：为 spde 提供高质量的 Peer 和 DHT 节点资源
+- ❌ **不是应用场景**：不直接参与下载或带宽变现，是基础能力提供者
 
-## 閮ㄧ讲鎷撴墤
+## 部署拓扑
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 graph TB
-    subgraph "鎺у埗鑺傜偣"
-        PK[pk 涓绘帶鍙?br/>5566绔彛]
+    subgraph "控制节点"
+        PK[pk 主控台<br/>5566端口]
     end
 
-    subgraph "杈圭紭鑺傜偣 1"
-        PDC1[PDC Agent<br/>6880绔彛]
+    subgraph "边缘节点 1"
+        PDC1[PDC Agent<br/>6880端口]
         SPDE1[spde Agent]
     end
 
-    subgraph "杈圭紭鑺傜偣 2"
-        PDC2[PDC Agent<br/>6880绔彛]
+    subgraph "边缘节点 2"
+        PDC2[PDC Agent<br/>6880端口]
         SPDE2[spde Agent]
     end
 
-    subgraph "杈圭紭鑺傜偣 N"
-        PDCn[PDC Agent<br/>6880绔彛]
+    subgraph "边缘节点 N"
+        PDCn[PDC Agent<br/>6880端口]
         SPDEn[spde Agent]
     end
 
-    PK -->|娉ㄥ唽/蹇冭烦| PDC1 & PDC2 & PDCn
-    PDC1 -->|Peer鍒楄〃| SPDE1
-    PDC2 -->|Peer鍒楄〃| SPDE2
-    PDCn -->|Peer鍒楄〃| SPDEn
+    PK -->|注册/心跳| PDC1 & PDC2 & PDCn
+    PDC1 -->|Peer列表| SPDE1
+    PDC2 -->|Peer列表| SPDE2
+    PDCn -->|Peer列表| SPDEn
 
-    PDC1 & PDC2 & PDCn -->|DHT/Tracker/PEX| 浜掕仈缃?
+    PDC1 & PDC2 & PDCn -->|DHT/Tracker/PEX| 互联网
 ```
 
-## 绔彛瑙勫垝
+## 端口规划
 
-| 绔彛 | 鍗忚 | 鐢ㄩ€?|
+| 端口 | 协议 | 用途 |
 |---|---|---|
-| 6880 | TCP+UDP | 瓒呯骇 Tracker 鏈嶅姟锛坅nnounce/scrape锛?|
-| 6882 | UDP | DHT 鐖櫕绔彛 |
-| 5566 | HTTP | pk 涓绘帶鍙?WebUI锛圥DC 涓嶅崰鐢級 |
-| 鍔ㄦ€?| TCP | PEX 杩炴帴锛堝嚭绔欙級 |
+| 6880 | TCP+UDP | 超级 Tracker 服务（announce/scrape） |
+| 6882 | UDP | DHT 爬虫端口 |
+| 5566 | HTTP | pk 主控台 WebUI（PDC 不占用） |
+| 动态 | TCP | PEX 连接（出站） |
 
-## 涓嬩竴姝?
+## 下一步
 
-- 闃呰 [02-container.md](02-container.md) 浜嗚В PDC 鍐呴儴妯″潡鍒掑垎
-- 闃呰 [03-intelligence.md](03-intelligence.md) 浜嗚В鏅鸿兘灞傝璁?
+- 阅读 [02-container.md](02-container.md) 了解 PDC 内部模块划分
+- 阅读 [03-intelligence.md](03-intelligence.md) 了解智能层设计

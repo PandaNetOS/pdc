@@ -1,49 +1,49 @@
-﻿# 03 鈥?鏅鸿兘灞傝缁嗚璁?(C4 Level 3)
+# 03 — 智能层详细设计 (C4 Level 3)
 
-> Intelligence 灞?鈥?璇勫垎绯荤粺銆佸喎鐑垎灞傘€佽妭鐐归€夋嫨鐨勭粺涓€鏀跺彛
+> Intelligence 层 — 评分系统、冷热分层、节点选择的统一收口
 
-## 璁捐鍘熷垯
+## 设计原则
 
-### 缁熶竴鏀跺彛
-鎵€鏈夋櫤鑳藉喅绛栵紙璇勫垎銆佸喎鐑€侀€夋嫨锛夌粺涓€鍦?intelligence 灞傦細
-- **鏁版嵁灞?(Repo)**锛氬彧璐熻矗鏁版嵁瀛樺偍鍜屾煡璇紝涓嶅仛鏅鸿兘鍒ゆ柇
-- **涓氬姟灞?(Services)**锛氬彧璐熻矗涓氬姟閫昏緫锛岄€氳繃 intelligence 灞傝幏鍙栬瘎鍒嗗拰鍐风儹鍒ゆ柇
-- **鏅鸿兘灞?(Intelligence)**锛氬敮涓€鐨勬櫤鑳藉喅绛栧叆鍙?
+### 统一收口
+所有智能决策（评分、冷热、选择）统一在 intelligence 层：
+- **数据层 (Repo)**：只负责数据存储和查询，不做智能判断
+- **业务层 (Services)**：只负责业务逻辑，通过 intelligence 层获取评分和冷热判断
+- **智能层 (Intelligence)**：唯一的智能决策入口
 
-### 澧為噺浼樺厛
-璇勫垎閲嶇畻銆佹暟鎹寔涔呭寲绛夋搷浣滀紭鍏堥噰鐢ㄥ閲忔柟寮忥紝閬垮厤鍏ㄩ噺鎿嶄綔甯︽潵鐨勬€ц兘闂銆?
+### 增量优先
+评分重算、数据持久化等操作优先采用增量方式，避免全量操作带来的性能问题。
 
-### 鍙娴嬫€?
-鍏抽敭鎿嶄綔閮芥湁缁熻鍜屾棩蹇楋紝鏀寔鐩戞帶鍜岄棶棰樺畾浣嶃€?
+### 可观测性
+关键操作都有统计和日志，支持监控和问题定位。
 
-## 瀛愮郴缁熷垝鍒?
+## 子系统划分
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 graph TB
-    subgraph "Intelligence 灞?
-        ORCH[Intelligence 璋冨害<br/>瀹氭椂浠诲姟绠＄悊]
+    subgraph "Intelligence 层"
+        ORCH[Intelligence 调度<br/>定时任务管理]
 
-        subgraph "ScoreSystem 璇勫垎绯荤粺"
-            SM[ScoreMaintainer<br/>缁熶竴缁存姢]
-            NS[NodeScorer<br/>DHT鑺傜偣璇勫垎]
-            PS[PeerScorer<br/>BT Peer璇勫垎]
-            TS[TrackerScorer<br/>Tracker璇勫垎]
-            HS[HealthScorer<br/>绯荤粺鍋ュ悍搴
+        subgraph "ScoreSystem 评分系统"
+            SM[ScoreMaintainer<br/>统一维护]
+            NS[NodeScorer<br/>DHT节点评分]
+            PS[PeerScorer<br/>BT Peer评分]
+            TS[TrackerScorer<br/>Tracker评分]
+            HS[HealthScorer<br/>系统健康度]
         end
 
-        subgraph "TierSystem 鍐风儹鍒嗗眰"
-            TM[TierManager<br/>缁熶竴璋冨害]
-            NTM[NodeTierManager<br/>鑺傜偣鍒嗗眰]
-            PTM[PeerTierManager<br/>Peer鍒嗗眰]
+        subgraph "TierSystem 冷热分层"
+            TM[TierManager<br/>统一调度]
+            NTM[NodeTierManager<br/>节点分层]
+            PTM[PeerTierManager<br/>Peer分层]
         end
 
-        subgraph "SelectSystem 鑺傜偣閫夋嫨"
-            SS[SelectSystem<br/>缁熶竴閫夋嫨]
+        subgraph "SelectSystem 节点选择"
+            SS[SelectSystem<br/>统一选择]
         end
 
-        subgraph "閰嶇疆"
-            CFG[ScorerConfig<br/>鍙厤缃潈閲峕
+        subgraph "配置"
+            CFG[ScorerConfig<br/>可配置权重]
         end
     end
 
@@ -53,25 +53,25 @@ graph TB
     CFG --> NS & PS & TS
 ```
 
-## ScoreSystem 璇勫垎绯荤粺
+## ScoreSystem 评分系统
 
-### 鏋舵瀯
+### 架构
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 sequenceDiagram
-    participant S as 涓氬姟灞?
+    participant S as 业务层
     participant R as NodeRepo
     participant SM as ScoreMaintainer
     participant NS as NodeScorer
 
-    Note over S,R: 1. 缁熻鏁版嵁鏇存柊鏃舵爣璁拌剰
+    Note over S,R: 1. 统计数据更新时标记脏
     S->>R: record_query(addr, success, latency)
-    R->>R: 鏇存柊缁熻鏁版嵁
+    R->>R: 更新统计数据
     R->>R: mark_dirty(addr)
 
-    Note over SM: 2. 姣?0绉掑閲忛噸绠?
-    loop 姣?0绉?
+    Note over SM: 2. 每10秒增量重算
+    loop 每10秒
         SM->>R: dirty_nodes()
         R-->>SM: [addr1, addr2, ...]
         SM->>NS: rescore_dirty(repo)
@@ -82,82 +82,82 @@ sequenceDiagram
         NS->>R: clear_all_dirty()
     end
 
-    Note over SM: 3. 姣?00绉掑叏閲忛噸绠楀厹搴?
-    loop 姣?00绉?
+    Note over SM: 3. 每300秒全量重算兜底
+    loop 每300秒
         SM->>NS: rescore_all(repo)
         NS->>R: all_nodes()
-        R-->>NS: [鎵€鏈夎妭鐐筣
-        NS->>R: update_scores_batch(鍏ㄩ儴璇勫垎)
+        R-->>NS: [所有节点]
+        NS->>R: update_scores_batch(全部评分)
     end
 ```
 
-### 璇勫垎缁村害
+### 评分维度
 
-#### NodeScorer 鈥?DHT 鑺傜偣璇勫垎锛?缁村害鍔犳潈锛?
+#### NodeScorer — DHT 节点评分（4维度加权）
 
-| 缁村害 | 鏉冮噸 | 璇存槑 |
+| 维度 | 权重 | 说明 |
 |---|---|---|
-| 鍝嶅簲鐜?| 40% | success_count / query_count |
-| 寤惰繜 | 20% | 骞冲潎鍝嶅簲鏃堕棿锛岃秺蹇秺楂?|
-| 鑺傜偣浜у嚭 | 25% | 姣忔鏌ヨ骞冲潎杩斿洖鐨勮妭鐐规暟 |
-| 鍦ㄧ嚎鐜?| 15% | 鍩轰簬杩炵画澶辫触娆℃暟 |
+| 响应率 | 40% | success_count / query_count |
+| 延迟 | 20% | 平均响应时间，越快越高 |
+| 节点产出 | 25% | 每次查询平均返回的节点数 |
+| 在线率 | 15% | 基于连续失败次数 |
 
-**鐗规畩瑙勫垯**锛?
-- Bad 鐘舵€佺洿鎺?0 鍒?
-- Questionable 鐘舵€佹儵缃氾細璇勫垎 脳 0.7
-- 鏃堕棿琛板噺锛氭渶鍚庢煡璇㈣秴杩?24 灏忔椂锛岃瘎鍒嗘寜鏃堕棿琛板噺锛堟渶浣?0.5锛?
+**特殊规则**：
+- Bad 状态直接 0 分
+- Questionable 状态惩罚：评分 × 0.7
+- 时间衰减：最后查询超过 24 小时，评分按时间衰减（最低 0.5）
 
-#### PeerScorer 鈥?BT Peer 璇勫垎锛?缁村害鍔犳潈锛?
+#### PeerScorer — BT Peer 评分（5维度加权）
 
-| 缁村害 | 鏉冮噸 | 璇存槑 |
+| 维度 | 权重 | 说明 |
 |---|---|---|
-| 鏉ユ簮鍙俊搴?| 30% | Tracker > SuperTracker > LPD > WebSeed > DHT > PEX > Manual |
-| TCP 鍙揪鎬?| 30% | connection_successes / connection_attempts |
-| DHT 鏀寔 | 20% | 鏄惁鏀寔 DHT 鍗忚 |
-| 瀛樻椿鏃堕棿 | 10% | first_seen 鍒扮幇鍦ㄧ殑鏃堕棿 |
-| 澶?infohash 鍏变韩 | 10% | 鍑虹幇鍦ㄥ灏戜釜 infohash 涓?|
+| 来源可信度 | 30% | Tracker > SuperTracker > LPD > WebSeed > DHT > PEX > Manual |
+| TCP 可达性 | 30% | connection_successes / connection_attempts |
+| DHT 支持 | 20% | 是否支持 DHT 协议 |
+| 存活时间 | 10% | first_seen 到现在的时间 |
+| 多 infohash 共享 | 10% | 出现在多少个 infohash 下 |
 
-#### TrackerScorer 鈥?Tracker 璇勫垎锛?缁村害鍔犳潈锛?
+#### TrackerScorer — Tracker 评分（4维度加权）
 
-| 缁村害 | 鏉冮噸 | 璇存槑 |
+| 维度 | 权重 | 说明 |
 |---|---|---|
-| 鎴愬姛鐜?| 40% | success_requests / total_requests |
-| 鍝嶅簲閫熷害 | 20% | 骞冲潎鍝嶅簲鏃堕棿 |
-| Peer 浜у嚭 | 25% | 姣忔璇锋眰骞冲潎鍙戠幇鐨?Peer 鏁?|
-| 鍦ㄧ嚎鐜?| 15% | 鍩轰簬杩炵画澶辫触娆℃暟 |
+| 成功率 | 40% | success_requests / total_requests |
+| 响应速度 | 20% | 平均响应时间 |
+| Peer 产出 | 25% | 每次请求平均发现的 Peer 数 |
+| 在线率 | 15% | 基于连续失败次数 |
 
-**鐗规畩瑙勫垯**锛歞isabled 鐩存帴 0 鍒?
+**特殊规则**：disabled 直接 0 分
 
-### 澧為噺璇勫垎鏈哄埗
+### 增量评分机制
 
-#### 鑴忔爣璁?(Dirty Flag)
+#### 脏标记 (Dirty Flag)
 
 ```rust
-// NodeRepository trait 鏂板鏂规硶
+// NodeRepository trait 新增方法
 async fn mark_dirty(&self, addr: &SocketAddr);
 async fn dirty_nodes(&self) -> Vec<SocketAddr>;
 async fn clear_dirty(&self, addr: &SocketAddr);
 async fn clear_all_dirty(&self);
 ```
 
-**瑙﹀彂鑴忔爣璁扮殑鏃舵満**锛?
-- `record_query()` 鈥?鑺傜偣鏌ヨ缁熻鏇存柊
-- `record_query_with_nodes()` 鈥?鑺傜偣鏌ヨ+浜у嚭缁熻鏇存柊
-- `set_node_state()` 鈥?鑺傜偣鐘舵€佸彉鍖?
+**触发脏标记的时机**：
+- `record_query()` — 节点查询统计更新
+- `record_query_with_nodes()` — 节点查询+产出统计更新
+- `set_node_state()` — 节点状态变化
 
-#### 鎵归噺鏇存柊
+#### 批量更新
 
 ```rust
-// NodeRepository trait 鏂板鏂规硶
+// NodeRepository trait 新增方法
 async fn update_scores_batch(&self, scores: &[(SocketAddr, f64)]);
 ```
 
-**浼樺娍**锛?
-- 涓€娆″啓閿侊紝閬垮厤 60000 娆￠攣绔炰簤
-- 涓€娆′簨鍔★紝閬垮厤 60000 娆?SQLite UPDATE
-- 鎬ц兘鎻愬崌锛氫粠 O(n) 娆￠攣+浜嬪姟 鈫?O(1) 娆￠攣+浜嬪姟
+**优势**：
+- 一次写锁，避免 60000 次锁竞争
+- 一次事务，避免 60000 次 SQLite UPDATE
+- 性能提升：从 O(n) 次锁+事务 → O(1) 次锁+事务
 
-### 鍙厤缃潈閲?
+### 可配置权重
 
 ```rust
 pub struct ScorerConfig {
@@ -167,18 +167,18 @@ pub struct ScorerConfig {
 }
 
 pub struct NodeScoreConfig {
-    pub response_rate_weight: f64,    // 榛樿 40.0
-    pub latency_weight: f64,           // 榛樿 20.0
-    pub nodes_output_weight: f64,      // 榛樿 25.0
-    pub uptime_weight: f64,            // 榛樿 15.0
-    pub questionable_penalty: f64,     // 榛樿 0.7
-    pub decay_start_hours: f64,        // 榛樿 24.0
-    pub decay_end_hours: f64,          // 榛樿 168.0
-    pub decay_min_factor: f64,         // 榛樿 0.5
+    pub response_rate_weight: f64,    // 默认 40.0
+    pub latency_weight: f64,           // 默认 20.0
+    pub nodes_output_weight: f64,      // 默认 25.0
+    pub uptime_weight: f64,            // 默认 15.0
+    pub questionable_penalty: f64,     // 默认 0.7
+    pub decay_start_hours: f64,        // 默认 24.0
+    pub decay_end_hours: f64,          // 默认 168.0
+    pub decay_min_factor: f64,         // 默认 0.5
 }
 ```
 
-**浣跨敤鏂瑰紡**锛?
+**使用方式**：
 ```rust
 let scorer = NodeScorerImpl::with_config(NodeScoreConfig {
     response_rate_weight: 50.0,
@@ -186,38 +186,38 @@ let scorer = NodeScorerImpl::with_config(NodeScoreConfig {
 });
 ```
 
-## TierSystem 鍐风儹鍒嗗眰
+## TierSystem 冷热分层
 
-### 澶氱淮搴﹀垽瀹?
+### 多维度判定
 
-| 缁村害 | 鏉冮噸 | 璇存槑 |
+| 维度 | 权重 | 说明 |
 |---|---|---|
-| 鏈€鍚庢椿璺冩椂闂?| 40% | 鏈€杩戞椿璺冪殑鏇村彲鑳借鍐嶆璁块棶 |
-| 鑺傜偣璇勫垎 | 30% | 楂樿瘎鍒嗚妭鐐规洿鍙兘琚埇铏€夋嫨 |
-| 璁块棶棰戠巼 | 20% | query_count 楂樼殑鑺傜偣鏇存椿璺?|
-| 鏁版嵁閲嶈鎬?| 10% | 棰勭暀鎵╁睍锛堝鐑棬 infohash 鐨?peer锛?|
+| 最后活跃时间 | 40% | 最近活跃的更可能被再次访问 |
+| 节点评分 | 30% | 高评分节点更可能被爬虫选择 |
+| 访问频率 | 20% | query_count 高的节点更活跃 |
+| 数据重要性 | 10% | 预留扩展（如热门 infohash 的 peer） |
 
-### 鐗规畩瑙勫垯
+### 特殊规则
 
-#### 楂樿瘎鍒嗕繚搴?
-璇勫垎 > 70 鐨勮妭鐐癸紝鍗充娇鏆傛椂涓嶆椿璺冧篃鑷冲皯淇濈暀涓?*娓╂暟鎹?*锛岄伩鍏嶄紭璐ㄨ妭鐐硅璇檷绾с€?
+#### 高评分保底
+评分 > 70 的节点，即使暂时不活跃也至少保留为**温数据**，避免优质节点被误降级。
 
-#### 浣庤瘎鍒嗗姞閫熼檷绾?
-璇勫垎 < 30 鐨勮妭鐐癸紝鐑槇鍊肩缉鐭负 1/3锛屽姞閫熼檷绾т互閲婃斁鍐呭瓨銆?
+#### 低评分加速降级
+评分 < 30 的节点，热阈值缩短为 1/3，加速降级以释放内存。
 
-#### 璁块棶棰戠巼璋冩暣
-- 楂橀璁块棶锛?100娆★級锛氱儹闃堝€煎欢闀?1.5 鍊?
-- 浣庨璁块棶锛?5娆★級锛氱儹闃堝€肩缉鐭负 1/2
+#### 访问频率调整
+- 高频访问（>100次）：热阈值延长 1.5 倍
+- 低频访问（<5次）：热阈值缩短为 1/2
 
-### 灞傜骇瀹氫箟
+### 层级定义
 
-| 灞傜骇 | 璇存槑 | 瀛樺偍绛栫暐 |
+| 层级 | 说明 | 存储策略 |
 |---|---|---|
-| Hot锛堢儹锛?| 鏈€杩戞椿璺?+ 楂樿瘎鍒?+ 楂橀璁块棶 | 鍐呭瓨甯搁┗锛屼紭鍏堣闂?|
-| Warm锛堟俯锛?| 鏈夋椿璺冧絾棰戠巼涓嶉珮锛屾垨楂樿瘎鍒嗕絾鏆傛椂涓嶆椿璺?| 閮ㄥ垎鍦ㄥ唴瀛橈紝鍙粠纾佺洏鍔犺浇 |
-| Cold锛堝喎锛?| 闀挎椂闂存棤娲昏穬锛屼綆璇勫垎 | 纾佺洏褰掓。锛屽彲浠庡唴瀛樻竻鐞?|
+| Hot（热） | 最近活跃 + 高评分 + 高频访问 | 内存常驻，优先访问 |
+| Warm（温） | 有活跃但频率不高，或高评分但暂时不活跃 | 部分在内存，可从磁盘加载 |
+| Cold（冷） | 长时间无活跃，低评分 | 磁盘归档，可从内存清理 |
 
-### TierSystem 鎺ュ彛
+### TierSystem 接口
 
 ```rust
 impl TierSystem {
@@ -230,65 +230,65 @@ impl TierSystem {
 }
 ```
 
-## SelectSystem 鑺傜偣閫夋嫨
+## SelectSystem 节点选择
 
-### 缁熶竴閫夋嫨鎺ュ彛
+### 统一选择接口
 
 ```rust
 impl SelectSystem {
-    /// 澶氭牱鎬ч€夋嫨锛堢埇铏敤锛?
+    /// 多样性选择（爬虫用）
     pub fn select_diverse_nodes(repo, count, max_per_subnet) -> Vec<KBucketEntry>;
 
-    /// 鎸夎瘎鍒嗛€?Top N
+    /// 按评分选 Top N
     pub fn select_top_nodes(repo, n) -> Vec<KBucketEntry>;
 
-    /// 鐖櫕鍊欓€夐€夋嫨锛堢儹鑺傜偣浼樺厛 + 楂樿瘎鍒?+ 澶氭牱鎬э級
+    /// 爬虫候选选择（热节点优先 + 高评分 + 多样性）
     pub fn select_crawl_candidates(repo, count, max_per_subnet) -> Vec<KBucketEntry>;
 }
 ```
 
-### 澶氭牱鎬ч€夋嫨绠楁硶
+### 多样性选择算法
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 graph LR
-    A[鍙?Top 500 鍊欓€?br/>鎸夎瘎鍒嗛檷搴廬 --> B[鎸?ID 楂?浣嶅垎16妗禲
-    B --> C[杞鍚勬《閫夊彇]
-    C --> D{IP /24 鍘婚噸妫€鏌
-    D -->|鏈揪涓婇檺| E[閫変腑璇ヨ妭鐐筣
-    D -->|宸茶揪涓婇檺| F[璺宠繃锛岀户缁笅涓€涓猐
-    E --> G{閫夋弧 count?}
+    A[取 Top 500 候选<br/>按评分降序] --> B[按 ID 高4位分16桶]
+    B --> C[轮询各桶选取]
+    C --> D{IP /24 去重检查}
+    D -->|未达上限| E[选中该节点]
+    D -->|已达上限| F[跳过，继续下一个]
+    E --> G{选满 count?}
     F --> G
-    G -->|鏄瘄 H[杩斿洖缁撴灉]
-    G -->|鍚 C
+    G -->|是| H[返回结果]
+    G -->|否| C
 ```
 
-### 鎬ц兘浼樺寲
+### 性能优化
 
-**涔嬪墠**锛?
-- 璋冪敤 `repo.all_nodes_sync()` 鍏ㄩ噺鍏嬮殕 60000+ 鑺傜偣
-- 姣忔閫夋嫨閮藉垎閰?60000+ 涓?KBucketEntry 鐨勫唴瀛?
+**之前**：
+- 调用 `repo.all_nodes_sync()` 全量克隆 60000+ 节点
+- 每次选择都分配 60000+ 个 KBucketEntry 的内存
 
-**鐜板湪**锛?
-- 璋冪敤 `repo.top_nodes_sync(500)` 鍙彇 Top 500
-- 鍙湪鏈€鍚庤繑鍥為€変腑鑺傜偣鏃跺厠闅?
-- 鍐呭瓨鍒嗛厤浠?60000+ 鈫?500
+**现在**：
+- 调用 `repo.top_nodes_sync(500)` 只取 Top 500
+- 只在最后返回选中节点时克隆
+- 内存分配从 60000+ → 500
 
-## HealthScorer 鍋ュ悍搴?
+## HealthScorer 健康度
 
-### 涓夊眰鍔犳潈
+### 三层加权
 
-| 灞傜骇 | 鏉冮噸 | 璇存槑 |
+| 层级 | 权重 | 说明 |
 |---|---|---|
-| Tracker 灞?| 40% | 娲昏穬姣斾緥 + 骞冲潎璇勫垎 |
-| DHT 灞?| 30% | 鑺傜偣涓板瘜搴?+ 骞冲潎璐ㄩ噺 + 娲昏穬姣斾緥 |
-| Peer 灞?| 30% | infohash 瑕嗙洊搴?+ peer 涓板瘜搴?|
+| Tracker 层 | 40% | 活跃比例 + 平均评分 |
+| DHT 层 | 30% | 节点丰富度 + 平均质量 + 活跃比例 |
+| Peer 层 | 30% | infohash 覆盖度 + peer 丰富度 |
 
-### 鎬ц兘浼樺寲
+### 性能优化
 
-**涔嬪墠**锛氭瘡娆¤绠楄皟鐢?`nodes.all_nodes()` 鍏ㄩ噺鍏嬮殕 60000+ 鑺傜偣
+**之前**：每次计算调用 `nodes.all_nodes()` 全量克隆 60000+ 节点
 
-**鐜板湪**锛氳皟鐢?`nodes.stats()` 閬嶅巻寮曠敤缁熻锛岄浂鍏嬮殕
+**现在**：调用 `nodes.stats()` 遍历引用统计，零克隆
 
 ```rust
 pub struct NodeStats {
@@ -301,24 +301,24 @@ pub struct NodeStats {
 }
 ```
 
-## 鍗冧竾绾ц妭鐐瑰簲瀵圭瓥鐣?
+## 千万级节点应对策略
 
-### 璇勫垎绯荤粺
-- **澧為噺閲嶇畻**锛氬彧閲嶇畻鑴忚妭鐐癸紝閫氬父 < 1000 涓?杞?
-- **鎵归噺鏇存柊**锛氫竴娆′簨鍔℃洿鏂版墍鏈夎瘎鍒?
-- **鍒嗙墖骞惰**锛氳剰鑺傜偣鍙垎鎴愬涓垎鐗囧苟琛岃绠楋紙鏈潵浼樺寲锛?
-- **闄愭祦**锛氭瘡杞渶澶氶噸绠?X 涓妭鐐癸紝閬垮厤 CPU 鍗犳弧锛堟湭鏉ヤ紭鍖栵級
+### 评分系统
+- **增量重算**：只重算脏节点，通常 < 1000 个/轮
+- **批量更新**：一次事务更新所有评分
+- **分片并行**：脏节点可分成多个分片并行计算（未来优化）
+- **限流**：每轮最多重算 X 个节点，避免 CPU 占满（未来优化）
 
-### 鍐风儹鍒嗗眰
-- **鐑妭鐐?*锛? 5000锛屽叏閲忛珮棰戦噸绠?
-- **娓╄妭鐐?*锛?000-50000锛屽閲忛噸绠楄剰鑺傜偣
-- **鍐疯妭鐐?*锛? 50000锛屼笉閲嶇畻锛堣瘎鍒嗗凡绋冲畾锛?
+### 冷热分层
+- **热节点**：< 5000，全量高频重算
+- **温节点**：5000-50000，增量重算脏节点
+- **冷节点**：> 50000，不重算（评分已稳定）
 
-### 鑺傜偣閫夋嫨
-- **Top N 鍊欓€?*锛氬彧鍙栬瘎鍒嗘渶楂樼殑 500 涓綔涓哄€欓€夋睜
-- **涓嶅叏閲忓厠闅?*锛氶亶鍘嗗紩鐢紝鍙湪鏈€鍚庤繑鍥炴椂鍏嬮殕
+### 节点选择
+- **Top N 候选**：只取评分最高的 500 个作为候选池
+- **不全量克隆**：遍历引用，只在最后返回时克隆
 
-## 涓嬩竴姝?
+## 下一步
 
-- 闃呰 [04-data-model.md](04-data-model.md) 浜嗚В鏁版嵁妯″瀷
-- 闃呰 [05-runtime-flow.md](05-runtime-flow.md) 浜嗚В杩愯鏃舵祦绋?
+- 阅读 [04-data-model.md](04-data-model.md) 了解数据模型
+- 阅读 [05-runtime-flow.md](05-runtime-flow.md) 了解运行时流程
