@@ -1,104 +1,106 @@
-# 04 — 数据模型
+﻿# 04 鈥?鏁版嵁妯″瀷
 
-> SQLite 表结构、Repo 设计、内存缓存策略
+> SQLite 琛ㄧ粨鏋勩€丷epo 璁捐銆佸唴瀛樼紦瀛樼瓥鐣?
 
-## 数据库总览
+## 鏁版嵁搴撴€昏
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 erDiagram
-    dht_nodes ||--o{ peer_history : "产生"
-    infohashes ||--o{ peers : "包含"
-    infohashes ||--o{ peer_history : "历史"
-    trackers ||--o{ stats_history : "统计"
+    dht_nodes ||--o{ peer_history : "浜х敓"
+    infohashes ||--o{ peers : "鍖呭惈"
+    infohashes ||--o{ peer_history : "鍘嗗彶"
+    trackers ||--o{ stats_history : "缁熻"
 
     dht_nodes {
-        blob id PK "节点ID 20字节"
-        text ip "IP地址"
-        integer port "端口"
-        real score "评分 0-100"
+        blob id PK "鑺傜偣ID 20瀛楄妭"
+        text ip "IP鍦板潃"
+        integer port "绔彛"
+        real score "璇勫垎 0-100"
         text state "Good/Questionable/Bad"
-        integer query_count "查询次数"
-        integer success_count "成功次数"
-        real total_latency_ms "累计延迟"
-        integer consecutive_failures "连续失败"
-        integer nodes_returned "累计返回节点数"
-        integer last_query_time "最后查询时间"
+        integer query_count "鏌ヨ娆℃暟"
+        integer success_count "鎴愬姛娆℃暟"
+        real total_latency_ms "绱寤惰繜"
+        integer consecutive_failures "杩炵画澶辫触"
+        integer nodes_returned "绱杩斿洖鑺傜偣鏁?
+        integer last_query_time "鏈€鍚庢煡璇㈡椂闂?
     }
 
     peers {
         blob infohash FK "Infohash"
-        text ip "IP地址"
-        integer port "端口"
-        text source "来源"
-        real score "评分"
-        integer connection_attempts "连接尝试"
-        integer connection_successes "连接成功"
-        integer last_active "最后活跃时间"
+        text ip "IP鍦板潃"
+        integer port "绔彛"
+        text source "鏉ユ簮"
+        real score "璇勫垎"
+        integer connection_attempts "杩炴帴灏濊瘯"
+        integer connection_successes "杩炴帴鎴愬姛"
+        integer last_active "鏈€鍚庢椿璺冩椂闂?
     }
 
     peer_history {
-        integer id PK "自增ID"
+        integer id PK "鑷ID"
         blob infohash "Infohash"
-        text ip "IP地址"
-        integer port "端口"
-        text source "来源"
-        integer first_seen "首次发现"
-        integer last_seen "最后发现"
+        text ip "IP鍦板潃"
+        integer port "绔彛"
+        text source "鏉ユ簮"
+        integer first_seen "棣栨鍙戠幇"
+        integer last_seen "鏈€鍚庡彂鐜?
     }
 
     trackers {
         text url PK "Tracker URL"
-        real score "评分"
-        integer disabled "是否禁用"
-        integer total_requests "总请求数"
-        integer success_requests "成功请求数"
-        integer failed_requests "失败请求数"
-        integer total_peers_discovered "累计发现Peer"
-        real avg_response_time_ms "平均响应时间"
-        integer consecutive_failures "连续失败"
-        integer last_used "最后使用时间"
+        real score "璇勫垎"
+        integer disabled "鏄惁绂佺敤"
+        integer total_requests "鎬昏姹傛暟"
+        integer success_requests "鎴愬姛璇锋眰鏁?
+        integer failed_requests "澶辫触璇锋眰鏁?
+        integer total_peers_discovered "绱鍙戠幇Peer"
+        real avg_response_time_ms "骞冲潎鍝嶅簲鏃堕棿"
+        integer consecutive_failures "杩炵画澶辫触"
+        integer last_used "鏈€鍚庝娇鐢ㄦ椂闂?
     }
 
     infohashes {
-        blob infohash PK "Infohash 20字节"
-        integer ref_count "引用计数"
-        text first_source "首次来源"
-        integer first_seen "首次发现"
-        integer last_seen "最后发现"
+        blob infohash PK "Infohash 20瀛楄妭"
+        integer ref_count "寮曠敤璁℃暟"
+        text first_source "棣栨鏉ユ簮"
+        integer first_seen "棣栨鍙戠幇"
+        integer last_seen "鏈€鍚庡彂鐜?
     }
 
     stats_history {
-        integer id PK "自增ID"
-        integer timestamp "时间戳"
-        text metric "指标名"
-        real value "指标值"
+        integer id PK "鑷ID"
+        integer timestamp "鏃堕棿鎴?
+        text metric "鎸囨爣鍚?
+        real value "鎸囨爣鍊?
     }
 
     stats_aggregate {
-        text metric PK "指标名"
-        real value "聚合值"
-        integer updated_at "更新时间"
+        text metric PK "鎸囨爣鍚?
+        real value "鑱氬悎鍊?
+        integer updated_at "鏇存柊鏃堕棿"
     }
 ```
 
-## 四大 Repo 设计
+## 鍥涘ぇ Repo 璁捐
 
-### 统一架构
+### 缁熶竴鏋舵瀯
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 50, 'rankSpacing': 80}, 'sequence': {'actorMargin': 50, 'messageMargin': 20}}}%%
 graph TB
-    subgraph "RepoImpl 实现层"
-        MEM[内存缓存<br/>parking_lot::RwLock<br/>HashMap]
-        DIRTY[脏标记<br/>HashSet]
-        SYNC[同步便捷方法<br/>*_sync]
+    subgraph "RepoImpl 瀹炵幇灞?
+        MEM[鍐呭瓨缂撳瓨<br/>parking_lot::RwLock<br/>HashMap]
+        DIRTY[鑴忔爣璁?br/>HashSet]
+        SYNC[鍚屾渚挎嵎鏂规硶<br/>*_sync]
     end
 
-    subgraph "Repository Trait 层"
+    subgraph "Repository Trait 灞?
         TRAIT[async trait<br/>NodeRepository/PeerRepository/...]
     end
 
-    subgraph "SQLite 持久化层"
-        DB[(SQLite WAL<br/>批量写入)]
+    subgraph "SQLite 鎸佷箙鍖栧眰"
+        DB[(SQLite WAL<br/>鎵归噺鍐欏叆)]
     end
 
     TRAIT --> SYNC
@@ -107,11 +109,11 @@ graph TB
     MEM --> DB
 ```
 
-### NodeRepo — DHT 节点归口
+### NodeRepo 鈥?DHT 鑺傜偣褰掑彛
 
-**职责**：存储所有 DHT 节点，作为爬虫候选池的唯一归口。
+**鑱岃矗**锛氬瓨鍌ㄦ墍鏈?DHT 鑺傜偣锛屼綔涓虹埇铏€欓€夋睜鐨勫敮涓€褰掑彛銆?
 
-**内存结构**：
+**鍐呭瓨缁撴瀯**锛?
 ```rust
 pub struct NodeRepoImpl {
     nodes: RwLock<HashMap<SocketAddr, KBucketEntry>>,
@@ -120,50 +122,50 @@ pub struct NodeRepoImpl {
 }
 ```
 
-**关键方法**：
-| 方法 | 说明 |
+**鍏抽敭鏂规硶**锛?
+| 鏂规硶 | 璇存槑 |
 |---|---|
-| `add_node_sync(id, addr)` | 添加节点，立即计算初始评分 |
-| `record_query_sync(addr, success, latency)` | 记录查询，标记脏 |
-| `record_query_with_nodes_sync(addr, latency, nodes)` | 记录查询+产出，标记脏 |
-| `stats_sync()` | 节点统计（避免全量克隆） |
-| `top_nodes_sync(n)` | Top N 节点（按评分排序） |
-| `dirty_nodes_sync()` | 获取脏节点 |
-| `update_scores_batch_sync(scores)` | 批量更新评分 |
-| `save_all()` | 全量保存到 SQLite |
+| `add_node_sync(id, addr)` | 娣诲姞鑺傜偣锛岀珛鍗宠绠楀垵濮嬭瘎鍒?|
+| `record_query_sync(addr, success, latency)` | 璁板綍鏌ヨ锛屾爣璁拌剰 |
+| `record_query_with_nodes_sync(addr, latency, nodes)` | 璁板綍鏌ヨ+浜у嚭锛屾爣璁拌剰 |
+| `stats_sync()` | 鑺傜偣缁熻锛堥伩鍏嶅叏閲忓厠闅嗭級 |
+| `top_nodes_sync(n)` | Top N 鑺傜偣锛堟寜璇勫垎鎺掑簭锛?|
+| `dirty_nodes_sync()` | 鑾峰彇鑴忚妭鐐?|
+| `update_scores_batch_sync(scores)` | 鎵归噺鏇存柊璇勫垎 |
+| `save_all()` | 鍏ㄩ噺淇濆瓨鍒?SQLite |
 
-**数据规模**：60,000+ 节点，目标 1,000,000+
+**鏁版嵁瑙勬ā**锛?0,000+ 鑺傜偣锛岀洰鏍?1,000,000+
 
-### PeerRepo — BT Peer 归口
+### PeerRepo 鈥?BT Peer 褰掑彛
 
-**职责**：存储所有 BT Peer，按 infohash 分组，跨 infohash 去重。
+**鑱岃矗**锛氬瓨鍌ㄦ墍鏈?BT Peer锛屾寜 infohash 鍒嗙粍锛岃法 infohash 鍘婚噸銆?
 
-**内存结构**：
+**鍐呭瓨缁撴瀯**锛?
 ```rust
 struct PeerCache {
-    global: HashMap<SocketAddr, PeerInfo>,           // 全局去重
-    by_infohash: HashMap<Infohash, HashSet<SocketAddr>>, // 按 infohash 分组
-    infohash_refs: HashMap<SocketAddr, HashSet<Infohash>>, // 反向引用
+    global: HashMap<SocketAddr, PeerInfo>,           // 鍏ㄥ眬鍘婚噸
+    by_infohash: HashMap<Infohash, HashSet<SocketAddr>>, // 鎸?infohash 鍒嗙粍
+    infohash_refs: HashMap<SocketAddr, HashSet<Infohash>>, // 鍙嶅悜寮曠敤
 }
 ```
 
-**关键方法**：
-| 方法 | 说明 |
+**鍏抽敭鏂规硶**锛?
+| 鏂规硶 | 璇存槑 |
 |---|---|
-| `add_peer(infohash, peer)` | 添加单个 Peer |
-| `add_peers(infohash, peers)` | 批量添加 Peer |
-| `get_peers(infohash, limit)` | 获取指定 infohash 的 Peer（按评分排序） |
-| `get_peer_infohash_count(addr)` | 获取 Peer 出现在多少个 infohash 下 |
-| `update_probe_stats(addr, tcp_ok, supports_dht)` | 更新探测统计 |
-| `flush_history()` | 批量写入 peer_history |
+| `add_peer(infohash, peer)` | 娣诲姞鍗曚釜 Peer |
+| `add_peers(infohash, peers)` | 鎵归噺娣诲姞 Peer |
+| `get_peers(infohash, limit)` | 鑾峰彇鎸囧畾 infohash 鐨?Peer锛堟寜璇勫垎鎺掑簭锛?|
+| `get_peer_infohash_count(addr)` | 鑾峰彇 Peer 鍑虹幇鍦ㄥ灏戜釜 infohash 涓?|
+| `update_probe_stats(addr, tcp_ok, supports_dht)` | 鏇存柊鎺㈡祴缁熻 |
+| `flush_history()` | 鎵归噺鍐欏叆 peer_history |
 
-**数据规模**：800+ Peer，目标 10,000+
+**鏁版嵁瑙勬ā**锛?00+ Peer锛岀洰鏍?10,000+
 
-### TrackerRepo — Tracker 归口
+### TrackerRepo 鈥?Tracker 褰掑彛
 
-**职责**：存储 Tracker 池，统一管理 Tracker 评分和统计。
+**鑱岃矗**锛氬瓨鍌?Tracker 姹狅紝缁熶竴绠＄悊 Tracker 璇勫垎鍜岀粺璁°€?
 
-**内存结构**：
+**鍐呭瓨缁撴瀯**锛?
 ```rust
 pub struct TrackerRepoImpl {
     trackers: RwLock<HashMap<String, TrackerEntry>>,
@@ -171,22 +173,22 @@ pub struct TrackerRepoImpl {
 }
 ```
 
-**关键方法**：
-| 方法 | 说明 |
+**鍏抽敭鏂规硶**锛?
+| 鏂规硶 | 璇存槑 |
 |---|---|
-| `add_tracker(url)` | 添加 Tracker |
-| `record_request(url, success, peers, latency)` | 记录请求统计 |
-| `top_trackers(n)` | Top N Tracker（按评分排序） |
-| `active_trackers()` | 获取活跃 Tracker（未禁用） |
-| `set_disabled(url, disabled)` | 设置禁用状态 |
+| `add_tracker(url)` | 娣诲姞 Tracker |
+| `record_request(url, success, peers, latency)` | 璁板綍璇锋眰缁熻 |
+| `top_trackers(n)` | Top N Tracker锛堟寜璇勫垎鎺掑簭锛?|
+| `active_trackers()` | 鑾峰彇娲昏穬 Tracker锛堟湭绂佺敤锛?|
+| `set_disabled(url, disabled)` | 璁剧疆绂佺敤鐘舵€?|
 
-**数据规模**：79 个 Tracker，目标 200+
+**鏁版嵁瑙勬ā**锛?9 涓?Tracker锛岀洰鏍?200+
 
-### InfohashRepo — Infohash 归口
+### InfohashRepo 鈥?Infohash 褰掑彛
 
-**职责**：存储所有 infohash，统一引用计数管理。
+**鑱岃矗**锛氬瓨鍌ㄦ墍鏈?infohash锛岀粺涓€寮曠敤璁℃暟绠＄悊銆?
 
-**内存结构**：
+**鍐呭瓨缁撴瀯**锛?
 ```rust
 pub struct InfohashRepoImpl {
     infohashes: RwLock<HashMap<Infohash, InfohashEntry>>,
@@ -194,65 +196,65 @@ pub struct InfohashRepoImpl {
 }
 ```
 
-**关键方法**：
-| 方法 | 说明 |
+**鍏抽敭鏂规硶**锛?
+| 鏂规硶 | 璇存槑 |
 |---|---|
-| `register(infohash, source)` | 注册 infohash，引用计数+1 |
-| `unregister(infohash)` | 注销 infohash，引用计数-1 |
-| `ref_count(infohash)` | 获取引用计数 |
-| `cleanup_zero_ref()` | 清理引用计数为 0 的 infohash |
+| `register(infohash, source)` | 娉ㄥ唽 infohash锛屽紩鐢ㄨ鏁?1 |
+| `unregister(infohash)` | 娉ㄩ攢 infohash锛屽紩鐢ㄨ鏁?1 |
+| `ref_count(infohash)` | 鑾峰彇寮曠敤璁℃暟 |
+| `cleanup_zero_ref()` | 娓呯悊寮曠敤璁℃暟涓?0 鐨?infohash |
 
-**数据规模**：90+ infohash，目标 1,000+
+**鏁版嵁瑙勬ā**锛?0+ infohash锛岀洰鏍?1,000+
 
-## 内存缓存策略
+## 鍐呭瓨缂撳瓨绛栫暐
 
-### 锁类型
-统一使用 `parking_lot::RwLock`，比 `std::sync::RwLock` 性能更好，支持无阻塞读。
+### 閿佺被鍨?
+缁熶竴浣跨敤 `parking_lot::RwLock`锛屾瘮 `std::sync::RwLock` 鎬ц兘鏇村ソ锛屾敮鎸佹棤闃诲璇汇€?
 
-### 双写模式
-- **内存为主**：所有读写操作先操作内存缓存，延迟极低
-- **定期持久化**：每 300 秒全量保存到 SQLite，避免频繁磁盘 IO
-- **崩溃恢复**：重启时从 SQLite 加载到内存，最多丢 5 分钟数据
+### 鍙屽啓妯″紡
+- **鍐呭瓨涓轰富**锛氭墍鏈夎鍐欐搷浣滃厛鎿嶄綔鍐呭瓨缂撳瓨锛屽欢杩熸瀬浣?
+- **瀹氭湡鎸佷箙鍖?*锛氭瘡 300 绉掑叏閲忎繚瀛樺埌 SQLite锛岄伩鍏嶉绻佺鐩?IO
+- **宕╂簝鎭㈠**锛氶噸鍚椂浠?SQLite 鍔犺浇鍒板唴瀛橈紝鏈€澶氫涪 5 鍒嗛挓鏁版嵁
 
-### 避免全量克隆
-- `stats_sync()`：遍历引用统计，返回统计结构体，零克隆
-- `top_nodes_sync(n)`：只克隆 Top N，不全量克隆
-- `dirty_nodes_sync()`：只返回脏节点地址列表
+### 閬垮厤鍏ㄩ噺鍏嬮殕
+- `stats_sync()`锛氶亶鍘嗗紩鐢ㄧ粺璁★紝杩斿洖缁熻缁撴瀯浣擄紝闆跺厠闅?
+- `top_nodes_sync(n)`锛氬彧鍏嬮殕 Top N锛屼笉鍏ㄩ噺鍏嬮殕
+- `dirty_nodes_sync()`锛氬彧杩斿洖鑴忚妭鐐瑰湴鍧€鍒楄〃
 
-## SQLite 优化
+## SQLite 浼樺寲
 
-### 配置
+### 閰嶇疆
 ```sql
-PRAGMA journal_mode=WAL;        -- WAL 模式，读写并发
-PRAGMA synchronous=NORMAL;       -- 正常同步，性能优先
-PRAGMA wal_autocheckpoint=2000;  -- 2000页自动 checkpoint
-PRAGMA temp_store=MEMORY;        -- 临时表存内存
+PRAGMA journal_mode=WAL;        -- WAL 妯″紡锛岃鍐欏苟鍙?
+PRAGMA synchronous=NORMAL;       -- 姝ｅ父鍚屾锛屾€ц兘浼樺厛
+PRAGMA wal_autocheckpoint=2000;  -- 2000椤佃嚜鍔?checkpoint
+PRAGMA temp_store=MEMORY;        -- 涓存椂琛ㄥ瓨鍐呭瓨
 ```
 
-### 批量写入
-所有 Repo 的 save_all 都使用批量写入：
-- 一次事务写入所有记录
-- 避免逐条写入的事务开销
-- 使用 `spawn_blocking` 避免阻塞 tokio 工作线程
+### 鎵归噺鍐欏叆
+鎵€鏈?Repo 鐨?save_all 閮戒娇鐢ㄦ壒閲忓啓鍏ワ細
+- 涓€娆′簨鍔″啓鍏ユ墍鏈夎褰?
+- 閬垮厤閫愭潯鍐欏叆鐨勪簨鍔″紑閿€
+- 浣跨敤 `spawn_blocking` 閬垮厤闃诲 tokio 宸ヤ綔绾跨▼
 
 ### WAL Checkpoint
-- 自动 checkpoint：每 2000 页
-- 手动 checkpoint：每 600 秒执行一次 `wal_checkpoint(TRUNCATE)`
-- 避免 WAL 文件无限增长
+- 鑷姩 checkpoint锛氭瘡 2000 椤?
+- 鎵嬪姩 checkpoint锛氭瘡 600 绉掓墽琛屼竴娆?`wal_checkpoint(TRUNCATE)`
+- 閬垮厤 WAL 鏂囦欢鏃犻檺澧為暱
 
-## 数据一致性
+## 鏁版嵁涓€鑷存€?
 
-### 评分一致性
-- 评分系统是唯一维护评分的地方
-- 其他模块只更新统计数据，不自行计算评分
-- 增量重算（10s）+ 全量重算（300s）双模式保证一致性
+### 璇勫垎涓€鑷存€?
+- 璇勫垎绯荤粺鏄敮涓€缁存姢璇勫垎鐨勫湴鏂?
+- 鍏朵粬妯″潡鍙洿鏂扮粺璁℃暟鎹紝涓嶈嚜琛岃绠楄瘎鍒?
+- 澧為噺閲嶇畻锛?0s锛? 鍏ㄩ噺閲嶇畻锛?00s锛夊弻妯″紡淇濊瘉涓€鑷存€?
 
-### 数据归口一致性
-- 四大 Repo 是所有关键数据的唯一归口
-- 业务模块通过 trait 访问，不绕过 Repo 直接操作底层
-- 所有产生的来源数据全部存入 Repo
+### 鏁版嵁褰掑彛涓€鑷存€?
+- 鍥涘ぇ Repo 鏄墍鏈夊叧閿暟鎹殑鍞竴褰掑彛
+- 涓氬姟妯″潡閫氳繃 trait 璁块棶锛屼笉缁曡繃 Repo 鐩存帴鎿嶄綔搴曞眰
+- 鎵€鏈変骇鐢熺殑鏉ユ簮鏁版嵁鍏ㄩ儴瀛樺叆 Repo
 
-## 下一步
+## 涓嬩竴姝?
 
-- 阅读 [05-runtime-flow.md](05-runtime-flow.md) 了解运行时流程
-- 阅读 [../adr/002-intelligence-layer.md](../adr/002-intelligence-layer.md) 了解智能层决策记录
+- 闃呰 [05-runtime-flow.md](05-runtime-flow.md) 浜嗚В杩愯鏃舵祦绋?
+- 闃呰 [../adr/002-intelligence-layer.md](../adr/002-intelligence-layer.md) 浜嗚В鏅鸿兘灞傚喅绛栬褰?

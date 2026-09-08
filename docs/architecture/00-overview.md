@@ -21,6 +21,7 @@ PDC 是 PandaNetOS 生态中的**节点发现 Agent**，负责通过 DHT、Track
 ## 架构分层
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'16px'}, 'flowchart': {'nodeSpacing': 60, 'rankSpacing': 100}}}%%
 graph TB
     subgraph "业务服务层 Services"
         S1[Discover 发现服务]
