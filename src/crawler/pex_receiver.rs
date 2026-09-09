@@ -1,4 +1,4 @@
-//! PEX 被动接收器（BEP 11）
+﻿//! PEX 被动接收器（BEP 11）
 //!
 //! 目的：从其他 BT 客户端的 PEX（Peer Exchange）消息中被动获取 peer 列表，
 //! 加入 PeerRepo。PEX 消息通过 BT 扩展协议（BEP 10）发送。
@@ -495,8 +495,8 @@ mod tests {
     #[test]
     fn test_extension_handshake_parse() {
         // 构造一个简单的扩展握手 bencode
-        // d1:md5:ut_pexi1e4:ut_uti2ee1:pi6881e1:v11:TestCliente
-        let data = b"d1:md5:ut_pexi1e4:ut_uti2ee1:pi6881e1:v11:TestCliente";
+        // d1:md6:ut_pexi1e5:ut_uti2ee1:pi6881e1:v10:TestCliente
+        let data = b"d1:md6:ut_pexi1e5:ut_uti2ee1:pi6881e1:v10:TestCliente";
         let handshake = ExtensionHandshake::parse(data).unwrap();
         assert_eq!(handshake.ut_pex_id, Some(1));
         assert_eq!(handshake.port, Some(6881));

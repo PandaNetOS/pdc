@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -332,8 +332,9 @@ impl SuperTrackerState {
 // HTTP 路由
 // ---------------------------------------------------------------------------
 
-/// announce 请求查询参数
+/// announce 请求查询参数（保留用于文档参考，实际使用 RawQuery 手动解析）
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct AnnounceQuery {
     info_hash: String,
     peer_id: String,
@@ -349,8 +350,9 @@ pub struct AnnounceQuery {
     trackerid: Option<String>,
 }
 
-/// scrape 请求查询参数
+/// scrape 请求查询参数（保留用于文档参考，实际使用 RawQuery 手动解析）
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ScrapeQuery {
     info_hash: Option<Vec<String>>,
 }
@@ -366,11 +368,22 @@ pub fn routes(state: AppState) -> Router {
 /// announce 处理函数
 async fn announce_handler(
     State(state): State<AppState>,
-    Query(query): Query<AnnounceQuery>,
+    RawQuery(raw_query): RawQuery,
     remote_addr: Option<axum::extract::ConnectInfo<SocketAddr>>,
 ) -> Response {
+    // 手动解析查询参数（支持非 UTF-8 的 info_hash / peer_id 原始字节）
+    let query_str = raw_query.as_deref().unwrap_or("");
+    let params = parse_query_params(query_str);
+
     // 解析 infohash（URL 编码的 20 字节）
-    let info_hash = match parse_info_hash(&query.info_hash) {
+    let info_hash_str = match params.get("info_hash").and_then(|v| v.first()) {
+        Some(s) => s.clone(),
+        None => {
+            warn!("[super_tracker] 缺少 info_hash 参数");
+            return error_response("missing info_hash");
+        }
+    };
+    let info_hash = match parse_info_hash(&info_hash_str) {
         Ok(ih) => ih,
         Err(e) => {
             warn!("[super_tracker] 无效的 info_hash: {}", e);
@@ -379,7 +392,15 @@ async fn announce_handler(
     };
 
     // 解析 peer_id
-    let peer_id = parse_peer_id(&query.peer_id).unwrap_or_default();
+    let peer_id_str = params.get("peer_id").and_then(|v| v.first()).cloned().unwrap_or_default();
+    let peer_id = parse_peer_id(&peer_id_str).unwrap_or_default();
+
+    // 解析 port
+    let port: u16 = params
+        .get("port")
+        .and_then(|v| v.first())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     // 获取远程地址
     let client_addr = remote_addr
@@ -389,23 +410,23 @@ async fn announce_handler(
     let req = TrackerAnnounceRequest {
         info_hash,
         peer_id,
-        port: query.port,
-        uploaded: query.uploaded.unwrap_or(0),
-        downloaded: query.downloaded.unwrap_or(0),
-        left: query.left.unwrap_or(0),
-        event: query.event.as_deref().and_then(|s| s.parse().ok()),
-        compact: query.compact.unwrap_or(1) == 1,
-        numwant: query.numwant,
-        no_peer_id: query.no_peer_id.unwrap_or(0) == 1,
-        key: query.key,
-        trackerid: query.trackerid,
+        port,
+        uploaded: params.get("uploaded").and_then(|v| v.first()).and_then(|s| s.parse().ok()).unwrap_or(0),
+        downloaded: params.get("downloaded").and_then(|v| v.first()).and_then(|s| s.parse().ok()).unwrap_or(0),
+        left: params.get("left").and_then(|v| v.first()).and_then(|s| s.parse().ok()).unwrap_or(0),
+        event: params.get("event").and_then(|v| v.first()).and_then(|s| s.parse().ok()),
+        compact: params.get("compact").and_then(|v| v.first()).and_then(|s| s.parse::<u8>().ok()).unwrap_or(1) == 1,
+        numwant: params.get("numwant").and_then(|v| v.first()).and_then(|s| s.parse().ok()),
+        no_peer_id: params.get("no_peer_id").and_then(|v| v.first()).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0) == 1,
+        key: params.get("key").and_then(|v| v.first()).cloned(),
+        trackerid: params.get("trackerid").and_then(|v| v.first()).cloned(),
         remote_addr: client_addr,
     };
 
     debug!(
         "[super_tracker] announce: infohash={}, port={}, event={:?}, addr={}",
         hex::encode(&info_hash[..4]),
-        query.port,
+        port,
         req.event,
         client_addr
     );
@@ -444,14 +465,21 @@ async fn announce_handler(
 /// scrape 处理函数
 async fn scrape_handler(
     State(state): State<AppState>,
-    Query(query): Query<ScrapeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let info_hashes: Vec<Infohash> = query
-        .info_hash
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|h| parse_info_hash(h).ok())
-        .collect();
+    // 手动解析查询参数（scrape 可能有多个 info_hash）
+    let query_str = raw_query.as_deref().unwrap_or("");
+    let params = parse_query_params(query_str);
+
+    let info_hashes: Vec<Infohash> = params
+        .get("info_hash")
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|h| parse_info_hash(h).ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
     if info_hashes.is_empty() {
         return error_response("no info_hash provided");
@@ -473,6 +501,36 @@ async fn scrape_handler(
 // ---------------------------------------------------------------------------
 // 辅助函数
 // ---------------------------------------------------------------------------
+
+/// 手动解析 URL 查询字符串，保留原始字节（不强制 UTF-8）
+///
+/// 返回 key -> Vec<value> 的映射（同一个 key 可能出现多次，如 scrape 的 info_hash）
+/// value 为 percent-decode 后的原始字节以 String 形式存储（可能包含非 UTF-8 字节的替代表示）
+fn parse_query_params(raw_query: &str) -> FxHashMap<String, Vec<String>> {
+    let mut params: FxHashMap<String, Vec<String>> = FxHashMap::default();
+
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.find('=') {
+            Some(idx) => (&pair[..idx], &pair[idx + 1..]),
+            None => (pair, ""),
+        };
+
+        // key 通常是 ASCII，直接 percent_decode 后转 String
+        let key_decoded = percent_decode(key);
+        let key_str = String::from_utf8_lossy(&key_decoded).into_owned();
+
+        // value 保留原始字节，用 from_utf8_lossy 处理（info_hash/peer_id 可能含非 UTF-8 字节）
+        let value_decoded = percent_decode(value);
+        let value_str = String::from_utf8_lossy(&value_decoded).into_owned();
+
+        params.entry(key_str).or_default().push(value_str);
+    }
+
+    params
+}
 
 /// 解析 URL 编码的 infohash
 fn parse_info_hash(s: &str) -> Result<Infohash, String> {
@@ -626,6 +684,31 @@ mod tests {
     fn test_error_response() {
         let resp = error_response("test error");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_parse_query_params_basic() {
+        let params = parse_query_params("port=6881&uploaded=100&downloaded=0");
+        assert_eq!(params.get("port").unwrap()[0], "6881");
+        assert_eq!(params.get("uploaded").unwrap()[0], "100");
+        assert_eq!(params.get("downloaded").unwrap()[0], "0");
+    }
+
+    #[test]
+    fn test_parse_query_params_multiple_info_hash() {
+        let params = parse_query_params("info_hash=aaa&info_hash=bbb");
+        let info_hashes = params.get("info_hash").unwrap();
+        assert_eq!(info_hashes.len(), 2);
+        assert_eq!(info_hashes[0], "aaa");
+        assert_eq!(info_hashes[1], "bbb");
+    }
+
+    #[test]
+    fn test_parse_query_params_percent_encoded() {
+        // 模拟 info_hash 包含非 ASCII 字节
+        let params = parse_query_params("info_hash=%01%02%03&peer_id=abc");
+        assert_eq!(params.get("info_hash").unwrap()[0], "\u{1}\u{2}\u{3}");
+        assert_eq!(params.get("peer_id").unwrap()[0], "abc");
     }
 
     #[tokio::test]

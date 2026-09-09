@@ -308,7 +308,7 @@ impl NatManager {
                     external_port: ext_port,
                     description: "PDC HTTP Tracker".to_string(),
                     verified: false,
-                reachable: false,
+                    reachable: false,
                 });
                 success_count += 1;
             }
@@ -336,7 +336,7 @@ impl NatManager {
                     external_port: ext_port,
                     description: "PDC UDP Tracker".to_string(),
                     verified: false,
-                reachable: false,
+                    reachable: false,
                 });
                 success_count += 1;
             }
@@ -368,7 +368,7 @@ impl NatManager {
                         external_port: ext_port,
                         description: "PDC DHT Crawler".to_string(),
                         verified: false,
-                    reachable: false,
+                        reachable: false,
                     });
                     success_count += 1;
                 }
@@ -829,6 +829,7 @@ mod tests {
             external_port: 6880,
             description: "test".to_string(),
             verified: true,
+            reachable: false,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("6880"));
@@ -840,9 +841,14 @@ mod tests {
         let status = NatStatus {
             enabled: true,
             gateway_found: true,
+            gateway_healthy: true,
             gateway_addr: Some("192.168.1.1".to_string()),
             external_ip: Some("1.2.3.4".to_string()),
+            local_ip: Some("192.168.1.100".to_string()),
+            nat_type: NatType::Unknown,
+            reachability_score: 0,
             mappings: vec![],
+            metrics: NatMetricsSummary::default(),
             last_error: None,
         };
         let json = serde_json::to_string(&status).unwrap();

@@ -363,7 +363,7 @@ impl Clone for NatMetricsExt {
 // ---------------------------------------------------------------------------
 
 /// NAT 指标汇总（用于监控显示和序列化）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatMetricsSummary {
     /// 总映射成功次数
     pub total_mapping_success: u64,
