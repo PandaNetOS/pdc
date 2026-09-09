@@ -1,4 +1,4 @@
-//! HTTP Tracker 协议适配层（超级 Tracker）
+﻿//! HTTP Tracker 协议适配层（超级 Tracker）
 //!
 //! 实现 BEP 3（HTTP Tracker 协议）和 BEP 48（Tracker 扩展），
 //! 对 qBittorrent 等 BT 客户端暴露标准 /announce 和 /scrape 接口。
@@ -502,10 +502,10 @@ async fn scrape_handler(
 // 辅助函数
 // ---------------------------------------------------------------------------
 
-/// 手动解析 URL 查询字符串，保留原始字节（不强制 UTF-8）
+/// 手动解析 URL 查询字符串
 ///
 /// 返回 key -> Vec<value> 的映射（同一个 key 可能出现多次，如 scrape 的 info_hash）
-/// value 为 percent-decode 后的原始字节以 String 形式存储（可能包含非 UTF-8 字节的替代表示）
+/// value 保留原始 percent-encoded 字符串，由调用方自行解码，避免 from_utf8_lossy 破坏非 UTF-8 原始字节
 fn parse_query_params(raw_query: &str) -> FxHashMap<String, Vec<String>> {
     let mut params: FxHashMap<String, Vec<String>> = FxHashMap::default();
 
@@ -518,15 +518,8 @@ fn parse_query_params(raw_query: &str) -> FxHashMap<String, Vec<String>> {
             None => (pair, ""),
         };
 
-        // key 通常是 ASCII，直接 percent_decode 后转 String
-        let key_decoded = percent_decode(key);
-        let key_str = String::from_utf8_lossy(&key_decoded).into_owned();
-
-        // value 保留原始字节，用 from_utf8_lossy 处理（info_hash/peer_id 可能含非 UTF-8 字节）
-        let value_decoded = percent_decode(value);
-        let value_str = String::from_utf8_lossy(&value_decoded).into_owned();
-
-        params.entry(key_str).or_default().push(value_str);
+        // key 都是 ASCII，直接使用；value 保留原始 percent-encoded 字符串
+        params.entry(key.to_string()).or_default().push(value.to_string());
     }
 
     params
@@ -707,7 +700,8 @@ mod tests {
     fn test_parse_query_params_percent_encoded() {
         // 模拟 info_hash 包含非 ASCII 字节
         let params = parse_query_params("info_hash=%01%02%03&peer_id=abc");
-        assert_eq!(params.get("info_hash").unwrap()[0], "\u{1}\u{2}\u{3}");
+        // value 保留原始 percent-encoded 字符串，由 parse_info_hash 自行解码
+        assert_eq!(params.get("info_hash").unwrap()[0], "%01%02%03");
         assert_eq!(params.get("peer_id").unwrap()[0], "abc");
     }
 
