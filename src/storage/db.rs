@@ -143,7 +143,8 @@ impl Storage {
                 ref_count INTEGER DEFAULT 1,
                 first_source TEXT,
                 first_seen INTEGER,
-                last_seen INTEGER
+                last_seen INTEGER,
+                score REAL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS peers (
@@ -206,6 +207,8 @@ impl Storage {
         // 向后兼容迁移：为已存在的 dht_nodes 表添加新列
         let _ = conn.execute("ALTER TABLE dht_nodes ADD COLUMN nodes_returned INTEGER DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE dht_nodes ADD COLUMN last_query_time INTEGER", []);
+        // 向后兼容迁移：为已存在的 infohashes 表添加 score 列
+        let _ = conn.execute("ALTER TABLE infohashes ADD COLUMN score REAL DEFAULT 0", []);
 
         debug!("[storage] 表结构初始化完成");
         Ok(())
@@ -392,16 +395,17 @@ impl Storage {
         infohash: &[u8; 20],
         ref_count: u32,
         first_source: &str,
+        score: f64,
     ) -> anyhow::Result<()> {
         self.record_write("infohashes", 1);
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
-            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen)
-               VALUES (?1, ?2, ?3, ?4, ?4)
+            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score)
+               VALUES (?1, ?2, ?3, ?4, ?4, ?5)
                ON CONFLICT(infohash) DO UPDATE SET
-                ref_count=excluded.ref_count, last_seen=excluded.last_seen"#,
-            params![infohash.as_slice(), ref_count as i64, first_source, now],
+                ref_count=excluded.ref_count, last_seen=excluded.last_seen, score=excluded.score"#,
+            params![infohash.as_slice(), ref_count as i64, first_source, now, score],
         )?;
         Ok(())
     }
@@ -409,7 +413,7 @@ impl Storage {
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT infohash, ref_count, first_source FROM infohashes")?;
+        let mut stmt = conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
             let mut arr = [0u8; 20];
@@ -420,9 +424,37 @@ impl Storage {
                 infohash: arr,
                 ref_count: row.get::<_, i64>(1)? as u32,
                 first_source: row.get(2)?,
+                score: row.get::<_, f64>(3).unwrap_or(0.0),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// 更新 infohash 评分
+    pub fn update_infohash_score(&self, infohash: &[u8; 20], score: f64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE infohashes SET score = ?1 WHERE infohash = ?2",
+            params![score, infohash.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// 批量更新 infohash 评分（一次事务）
+    pub fn update_infohash_scores_batch(&self, scores: &[([u8; 20], f64)]) -> anyhow::Result<()> {
+        if scores.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE infohashes SET score = ?1 WHERE infohash = ?2")?;
+            for (infohash, score) in scores {
+                stmt.execute(params![score, infohash.as_slice()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// 清空 infohash 表
@@ -721,6 +753,7 @@ pub struct InfohashRow {
     pub infohash: [u8; 20],
     pub ref_count: u32,
     pub first_source: String,
+    pub score: f64,
 }
 
 /// Peer 行（运行时活跃 peer）

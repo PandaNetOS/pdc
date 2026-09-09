@@ -12,6 +12,8 @@ pub mod nat_service;
 pub mod tracker_fetcher;
 pub mod subscription_service;
 pub mod keyword_search_service;
+pub mod scrape_service;
+pub mod metadata_service;
 
 pub use crawler_service::CrawlerService;
 pub use discover_service::DiscoverService;
@@ -22,3 +24,5 @@ pub use nat_service::NatService;
 pub use tracker_fetcher::TrackerPeerFetcher;
 pub use subscription_service::{SubscriptionConfig, SubscriptionService};
 pub use keyword_search_service::{KeywordSearchConfig, KeywordSearchService};
+pub use scrape_service::{ScrapeService, ScrapeResult};
+pub use metadata_service::{MetadataService, TorrentMetadata};

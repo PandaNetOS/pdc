@@ -13,3 +13,7 @@ storage:
 nat:
   enabled: true
   lease_duration: 3600
+
+super_tracker:
+  interval: 30
+  min_interval: 0

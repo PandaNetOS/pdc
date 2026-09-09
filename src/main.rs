@@ -30,6 +30,8 @@ use PeerDiscoveryCenter::event_bus::EventBus;
 use PeerDiscoveryCenter::health_check::{HealthCheckConfig, HealthCheckTask};
 use PeerDiscoveryCenter::nat::NatManager;
 use PeerDiscoveryCenter::storage::{InfohashRepository, NodeRepository, TrackerRepository};
+use PeerDiscoveryCenter::intelligence::{DhtActivityTracker, PeerHistoryManager, AvailabilityCalculator};
+use PeerDiscoveryCenter::services::{ScrapeService, MetadataService};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> anyhow::Result<()> {
@@ -411,116 +413,36 @@ async fn main() -> anyhow::Result<()> {
     info!("[main] 健康检查任务已启动");
 
     // 8.5 启动定期持久化任务（每 60 秒全量保存所有 Repo 到 SQLite）
-    // 启动后延迟 30 秒开始，与 ScoreMaintainer（第0秒开始）错开，避免同时竞争锁
+    // 8.6 ScoreMaintainer: multi-source infohash scoring
     {
-        let node_repo = node_repo.clone();
-        let tracker_repo = tracker_repo.clone();
-        let infohash_repo = infohash_repo.clone();
-        let peer_repo = peer_repo.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            loop {
-                if let Err(e) = node_repo.save_all().await {
-                    debug!("[main] 定期持久化 NodeRepo 失败: {}", e);
-                }
-                if let Err(e) = tracker_repo.save_all().await {
-                    debug!("[main] 定期持久化 TrackerRepo 失败: {}", e);
-                }
-                if let Err(e) = infohash_repo.save_all().await {
-                    debug!("[main] 定期持久化 InfohashRepo 失败: {}", e);
-                }
-                if let Err(e) = peer_repo.save_all().await {
-                    debug!("[main] 定期持久化 PeerRepo 失败: {}", e);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            }
-        });
-        info!("[main] 定期持久化任务已启动（每 5 分钟，延迟 30 秒开始）");
-    }
+        use PeerDiscoveryCenter::intelligence::{InfohashScorerImpl, NodeScorerImpl, PeerScorerImpl, ScoreMaintainer, TrackerScorerImpl};
 
-    // 8.5.1 启动定期 WAL checkpoint 任务（每 10 分钟执行一次，减少 WAL 文件大小）
-    {
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            loop {
-                if let Err(e) = storage.checkpoint() {
-                    warn!("[main] WAL checkpoint 失败: {}", e);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-            }
-        });
-        info!("[main] 定期 WAL checkpoint 任务已启动（每 10 分钟）");
-    }
+        // Create P1-P3 services
+        let dht_activity = Arc::new(DhtActivityTracker::new());
+        let peer_history = Arc::new(PeerHistoryManager::new());
+        let scrape_service = Arc::new(ScrapeService::new().with_tracker_repo(tracker_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>));
+        let metadata_service = Arc::new(MetadataService::new());
+        let availability_calculator = Arc::new(AvailabilityCalculator::new());
 
-    // 8.5.2 启动定期 flush peer_history 任务（每 30 秒批量写入，减少 fsync）
-    {
-        let peer_repo = peer_repo.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                match peer_repo.flush_history().await {
-                    Ok(count) if count > 0 => debug!("[main] peer_history 批量写入: {} 条", count),
-                    Ok(_) => {}
-                    Err(e) => warn!("[main] peer_history flush 失败: {}", e),
-                }
-            }
-        });
-        info!("[main] 定期 peer_history flush 任务已启动（每 30 秒）");
-    }
+        info!("[main] Infohash multi-source scoring services created");
 
-    // 8.5.3 写入统计任务（每 10 秒输出一次，用于定位 IO 来源）
-    {
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            let mut last_stats = storage.write_stats();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let cur = storage.write_stats();
-                let dht_writes = cur.dht_nodes_writes - last_stats.dht_nodes_writes;
-                let dht_rows = cur.dht_nodes_rows - last_stats.dht_nodes_rows;
-                let peer_writes = cur.peers_writes - last_stats.peers_writes;
-                let peer_rows = cur.peers_rows - last_stats.peers_rows;
-                let hist_writes = cur.peer_history_writes - last_stats.peer_history_writes;
-                let hist_rows = cur.peer_history_rows - last_stats.peer_history_rows;
-                let tracker_writes = cur.trackers_writes - last_stats.trackers_writes;
-                let ih_writes = cur.infohashes_writes - last_stats.infohashes_writes;
-                let stats_writes = cur.stats_writes - last_stats.stats_writes;
-                info!("[io-stats] 10s写入: dht_nodes={}次/{}行, peers={}次/{}行, history={}次/{}行, trackers={}次, infohashes={}次, stats={}次",
-                    dht_writes, dht_rows, peer_writes, peer_rows, hist_writes, hist_rows, tracker_writes, ih_writes, stats_writes);
-                last_stats = cur;
-            }
-        });
-        info!("[main] 写入统计任务已启动（每 10 秒）");
-    }
-
-    // 8.5.2 启动冷热分层管理器（每 5 分钟检查一次温度，清理冷数据）
-    {
-        use PeerDiscoveryCenter::intelligence::{TierManager, TierConfig};
-        let tier_manager = Arc::new(
-            TierManager::new(TierConfig::default())
-                .with_storage(storage.clone())
-                .with_peer_repo(peer_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::PeerRepository>)
-                .with_node_repo(node_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>)
-        );
-        tokio::spawn(async move {
-            tier_manager.run().await;
-        });
-        info!("[main] 冷热分层管理器已启动（每 5 分钟）");
-    }
-
-    // 8.6 启动统一评分维护任务（ScoreMaintainer：每10秒增量重算脏节点，每5分钟全量重算兜底）
-    {
-        use PeerDiscoveryCenter::intelligence::{NodeScorerImpl, PeerScorerImpl, ScoreMaintainer, TrackerScorerImpl};
         let maintainer = Arc::new(
             ScoreMaintainer::new(
                 Arc::new(NodeScorerImpl::new()),
                 Arc::new(PeerScorerImpl::new()),
                 Arc::new(TrackerScorerImpl::new()),
+                Arc::new(InfohashScorerImpl::new()),
             )
             .with_node_repo(node_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>)
             .with_peer_repo(peer_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::PeerRepository>)
-            .with_tracker_repo(tracker_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>),
+            .with_tracker_repo(tracker_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>)
+            .with_infohash_repo(infohash_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::InfohashRepository>)
+            .with_dht_activity(dht_activity.clone())
+            .with_peer_history(peer_history.clone())
+            .with_scrape_service(scrape_service.clone())
+            .with_metadata_service(metadata_service.clone())
+            .with_availability_calculator(availability_calculator.clone())
+            .with_super_tracker(super_tracker.clone()),
         );
         maintainer.start();
     }

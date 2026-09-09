@@ -15,8 +15,8 @@ use crate::storage::repo_traits::InfohashRepository;
 use crate::types::Infohash;
 
 struct InfohashCacheInner {
-    /// infohash -> (引用计数, 首次发现来源)
-    entries: FxHashMap<Infohash, (u32, String)>,
+    /// infohash -> (引用计数, 首次发现来源, 热门度评分)
+    entries: FxHashMap<Infohash, (u32, String, f64)>,
 }
 
 impl InfohashCacheInner {
@@ -60,7 +60,7 @@ impl InfohashRepoImpl {
             let entry = cache
                 .entries
                 .entry(infohash)
-                .or_insert((0, source.to_string()));
+                .or_insert((0, source.to_string(), 0.0));
             entry.0 += 1;
             entry.0 == 1
         };
@@ -85,7 +85,7 @@ impl InfohashRepoImpl {
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
             for (infohash, source) in &pending {
-                storage.save_infohash(infohash, 1, source)?;
+                storage.save_infohash(infohash, 1, source, 0.0)?;
             }
             Ok::<(), anyhow::Error>(())
         }).await??;
@@ -104,18 +104,18 @@ impl InfohashRepoImpl {
         // 先 flush pending 新 infohash
         self.flush_pending().await?;
 
-        let entries: Vec<(Infohash, u32, String)> = self
+        let entries: Vec<(Infohash, u32, String, f64)> = self
             .cache
             .read()
             .entries
             .iter()
-            .map(|(ih, (count, src))| (*ih, *count, src.clone()))
+            .map(|(ih, (count, src, score))| (*ih, *count, src.clone(), *score))
             .collect();
 
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {
-            for (infohash, ref_count, source) in &entries {
-                storage.save_infohash(infohash, *ref_count, source)?;
+            for (infohash, ref_count, source, score) in &entries {
+                storage.save_infohash(infohash, *ref_count, source, *score)?;
             }
             Ok::<(), anyhow::Error>(())
         }).await??;
@@ -130,7 +130,7 @@ impl InfohashRepoImpl {
         for row in rows {
             cache
                 .entries
-                .insert(row.infohash, (row.ref_count, row.first_source));
+                .insert(row.infohash, (row.ref_count, row.first_source, row.score));
             count += 1;
         }
         Ok(count)
@@ -145,7 +145,7 @@ impl InfohashRepository for InfohashRepoImpl {
 
     async fn unregister(&self, infohash: &Infohash) {
         let mut cache = self.cache.write();
-        if let Some((count, _)) = cache.entries.get_mut(infohash) {
+        if let Some((count, _, _)) = cache.entries.get_mut(infohash) {
             *count = count.saturating_sub(1);
         }
     }
@@ -155,7 +155,7 @@ impl InfohashRepository for InfohashRepoImpl {
             .read()
             .entries
             .get(infohash)
-            .map(|(c, _)| *c)
+            .map(|(c, _, _)| *c)
             .unwrap_or(0)
     }
 
@@ -170,8 +170,67 @@ impl InfohashRepository for InfohashRepoImpl {
     async fn cleanup_zero_ref(&self) -> usize {
         let mut cache = self.cache.write();
         let before = cache.entries.len();
-        cache.entries.retain(|_, (count, _)| *count > 0);
+        cache.entries.retain(|_, (count, _, _)| *count > 0);
         before - cache.entries.len()
+    }
+
+    async fn update_score(&self, infohash: &Infohash, score: f64) {
+        // 更新内存缓存
+        {
+            let mut cache = self.cache.write();
+            if let Some((_, _, s)) = cache.entries.get_mut(infohash) {
+                *s = score;
+            }
+        }
+        // 异步持久化到 SQLite
+        let storage = self.storage.clone();
+        let ih = *infohash;
+        tokio::task::spawn_blocking(move || {
+            let _ = storage.update_infohash_score(&ih, score);
+        });
+    }
+
+    async fn update_scores_batch(&self, scores: &[(Infohash, f64)]) {
+        if scores.is_empty() {
+            return;
+        }
+        // 更新内存缓存
+        {
+            let mut cache = self.cache.write();
+            for (infohash, score) in scores {
+                if let Some((_, _, s)) = cache.entries.get_mut(infohash) {
+                    *s = *score;
+                }
+            }
+        }
+        // 异步批量持久化到 SQLite
+        let storage = self.storage.clone();
+        let scores_vec: Vec<([u8; 20], f64)> = scores.iter().map(|(ih, s)| (*ih, *s)).collect();
+        tokio::task::spawn_blocking(move || {
+            let _ = storage.update_infohash_scores_batch(&scores_vec);
+        });
+    }
+
+    async fn get_score(&self, infohash: &Infohash) -> f64 {
+        self.cache
+            .read()
+            .entries
+            .get(infohash)
+            .map(|(_, _, s)| *s)
+            .unwrap_or(0.0)
+    }
+
+    async fn top_infohashes(&self, n: usize) -> Vec<(Infohash, f64)> {
+        let mut entries: Vec<(Infohash, f64)> = self
+            .cache
+            .read()
+            .entries
+            .iter()
+            .map(|(ih, (_, _, score))| (*ih, *score))
+            .collect();
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        entries.truncate(n);
+        entries
     }
 }
 

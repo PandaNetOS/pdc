@@ -126,7 +126,7 @@ impl SuperTrackerState {
 
         TrackerAnnounceResponse {
             interval: config.interval,
-            min_interval: Some(config.min_interval),
+            min_interval: if config.min_interval > 0 { Some(config.min_interval) } else { None },
             tracker_id: Some("pdc".to_string()),
             complete,
             incomplete,
@@ -258,6 +258,33 @@ impl SuperTrackerState {
     /// 获取当前存储的 peer 总数
     pub fn peer_count(&self) -> usize {
         self.peers.iter().map(|entry| entry.value().len()).sum()
+    }
+
+    /// 获取单个 infohash 的 swarm 统计（做种者数、下载者数、总peer数）
+    pub fn get_swarm_stats(&self, infohash: &Infohash) -> Option<(u32, u32, u32)> {
+        self.peers.get(infohash).map(|entry| {
+            let mut seeders = 0u32;
+            let mut leechers = 0u32;
+            for peer in entry.values() {
+                if peer.left == 0 {
+                    seeders += 1;
+                } else {
+                    leechers += 1;
+                }
+            }
+            (seeders, leechers, seeders + leechers)
+        })
+    }
+
+    /// 获取单个 infohash 最近指定时间窗口内的 announce 次数（近似值）
+    pub fn get_recent_announce_count(&self, infohash: &Infohash, window_secs: u64) -> u32 {
+        self.peers
+            .get(infohash)
+            .map(|entry| {
+                let cutoff = Instant::now() - Duration::from_secs(window_secs);
+                entry.values().filter(|p| p.last_seen >= cutoff).count() as u32
+            })
+            .unwrap_or(0)
     }
 
     /// 处理 UDP announce（BEP 15 服务端）

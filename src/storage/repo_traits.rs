@@ -115,6 +115,14 @@ pub trait InfohashRepository: Send + Sync {
     async fn all_infohashes(&self) -> Vec<Infohash>;
     async fn count(&self) -> usize;
     async fn cleanup_zero_ref(&self) -> usize;
+    /// 更新 infohash 热门度评分（由 InfohashScorer 计算后写入）
+    async fn update_score(&self, infohash: &Infohash, score: f64);
+    /// 批量更新 infohash 评分（一次事务，避免逐个更新的锁竞争）
+    async fn update_scores_batch(&self, scores: &[(Infohash, f64)]);
+    /// 获取 infohash 评分
+    async fn get_score(&self, infohash: &Infohash) -> f64;
+    /// 获取热门 infohash 排行榜（按评分降序）
+    async fn top_infohashes(&self, n: usize) -> Vec<(Infohash, f64)>;
 }
 
 // ---------------------------------------------------------------------------
