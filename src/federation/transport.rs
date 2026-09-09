@@ -3,33 +3,55 @@
 //! 封装 tokio TcpStream，处理粘包/半包，提供基于帧的消息收发。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::federation::protocol::{
     decode_frame, encode_message, frame_size_in_buffer, MessageType, FRAME_HEADER_SIZE,
 };
 
-/// TCP 传输层
-///
-/// 内部维护读写缓冲区，自动处理 TCP 粘包/半包问题。
-pub struct TcpTransport {
-    stream: TcpStream,
+/// TCP 读取端（含读取缓冲区）
+struct TcpReader {
+    reader: tokio::net::tcp::OwnedReadHalf,
     read_buf: BytesMut,
-    write_buf: BytesMut,
+}
+
+/// TCP 写入端
+struct TcpWriter {
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
+
+/// TCP 传输层（读写分离，独立锁，可并发收发）
+///
+/// 内部使用 owned split 分离读写，读和写各持独立锁，
+/// 发送和接收可并发执行，互不阻塞。
+pub struct TcpTransport {
+    reader: TokioMutex<TcpReader>,
+    writer: TokioMutex<TcpWriter>,
+    peer: Option<SocketAddr>,
+    local: Option<SocketAddr>,
 }
 
 impl TcpTransport {
     /// 从已有的 TcpStream 创建传输层
     pub fn new(stream: TcpStream) -> Self {
+        let peer = stream.peer_addr().ok();
+        let local = stream.local_addr().ok();
+        let (reader, writer) = stream.into_split();
         Self {
-            stream,
-            read_buf: BytesMut::with_capacity(8192),
-            write_buf: BytesMut::with_capacity(8192),
+            reader: TokioMutex::new(TcpReader {
+                reader,
+                read_buf: BytesMut::with_capacity(8192),
+            }),
+            writer: TokioMutex::new(TcpWriter { writer }),
+            peer,
+            local,
         }
     }
 
@@ -56,12 +78,14 @@ impl TcpTransport {
 
     /// 发送消息（编码为完整帧并写入）
     pub async fn send_message<T: Serialize>(
-        &mut self,
+        &self,
         msg_type: MessageType,
         msg: &T,
     ) -> anyhow::Result<()> {
         let frame = encode_message(msg_type, msg)?;
-        self.stream
+        let mut writer = self.writer.lock().await;
+        writer
+            .writer
             .write_all(&frame)
             .await
             .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
@@ -69,8 +93,10 @@ impl TcpTransport {
     }
 
     /// 发送原始帧字节
-    pub async fn send_raw(&mut self, frame: &[u8]) -> anyhow::Result<()> {
-        self.stream
+    pub async fn send_raw(&self, frame: &[u8]) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().await;
+        writer
+            .writer
             .write_all(frame)
             .await
             .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
@@ -80,46 +106,45 @@ impl TcpTransport {
     /// 接收一条完整消息
     ///
     /// 循环读取直到获得完整帧，返回 `(消息类型, payload 字节)`。
-    pub async fn recv_message(&mut self) -> anyhow::Result<(MessageType, Vec<u8>)> {
+    pub async fn recv_message(&self) -> anyhow::Result<(MessageType, Vec<u8>)> {
+        let mut reader = self.reader.lock().await;
         loop {
             // 检查缓冲区中是否已有完整帧
-            if let Some(frame_len) = frame_size_in_buffer(&self.read_buf) {
-                let frame = self.read_buf.split_to(frame_len);
+            if let Some(frame_len) = frame_size_in_buffer(&reader.read_buf) {
+                let frame = reader.read_buf.split_to(frame_len);
                 let (msg_type, payload) = decode_frame(&frame)?;
                 return Ok((msg_type, payload.to_vec()));
             }
 
             // 缓冲区不足，读取更多数据
             let mut tmp = [0u8; 8192];
-            let n = self
-                .stream
+            let n = reader
+                .reader
                 .read(&mut tmp)
                 .await
                 .map_err(|e| anyhow::anyhow!("读取失败: {}", e))?;
             if n == 0 {
                 anyhow::bail!("连接已关闭");
             }
-            self.read_buf.put_slice(&tmp[..n]);
+            reader.read_buf.put_slice(&tmp[..n]);
         }
     }
 
     /// 获取对端地址
     pub fn peer_addr(&self) -> anyhow::Result<SocketAddr> {
-        self.stream
-            .peer_addr()
-            .map_err(|e| anyhow::anyhow!("获取对端地址失败: {}", e))
+        self.peer.ok_or_else(|| anyhow::anyhow!("获取对端地址失败"))
     }
 
     /// 获取本地地址
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
-        self.stream
-            .local_addr()
-            .map_err(|e| anyhow::anyhow!("获取本地地址失败: {}", e))
+        self.local.ok_or_else(|| anyhow::anyhow!("获取本地地址失败"))
     }
 
     /// 关闭连接
-    pub async fn close(&mut self) -> anyhow::Result<()> {
-        self.stream
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().await;
+        writer
+            .writer
             .shutdown()
             .await
             .map_err(|e| anyhow::anyhow!("关闭连接失败: {}", e))?;
@@ -130,8 +155,8 @@ impl TcpTransport {
 impl std::fmt::Debug for TcpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpTransport")
-            .field("peer", &self.stream.peer_addr().ok())
-            .field("read_buf_len", &self.read_buf.len())
+            .field("peer", &self.peer)
+            .field("local", &self.local)
             .finish()
     }
 }
@@ -219,8 +244,6 @@ impl UdpTransport {
             .map_err(|e| anyhow::anyhow!("获取本地地址失败: {}", e))
     }
 }
-
-use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {

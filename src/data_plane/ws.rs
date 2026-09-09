@@ -235,8 +235,10 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
 
     // NAT 状态
     let nat_status = state.nat.status();
-    let tcp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "TCP" && m.verified).count();
-    let udp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.verified).count();
+    let tcp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "TCP").count();
+    let udp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "UDP").count();
+    let tcp_verified = nat_status.mappings.iter().filter(|m| m.protocol == "TCP" && m.verified).count();
+    let udp_verified = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.verified).count();
     let udp_reachable = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.reachable).count();
 
     serde_json::json!({
@@ -294,6 +296,8 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             "nat_type": nat_status.nat_type.as_str(),
             "tcp_mapped": tcp_mapped,
             "udp_mapped": udp_mapped,
+            "tcp_verified": tcp_verified,
+            "udp_verified": udp_verified,
             "udp_reachable": udp_reachable,
             "total_mappings": nat_status.mappings.len(),
             "reachability_score": nat_status.reachability_score,
@@ -378,20 +382,6 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
                 "peers_extracted": stats.peers_extracted,
                 "timeouts": stats.timeouts,
                 "errors": stats.errors,
-            })
-        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
-        // 联邦网络状态
-        "federation": state.federation.as_ref().map(|f| {
-            let status = f.status();
-            serde_json::json!({
-                "enabled": status.enabled,
-                "node_id": status.node_id,
-                "connections": status.connections,
-                "known_nodes": status.known_nodes,
-                "reachability": status.reachability,
-                "uptime_secs": status.uptime_secs,
-                "gossip_queue_size": status.gossip_queue_size,
-                "relay_channels": status.relay_channels,
             })
         }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
         // 联邦网络状态

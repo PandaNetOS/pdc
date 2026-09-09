@@ -230,6 +230,19 @@ impl NodeTable {
         }
     }
 
+    /// 重置所有处于 Connecting 状态的节点为 Disconnected（防止连接状态卡住）
+    pub fn reset_stale_connecting(&self) -> usize {
+        let mut nodes = self.nodes.write();
+        let mut count = 0;
+        for entry in nodes.values_mut() {
+            if entry.status == NodeStatus::Connecting {
+                entry.status = NodeStatus::Disconnected;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// 更新节点 RTT
     pub fn update_rtt(&self, node_id: &NodeId, rtt_ms: u32) {
         if let Some(entry) = self.nodes.write().get_mut(node_id) {

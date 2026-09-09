@@ -17,3 +17,14 @@ nat:
 super_tracker:
   interval: 30
   min_interval: 0
+
+federation:
+  enabled: true
+  listen_port: 6885
+  seed_nodes:
+    - "192.168.30.51:6885"
+  target_neighbors: 8
+  max_connections: 32
+  heartbeat_interval_secs: 30
+  enable_relay: true
+  nat_mapping_enabled: true

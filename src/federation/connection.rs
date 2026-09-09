@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::{broadcast, Mutex as TokioMutex, OnceCell};
 use tracing::{debug, info, warn};
 
@@ -21,8 +21,8 @@ use crate::federation::transport::TcpTransport;
 
 /// 单条连接
 pub struct Connection {
-    /// TCP 传输层（异步锁，因为需要跨 await 持有）
-    pub transport: TokioMutex<TcpTransport>,
+    /// TCP 传输层（内部读写分离，独立锁，可并发收发）
+    pub transport: TcpTransport,
     /// 对端节点 ID
     pub node_id: NodeId,
     /// 对端地址
@@ -37,7 +37,7 @@ impl Connection {
     /// 创建新连接
     pub fn new(transport: TcpTransport, node_id: NodeId, addr: SocketAddr) -> Self {
         Self {
-            transport: TokioMutex::new(transport),
+            transport,
             node_id,
             addr,
             connected_at: Instant::now(),
@@ -51,16 +51,14 @@ impl Connection {
         msg_type: MessageType,
         msg: &T,
     ) -> anyhow::Result<()> {
-        let mut transport = self.transport.lock().await;
-        transport.send_message(msg_type, msg).await?;
+        self.transport.send_message(msg_type, msg).await?;
         *self.last_active.write() = Instant::now();
         Ok(())
     }
 
     /// 接收消息
     pub async fn recv_message(&self) -> anyhow::Result<(MessageType, Vec<u8>)> {
-        let mut transport = self.transport.lock().await;
-        let result = transport.recv_message().await?;
+        let result = self.transport.recv_message().await?;
         *self.last_active.write() = Instant::now();
         Ok(result)
     }
@@ -90,6 +88,8 @@ impl std::fmt::Debug for Connection {
 pub struct ConnectionManager {
     /// 活跃连接池
     connections: RwLock<FxHashMap<NodeId, Arc<Connection>>>,
+    /// 正在连接中的地址（防止并发重复连接）
+    connecting: RwLock<FxHashSet<SocketAddr>>,
     /// 节点表
     node_table: Arc<NodeTable>,
     /// 节点身份
@@ -118,6 +118,7 @@ impl ConnectionManager {
     ) -> Self {
         Self {
             connections: RwLock::new(FxHashMap::default()),
+            connecting: RwLock::new(FxHashSet::default()),
             node_table,
             identity,
             config,
@@ -151,22 +152,31 @@ impl ConnectionManager {
         info!("[federation] 联邦监听已启动: {}", listen_addr);
 
         let shutdown_rx = self.shutdown.subscribe();
+        info!("[federation] 准备 spawn accept_loop task");
         tokio::spawn(async move {
+            info!("[federation] accept_loop task 已启动");
             tokio::select! {
-                _ = self.accept_loop(listener) => {}
+                _ = self.accept_loop(listener) => {
+                    warn!("[federation] accept_loop 意外退出");
+                }
                 _ = Self::wait_shutdown(shutdown_rx) => {
-                    debug!("[federation] 监听任务收到关闭信号");
+                    info!("[federation] 监听任务收到关闭信号");
                 }
             }
+            info!("[federation] accept_loop task 已结束");
         });
+        info!("[federation] start_listen 返回");
         Ok(())
     }
 
     /// 接受连接循环
     async fn accept_loop(self: Arc<Self>, listener: tokio::net::TcpListener) {
+        info!("[federation] accept_loop 开始运行，等待连接...");
         loop {
+            debug!("[federation] 调用 listener.accept()");
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    info!("[federation] 收到入站连接: {}", addr);
                     let self_clone = self.clone();
                     tokio::spawn(async move {
                         if let Err(e) = self_clone.handle_inbound(stream, addr).await {
@@ -189,10 +199,10 @@ impl ConnectionManager {
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let _ = stream.set_nodelay(true);
-        let mut transport = TcpTransport::new(stream);
+        let transport = TcpTransport::new(stream);
 
         // 入站握手
-        let (node_id, _hello) = self.handshake_inbound(&mut transport).await?;
+        let (node_id, _hello) = self.handshake_inbound(&transport).await?;
 
         // 检查是否已存在连接
         if self.connections.read().contains_key(&node_id) {
@@ -222,13 +232,19 @@ impl ConnectionManager {
         node_id: NodeId,
         addr: SocketAddr,
     ) -> anyhow::Result<Arc<Connection>> {
-        // 检查是否已连接
+        // 检查是否已连接（用实际节点ID）
         if let Some(conn) = self.get_connection(&node_id) {
             return Ok(conn);
         }
 
+        // 检查是否正在连接中（用地址，防止并发重复连接）
+        if !self.connecting.write().insert(addr) {
+            anyhow::bail!("地址 {} 正在连接中，跳过重复连接", addr);
+        }
+
         // 检查连接数上限
         if self.connection_count() >= self.config.max_connections {
+            self.connecting.write().remove(&addr);
             anyhow::bail!("连接数已达上限");
         }
 
@@ -237,14 +253,28 @@ impl ConnectionManager {
         let transport = match TcpTransport::connect(addr).await {
             Ok(t) => t,
             Err(e) => {
+                self.connecting.write().remove(&addr);
                 self.node_table.mark_failed(&node_id);
                 return Err(e);
             }
         };
 
         // 出站握手
-        let mut transport = transport;
-        let peer_id = self.handshake_outbound(&mut transport, node_id).await?;
+        let transport = transport;
+        let peer_id = match self.handshake_outbound(&transport, node_id).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.connecting.write().remove(&addr);
+                return Err(e);
+            }
+        };
+
+        // 握手成功后再次检查是否已连接（可能并发建立了连接）
+        if let Some(conn) = self.get_connection(&peer_id) {
+            self.connecting.write().remove(&addr);
+            info!("[federation] 连接 {} 已存在，复用已有连接", peer_id);
+            return Ok(conn);
+        }
 
         let connection = Arc::new(Connection::new(transport, peer_id, addr));
         self.register_connection(connection.clone());
@@ -255,13 +285,16 @@ impl ConnectionManager {
         // 启动消息处理循环
         self.clone().spawn_message_handler(connection.clone()).await;
 
+        // 连接建立成功，移除 connecting 标记
+        self.connecting.write().remove(&addr);
+
         Ok(connection)
     }
 
     /// 出站握手：发 Hello -> 收 HelloAck（阶段2：Ed25519 签名验证）
     async fn handshake_outbound(
         &self,
-        transport: &mut TcpTransport,
+        transport: &TcpTransport,
         expected_node_id: NodeId,
     ) -> anyhow::Result<NodeId> {
         let hello = HelloMessage::sign_and_build(
@@ -296,7 +329,7 @@ impl ConnectionManager {
     /// 入站握手：收 Hello -> 发 HelloAck（阶段2：Ed25519 签名验证）
     async fn handshake_inbound(
         &self,
-        transport: &mut TcpTransport,
+        transport: &TcpTransport,
     ) -> anyhow::Result<(NodeId, HelloMessage)> {
         let (msg_type, payload) = transport.recv_message().await?;
         if msg_type != MessageType::Hello {

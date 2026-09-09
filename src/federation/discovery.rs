@@ -209,6 +209,93 @@ impl DiscoveryService {
         info!("[federation] PEX 交换任务已启动（间隔 300s）");
     }
 
+    /// 启动连接维护后台任务（每30秒重置卡住的连接状态，并尝试重连断开的节点）
+    pub fn spawn_connection_maintainer(self: Arc<Self>) {
+        let mut shutdown_rx = self.shutdown.subscribe();
+        let interval = Duration::from_secs(30);
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // 跳过第一次立即触发
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        self.clone().connection_maintainer_tick().await;
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("[federation] 连接维护任务收到关闭信号");
+                        break;
+                    }
+                }
+            }
+        });
+        info!("[federation] 连接维护任务已启动（间隔 30s）");
+    }
+
+    /// 连接维护单次执行
+    async fn connection_maintainer_tick(self: Arc<Self>) {
+        // 1. 重置卡住的 Connecting 状态
+        let stale = self.node_table.reset_stale_connecting();
+        if stale > 0 {
+            debug!("[federation] 重置了 {} 个卡住的 Connecting 状态", stale);
+        }
+
+        // 2. 如果连接数少于 target_neighbors，尝试连接未连接的节点
+        let connected = self.node_table.connected_count();
+        if connected >= self.config.target_neighbors {
+            return;
+        }
+
+        let need = self.config.target_neighbors - connected;
+
+        // 优先连接种子节点（如果种子节点未连接）
+        for seed in &self.config.seed_nodes {
+            if need <= 0 {
+                break;
+            }
+            if let Ok(addr) = seed.parse::<SocketAddr>() {
+                // 检查是否已连接（通过地址匹配）
+                let already_connected = self.connection_manager.all_connections()
+                    .iter()
+                    .any(|c| c.addr == addr);
+                if !already_connected {
+                    let cm = self.connection_manager.clone();
+                    let temp_id = NodeId::random();
+                    tokio::spawn(async move {
+                        if let Err(e) = cm.connect_to(temp_id, addr).await {
+                            debug!("[federation] 维护重连种子节点 {} 失败: {}", addr, e);
+                        }
+                    });
+                }
+            }
+        }
+
+        // 3. 连接节点表中其他未连接的节点
+        let candidates = self.node_table
+            .all_nodes()
+            .into_iter()
+            .filter(|e| {
+                e.status != crate::federation::node_table::NodeStatus::Connected
+                    && e.info.preferred_addr().is_some()
+            })
+            .take(need)
+            .collect::<Vec<_>>();
+
+        for entry in candidates {
+            if let Some(addr) = entry.info.preferred_addr() {
+                let cm = self.connection_manager.clone();
+                let node_id = NodeId(entry.info.node_id);
+                tokio::spawn(async move {
+                    if let Err(e) = cm.connect_to(node_id, addr).await {
+                        debug!("[federation] 维护重连 {} 失败: {}", node_id, e);
+                    }
+                });
+            }
+        }
+    }
+
     /// PEX 交换单次执行
     async fn pex_exchange_tick(self: Arc<Self>) {
         let conns = self.connection_manager.all_connections();

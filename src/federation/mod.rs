@@ -305,6 +305,9 @@ impl FederationService {
         // 3. 启动 PEX 交换任务
         self.discovery.clone().spawn_pex_exchange();
 
+        // 3.1 启动连接维护任务（定期重置卡住的连接状态并重连）
+        self.discovery.clone().spawn_connection_maintainer();
+
         // 4. 启动 NAT 地址刷新任务（含 STUN 探测）
         self.nat_integration.clone().spawn_address_refresh();
 

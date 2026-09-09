@@ -84,7 +84,7 @@ fn default_sync_node_interval() -> u64 { 300 }
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             node_id: None,
             seed_nodes: Vec::new(),
             listen_port: default_listen_port(),
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let cfg = FederationConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         assert_eq!(cfg.listen_port, 6885);
         assert_eq!(cfg.max_connections, 32);
         assert_eq!(cfg.target_neighbors, 8);
@@ -156,6 +156,6 @@ max_connections: 64
         let cfg = FederationConfig::default();
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         assert!(yaml.contains("listen_port: 6885"));
-        assert!(yaml.contains("enabled: false"));
+        assert!(yaml.contains("enabled: true"));
     }
 }
