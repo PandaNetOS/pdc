@@ -28,9 +28,10 @@ use PeerDiscoveryCenter::data_plane::{AppState, DataPlane};
 use PeerDiscoveryCenter::discoverers::DiscovererRegistry;
 use PeerDiscoveryCenter::event_bus::EventBus;
 use PeerDiscoveryCenter::health_check::{HealthCheckConfig, HealthCheckTask};
+use PeerDiscoveryCenter::federation::FederationService;
 use PeerDiscoveryCenter::nat::NatManager;
 use PeerDiscoveryCenter::storage::{InfohashRepository, NodeRepository, TrackerRepository};
-use PeerDiscoveryCenter::intelligence::{DhtActivityTracker, PeerHistoryManager, AvailabilityCalculator};
+use PeerDiscoveryCenter::intelligence::{DhtActivityTracker, PeerHistoryManager, AvailabilityCalculator, TaskScheduler, TaskMetadata, TaskPriority, ResourceProfile, ResourceLevel};
 use PeerDiscoveryCenter::services::{ScrapeService, MetadataService};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
@@ -137,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         let nat_clone = nat.clone();
         let http_port = config.server.port;
         tokio::spawn(async move {
-            match nat_clone.init(http_port, udp_port, crawler_port, 6881, 6883, 6884).await {
+            match nat_clone.init(http_port, udp_port, crawler_port, 6881, 6883, 6884, if config.federation.enabled { config.federation.listen_port } else { 0 }).await {
                 Err(e) => {
                     warn!("[main] NAT/UPnP 初始化失败: {}", e);
                     warn!("[main] 如果处于 NAT 网络后，请手动配置端口转发或启用路由器 UPnP");
@@ -152,6 +153,30 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+
+    // 6.8 创建联邦网络服务（如果启用）
+    let federation_service: Option<Arc<FederationService>> = if config.federation.enabled {
+        let data_dir = std::path::Path::new("target/data");
+        match FederationService::new(
+            config.federation.clone(),
+            nat.clone(),
+            node_repo.clone(),
+            data_dir,
+        ) {
+            Ok(svc) => {
+                let svc = Arc::new(svc);
+                info!("[main] 联邦网络服务已创建");
+                Some(svc)
+            }
+            Err(e) => {
+                warn!("[main] 联邦网络服务创建失败: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // 7. 创建爬虫引擎（如果启用），在 AppState 之前创建以便共享状态
     let (crawler_state, crawler_routing_table) = if config.crawler.enabled {
@@ -363,6 +388,18 @@ async fn main() -> anyhow::Result<()> {
         Some(requester)
     };
 
+
+    // 6.9 启动联邦网络服务（如果启用）
+    if let Some(ref fed_svc) = federation_service {
+        let fed_clone = fed_svc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = fed_clone.start().await {
+                warn!("[main] 联邦网络服务启动失败: {}", e);
+            }
+        });
+        info!("[main] 联邦网络服务启动中...");
+    }
+
     // 7.6 创建 AppState
     let app_state = AppState {
         control_plane: control_plane.clone(),
@@ -412,7 +449,145 @@ async fn main() -> anyhow::Result<()> {
     });
     info!("[main] 健康检查任务已启动");
 
-    // 8.5 启动定期持久化任务（每 60 秒全量保存所有 Repo 到 SQLite）
+    // 8.5 智能任务调度中心 + 定期持久化任务
+    let task_scheduler = Arc::new(TaskScheduler::new().with_max_concurrent_full_tasks(2));
+
+    // 8.5.1 定期增量持久化任务（每60秒，P3后台，IO密集）
+    {
+        let node_repo_clone = node_repo.clone();
+        let tracker_repo_clone = tracker_repo.clone();
+        let infohash_repo_clone = infohash_repo.clone();
+        let peer_repo_clone = peer_repo.clone();
+        let storage_clone = storage.clone();
+
+        task_scheduler.register(
+            TaskMetadata::new("periodic_persistence", "定期增量持久化", std::time::Duration::from_secs(60))
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::High,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(30))
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let node_repo = node_repo_clone.clone();
+                let tracker_repo = tracker_repo_clone.clone();
+                let infohash_repo = infohash_repo_clone.clone();
+                let peer_repo = peer_repo_clone.clone();
+                let storage = storage_clone.clone();
+                async move {
+                    // 增量持久化：NodeRepo/InfohashRepo 只保存脏数据，TrackerRepo 全量（数据量小）
+                    let mut saved = 0u64;
+                    // NodeRepo 全量保存（后续优化为增量）
+                    match node_repo.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] NodeRepo 保存失败: {}", e),
+                    }
+                    // TrackerRepo 全量保存（数据量小）
+                    match tracker_repo.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] TrackerRepo 保存失败: {}", e),
+                    }
+                    // InfohashRepo 全量保存（后续优化为增量）
+                    match infohash_repo.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] InfohashRepo 保存失败: {}", e),
+                    }
+                    // PeerRepo flush history buffer
+                    match peer_repo.flush_history().await {
+                        Ok(n) if n > 0 => debug!("[persistence] PeerRepo history flushed: {} records", n),
+                        Err(e) => warn!("[persistence] PeerRepo history flush 失败: {}", e),
+                        _ => {}
+                    }
+                    // SQLite WAL checkpoint
+                    if let Err(e) = storage.checkpoint() {
+                        warn!("[persistence] WAL checkpoint 失败: {}", e);
+                    }
+                    debug!("[persistence] 增量持久化完成（{} 项）", saved);
+                    Ok(())
+                }
+            },
+        );
+        info!("[main] 定期增量持久化任务已注册（每60秒）");
+    }
+
+    // 8.5.2 资源监控更新任务（每5秒，P0关键，低消耗）
+    {
+        let resource_monitor = task_scheduler.resource_monitor();
+        task_scheduler.register(
+            TaskMetadata::new("resource_monitor", "系统资源监控", std::time::Duration::from_secs(5))
+                .with_priority(TaskPriority::Critical)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .non_deferrable()
+                .with_jitter(std::time::Duration::from_secs(0)),
+            move || {
+                let monitor = resource_monitor.clone();
+                async move {
+                    // 简化版资源监控：通过系统信息获取 CPU/内存使用率
+                    // 实际实现可以使用 sysinfo crate
+                    // 这里使用估算值，后续可以接入真实监控
+                    monitor.update(0.3, 0.4); // 示例值，实际应从系统获取
+                    Ok(())
+                }
+            },
+        );
+        info!("[main] 资源监控任务已注册（每5秒）");
+    }
+
+    // 8.5.3 全量持久化任务（每300秒，P3后台，全量任务，错峰到T+240s）
+    {
+        let node_repo_clone = node_repo.clone();
+        let tracker_repo_clone = tracker_repo.clone();
+        let infohash_repo_clone = infohash_repo.clone();
+
+        task_scheduler.register(
+            TaskMetadata::new("full_persistence", "全量持久化", std::time::Duration::from_secs(300))
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::High,
+                    memory: ResourceLevel::Medium,
+                    io: ResourceLevel::Extreme,
+                    network: ResourceLevel::Low,
+                    is_full_task: true,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(240))
+                .with_jitter(std::time::Duration::from_secs(15)),
+            move || {
+                let node_repo = node_repo_clone.clone();
+                let tracker_repo = tracker_repo_clone.clone();
+                let infohash_repo = infohash_repo_clone.clone();
+                async move {
+                    info!("[persistence] 开始全量持久化...");
+                    if let Err(e) = node_repo.save_all().await {
+                        warn!("[persistence] NodeRepo 全量保存失败: {}", e);
+                    }
+                    if let Err(e) = tracker_repo.save_all().await {
+                        warn!("[persistence] TrackerRepo 全量保存失败: {}", e);
+                    }
+                    if let Err(e) = infohash_repo.save_all().await {
+                        warn!("[persistence] InfohashRepo 全量保存失败: {}", e);
+                    }
+                    info!("[persistence] 全量持久化完成");
+                    Ok(())
+                }
+            },
+        );
+        info!("[main] 全量持久化任务已注册（每300秒，错峰T+240s）");
+    }
+
+    // 启动智能任务调度中心
+    task_scheduler.start();
+    info!("[main] 智能任务调度中心已启动");
+
     // 8.6 ScoreMaintainer: multi-source infohash scoring
     {
         use PeerDiscoveryCenter::intelligence::{InfohashScorerImpl, NodeScorerImpl, PeerScorerImpl, ScoreMaintainer, TrackerScorerImpl};

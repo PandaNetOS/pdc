@@ -16,9 +16,10 @@
 //! - infohashes 表：longevity_secs（持续时长）
 //!
 //! 【增量评分策略】
-//! - 热节点（最近活跃）：统计数据变化频繁，每 10 秒增量重算脏节点
-//! - 全量重算：每 300 秒兜底一次，确保所有节点评分一致性
+//! - 热节点（最近活跃）：统计数据变化频繁，每 60 秒增量重算脏节点
+//! - 全量重算：每 600 秒兜底一次，确保所有节点评分一致性
 //! - 脏标记：节点统计数据变化时自动标记，只重算脏节点
+//! - 错峰调度：全量重算初始延迟 120s，避免与 HealthCheck/TierManager 同时爆发
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,9 +90,9 @@ impl ScoreMaintainer {
             metadata_service: None,
             availability_calculator: None,
             super_tracker: None,
-            incremental_interval_secs: 10,
-            full_interval_secs: 300,
-            snapshot_interval_secs: 60,
+            incremental_interval_secs: 60,
+            full_interval_secs: 600,
+            snapshot_interval_secs: 120,
             last_snapshot: std::sync::Mutex::new(None),
         }
     }
@@ -371,8 +372,8 @@ impl ScoreMaintainer {
         {
             let maintainer = self.clone();
             tokio::spawn(async move {
-                // 延迟 60 秒开始第一次全量重算，避免启动时和增量任务竞争
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // 延迟 120 秒开始第一次全量重算，错峰避免与其他全量任务（HealthCheck/TierManager）同时执行
+                tokio::time::sleep(Duration::from_secs(120)).await;
                 loop {
                     maintainer.rescore_all().await;
                     tokio::time::sleep(full_interval).await;

@@ -17,6 +17,7 @@ pub mod score_maintainer;
 pub mod dht_activity;
 pub mod peer_history;
 pub mod availability;
+pub mod task_scheduler;
 
 pub use node_score::{calculate_node_score, NodeScorerImpl};
 pub use tracker_score::{TrackerScore, TrackerStats, TrackerScorerImpl};
@@ -32,3 +33,4 @@ pub use scorer_traits::*;
 pub use dht_activity::{DhtActivityTracker, ActivityEventType};
 pub use peer_history::PeerHistoryManager;
 pub use availability::{AvailabilityCalculator, AvailabilityResult, AvailabilityMethod};
+pub use task_scheduler::{TaskScheduler, TaskMetadata, TaskPriority, ResourceProfile, ResourceLevel, ResourceState, ResourceMonitor, TaskStats, TaskSchedulerSummary};
