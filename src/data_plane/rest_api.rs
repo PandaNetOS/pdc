@@ -8,7 +8,7 @@
 //! - GET /api/v1/cache/{infohash} - 查询缓存
 
 use crate::intelligence::scorer_traits::HealthScorer;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -217,6 +217,10 @@ pub fn routes(state: AppState) -> Router {
         .route("/api/v1/pex", get(pex_handler))
         .route("/api/v1/history/peers/{infohash}", get(peer_history_handler))
         .route("/api/v1/history/stats/{metric}", get(stats_history_handler))
+        .route("/api/v1/federation/status", get(federation_status_handler))
+        .route("/api/v1/federation/nodes", get(federation_nodes_handler))
+        .route("/api/v1/federation/connections", get(federation_connections_handler))
+        .route("/api/v1/federation/sync-stats", get(federation_sync_stats_handler))
         .route("/metrics", get(crate::data_plane::metrics::metrics_handler))
         .route("/ws", get(crate::data_plane::ws::ws_handler))
         .with_state(state)
@@ -774,5 +778,90 @@ async fn pex_handler(State(state): State<AppState>) -> Response {
             })).into_response()
         }
         None => Json(serde_json::json!({ "enabled": false })).into_response(),
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// 联邦网络 API
+// ---------------------------------------------------------------------------
+
+/// 联邦状态
+async fn federation_status_handler(State(state): State<AppState>) -> Response {
+    match &state.federation {
+        Some(fed) => Json(fed.status()).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "federation not enabled" })),
+        )
+            .into_response(),
+    }
+}
+
+/// 联邦节点列表
+async fn federation_nodes_handler(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    match &state.federation {
+        Some(fed) => {
+            let limit: usize = params
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50);
+            let snapshot = fed.snapshot();
+            let total = snapshot.nodes.len();
+            let nodes: Vec<_> = snapshot.nodes.into_iter().take(limit).collect();
+            Json(serde_json::json!({
+                "total": total,
+                "returned": nodes.len(),
+                "nodes": nodes,
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "federation not enabled" })),
+        )
+            .into_response(),
+    }
+}
+
+/// 联邦连接列表
+async fn federation_connections_handler(State(state): State<AppState>) -> Response {
+    match &state.federation {
+        Some(fed) => {
+            let snapshot = fed.snapshot();
+            Json(serde_json::json!({
+                "count": snapshot.connections.len(),
+                "connections": snapshot.connections,
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "federation not enabled" })),
+        )
+            .into_response(),
+    }
+}
+
+/// 联邦同步统计 + 中继统计 + metrics
+async fn federation_sync_stats_handler(State(state): State<AppState>) -> Response {
+    match &state.federation {
+        Some(fed) => {
+            let snapshot = fed.snapshot();
+            Json(serde_json::json!({
+                "sync_stats": snapshot.sync_stats,
+                "relay_stats": snapshot.relay_stats,
+                "metrics": snapshot.status.metrics,
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "federation not enabled" })),
+        )
+            .into_response(),
     }
 }

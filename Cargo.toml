@@ -1,8 +1,8 @@
-[package]
+﻿[package]
 name = "PeerDiscoveryCenter"
 version = "0.2.0"
 edition = "2021"
-description = "统一的 BitTorrent Peer 发现中心：事件驱动 + 控制面/数据面分离 + 插件化发现器 + 超级 Tracker"
+description = "缁熶竴鐨?BitTorrent Peer 鍙戠幇涓績锛氫簨浠堕┍鍔?+ 鎺у埗闈?鏁版嵁闈㈠垎绂?+ 鎻掍欢鍖栧彂鐜板櫒 + 瓒呯骇 Tracker"
 license = "MIT"
 
 [[bin]]
@@ -43,6 +43,12 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 hickory-resolver = "0.24"
 rustc-hash = "2"
 crossbeam = "0.8"
+bincode = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+blake3 = "1"
+lru = "0.12"
+bytes = "1"
+serde-big-array = "0.5"
 
 [dev-dependencies]
 tokio-test = "0.4"

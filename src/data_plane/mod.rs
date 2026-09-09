@@ -76,6 +76,8 @@ pub struct AppState {
     pub tcp_pex_server: Option<Arc<crate::crawler::tcp_pex_server::TcpPexServer>>,
     /// 主动 PEX 请求器（BEP 11，主动连接 peer 请求 PEX 消息）
     pub active_pex: Option<Arc<crate::crawler::active_pex::ActivePexRequester>>,
+    /// 联邦网络服务（可选）
+    pub federation: Option<Arc<crate::federation::FederationService>>,
 }
 
 /// 数据面

@@ -1,0 +1,1296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDC 多实例外网数据同步方案研究报告</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #1c2128;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-muted: #8b949e;
+  --accent: #00ff41;
+  --accent-dim: #00cc33;
+  --accent-bg: rgba(0,255,65,0.08);
+  --red: #f85149;
+  --orange: #d29922;
+  --blue: #58a6ff;
+  --purple: #bc8cff;
+  --code-bg: #0d1117;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Courier New', monospace;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  font-size: 14px;
+}
+/* Layout */
+.layout { display:flex; min-height:100vh; }
+.sidebar {
+  width: 280px;
+  min-width:280px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  position: fixed;
+  top:0; left:0; bottom:0;
+  overflow-y: auto;
+  padding: 24px 0;
+  z-index:100;
+}
+.sidebar-header {
+  padding: 0 20px 20px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.sidebar-header h2 {
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.sidebar-header p { color: var(--text-muted); font-size: 11px; }
+.sidebar nav { padding: 0 12px; }
+.sidebar nav a {
+  display:block;
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 4px;
+  transition: all 0.15s;
+  border-left: 2px solid transparent;
+}
+.sidebar nav a:hover { color: var(--accent); background: var(--accent-bg); border-left-color: var(--accent); }
+.sidebar nav a.sub { padding-left: 28px; font-size: 11px; }
+.sidebar nav a.active { color: var(--accent); background: var(--accent-bg); border-left-color: var(--accent); }
+.main {
+  margin-left: 280px;
+  flex:1;
+  padding: 40px 60px;
+  max-width: 1100px;
+}
+/* Typography */
+h1 { color: var(--accent); font-size: 28px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.5px; }
+h2 {
+  color: var(--accent);
+  font-size: 22px;
+  font-weight: 700;
+  margin: 48px 0 20px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--accent);
+  letter-spacing: -0.3px;
+}
+h3 { color: var(--text); font-size: 17px; font-weight: 600; margin: 32px 0 14px; }
+h4 { color: var(--text); font-size: 15px; font-weight: 600; margin: 24px 0 10px; }
+p { margin-bottom: 14px; }
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: #fff; font-weight: 600; }
+em { color: var(--accent-dim); font-style: normal; }
+/* Header banner */
+.report-header {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 32px;
+  margin-bottom: 40px;
+  position: relative;
+  overflow: hidden;
+}
+.report-header::before {
+  content:'';
+  position:absolute;
+  top:0; left:0; right:0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent), transparent);
+}
+.report-header .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.report-header .meta span { display:flex; align-items:center; gap:6px; }
+.report-header .meta .label { color: var(--accent); }
+/* Tables */
+.table-wrap { overflow-x: auto; margin: 16px 0 24px; border-radius: 6px; border: 1px solid var(--border); }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  background: var(--bg-secondary);
+}
+thead th {
+  background: var(--bg-tertiary);
+  color: var(--accent);
+  font-weight: 600;
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+}
+tbody td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+tbody tr:hover { background: var(--accent-bg); }
+tbody tr:last-child td { border-bottom: none; }
+/* Code */
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  overflow-x: auto;
+  margin: 14px 0 20px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  color: var(--accent-dim);
+}
+pre code { color: var(--text); }
+:not(pre) > code {
+  background: var(--bg-tertiary);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+/* Callout */
+.callout {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-bg);
+  padding: 14px 18px;
+  border-radius: 0 6px 6px 0;
+  margin: 16px 0 20px;
+}
+.callout.warn { border-left-color: var(--orange); background: rgba(210,153,34,0.08); }
+.callout.danger { border-left-color: var(--red); background: rgba(248,81,73,0.08); }
+.callout .title { color: var(--accent); font-weight: 600; margin-bottom: 6px; font-size: 13px; }
+.callout.warn .title { color: var(--orange); }
+.callout.danger .title { color: var(--red); }
+/* Lists */
+ul, ol { margin: 10px 0 16px 24px; }
+li { margin-bottom: 6px; }
+/* Mermaid */
+.mermaid {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  margin: 20px 0 28px;
+  text-align: center;
+  overflow-x: auto;
+}
+/* Badge */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.badge-green { background: rgba(0,255,65,0.15); color: var(--accent); border:1px solid rgba(0,255,65,0.3); }
+.badge-red { background: rgba(248,81,73,0.15); color: var(--red); border:1px solid rgba(248,81,73,0.3); }
+.badge-orange { background: rgba(210,153,34,0.15); color: var(--orange); border:1px solid rgba(210,153,34,0.3); }
+.badge-blue { background: rgba(88,166,255,0.15); color: var(--blue); border:1px solid rgba(88,166,255,0.3); }
+/* Timeline */
+.timeline { position: relative; padding-left: 32px; margin: 20px 0; }
+.timeline::before {
+  content:'';
+  position:absolute;
+  left: 11px; top:0; bottom:0;
+  width: 2px;
+  background: var(--border);
+}
+.timeline-item { position: relative; margin-bottom: 28px; }
+.timeline-item::before {
+  content:'';
+  position:absolute;
+  left: -27px; top: 6px;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.timeline-item .milestone {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.timeline-item .duration { color: var(--text-muted); font-size: 11px; margin-left: 8px; }
+.timeline-item .desc { font-size: 13px; color: var(--text); }
+/* Footer */
+.footer {
+  margin-top: 60px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: center;
+}
+/* Mobile */
+@media (max-width: 900px) {
+  .sidebar { display:none; }
+  .main { margin-left:0; padding: 20px; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 18px; }
+}
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+/* Section anchor offset */
+section[id] { scroll-margin-top: 20px; }
+</style>
+</head>
+<body>
+<div class="layout">
+<!-- Sidebar -->
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <h2>PDC SYNC REPORT</h2>
+    <p>多实例外网数据同步方案 v1.0</p>
+    <p style="margin-top:6px;">2026-09-09</p>
+  </div>
+  <nav>
+    <a href="#bg">1. 背景与目标</a>
+    <a href="#status">2. PDC 现状分析</a>
+    <a href="#compare">3. 候选方案全景对比</a>
+    <a href="#design">4. 推荐方案详细设计</a>
+    <a href="#design-arch" class="sub">4.1 整体架构</a>
+    <a href="#design-data" class="sub">4.2 数据分类同步策略</a>
+    <a href="#design-gossip" class="sub">4.3 Gossip 同步协议</a>
+    <a href="#design-crdt" class="sub">4.4 一致性模型与 CRDT</a>
+    <a href="#design-nat" class="sub">4.5 NAT 穿透方案</a>
+    <a href="#design-security" class="sub">4.6 安全认证架构</a>
+    <a href="#design-perf" class="sub">4.7 性能影响分析</a>
+    <a href="#roadmap">5. 实施路线图</a>
+    <a href="#risk">6. 风险与待确认事项</a>
+    <a href="#appendix">7. 附录</a>
+  </nav>
+</aside>
+
+<!-- Main Content -->
+<main class="main">
+
+<!-- Header -->
+<div class="report-header">
+  <h1>PDC 多实例外网数据同步方案研究报告</h1>
+  <p style="color:var(--text-muted);font-size:13px;">控制面中心化（pnos-runtime）+ 数据面 Gossip P2P 同步 + CRDT 最终一致 + 三级 NAT 穿透 + Ed25519/Noise 安全</p>
+  <div class="meta">
+    <span><span class="label">版本:</span> v1.0</span>
+    <span><span class="label">日期:</span> 2026-09-09</span>
+    <span><span class="label">基准代码:</span> PDC v0.2.0</span>
+    <span><span class="label">状态:</span> 最终整合版</span>
+  </div>
+</div>
+
+<!-- Section 1 -->
+<section id="bg">
+<h2>1. 背景与目标</h2>
+
+<h3>1.1 为什么需要多 PDC 同步</h3>
+<p>PDC（节点发现 Agent）是 PandaNetOS 生态中的核心基础设施，负责 DHT 节点发现、BT Peer 索引、Tracker 池管理和超级 Tracker 服务。随着性能目标提升至<strong>超级 Tracker 10万 QPS、千万级数据规模</strong>，单实例架构面临以下挑战：</p>
+<ul>
+  <li><strong>单机性能极限</strong>：P3 优化清单已明确"多实例分片"作为未来方向，说明单机 10万 QPS 可能是物理极限</li>
+  <li><strong>地域覆盖需求</strong>：不同地域的 PDC 实例可以就近服务 BT 客户端，降低 announce 延迟</li>
+  <li><strong>高可用需求</strong>：单实例宕机导致整个节点发现服务中断，多实例可实现故障转移</li>
+  <li><strong>数据协同需求</strong>：各实例独立爬取的 DHT 节点和发现的 Peer 需要共享，避免重复劳动</li>
+</ul>
+
+<h3>1.2 同步目标</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>目标维度</th><th>具体要求</th><th>优先级</th></tr></thead>
+<tbody>
+<tr><td><strong>相互连接</strong></td><td>多 PDC 实例通过外网建立连接，支持 NAT 穿透，实例间可直接通信</td><td><span class="badge badge-green">P0</span></td></tr>
+<tr><td><strong>同步数据</strong></td><td>四大 Repo（Node/Peer/Infohash/Tracker）数据在实例间同步，达到最终一致</td><td><span class="badge badge-green">P0</span></td></tr>
+<tr><td><strong>协同工作</strong></td><td>写 QPS 可水平扩展，爬虫可协同，故障时自动转移</td><td><span class="badge badge-orange">P1</span></td></tr>
+<tr><td><strong>不破坏性能红线</strong></td><td>超级 Tracker 10万 QPS、&lt;100μs 响应延迟、磁盘 IO &lt;2MB/s、内存 &lt;8GB</td><td><span class="badge badge-red">红线</span></td></tr>
+<tr><td><strong>安全可控</strong></td><td>实例身份认证、传输加密、防伪造、防 Sybil 攻击</td><td><span class="badge badge-orange">P1</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>1.3 核心矛盾</h3>
+<div class="callout danger">
+<div class="title">同步的本质矛盾</div>
+<p>1. <strong>写密集 vs 同步带宽</strong>：PeerRepo 的 announce 是写密集型（目标 10万 QPS），如果每条 announce 都同步，带宽不可承受<br>
+2. <strong>数据时效性 vs 一致性</strong>：DHT 节点和 BT Peer 高度动态，强一致代价极高且价值低<br>
+3. <strong>单机极限 vs 水平扩展</strong>：多实例的核心诉求是水平扩展写性能，而非单纯数据共享<br>
+4. <strong>控制面 vs 数据面</strong>：控制面信息量小需一致性，数据面信息量大允许最终一致</p>
+</div>
+</section>
+
+<!-- Section 2 -->
+<section id="status">
+<h2>2. PDC 现状分析</h2>
+
+<h3>2.1 四大 Repo 数据特征</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Repo</th><th>数据内容</th><th>目标规模</th><th>实际规模</th><th>变更频率</th><th>同步价值</th></tr></thead>
+<tbody>
+<tr><td><strong>NodeRepo</strong></td><td>DHT 节点（id/ip/port/score/state/统计）</td><td>1000万+</td><td>77,079</td><td>高（爬虫持续发现）</td><td>高——爬虫候选池共享</td></tr>
+<tr><td><strong>PeerRepo</strong></td><td>BT Peer（按 infohash 分组，ip/port/score/统计）</td><td>1000万+</td><td>800+</td><td>极高（超级Tracker announce）</td><td>极高——infohash→peer 索引共享</td></tr>
+<tr><td><strong>TrackerRepo</strong></td><td>Tracker 池（url/score/统计/禁用状态）</td><td>200+</td><td>79</td><td>低</td><td>中——Tracker 池共享</td></tr>
+<tr><td><strong>InfohashRepo</strong></td><td>Infohash 注册（infohash/ref_count/first_seen/last_seen）</td><td>1K+</td><td>90+</td><td>中</td><td>中——已知 infohash 目录</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>2.2 代码实证关键发现</h3>
+<div class="callout warn">
+<div class="title">重要代码实证修正</div>
+<p><strong>发现 1：dirty 机制只有 NodeRepo 有</strong><br>
+PeerRepo/InfohashRepo/TrackerRepo 均无 dirty 标记。Gossip 方案若要复用 dirty，需先为 PeerRepo 补充 dirty 机制。</p>
+<p style="margin-top:8px;"><strong>发现 2：PeerRepo 实际是单 RwLock，不是 64 分片</strong><br>
+<code>ShardedHashMap</code>/<code>DirtyShardedHashMap</code> 已定义但未在 PeerRepo 中使用。超级 Tracker 的 <code>SuperTrackerState.peers</code> 使用 <code>DashMap</code>（内部分片），但 PeerRepo 缓存层是单 RwLock。10万 QPS 下 PeerRepo 的单 RwLock 是潜在瓶颈。</p>
+<p style="margin-top:8px;"><strong>发现 3：UDP scrape 未实现</strong><br>
+UDP scrape 返回 "scrape not implemented" 错误；HTTP /scrape 已实现，downloaded 恒为 0。</p>
+</div>
+
+<h3>2.3 四大 Repo 实际状态</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Repo</th><th>内存结构</th><th>锁机制</th><th>dirty 标记</th><th>持久化方式</th></tr></thead>
+<tbody>
+<tr><td><strong>NodeRepo</strong></td><td><code>RwLock&lt;FxHashMap&lt;SocketAddr, KBucketEntry&gt;&gt;</code></td><td>单 RwLock</td><td><span class="badge badge-green">有</span> <code>FxHashSet</code></td><td>增量（仅 dirty）</td></tr>
+<tr><td><strong>PeerRepo</strong></td><td><code>RwLock&lt;PeerMemoryStore&gt;</code>（三表）</td><td>单 RwLock</td><td><span class="badge badge-red">无</span></td><td>全量 save_all + history 攒批</td></tr>
+<tr><td><strong>InfohashRepo</strong></td><td><code>RwLock&lt;FxHashMap&lt;Infohash, (u32,String,f64)&gt;&gt;</code></td><td>单 RwLock</td><td><span class="badge badge-red">无</span>（有 pending 缓冲区）</td><td>新 ih 批量写入 + 全量 ref_count 更新</td></tr>
+<tr><td><strong>TrackerRepo</strong></td><td><code>RwLock&lt;FxHashMap&lt;String, TrackerEntry&gt;&gt;</code></td><td>单 RwLock</td><td><span class="badge badge-red">无</span></td><td>全量</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>2.4 现有网络/NAT 能力</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>能力</th><th>状态</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>UPnP IGD</td><td><span class="badge badge-green">已实现</span></td><td>支持 TCP/UDP 映射、自动续租、冲突重试</td></tr>
+<tr><td>NAT-PMP</td><td><span class="badge badge-green">已实现</span></td><td>Apple 路由器/部分 OpenWrt 支持</td></tr>
+<tr><td>PCP</td><td><span class="badge badge-green">已实现</span></td><td>NAT-PMP 后继协议</td></tr>
+<tr><td>STUN Binding (RFC 5389)</td><td><span class="badge badge-green">已实现</span></td><td>支持 XOR-MAPPED-ADDRESS，双服务器 NAT 类型检测</td></tr>
+<tr><td>UDP 打洞</td><td><span class="badge badge-green">已实现</span></td><td>支持 Symmetric NAT 端口预测，按 NAT 类型选策略</td></tr>
+<tr><td>自定义中继（6881）</td><td><span class="badge badge-green">已实现</span></td><td>UDP+TCP，magic byte 0x5044，广播式转发</td></tr>
+<tr><td>打洞信令</td><td><span class="badge badge-green">已实现</span></td><td>HTTP REST，会话管理，长轮询</td></tr>
+<tr><td>IPv6</td><td><span class="badge badge-green">已实现</span></td><td>双栈支持</td></tr>
+<tr><td>TURN (RFC 5766)</td><td><span class="badge badge-red">未实现</span></td><td>标准中继协议，当前自定义中继不兼容</td></tr>
+<tr><td>ICE (RFC 8445)</td><td><span class="badge badge-red">未实现</span></td><td>STUN+TURN 组合的标准化连接建立流程</td></tr>
+<tr><td>TCP 打洞</td><td><span class="badge badge-red">未实现</span></td><td>仅 UDP 打洞</td></tr>
+<tr><td>传输加密</td><td><span class="badge badge-red">未实现</span></td><td>实例间通信无加密</td></tr>
+<tr><td>实例级加密身份</td><td><span class="badge badge-red">未实现</span></td><td>无实例身份认证机制</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>2.5 pnos-runtime 能力缺口</h3>
+<div class="callout danger">
+<div class="title">pnos-runtime 当前能力与定位差距大</div>
+<p>pnos-runtime 当前是<strong>轻量级单实例组件注册中心 + 应用管理器</strong>，以下能力完全缺失：</p>
+<ul style="margin-top:8px;">
+<li><strong>事件总线</strong>：pnos-sdk README 提到"事件订阅"，但 runtime 代码中无任何发布订阅实现</li>
+<li><strong>数据同步/分发</strong>：完全不具备大规模数据同步、中继、分发能力</li>
+<li><strong>持久化</strong>：注册中心纯内存，重启后所有组件信息丢失</li>
+<li><strong>集群/高可用</strong>：单实例，无主从、无分片、无共识协议</li>
+<li><strong>外网穿透</strong>：默认绑定 127.0.0.1，无 NAT 穿透/中继能力</li>
+</ul>
+</div>
+
+<h3>2.6 现有可复用组件</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>组件</th><th>位置</th><th>复用价值</th></tr></thead>
+<tbody>
+<tr><td>Kademlia 路由表（160 bucket，K=8）</td><td><code>dht/routing_table.rs</code></td><td>分片方案的实例间路由参考</td></tr>
+<tr><td>DHT KRPC 协议</td><td><code>discoverers/dht/</code></td><td>协议编解码可复用</td></tr>
+<tr><td>NatService</td><td><code>nat/</code>、<code>services/nat_service.rs</code></td><td>外网可达性，直接复用</td></tr>
+<tr><td>ShardedHashMap / DirtyShardedHashMap</td><td><code>storage/sharded_map.rs</code></td><td>Gossip 变更源、分片存储</td></tr>
+<tr><td>RateLimiter</td><td><code>data_plane/rate_limiter.rs</code></td><td>P2P 连接限流与恶意节点防护</td></tr>
+<tr><td>EventBus</td><td><code>event_bus.rs</code></td><td>本地变更事件作为 gossip 触发源</td></tr>
+<tr><td>ObjectPool</td><td><code>utils/object_pool.rs</code></td><td>gossip 消息对象复用</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>2.7 监听端口</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>端口</th><th>协议</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><strong>6880</strong></td><td>TCP + UDP</td><td>超级 Tracker（HTTP + BEP 15 UDP），REST API，WebSocket 监控</td></tr>
+<tr><td><strong>6881</strong></td><td>UDP + TCP</td><td>自定义中继（升级为 TURN 兼容）</td></tr>
+<tr><td><strong>6882</strong></td><td>UDP</td><td>DHT 爬虫</td></tr>
+<tr><td><strong>6883（新增）</strong></td><td>TCP + UDP</td><td><strong>实例间同步专用端口</strong>，与 Tracker 物理隔离</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- Section 3 -->
+<section id="compare">
+<h2>3. 候选方案全景对比</h2>
+
+<h3>3.1 五个候选方案</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>方案</th><th>核心思路</th><th>拓扑</th><th>写扩展</th></tr></thead>
+<tbody>
+<tr><td><strong>方案1：中心化同步</strong></td><td>所有数据经 pnos-runtime 中继分发</td><td>星型</td><td><span class="badge badge-red">不可行</span> runtime 瓶颈</td></tr>
+<tr><td><strong>方案2：主从/读写分离</strong></td><td>Master 处理所有写，Slave 只读接收同步</td><td>星型</td><td><span class="badge badge-red">无法扩展</span> 写集中在 Master</td></tr>
+<tr><td><strong>方案3：Gossip P2P</strong></td><td>全量副本 + 流行病协议随机传播</td><td>部分网状</td><td><span class="badge badge-green">线性扩展</span></td></tr>
+<tr><td><strong>方案4：分片/DHT</strong></td><td>按 key 空间分片，每实例仅存部分数据</td><td>结构化 DHT</td><td><span class="badge badge-orange">理论可扩展</span> 但延迟破坏</td></tr>
+<tr><td><strong>方案5：混合架构</strong></td><td>控制面中心化 + 数据面 Gossip P2P</td><td>混合</td><td><span class="badge badge-green">线性扩展</span> 推荐</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>3.2 十维度横向对比</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>维度</th><th>中心化</th><th>主从</th><th>Gossip</th><th>分片</th><th>混合（推荐）</th></tr></thead>
+<tbody>
+<tr><td><strong>网络拓扑</strong></td><td>星型（runtime中心）</td><td>星型（Master中心）</td><td>部分网状 f=4~8</td><td>结构化 DHT O(logN)</td><td>控制面星型+数据面网状</td></tr>
+<tr><td><strong>同步协议</strong></td><td>中心化中继+状态同步</td><td>操作日志单向同步</td><td>Push Rumor + Pull Anti-Entropy</td><td>分片路由+转发</td><td>控制面中心化+数据面gossip</td></tr>
+<tr><td><strong>一致性模型</strong></td><td>最终一致</td><td>最终一致+单调读+强顺序</td><td>最终一致 LWW</td><td>分片内强一致单writer</td><td>控制面强一致+数据面最终一致</td></tr>
+<tr><td><strong>写QPS扩展</strong></td><td><span class="badge badge-red">不扩展</span></td><td><span class="badge badge-red">无法扩展</span></td><td><span class="badge badge-green">线性扩展</span></td><td><span class="badge badge-orange">需转发</span></td><td><span class="badge badge-green">线性扩展</span></td></tr>
+<tr><td><strong>announce延迟</strong></td><td>异步不影响</td><td>异步不影响</td><td><span class="badge badge-green">零侵入 &lt;100μs</span></td><td><span class="badge badge-red">1~50ms 转发</span></td><td><span class="badge badge-green">零侵入 &lt;100μs</span></td></tr>
+<tr><td><strong>带宽(N=5)</strong></td><td>runtime 96 Mbps</td><td>Master 90 Mbps</td><td>集群总 16 Mbps</td><td>转发 ~240 Mbps</td><td>集群总 16 Mbps</td></tr>
+<tr><td><strong>磁盘IO</strong></td><td>runtime端增加</td><td>Master操作日志可能超2MB/s</td><td><span class="badge badge-green">无影响</span></td><td>不变</td><td><span class="badge badge-green">无影响</span></td></tr>
+<tr><td><strong>NAT穿透难度</strong></td><td><span class="badge badge-green">低</span> 出站连接</td><td><span class="badge badge-orange">中</span> Master需公网</td><td><span class="badge badge-red">高</span> P2P双向</td><td><span class="badge badge-red">高</span> 必须可达</td><td><span class="badge badge-orange">中高</span> 三级降级</td></tr>
+<tr><td><strong>实现复杂度</strong></td><td><span class="badge badge-red">极大</span> runtime新建同步子系统</td><td><span class="badge badge-orange">中到大</span></td><td><span class="badge badge-orange">中</span> ~2500行</td><td><span class="badge badge-red">大</span> ~4700行+热路径重构</td><td><span class="badge badge-orange">大</span> P2P+gossip占60%</td></tr>
+<tr><td><strong>可扩展性</strong></td><td>3~10实例</td><td>5~20实例（读扩展）</td><td>10~100实例</td><td>~20实例（延迟约束）</td><td>10~100实例</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>3.3 核心指标加权评分</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>指标</th><th>中心化</th><th>主从</th><th>Gossip</th><th>分片</th><th>混合</th><th>权重</th></tr></thead>
+<tbody>
+<tr><td>写QPS可扩展性</td><td>★★☆☆☆</td><td>★☆☆☆☆</td><td>★★★★★</td><td>★★★☆☆</td><td>★★★★★</td><td>30%</td></tr>
+<tr><td>带宽效率</td><td>★★☆☆☆</td><td>★★☆☆☆</td><td>★★★★★</td><td>★★☆☆☆</td><td>★★★★★</td><td>15%</td></tr>
+<tr><td>实现可行性</td><td>★★☆☆☆</td><td>★★★★☆</td><td>★★★☆☆</td><td>★★☆☆☆</td><td>★★★☆☆</td><td>20%</td></tr>
+<tr><td>与现有架构协同</td><td>★★★☆☆</td><td>★★★☆☆</td><td>★★★★★</td><td>★★★☆☆</td><td>★★★★★</td><td>15%</td></tr>
+<tr><td>可扩展性（实例数）</td><td>★★☆☆☆</td><td>★★★☆☆</td><td>★★★★★</td><td>★★★★☆</td><td>★★★★★</td><td>10%</td></tr>
+<tr><td>NAT穿透难度（越低越好）</td><td>★★★★★</td><td>★★★★☆</td><td>★★☆☆☆</td><td>★★☆☆☆</td><td>★★★☆☆</td><td>10%</td></tr>
+<tr><td><strong>加权总分</strong></td><td><strong>2.15</strong></td><td><strong>2.45</strong></td><td><strong>4.10</strong></td><td><strong>2.95</strong></td><td><strong>4.10</strong></td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>3.4 分片方案的致命伤</h3>
+<div class="callout danger">
+<div class="title">分片方案无法同时满足 &lt;100μs 和数据归属</div>
+<p>分片方案下 announce 到达非负责实例时必须转发，互联网 RTT 10~100ms，即使 LAN 也 0.1~1ms = 目标的 10 倍。五种路由模式分析：</p>
+<ul style="margin-top:8px;">
+<li><strong>模式A 同步转发</strong>：延迟 1~50ms，直接破坏 &lt;100μs ❌</li>
+<li><strong>模式B 写本地+异步复制</strong>：announce 快了，但查询退化为全互联 fanout，失去分片意义 ⚠️</li>
+<li><strong>模式C 客户端重定向</strong>：BEP 3 不标准支持重定向，UDP Tracker 无重定向机制 ❌</li>
+<li><strong>模式D 入口层一致性哈希代理</strong>：需新增基础设施层，UDP 代理复杂度高 ⚠️</li>
+<li><strong>模式E 协作式+部分响应</strong>：唯一保住 &lt;100μs 的模式，但分片归属名存实亡 ✅（妥协）</li>
+</ul>
+<p style="margin-top:8px;"><strong>结论</strong>：分片方案若要保持 &lt;100μs，必须采用模式E，这实际上弱化了分片的归属意义——数据仍然分散在各实例，查询仍需跨实例合并。此时分片与 Gossip 的界限变得模糊，而 Gossip 的全量副本模型在查询完整性和 NAT 容错上更优。</p>
+</div>
+</section>
+
+<!-- Section 4 -->
+<section id="design">
+<h2>4. 推荐方案详细设计</h2>
+
+<div class="callout">
+<div class="title">推荐方案：混合架构</div>
+<p><strong>控制面中心化（pnos-runtime）+ 数据面 Gossip P2P 同步 + CRDT 最终一致 + 三级 NAT 穿透 + Ed25519/Noise 安全</strong></p>
+<p style="margin-top:6px;">这是唯一能水平扩展写 QPS 的方案，与 PDC 现有架构（dirty/ShardedHashMap/事件总线/NatService）高度协同，带宽效率最高，与 P3"多实例分片"路线一致。</p>
+</div>
+
+<!-- 4.1 -->
+<section id="design-arch">
+<h3>4.1 整体架构</h3>
+
+<div class="mermaid">
+graph TB
+    subgraph 控制面["控制面（中心化）"]
+        RT["pnos-runtime<br/>实例管理/配置/Tracker池/公钥目录/信令"]
+    end
+
+    subgraph 数据面["数据面（P2P Gossip 网状）"]
+        P1["PDC-Node-01<br/>全量四大Repo"]
+        P2["PDC-Node-02<br/>全量四大Repo"]
+        P3["PDC-Node-03<br/>全量四大Repo"]
+        P4["PDC-Node-N<br/>全量四大Repo"]
+    end
+
+    RT --- P1
+    RT --- P2
+    RT --- P3
+    RT --- P4
+
+    P1 <-->|Gossip 6883| P2
+    P2 <-->|Gossip 6883| P3
+    P3 <-->|Gossip 6883| P4
+    P1 <-->|Gossip 6883| P3
+    P2 <-->|Gossip 6883| P4
+
+    style RT fill:#1c2128,stroke:#00ff41,stroke-width:2px
+    style P1 fill:#1c2128,stroke:#58a6ff,stroke-width:1px
+    style P2 fill:#1c2128,stroke:#58a6ff,stroke-width:1px
+    style P3 fill:#1c2128,stroke:#58a6ff,stroke-width:1px
+    style P4 fill:#1c2128,stroke:#58a6ff,stroke-width:1px
+</div>
+
+<h4>架构分层</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>层面</th><th>职责</th><th>协议</th><th>一致性</th></tr></thead>
+<tbody>
+<tr><td><strong>控制面</strong></td><td>实例注册/发现、配置分发、Tracker 池管理、公钥目录、NAT 信令</td><td>HTTP（pnos-runtime）</td><td>强一致（runtime 为唯一真相源）</td></tr>
+<tr><td><strong>数据面</strong></td><td>Peer/Node/Infohash 数据同步，Gossip 传播，CRDT 合并</td><td>TCP/UDP（6883 端口）</td><td>最终一致（CRDT 无冲突合并）</td></tr>
+<tr><td><strong>传输层</strong></td><td>NAT 穿透（三级降级）、加密传输（Noise XX）</td><td>UPnP/STUN/TURN + Noise</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>关键设计原则</h4>
+<ul>
+<li><strong>只同步"事实数据"</strong>（ip/port/id/last_seen），不同步"推导数据"（评分/统计/健康度）——推导数据各实例本地计算，从根本上减少冲突</li>
+<li><strong>时效性字段本地化</strong>（last_active、ref_count 各实例独立维护），存在性/评分字段 gossip 化——将变更率从 10万/s 降至 ~4300/s</li>
+<li><strong>announce 热路径零侵入</strong>——Gossip 是异步后台任务，不进入 handle_udp_announce 同步调用链</li>
+<li><strong>物理隔离</strong>——同步通道 6883 与 Tracker 通道 6880 完全隔离，加密开销不影响 Tracker 性能</li>
+</ul>
+</section>
+
+<!-- 4.2 -->
+<section id="design-data">
+<h3>4.2 数据分类同步策略</h3>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Repo</th><th>同步层面</th><th>同步策略</th><th>同步频率</th><th>不同步的字段</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>PeerRepo</strong></td>
+  <td>数据面（P2P）</td>
+  <td>Gossip 实时传播 + 仅热数据；LWW-Element-Set（基于 last_active）</td>
+  <td>实时（announce 触发，批量攒批 100条/1s）</td>
+  <td>last_active（各实例本地维护）、connection_attempts（本地统计）</td>
+</tr>
+<tr>
+  <td><strong>NodeRepo</strong></td>
+  <td>数据面（P2P）</td>
+  <td>批量增量同步（复用 dirty 标记）；LWW-Register 属性 + G-Counter 统计</td>
+  <td>批量（5分钟间隔，dirty 节点批量）</td>
+  <td>score（各实例独立评分）、query_count/success_count（本地统计）</td>
+</tr>
+<tr>
+  <td><strong>InfohashRepo</strong></td>
+  <td>数据面（P2P）</td>
+  <td>Gossip 异步传播；PN-Counter（ref_count 精确计数）+ LWW-Register（source/score）</td>
+  <td>实时（随 peer 增减，增量 delta +1/-1）</td>
+  <td>—（ref_count 用 PN-Counter 精确合并）</td>
+</tr>
+<tr>
+  <td><strong>TrackerRepo</strong></td>
+  <td>控制面（中心化）</td>
+  <td>实时同步（runtime 为源）；全量快照 LWW 合并</td>
+  <td>低频（变更触发 + 5min 心跳）</td>
+  <td>—（数据量小，全量同步）</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout">
+<div class="title">核心设计洞察</div>
+<p>PDC 数据分为两类：<strong>事实数据</strong>（peer 的 ip/port、节点的 id/addr、infohash 的存在）和<strong>推导数据</strong>（评分、统计、健康度）。推导数据是各实例基于本地网络视角计算的，本就不应该同步。只同步事实数据后，冲突解决退化为简单的 LWW，不需要复杂的 CRDT（仅引用计数需要 PN-Counter）。</p>
+</div>
+</section>
+
+<!-- 4.3 -->
+<section id="design-gossip">
+<h3>4.3 Gossip 同步协议设计</h3>
+
+<h4>4.3.1 混合模式：Push Rumor Mongering + Pull Anti-Entropy</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>机制</th><th>作用</th><th>周期</th><th>带宽</th></tr></thead>
+<tbody>
+<tr><td><strong>Push Rumor Mongering</strong></td><td>增量变更传播，低延迟</td><td>500ms~1s</td><td>低（仅传播变更）</td></tr>
+<tr><td><strong>Pull Anti-Entropy</strong></td><td>周期性对账修复，兜底一致性</td><td>60s</td><td>极低（摘要交换）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.3.2 消息格式</h4>
+<pre><code>GossipMessage {
+    msg_id: u64,                  // 去重用
+    origin_instance: [u8; 32],    // 发起实例 ID（Ed25519 公钥）
+    repo_type: u8,                // 0=Node, 1=Peer, 2=Infohash, 3=Tracker
+    op: u8,                       // 0=upsert, 1=delete
+    hlc: Hlc,                     // 混合逻辑时钟（用于冲突解决）
+    payload: bytes,               // 序列化的变更记录（bincode）
+    signature: [u8; 64],          // Ed25519 签名
+}</code></pre>
+
+<h4>4.3.3 传播机制</h4>
+<ul>
+<li><strong>fan-out</strong>：每个实例随机选择 f=4~8 个邻居传播</li>
+<li><strong>去重</strong>：维护 seen_msgs（LRU，容量 100万），收到已处理的 msg_id 直接丢弃</li>
+<li><strong>TTL</strong>：消息带 TTL（3~5跳），防止无限传播</li>
+<li><strong>攒批</strong>：announce 到达时不立即传播，在内存中攒批（100条或1秒），然后批量 gossip</li>
+<li><strong>反熵</strong>：每60s随机选择1个邻居，交换 Merkle 树根哈希摘要，发现差异后 pull 修复</li>
+</ul>
+
+<h4>4.3.4 带宽量化估算</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>变更类型</th><th>速率</th><th>单条大小</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>新 peer 发现（稳态）</td><td>~2,778 条/s</td><td>~43 B</td><td>10M ÷ 3600s TTL，announce 中绝大多数是 re-announce</td></tr>
+<tr><td>Peer score 更新</td><td>~1,000 条/s</td><td>~22 B</td><td>ScoreMaintainer 10s 增量重算</td></tr>
+<tr><td>Node 新增</td><td>~3 条/s</td><td>~35 B</td><td>目标 10,000/h</td></tr>
+<tr><td>Node score/state 更新</td><td>~500 条/s</td><td>~15 B</td><td>—</td></tr>
+<tr><td>Infohash 新增</td><td>~0.1 条/s</td><td>~20 B</td><td>实际 1K+ 总量</td></tr>
+<tr><td>Tracker 变更</td><td>&lt;0.01 条/s</td><td>~100 B</td><td>—</td></tr>
+<tr><td><strong>合计有效变更率</strong></td><td><strong>~4,300 条/s</strong></td><td><strong>加权 ~35 B</strong></td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout">
+<div class="title">带宽结论：每实例 ~2 Mbps，与实例数无关</div>
+<p>单实例出口带宽 = 4,300 × 35B × 1.5(冗余) ≈ <strong>1.8 Mbps</strong><br>
+N=5 集群总出口 ≈ <strong>16 Mbps</strong>，N=10 ≈ 18 Mbps，N=50 ≈ 100 Mbps<br>
+<strong>关键</strong>：只要不同步 last_active（各实例本地维护），有效变更率从 10万/s 降到 ~4300/s，带宽降低两个数量级。</p>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>实例数 N</th><th>每实例出口</th><th>集群总出口</th><th>每实例入口</th></tr></thead>
+<tbody>
+<tr><td>3</td><td>~1.8 Mbps</td><td>~5.4 Mbps</td><td>~1.8 Mbps</td></tr>
+<tr><td>10</td><td>~1.8 Mbps</td><td>~18 Mbps</td><td>~1.8 Mbps</td></tr>
+<tr><td>50</td><td>~2.0 Mbps</td><td>~100 Mbps</td><td>~2.0 Mbps</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.3.5 与 dirty 标记结合</h4>
+<ul>
+<li><strong>NodeRepo</strong>：已有 dirty 机制（<code>FxHashSet&lt;SocketAddr&gt;</code>），直接作为增量同步数据源，每5分钟 take_dirty 批量发送</li>
+<li><strong>PeerRepo</strong>：需新增 <code>dirty: RwLock&lt;FxHashSet&lt;(Infohash, SocketAddr)&gt;&gt;</code>，在 add_peers_sync/remove_peer/update_score 时标记</li>
+<li><strong>InfohashRepo</strong>：利用 pending 缓冲区，register/unregister 时产生增量 delta</li>
+<li><strong>TrackerRepo</strong>：数据量小，全量快照同步，无需 dirty</li>
+</ul>
+</section>
+
+<!-- 4.4 -->
+<section id="design-crdt">
+<h3>4.4 一致性模型与 CRDT</h3>
+
+<h4>4.4.1 为什么不需要强一致</h4>
+<div class="callout">
+<div class="title">PDC 没有任何数据需要 Raft/Paxos</div>
+<p>1. <strong>PeerRepo</strong>：BT 协议本身就是最终一致的，peer 列表来自 DHT/Tracker/PEX 多源，多一条过期 peer 不影响下载<br>
+2. <strong>NodeRepo</strong>：DHT 节点池是候选池，多一个坏节点浪费一次探测，少一个好节点少一个候选<br>
+3. <strong>InfohashRepo</strong>：引用计数用 PN-Counter 精确合并，不需要强一致<br>
+4. <strong>TrackerRepo</strong>：数据量小，最终一致足够</p>
+</div>
+
+<h4>4.4.2 四大 Repo 的 CRDT 映射</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>数据字段</th><th>CRDT 类型</th><th>合并操作</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td>Infohash ref_count</td><td><strong>PN-Counter</strong></td><td>per-instance (p,n) 取 max</td><td>精确计数，并发增减无冲突</td></tr>
+<tr><td>Infohash source/score</td><td>LWW-Register</td><td>取 max(HLC)</td><td>单值属性</td></tr>
+<tr><td>Peer (infohash→addr)</td><td><strong>LWW-Element-Set</strong></td><td>取 max(last_active)，TTL 30min 过期</td><td>时效性强，无需显式删除</td></tr>
+<tr><td>Peer.last_active/source</td><td>LWW-Register</td><td>取 max(timestamp/HLC)</td><td>时间戳天然有序</td></tr>
+<tr><td>Peer.priority_score</td><td>LWW / max</td><td>取 max(value)</td><td>评分取高</td></tr>
+<tr><td>Peer.connection_attempts</td><td>G-Counter</td><td>per-instance 取 max 后求和</td><td>只增计数</td></tr>
+<tr><td>Node.state/last_active</td><td>LWW-Register</td><td>取 max(HLC)</td><td>状态机属性</td></tr>
+<tr><td>Node.score</td><td><strong>不同步</strong></td><td>N/A</td><td>评分依赖本地观察</td></tr>
+<tr><td>Node.query_count</td><td>G-Counter</td><td>per-instance 取 max 后求和</td><td>只增计数</td></tr>
+<tr><td>Tracker.disabled/score</td><td>LWW-Register</td><td>取 max(HLC)</td><td>布尔状态/评分</td></tr>
+<tr><td>Tracker.total_requests</td><td>G-Counter</td><td>per-instance 取 max 后求和</td><td>只增计数</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.4.3 PN-Counter（Infohash ref_count）</h4>
+<pre><code>struct PnCounterEntry {
+    // per-instance counters: instance_id -> (positive, negative)
+    counters: FxHashMap&lt;InstanceId, (u32, u32)&gt;,
+    source: LwwRegister&lt;String&gt;,
+    score: LwwRegister&lt;f64&gt;,
+}
+
+impl PnCounterEntry {
+    fn value(&self) -> u32 {
+        self.counters.values()
+            .map(|(p, n)| p.saturating_sub(*n))
+            .sum()
+    }
+    fn register(&mut self, instance: InstanceId) {
+        self.counters.entry(instance).or_default().0 += 1;
+    }
+    fn unregister(&mut self, instance: InstanceId) {
+        self.counters.entry(instance).or_default().1 += 1;
+    }
+    fn merge(&mut self, other: &Self) {
+        for (id, (p, n)) in &other.counters {
+            let local = self.counters.entry(*id).or_default();
+            local.0 = local.0.max(*p);
+            local.1 = local.1.max(*n);
+        }
+    }
+}</code></pre>
+<p>同步时只传输增量 delta（<code>{instance_id, infohash, +1/-1}</code>），每条 ~40B，不全量传输 counters。</p>
+
+<h4>4.4.4 LWW-Element-Set（Peer 集合）</h4>
+<p>Peer 数据有 30 分钟 TTL，使用简化的 LWW-Element-Set 而非完整 OR-Set：</p>
+<ul>
+<li>不做显式 remove，只做 add（携带 last_active 时间戳）</li>
+<li>过期 peer 自动从集合中剔除（last_active > 30min）</li>
+<li>并发 add 同一 peer：取 max(last_active)，天然合并</li>
+<li><strong>无需 tombstone</strong>，内存可控——任何冲突最多存在 30 分钟</li>
+</ul>
+
+<h4>4.4.5 HLC 混合逻辑时钟</h4>
+<pre><code>struct Hlc {
+    physical: u64,  // 毫秒级物理时钟
+    counter: u32,   // 逻辑计数器
+}
+
+impl Hlc {
+    fn increment(&mut self, now_ms: u64) {
+        if now_ms > self.physical {
+            self.physical = now_ms;
+            self.counter = 0;
+        } else {
+            self.counter += 1;
+        }
+    }
+    fn merge(&mut self, remote: &Hlc, now_ms: u64) {
+        if remote.physical > self.physical {
+            self.physical = remote.physical;
+            self.counter = remote.counter + 1;
+        } else if remote.physical == self.physical {
+            self.counter = max(self.counter, remote.counter) + 1;
+        } else {
+            self.increment(now_ms);
+        }
+    }
+}</code></pre>
+<p>HLC 替代裸时间戳解决 NTP 偏移问题：保证因果有序的事件不会被错误覆盖，且物理时钟分量仍接近真实时间可用于 TTL 判断。<strong>不用向量时钟</strong>——O(N) 空间在大规模下不可接受。</p>
+
+<h4>4.4.6 TTL 过期机制简化冲突解决</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>数据</th><th>TTL</th><th>对冲突解决的简化</th></tr></thead>
+<tbody>
+<tr><td>Peer</td><td>30 分钟</td><td>无需显式 remove，LWW-Element-Set 无需 tombstone，冲突最多存在 30 分钟</td></tr>
+<tr><td>Node</td><td>24 小时（Bad 更快）</td><td>节点状态冲突可被时间消解，坏节点自然淘汰</td></tr>
+<tr><td>Infohash</td><td>ref_count=0 时延迟删除</td><td>PN-Counter 精确计数，TTL 作为兜底</td></tr>
+<tr><td>Tracker</td><td>无 TTL（人工管理）</td><td>数据量小，LWW 足够</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- 4.5 -->
+<section id="design-nat">
+<h3>4.5 NAT 穿透方案</h3>
+
+<h4>4.5.1 三级降级策略</h4>
+<div class="mermaid">
+graph TD
+    A["阶段0: 预检<br/>STUN检测NAT类型+获取公网映射地址"] --> B{"对端有公网/Full Cone?"}
+    B -->|是| C["直连<br/>直接 TCP/UDP 连接"]
+    B -->|否| D["阶段1: UPnP<br/>尝试UPnP映射同步端口"]
+    D -->|成功| C
+    D -->|失败| E["阶段2: STUN+UDP打洞<br/>交换公网映射地址+同时发送打洞包<br/>Symmetric时端口预测"]
+    E -->|成功| C
+    E -->|失败(超时5s)| F["阶段3: TURN中继兜底<br/>分配中继端口+双方通过中继转发<br/>带宽限流+计费统计"]
+
+    style A fill:#1c2128,stroke:#00ff41
+    style C fill:#0d3b1e,stroke:#00ff41,stroke-width:2px
+    style F fill:#3b1e0d,stroke:#d29922,stroke-width:2px
+</div>
+
+<h4>4.5.2 NAT 类型组合穿透成功率矩阵</h4>
+<p>仅使用 UDP 打洞（无中继）的预期成功率：</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>发起方 \ 目标方</th><th>Open Internet</th><th>Full Cone</th><th>Restricted Cone</th><th>Port Restricted</th><th>Symmetric</th><th>CGNAT</th></tr></thead>
+<tbody>
+<tr><td><strong>Open Internet</strong></td><td>100%</td><td>100%</td><td>100%</td><td>100%</td><td>100%</td><td>100%</td></tr>
+<tr><td><strong>Full Cone</strong></td><td>100%</td><td>95%+</td><td>90%+</td><td>85%+</td><td>60%</td><td>85%+</td></tr>
+<tr><td><strong>Restricted Cone</strong></td><td>100%</td><td>90%+</td><td>85%+</td><td>80%+</td><td>40%</td><td>80%+</td></tr>
+<tr><td><strong>Port Restricted</strong></td><td>100%</td><td>85%+</td><td>80%+</td><td>75%+</td><td>30%</td><td>75%+</td></tr>
+<tr><td><strong>Symmetric</strong></td><td>100%</td><td>60%</td><td>40%</td><td>30%</td><td><strong style="color:#f85149;">&lt;5%</strong></td><td>30%</td></tr>
+<tr><td><strong>CGNAT</strong></td><td>100%</td><td>85%+</td><td>80%+</td><td>75%+</td><td>30%</td><td>70%+</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warn">
+<div class="title">关键洞察</div>
+<p>Symmetric NAT（企业/学校网络常见）与任何对端组合的打洞成功率都显著降低，<strong>Symmetric-Symmetric 几乎必须中继</strong>（&lt;5%）。这正是 TURN 存在的意义。WebRTC 统计：约 8-15% 的通话最终需要 TURN 中继。</p>
+</div>
+
+<h4>4.5.3 端口规划</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>端口</th><th>用途</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><strong>6880</strong></td><td>超级 Tracker（TCP+UDP）</td><td>10万 QPS、&lt;100μs 响应路径，<strong>不复用于同步</strong></td></tr>
+<tr><td><strong>6881</strong></td><td>中继/打洞（UDP+TCP）</td><td>升级为 TURN 兼容协议，增加认证+限流</td></tr>
+<tr><td><strong>6882</strong></td><td>DHT 爬虫（UDP）</td><td>不复用——DHT 面向公网匿名节点，混入同步消息增加复杂度</td></tr>
+<tr><td><strong>6883（新增）</strong></td><td><strong>实例间同步专用</strong>（TCP+UDP）</td><td>与 Tracker 物理隔离，独立加密，不影响 6880 性能</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.5.4 中继带宽估算</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>规模</th><th>参数</th><th>中继总带宽</th></tr></thead>
+<tbody>
+<tr><td>N=10</td><td>X=100条/s, S=200B, r=15%</td><td><strong>~300 Kbps</strong></td></tr>
+<tr><td>N=100</td><td>X=1000条/s, S=200B, r=15%</td><td><strong>~30 Mbps</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>大规模（N&gt;100）时中继出向带宽随 O(N²) 增长，需优化：gossip 协议（每实例只向 k=log₂N 邻居转发）、增量压缩（snappy/zstd 降 60-80%）、分层中继（按区域/网段分流）。</p>
+
+<div class="callout warn">
+<div class="title">6881 中继已知问题</div>
+<p>当前自定义中继是广播式转发（handle_udp_packet 中转发给所有其他客户端），N&gt;20 时产生 O(N²) 流量，<strong>必须改为定向转发或 gossip</strong>。</p>
+</div>
+</section>
+
+<!-- 4.6 -->
+<section id="design-security">
+<h3>4.6 安全认证架构</h3>
+
+<h4>4.6.1 安全威胁模型</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>威胁</th><th>描述</th><th>严重度</th></tr></thead>
+<tbody>
+<tr><td>未授权接入</td><td>任意节点连接同步端口，读取/写入数据</td><td><span class="badge badge-red">高</span></td></tr>
+<tr><td>数据篡改</td><td>中间人修改同步消息内容</td><td><span class="badge badge-red">高</span></td></tr>
+<tr><td>伪造实例</td><td>攻击者冒充合法 PDC 实例注入数据</td><td><span class="badge badge-red">高</span></td></tr>
+<tr><td>Sybil 攻击</td><td>攻击者创建大量恶意实例控制集群</td><td><span class="badge badge-orange">中高</span></td></tr>
+<tr><td>重放攻击</td><td>截获合法消息后重放</td><td><span class="badge badge-orange">中</span></td></tr>
+<tr><td>窃听</td><td>中间人读取同步流量</td><td><span class="badge badge-orange">中</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.6.2 三层安全架构</h4>
+<div class="mermaid">
+graph LR
+    subgraph 身份层["身份层"]
+        I1["Ed25519 密钥对生成"]
+        I2["实例ID=公钥"]
+        I3["TOFU/白名单信任锚"]
+    end
+    subgraph 传输层["传输层"]
+        T1["Noise XX 1-RTT握手"]
+        T2["ChaCha20-Poly1305加密"]
+        T3["0-RTT重连(IK模式)"]
+    end
+    subgraph 消息层["消息层"]
+        M1["消息签名 Ed25519"]
+        M2["时间戳+序列号防重放"]
+        M3["权限校验 runtime查询"]
+    end
+    subgraph 数据层["数据层"]
+        D1["实例信誉评分"]
+        D2["主动探测验证"]
+        D3["CRDT多源合并"]
+        D4["低信誉降权/封禁"]
+    end
+
+    身份层 --> 传输层 --> 消息层 --> 数据层
+
+    style 身份层 fill:#1c2128,stroke:#00ff41
+    style 传输层 fill:#1c2128,stroke:#58a6ff
+    style 消息层 fill:#1c2128,stroke:#bc8cff
+    style 数据层 fill:#1c2128,stroke:#d29922
+</div>
+
+<h4>4.6.3 Ed25519 实例身份</h4>
+<ul>
+<li>每个 PDC 实例首次启动时生成 Ed25519 密钥对，私钥存储在本地（<code>~/.pdc/identity.key</code>，权限 0600）</li>
+<li><strong>实例 ID = 公钥</strong>，全局唯一且自验证</li>
+<li>公钥随注册信息提交到 pnos-runtime，runtime 作为<strong>公钥目录</strong>（不签发证书，只存储和查询）</li>
+<li>信任模型：MVP 用 TOFU + 本地 known_instances 文件（类似 SSH known_hosts）；生产升级为 pnos-runtime 公证模式</li>
+</ul>
+
+<h4>4.6.4 Noise XX 握手</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>特性</th><th>Noise XX</th><th>TLS 1.3</th></tr></thead>
+<tbody>
+<tr><td>握手 RTT</td><td><strong>1-RTT</strong></td><td>1-RTT</td></tr>
+<tr><td>握手消息大小</td><td>~200B</td><td>~1KB</td></tr>
+<tr><td>内置身份认证</td><td><strong>XX 模式交换并验证公钥</strong></td><td>需额外证书层</td></tr>
+<tr><td>UDP/TCP 通用</td><td><strong>支持</strong></td><td>TCP only（DTLS for UDP）</td></tr>
+<tr><td>0-RTT 重连</td><td><strong>IK 模式</strong></td><td>支持</td></tr>
+<tr><td>Rust 生态</td><td><code>snow</code>（libp2p 同款）</td><td><code>rustls</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.6.5 消息信封格式</h4>
+<pre><code>Envelope {
+    version: u8,
+    msg_type: u8,          // SyncOp/Heartbeat/Ack
+    instance_id: [u8; 32], // 发送方公钥
+    timestamp: u64,        // 毫秒级 Unix 时间
+    seq: u64,              // per-instance 单调递增序列号
+    nonce: [u8; 16],       // 随机数
+    payload_len: u32,
+    payload: [u8],         // CRDT 操作 + 数据（bincode）
+    signature: [u8; 64],   // Ed25519 over header+payload
+}</code></pre>
+
+<h4>4.6.6 防重放</h4>
+<p><strong>时间戳窗口（±5分钟）+ per-instance 单调序列号</strong>：接收方维护 <code>last_seq[instance_id]</code>，拒绝 <code>seq &lt;= last_seq</code> 的消息。序列号无需持久化，重启后从对端同步最新值。</p>
+
+<h4>4.6.7 防 Sybil</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>手段</th><th>描述</th><th>阶段</th></tr></thead>
+<tbody>
+<tr><td>注册审批</td><td>pnos-runtime 管理员手动批准新实例</td><td>MVP</td></tr>
+<tr><td>IP 限速</td><td>同一 /24 网段最多 3 个实例</td><td>MVP</td></tr>
+<tr><td>邀请制</td><td>新实例需已有实例签名邀请，邀请者负连带责任</td><td>生产</td></tr>
+<tr><td>信誉加权</td><td>新实例初始信誉低，数据降权</td><td>生产</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.6.8 恶意数据多层防护</h4>
+<ol>
+<li><strong>L1 身份层</strong>：实例认证 + 消息签名，确保消息来自已知实例</li>
+<li><strong>L2 信誉层</strong>：实例信誉评分（数据准确率动态调整），低信誉降权</li>
+<li><strong>L3 数据验证层</strong>：按比例主动探测验证 peer/node 真实性，虚假数据回溯扣分</li>
+<li><strong>L4 冲突仲裁层</strong>：CRDT 多源合并，单实例虚假数据被多数稀释</li>
+<li><strong>L5 隔离层</strong>：信誉低于阈值自动断开连接并加入黑名单</li>
+</ol>
+
+<h4>4.6.9 MVP 选型</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Crate</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>snow</code></td><td>Noise Protocol 实现（libp2p 同款）</td></tr>
+<tr><td><code>ed25519-dalek</code></td><td>Ed25519 签名（或 ring）</td></tr>
+<tr><td><code>rand</code></td><td>nonce 生成（已在依赖中）</td></tr>
+<tr><td><code>serde</code>/<code>bincode</code></td><td>消息序列化（bincode 比 JSON 紧凑 3-5 倍）</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- 4.7 -->
+<section id="design-perf">
+<h3>4.7 性能影响分析</h3>
+
+<h4>4.7.1 对 10万 QPS / &lt;100μs 的影响</h4>
+<div class="callout">
+<div class="title">announce 热路径零侵入</div>
+<p>Gossip 是异步后台任务，<strong>不进入 handle_udp_announce 的同步调用链</strong>。announce 仍然纯本地内存操作，&lt;100μs 目标不受影响。间接开销仅为 PeerRepo 增加 dirty 标记（每次 add_peer 多一次 HashSet insert，~100ns），可忽略。</p>
+</div>
+
+<h4>4.7.2 安全机制 CPU 开销</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>安全机制</th><th>计算开销</th><th>对同步通道影响</th><th>对 Tracker(6880) 影响</th></tr></thead>
+<tbody>
+<tr><td>Noise XX 握手</td><td>~200μs/连接</td><td>每连接一次，长连接可忽略</td><td><span class="badge badge-green">零</span>（物理隔离）</td></tr>
+<tr><td>ChaCha20-Poly1305</td><td>~1-2μs/KB</td><td>1000 msg/s × 200B = 0.2-0.4% CPU</td><td><span class="badge badge-green">零</span></td></tr>
+<tr><td>Ed25519 消息签名</td><td>~20-50μs/条</td><td>1000 msg/s = 2-5% CPU</td><td><span class="badge badge-green">零</span></td></tr>
+<tr><td>Ed25519 消息验证</td><td>~50-100μs/条</td><td>接收侧 5-10% CPU</td><td><span class="badge badge-green">零</span></td></tr>
+<tr><td>时间戳+序列号检查</td><td>&lt;1μs/条</td><td>可忽略</td><td><span class="badge badge-green">零</span></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>结论</strong>：安全机制对同步通道的 CPU 开销在 <strong>5-15%</strong> 范围内（主要是签名验证），对 10万 QPS 的 Tracker 服务通道<strong>零影响</strong>（物理隔离在 6883 端口）。如签名验证成为瓶颈，可批量签名（每10条签一次 batch signature）将验证开销降为 1/10。</p>
+
+<h4>4.7.3 内存开销</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>组件</th><th>内存占用</th></tr></thead>
+<tbody>
+<tr><td>Gossip outbox + seen_msgs 去重缓存</td><td>~200-500 MB（千万级 key 的 dirty 集合）</td></tr>
+<tr><td>同步发送缓冲区</td><td>~10 MB</td></tr>
+<tr><td>Merkle Tree（反熵摘要）</td><td>~32 KB（1024 分片 × 32B）</td></tr>
+<tr><td>PN-Counter per-instance counters</td><td>N=10 时每 infohash 多 80B，可增量同步不全量传</td></tr>
+<tr><td>HLC 状态</td><td>每实例 12 字节，可忽略</td></tr>
+<tr><td><strong>合计增加</strong></td><td><strong>~210-520 MB</strong>，在 8GB 预算内</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>4.7.4 磁盘 IO</h4>
+<p><strong>无影响</strong>——同步数据来自内存（dirty/热数据），gossip 消息不需要持久化（丢失了靠反熵修复）。安全模块的私钥和 known_instances 文件仅在启动/连接时读写。</p>
+
+<h4>4.7.5 新实例冷启动</h4>
+<ul>
+<li>全量数据大小：10M × 35B = 350 MB（紧凑二进制），gzip 后 ~100 MB</li>
+<li>从单实例拉取：100 MB ÷ 100 Mbps = 8s；从多实例并行拉取可加速到 2~3s</li>
+<li>冷启动期间需限流（如 50 MB/s），避免影响提供数据的实例的 announce</li>
+<li>新实例标记为 "warmup" 状态，不参与查询响应（或仅响应已有数据）</li>
+</ul>
+</section>
+</section>
+
+<!-- Section 5 -->
+<section id="roadmap">
+<h2>5. 实施路线图</h2>
+
+<div class="callout">
+<div class="title">前置依赖</div>
+<p>PDC 需先接入 <strong>pnos-sdk</strong>（当前 Cargo.toml 尚无此依赖），这是多实例互联的前提。按 AGENTS.md 约束，所有生态项目统一依赖 <code>pnos</code>（git）+ <code>pnos-sdk</code>（path）。</p>
+</div>
+
+<div class="timeline">
+
+<div class="timeline-item">
+<div class="milestone">M1: 安全基础 <span class="duration">1-2 周</span></div>
+<div class="desc">
+Ed25519 身份 + Noise 握手 + 消息签名 + TOFU 信任锚<br>
+<strong>改造点</strong>：新增 identity 模块（密钥生成/持久化）、noise 握手模块、消息信封编解码、known_instances 文件<br>
+<strong>涉及模块</strong>：新增 <code>src/sync/identity.rs</code>、<code>src/sync/transport.rs</code><br>
+<strong>依赖 crate</strong>：snow + ed25519-dalek + bincode
+</div>
+</div>
+
+<div class="timeline-item">
+<div class="milestone">M2: CRDT 数据层 <span class="duration">3-5 天</span></div>
+<div class="desc">
+HLC 实现与持久化 + InfohashRepo PN-Counter 改造 + PeerRepo LWW-Element-Set 确认<br>
+<strong>改造点</strong>：HLC 结构体（physical+counter）、InfohashRepo entries 改为 PnCounterEntry、PeerRepo 增加 dirty 标记、expire_peers 定期任务<br>
+<strong>涉及模块</strong>：<code>storage/infohash_repo.rs</code>、<code>storage/peer_repo.rs</code>、新增 <code>src/sync/crdt/</code><br>
+<strong>优先级</strong>：<span class="badge badge-green">P0</span> CRDT 合并器就绪后才能处理同步消息
+</div>
+</div>
+
+<div class="timeline-item">
+<div class="milestone">M3: 直连同步 <span class="duration">1-2 周</span></div>
+<div class="desc">
+6883 同步端口 + pnos-runtime 发现 + 有公网实例直连同步<br>
+<strong>改造点</strong>：新增 6883 TCP 监听、通过 pnos-sdk 发现对端实例、GossipEngine 骨架（outbox/seen_msgs/邻居管理）、NodeRepo 批量增量同步（复用 dirty）<br>
+<strong>涉及模块</strong>：新增 <code>src/sync/gossip_engine.rs</code>、<code>src/sync/server.rs</code>、main.rs 启动集成<br>
+<strong>目标</strong>：验证 P2P 连接管理和基础同步，MVP 可用
+</div>
+</div>
+
+<div class="timeline-item">
+<div class="milestone">M4: NAT 打洞同步 <span class="duration">3-5 天</span></div>
+<div class="desc">
+集成现有 HolePuncher，NAT 后实例通过 STUN 打洞建立 6883 UDP 连接<br>
+<strong>改造点</strong>：HolePuncher 暴露 mapped_address() 和 nat_type()、同步模块集成打洞流程、pnos-sdk 注册增加 nat_type/mapped_addr 字段<br>
+<strong>涉及模块</strong>：<code>nat/udp_hole_punch.rs</code>、<code>data_plane/hole_punch_signaling.rs</code>、<code>src/sync/transport.rs</code><br>
+<strong>依赖</strong>：M1 安全握手（打洞建立连接后需安全握手）
+</div>
+</div>
+
+<div class="timeline-item">
+<div class="milestone">M5: 中继兜底 <span class="duration">1-2 周</span></div>
+<div class="desc">
+6881 中继升级（定向转发+认证+限流），打洞失败走中继<br>
+<strong>改造点</strong>：自定义中继广播式转发改为定向转发、增加 TURN Allocate/CreatePermission/Send 消息支持、集成实例身份认证、带宽限流<br>
+<strong>涉及模块</strong>：<code>data_plane/relay.rs</code>（升级重点）、<code>src/sync/transport.rs</code><br>
+<strong>已知问题</strong>：当前广播式转发 N&gt;20 时 O(N²) 流量，必须修复
+</div>
+</div>
+
+<div class="timeline-item">
+<div class="milestone">M6: 生产安全 <span class="duration">2-3 周</span></div>
+<div class="desc">
+runtime 公证 + 信誉系统 + 权限分级 + 反熵对账<br>
+<strong>改造点</strong>：pnos-runtime 公钥目录+公证签名、实例信誉评分系统、主动探测验证、权限分级（full/receive_only/report_only）、Anti-Entropy Merkle 对账、注册审批+IP限速<br>
+<strong>涉及模块</strong>：pnos-runtime（公钥目录）、新增 <code>src/sync/reputation.rs</code>、<code>src/sync/anti_entropy.rs</code><br>
+<strong>优先级</strong>：<span class="badge badge-orange">P1</span> 生产级可靠性
+</div>
+</div>
+
+<div class="timeline-item">
+<div class="milestone">M7: 大规模优化 <span class="duration">3-4 周</span></div>
+<div class="desc">
+gossip 协议优化 + 压缩 + 多中继 + ICE 标准化 + 按 infohash 分片<br>
+<strong>改造点</strong>：gossip 随机 k 邻居转发（k=log₂N）、snappy/zstd 增量压缩、多中继节点部署、标准 TURN 协议（RFC 5766）兼容、ICE 候选收集+连通性检查（Trickle ICE）、一致性哈希分片（与 P3 路线衔接）<br>
+<strong>涉及模块</strong>：<code>src/sync/gossip_engine.rs</code>、<code>data_plane/relay.rs</code>、新增分片路由层<br>
+<strong>触发条件</strong>：N&gt;50 场景或数据量突破单实例内存上限
+</div>
+</div>
+
+</div>
+
+<h4>三阶段演进（控制面报告视角）</h4>
+<div class="table-wrap">
+<table>
+<thead><tr><th>阶段</th><th>内容</th><th>对应里程碑</th><th>目标</th></tr></thead>
+<tbody>
+<tr><td><strong>阶段1（MVP）</strong></td><td>控制面中心化 + NodeRepo 批量增量同步</td><td>M1-M3</td><td>验证 P2P 连接管理和 NAT 穿透，建立基础架构</td></tr>
+<tr><td><strong>阶段2</strong></td><td>PeerRepo gossip 同步 + 反熵机制</td><td>M3-M6</td><td>验证写 QPS 水平扩展能力</td></tr>
+<tr><td><strong>阶段3</strong></td><td>按 infohash 分片（与 P3 路线衔接）</td><td>M7</td><td>支撑亿级数据和百万级 QPS</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- Section 6 -->
+<section id="risk">
+<h2>6. 风险与待确认事项</h2>
+
+<h3>6.1 关键风险</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>风险</th><th>描述</th><th>严重度</th><th>缓解措施</th></tr></thead>
+<tbody>
+<tr><td>pnos-runtime 公网可达性</td><td>runtime 作为信令/公钥目录需所有实例可访问，若 runtime 也在 NAT 后需先解决自身外网可达</td><td><span class="badge badge-red">高</span></td><td>runtime 部署在有公网 IP 的云服务器；或 runtime 自身启用 UPnP</td></tr>
+<tr><td>家用设备 NTP 偏移</td><td>Windows 默认 NTP 同步间隔 7 天，时钟偏移可能 &gt;1s，影响 LWW</td><td><span class="badge badge-orange">中</span></td><td>PDC 启动时强制 w32tm /resync，HLC 兜底</td></tr>
+<tr><td>Symmetric NAT 比例</td><td>企业/学校网络 Symmetric NAT 比例未知，影响中继带宽规划</td><td><span class="badge badge-orange">中</span></td><td>上线后收集 nat_type 统计数据，按实际比例调整中继容量</td></tr>
+<tr><td>CRDT 内存增长</td><td>PN-Counter per-instance counters 在 N 大时内存增长</td><td><span class="badge badge-orange">中</span></td><td>增量同步只传 delta，不全量传 counters；定期压缩（合并已离线实例的 counter）</td></tr>
+<tr><td>pnos-sdk 未接入</td><td>PDC 当前 Cargo.toml 无 pnos-sdk 依赖，注册机制未接入</td><td><span class="badge badge-red">高</span></td><td>按 AGENTS.md 约束接入 pnos + pnos-sdk，这是多实例互联的前提</td></tr>
+<tr><td>6881 中继广播问题</td><td>当前自定义中继广播式转发，N&gt;20 时 O(N²) 流量</td><td><span class="badge badge-orange">中</span></td><td>M5 升级为定向转发</td></tr>
+<tr><td>PeerRepo 单 RwLock 瓶颈</td><td>PeerRepo 实际是单 RwLock 而非 64 分片，10万 QPS 下是潜在瓶颈</td><td><span class="badge badge-orange">中</span></td><td>同步方案设计时考虑前置优化，将 PeerRepo 改为 ShardedHashMap</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>6.2 待确认事项</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>#</th><th>待确认项</th><th>影响</th><th>建议</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>部署规模</strong>：预期 PDC 实例数是多少？（3~10 / 10~50 / 50+）</td><td>直接影响方案选择和 gossip 参数调优</td><td>明确目标规模，3~10 实例全互联即可，50+ 需要部分互联</td></tr>
+<tr><td>2</td><td><strong>部署环境</strong>：实例是否都在公网？还是部分在 NAT 后？是否有公网中继节点？</td><td>NAT 穿透难度和中继带宽规划</td><td>调研实际部署环境，统计 NAT 类型分布</td></tr>
+<tr><td>3</td><td><strong>是否跨地域</strong>：实例是否跨地域部署？</td><td>跨地域 RTT 高，对分片方案更不利，对 gossip 无影响</td><td>跨地域场景下 Gossip 优势更明显</td></tr>
+<tr><td>4</td><td><strong>ref_count 精确性需求</strong>：业务上是否需要全局精确 ref_count？</td><td>当前代码中 ref_count 仅用于 cleanup_zero_ref，不精确可接受</td><td>确认是否需要精确计数；PN-Counter 已提供精确合并能力</td></tr>
+<tr><td>5</td><td><strong>spde 查询模式</strong>：spde 查询 peer 时是否容忍秒级数据延迟？</td><td>影响同步频率和一致性要求</td><td>确认 spde 对数据实时性的要求</td></tr>
+<tr><td>6</td><td><strong>公网 TURN 中继预算</strong>：是否有公网中继服务器预算？</td><td>方案 3 的兜底能力</td><td>确认基础设施预算，至少 1~2 个公网中继节点</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- Section 7 -->
+<section id="appendix">
+<h2>7. 附录</h2>
+
+<h3>7.1 术语表</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>术语</th><th>全称</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>NAT</td><td>Network Address Translation</td><td>网络地址转换，将私网地址映射为公网地址</td></tr>
+<tr><td>CGNAT</td><td>Carrier-Grade NAT</td><td>运营商级 NAT，多家用户共享一个公网 IP，UPnP 无效</td></tr>
+<tr><td>STUN</td><td>Session Traversal Utilities for NAT</td><td>RFC 5389，用于发现 NAT 类型和公网映射地址</td></tr>
+<tr><td>TURN</td><td>Traversal Using Relays around NAT</td><td>RFC 5766，通过中继服务器转发流量，穿透所有 NAT</td></tr>
+<tr><td>ICE</td><td>Interactive Connectivity Establishment</td><td>RFC 8445，STUN+TURN 组合的标准化连接建立流程</td></tr>
+<tr><td>CRDT</td><td>Conflict-free Replicated Data Type</td><td>无冲突复制数据类型，保证多副本合并无冲突</td></tr>
+<tr><td>PN-Counter</td><td>Positive-Negative Counter</td><td>支持增减的计数器 CRDT，per-replica (p,n) 取 max 合并</td></tr>
+<tr><td>OR-Set</td><td>Observed-Remove Set</td><td>支持并发 add/remove 的集合 CRDT</td></tr>
+<tr><td>LWW</td><td>Last-Write-Wins</td><td>最后写入胜出，基于时间戳的简单冲突解决策略</td></tr>
+<tr><td>HLC</td><td>Hybrid Logical Clock</td><td>混合逻辑时钟，结合物理时钟和逻辑时钟</td></tr>
+<tr><td>TOFU</td><td>Trust On First Use</td><td>首次使用信任，类似 SSH 的信任模型</td></tr>
+<tr><td>Sybil</td><td>Sybil Attack</td><td>女巫攻击，攻击者创建大量虚假节点控制网络</td></tr>
+<tr><td>Gossip</td><td>Gossip Protocol</td><td>谣言协议，节点随机向邻居传播信息，实现最终一致</td></tr>
+<tr><td>Anti-Entropy</td><td>反熵</td><td>周期性交换数据摘要修复不一致的机制</td></tr>
+<tr><td>Noise</td><td>Noise Protocol Framework</td><td>轻量加密协议框架，XX 模式 1-RTT 握手</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>7.2 参考资料</h3>
+<ul>
+<li><code>D:\PNOS\pdc\docs\architecture\07-multi-instance-sync-research.md</code> — 控制面方案研究（三方案十维度对比）</li>
+<li><code>D:\PNOS\pdc\docs\architecture\07-multi-instance-sync.md</code> — P2P 数据面方案研究（Gossip vs 分片）</li>
+<li><code>D:\PNOS\pdc\docs\architecture\07-multi-instance-interconnect.md</code> — NAT穿透/安全认证/一致性专项</li>
+<li><code>D:\PNOS\pdc\docs\architecture\00-overview.md</code> — PDC 架构总览</li>
+<li><code>D:\PNOS\pdc\docs\architecture\04-data-model.md</code> — PDC 数据模型与 Repo 设计</li>
+<li><code>D:\PNOS\pdc\docs\architecture\06-performance.md</code> — PDC 千万级性能优化设计</li>
+<li><code>D:\PNOS\AGENTS.md</code> — PandaNetOS 生态项目指南</li>
+<li>RFC 5389 — STUN</li>
+<li>RFC 5766 — TURN</li>
+<li>RFC 8445 — ICE</li>
+</ul>
+
+<h3>7.3 源报告核心结论索引</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>源报告</th><th>核心结论</th></tr></thead>
+<tbody>
+<tr><td><strong>控制面报告</strong></td><td>pnos-runtime 能力缺口大（无事件总线/数据同步/持久化/集群）；主从写集中无法扩展 10万 QPS；混合架构唯一能水平扩展写 QPS，N=5 时集群总出口仅 16 Mbps；只同步事实数据，评分/统计各实例本地推导</td></tr>
+<tr><td><strong>P2P 报告</strong></td><td>dirty 机制只有 NodeRepo 有；PeerRepo 实际是单 RwLock 非 64 分片；Gossip 带宽每实例 ~2 Mbps 与实例数无关；分片方案跨实例转发破坏 &lt;100μs，五种路由模式中只有模式 E 能保住延迟但分片归属名存实亡；UDP scrape 未实现</td></tr>
+<tr><td><strong>NAT/安全/一致性报告</strong></td><td>PDC NAT 模块已有 UPnP/NAT-PMP/PCP/STUN/UDP打洞/自定义中继/IPv6，缺 TURN/ICE/传输加密/实例身份；三级降级覆盖 95%+ 连接；Ed25519+Noise+消息签名+TOFU；四大 Repo 全部最终一致无需 Raft/Paxos；CRDT 映射：ref_count→PN-Counter，Peer→LWW-Element-Set，Node/Tracker→LWW-Register；HLC 替代裸时间戳；Peer 30min TTL 意味着冲突最多存在 30 分钟</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<div class="footer">
+<p>PDC 多实例外网数据同步方案研究报告 | v1.0 | 2026-09-09</p>
+<p>基于 PDC v0.2.0 代码状态分析 | 整合自三份专项研究报告</p>
+</div>
+
+</main>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    background: '#161b22',
+    primaryColor: '#1c2128',
+    primaryTextColor: '#c9d1d9',
+    primaryBorderColor: '#00ff41',
+    lineColor: '#8b949e',
+    secondaryColor: '#0d1117',
+    tertiaryColor: '#161b22',
+    fontFamily: 'JetBrains Mono, Consolas, monospace',
+    fontSize: '13px'
+  }
+});
+
+// Sidebar active state
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('.sidebar nav a');
+window.addEventListener('scroll', () => {
+  let current = '';
+  sections.forEach(section => {
+    const sectionTop = section.offsetTop;
+    if (window.scrollY >= sectionTop - 100) current = section.getAttribute('id');
+  });
+  navLinks.forEach(link => {
+    link.classList.remove('active');
+    if (link.getAttribute('href') === '#' + current) link.classList.add('active');
+  });
+});
+</script>
+</body>
+</html>

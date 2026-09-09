@@ -248,6 +248,7 @@ impl NatManager {
         relay_port: u16,
         utp_port: u16,
         tcp_pex_port: u16,
+        federation_port: u16,
     ) -> anyhow::Result<()> {
         if !self.enabled {
             info!("[nat] UPnP 未启用，跳过端口映射");
@@ -492,6 +493,63 @@ impl NatManager {
             }
         }
 
+
+        // 4.8 联邦网络端口（TCP + UDP）
+        if federation_port > 0 {
+            // 联邦 TCP
+            match self
+                .map_port_with_retry(
+                    &gateway,
+                    igd::PortMappingProtocol::TCP,
+                    federation_port,
+                    "PDC Federation TCP",
+                )
+                .await
+            {
+                Ok(ext_port) => {
+                    success_count += 1;
+                    info!("[nat] TCP {} → 外部 {} 映射成功（联邦）", federation_port, ext_port);
+                    self.mappings.write().push(NatMapping {
+                        protocol: "TCP".to_string(),
+                        internal_port: federation_port,
+                        external_port: ext_port,
+                        description: "PDC Federation TCP".to_string(),
+                        verified: false,
+                        reachable: false,
+                    });
+                }
+                Err(e) => {
+                    warn!("[nat] TCP {} 映射失败（联邦）: {}", federation_port, e);
+                }
+            }
+            // 联邦 UDP
+            match self
+                .map_port_with_retry(
+                    &gateway,
+                    igd::PortMappingProtocol::UDP,
+                    federation_port,
+                    "PDC Federation UDP",
+                )
+                .await
+            {
+                Ok(ext_port) => {
+                    success_count += 1;
+                    info!("[nat] UDP {} → 外部 {} 映射成功（联邦）", federation_port, ext_port);
+                    self.mappings.write().push(NatMapping {
+                        protocol: "UDP".to_string(),
+                        internal_port: federation_port,
+                        external_port: ext_port,
+                        description: "PDC Federation UDP".to_string(),
+                        verified: false,
+                        reachable: false,
+                    });
+                }
+                Err(e) => {
+                    warn!("[nat] UDP {} 映射失败（联邦）: {}", federation_port, e);
+                }
+            }
+        }
+
         // 5. 验证所有映射
         self.verify_mappings(&gateway).await;
 
@@ -510,6 +568,7 @@ impl NatManager {
                 if relay_port > 0 { total += 2; } // TCP + UDP
                 if utp_port > 0 { total += 1; }
                 if tcp_pex_port > 0 { total += 1; }
+                if federation_port > 0 { total += 2; } // TCP + UDP
                 total
             },
             verified_count

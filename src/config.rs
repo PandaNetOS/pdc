@@ -38,6 +38,9 @@ pub struct PdcConfig {
     /// 持久化优化配置
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    /// 联邦网络配置
+    #[serde(default)]
+    pub federation: crate::federation::config::FederationConfig,
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -145,6 +148,7 @@ impl Default for PdcConfig {
             nat: NatConfig::default(),
             storage: StorageConfig::default(),
             persistence: PersistenceConfig::default(),
+            federation: Default::default(),
             log_level: default_log_level(),
         }
     }

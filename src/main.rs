@@ -163,6 +163,10 @@ async fn main() -> anyhow::Result<()> {
             nat.clone(),
             node_repo.clone(),
             data_dir,
+            Some(event_bus.clone()),
+            Some(peer_repo.clone()),
+            Some(infohash_repo.clone()),
+            Some(tracker_repo.clone()),
         ) {
             Ok(svc) => {
                 let svc = Arc::new(svc);
@@ -423,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
         pex_receiver: Some(pex_receiver),
         tcp_pex_server,
         active_pex,
+        federation: federation_service.clone(),
     };
 
     // 8. 启动健康检查任务

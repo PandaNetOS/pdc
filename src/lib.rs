@@ -69,6 +69,7 @@ pub mod dht;
 pub mod discoverers;
 pub mod dns_pool;
 pub mod event_bus;
+pub mod federation;
 pub mod health_check;
 pub mod intelligence;
 pub mod nat;

@@ -380,6 +380,34 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
                 "errors": stats.errors,
             })
         }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
+        // 联邦网络状态
+        "federation": state.federation.as_ref().map(|f| {
+            let status = f.status();
+            serde_json::json!({
+                "enabled": status.enabled,
+                "node_id": status.node_id,
+                "connections": status.connections,
+                "known_nodes": status.known_nodes,
+                "reachability": status.reachability,
+                "uptime_secs": status.uptime_secs,
+                "gossip_queue_size": status.gossip_queue_size,
+                "relay_channels": status.relay_channels,
+            })
+        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
+        // 联邦网络状态
+        "federation": state.federation.as_ref().map(|f| {
+            let status = f.status();
+            serde_json::json!({
+                "enabled": status.enabled,
+                "node_id": status.node_id,
+                "connections": status.connections,
+                "known_nodes": status.known_nodes,
+                "reachability": status.reachability,
+                "uptime_secs": status.uptime_secs,
+                "gossip_queue_size": status.gossip_queue_size,
+                "relay_channels": status.relay_channels,
+            })
+        }).unwrap_or_else(|| serde_json::json!({"enabled": false})),
     })
 }
 
