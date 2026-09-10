@@ -29,5 +29,8 @@ fn main() {
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
     println!("cargo:rustc-env=GIT_BRANCH={}", git_branch);
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
+    // 当 git HEAD 或分支引用变化时重新运行 build.rs
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads/main");
+    println!("cargo:rerun-if-changed=.git/refs/heads/master");
 }
