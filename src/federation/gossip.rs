@@ -371,6 +371,10 @@ impl GossipEngine {
         // 使用索引而非引用，便于后续按连接分组和 bulk 合并。
         let mut by_conn: FxHashMap<NodeId, (Arc<Connection>, Vec<usize>)> = FxHashMap::default();
         {
+            // 全量同步期间：接收端设置了 receiving_full_sync=true（不转发），
+            // 流行病传播链断裂。此时必须广播到所有连接，否则未被随机 fanout 选中的
+            // 节点永远收不到全量数据（实测 5 节点中仅 1 个成功同步）。
+            let full_sync_broadcast = self.is_sending_full_sync();
             use rand::seq::SliceRandom;
             let mut rng = rand::rngs::StdRng::from_entropy();
             for (batch_idx, batch) in batches.iter().enumerate() {
@@ -379,10 +383,16 @@ impl GossipEngine {
                     .filter(|c| NodeId(batch.origin) != c.node_id)
                     .cloned()
                     .collect();
-                let selected: Vec<_> = filtered
-                    .choose_multiple(&mut rng, fanout.min(filtered.len()))
-                    .cloned()
-                    .collect();
+                let selected: Vec<_> = if full_sync_broadcast {
+                    // 全量同步：广播到所有连接，确保每个请求节点都收到完整数据
+                    filtered
+                } else {
+                    // 常规 Gossip：随机 fanout
+                    filtered
+                        .choose_multiple(&mut rng, fanout.min(filtered.len()))
+                        .cloned()
+                        .collect()
+                };
                 for conn in selected {
                     by_conn.entry(conn.node_id).or_insert_with(|| (conn, Vec::new())).1.push(batch_idx);
                 }
