@@ -792,14 +792,36 @@ async fn pex_handler(State(state): State<AppState>) -> Response {
 
 /// 联邦状态
 async fn federation_status_handler(State(state): State<AppState>) -> Response {
-    match &state.federation {
-        Some(fed) => Json(fed.status()).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "federation not enabled" })),
-        )
-            .into_response(),
-    }
+    let mut status = match &state.federation {
+        Some(fed) => fed.status(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "federation not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    // 填充各 Repo 实际总条目数（区分于联邦同步累计数）
+    status.node_repo_total = state
+        .node_repo
+        .as_ref()
+        .map(|r| r.len_sync() as u64)
+        .unwrap_or(0);
+    status.peer_repo_total = state.peer_repo.len() as u64;
+    status.infohash_repo_total = state
+        .infohash_repo
+        .as_ref()
+        .map(|r| r.count_sync() as u64)
+        .unwrap_or(0);
+    status.tracker_repo_total = state
+        .tracker_repo
+        .as_ref()
+        .map(|r| r.count_sync() as u64)
+        .unwrap_or(0);
+
+    Json(status).into_response()
 }
 
 /// 联邦节点列表

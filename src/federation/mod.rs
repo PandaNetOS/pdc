@@ -71,6 +71,14 @@ pub struct FederationStatus {
     pub tracker_sync_enabled: bool,
     /// 指标快照
     pub metrics: FederationMetricsSnapshot,
+    /// NodeRepo 实际总条目数（非联邦同步累计）
+    pub node_repo_total: u64,
+    /// PeerRepo 实际总条目数（非联邦同步累计）
+    pub peer_repo_total: u64,
+    /// InfohashRepo 实际总条目数（非联邦同步累计）
+    pub infohash_repo_total: u64,
+    /// TrackerRepo 实际总条目数（非联邦同步累计）
+    pub tracker_repo_total: u64,
 }
 
 /// 连接信息（用于快照）
@@ -327,6 +335,9 @@ impl FederationService {
         // 6. 启动 Node 同步任务
         self.sync_manager.clone().spawn_node_sync();
 
+        // 6.1 启动 Merkle 异步批量 flush 任务（apply 入队后后台批量更新 Merkle 树）
+        self.sync_manager.clone().spawn_merkle_flusher();
+
         // 7. 启动 Gossip 传播任务
         self.gossip_engine.clone().spawn_gossip_propagation();
 
@@ -453,6 +464,11 @@ impl FederationService {
             relay_channels: self.relay_manager.active_channel_count(),
             tracker_sync_enabled: self.config.sync_tracker_enabled,
             metrics: self.metrics.snapshot(),
+            // Repo 实际总数由 handler 从 AppState 填充，此处先置 0
+            node_repo_total: 0,
+            peer_repo_total: 0,
+            infohash_repo_total: 0,
+            tracker_repo_total: 0,
         }
     }
 }
@@ -621,6 +637,10 @@ mod tests {
             relay_channels: 0,
             tracker_sync_enabled: false,
             metrics: FederationMetricsSnapshot::default(),
+            node_repo_total: 0,
+            peer_repo_total: 0,
+            infohash_repo_total: 0,
+            tracker_repo_total: 0,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"enabled\":true"));

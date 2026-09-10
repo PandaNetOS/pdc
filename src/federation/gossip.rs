@@ -163,13 +163,23 @@ impl GossipEngine {
         let fanout = self.config.gossip_fanout;
         let mut shutdown_rx = self.shutdown.subscribe();
 
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await; // 跳过第一次
+        // P2: 全量同步期间发送端零节流加速。
+        // 全量同步进行中（outbox 洪峰）时使用 10ms 极短间隔连续发送；
+        // 10ms 同时作为限流跳过（rate_skipped）时的最小退避，避免 rate_try_consume
+        // 持续拒绝导致 CPU 忙等。非全量期保持原 gossip_interval_ms（默认 1000ms）。
+        const FULL_SYNC_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
+        tokio::spawn(async move {
             loop {
+                // 每轮循环开头根据全量同步标记动态计算下一次 tick 间隔
+                let tick_interval = if self.is_full_sync_in_progress() {
+                    FULL_SYNC_TICK_INTERVAL
+                } else {
+                    interval
+                };
+
                 tokio::select! {
-                    _ = ticker.tick() => {
+                    _ = tokio::time::sleep(tick_interval) => {
                         self.clone().propagation_tick(fanout).await;
                     }
                     _ = shutdown_rx.recv() => {
@@ -179,7 +189,7 @@ impl GossipEngine {
                 }
             }
         });
-        debug!("[federation] Gossip 传播任务已启动（间隔 {}ms, fanout={}）", interval.as_millis(), fanout);
+        debug!("[federation] Gossip 传播任务已启动（常规间隔 {}ms, 全量期间隔 {}ms, fanout={}）", interval.as_millis(), FULL_SYNC_TICK_INTERVAL.as_millis(), fanout);
     }
 
     /// 发送端全局速率限制：尝试在当前秒级窗口内计入 `bytes` 字节 / `msgs` 条消息。

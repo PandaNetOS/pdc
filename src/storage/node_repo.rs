@@ -6,12 +6,16 @@
 //! 千万级性能优化：FxHashMap 替代 std::HashMap，增量持久化只保存 dirty 节点。
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::federation::gossip::GossipEngine;
+use crate::federation::merkle::MerkleTree;
+use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::dht::kbucket::{KBucketEntry, NodeState};
 use crate::storage::db::Storage;
@@ -34,6 +38,9 @@ pub struct NodeRepoImpl {
     /// 脏节点集合（统计数据已变化，需要重算评分 + 增量持久化）
     dirty: RwLock<FxHashSet<SocketAddr>>,
     storage: Arc<Storage>,
+    /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
+    merkle: OnceLock<Arc<MerkleTree>>,
+    gossip: OnceLock<Arc<GossipEngine>>,
 }
 
 impl NodeRepoImpl {
@@ -42,6 +49,8 @@ impl NodeRepoImpl {
             nodes: RwLock::new(FxHashMap::default()),
             dirty: RwLock::new(FxHashSet::default()),
             storage,
+            merkle: OnceLock::new(),
+            gossip: OnceLock::new(),
         }
     }
 
@@ -50,54 +59,109 @@ impl NodeRepoImpl {
         Self::new(storage)
     }
 
-    // ── 同步便捷方法（爬虫高频调用，避免 async 开销）──
-
-    pub fn add_node_sync(&self, id: NodeId, addr: SocketAddr) -> bool {
-        let mut nodes = self.nodes.write();
-        if let Some(existing) = nodes.get_mut(&addr) {
-            existing.id = id;
-            existing.last_active = Instant::now();
-            false
-        } else {
-            let mut entry = KBucketEntry::new(id, addr);
-            // 新节点初始评分 45.0（中性分），后续由 ScoreMaintainer 统一更新
-            entry.score = 45.0;
-            nodes.insert(addr, entry);
-            // 新节点标记 dirty（需要增量持久化）
-            drop(nodes);
-            self.dirty.write().insert(addr);
-            true
-        }
+    /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
+    /// 未调用时（如单元测试），本地写入不触发传播，repo 行为完全不变。
+    pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
+        let _ = self.merkle.set(merkle);
+        let _ = self.gossip.set(gossip);
     }
 
-    pub fn add_nodes_sync_batch(&self, items: &[(NodeId, SocketAddr)]) -> usize {
+    /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
+    /// merkle/gossip 未注入时直接跳过，不 panic。
+    #[inline]
+    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>)>) {
+        if built.is_empty() {
+            return;
+        }
+        let Some(merkle) = self.merkle.get() else { return; };
+        let Some(gossip) = self.gossip.get() else { return; };
+        let refs: Vec<(&[u8], &[u8])> = built
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        merkle.update_batch(&refs);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries: Vec<SyncEntry> = built
+            .into_iter()
+            .map(|(key, payload)| SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: now,
+                payload,
+            })
+            .collect();
+        gossip.submit_gossip(rt, entries);
+    }
+
+    // ── 同步便捷方法（爬虫高频调用，避免 async 开销）──
+
+    /// 内部写入：批量新增节点 + 标记 dirty，不触发 Merkle/Gossip。
+    /// 返回真正新增的 (node_id, addr) 对。
+    /// 联邦同步入站（apply_node_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    pub(crate) fn add_nodes_batch_internal(&self, items: &[(NodeId, SocketAddr)]) -> Vec<(NodeId, SocketAddr)> {
         if items.is_empty() {
-            return 0;
+            return Vec::new();
         }
         let mut nodes = self.nodes.write();
-        let mut new_addrs: Vec<SocketAddr> = Vec::new();
+        let mut new_pairs: Vec<(NodeId, SocketAddr)> = Vec::new();
         for (id, addr) in items {
             if let Some(existing) = nodes.get_mut(addr) {
                 existing.id = *id;
                 existing.last_active = Instant::now();
             } else {
                 let mut entry = KBucketEntry::new(*id, *addr);
-                // 新节点初始评分 45.0（中性分），与单条 add_node_sync 一致
+                // 新节点初始评分 45.0（中性分），后续由 ScoreMaintainer 统一更新
                 entry.score = 45.0;
                 nodes.insert(*addr, entry);
-                new_addrs.push(*addr);
+                new_pairs.push((*id, *addr));
             }
         }
         drop(nodes);
 
         // 新节点统一标记 dirty（需要增量持久化），一次写锁
-        if !new_addrs.is_empty() {
+        if !new_pairs.is_empty() {
             let mut dirty = self.dirty.write();
-            for addr in &new_addrs {
+            for (_, addr) in &new_pairs {
                 dirty.insert(*addr);
             }
         }
-        new_addrs.len()
+        new_pairs
+    }
+
+    /// 把新节点列表构建成 merkle/gossip 条目并传播。
+    fn propagate_nodes(&self, new_pairs: Vec<(NodeId, SocketAddr)>) {
+        if new_pairs.is_empty() {
+            return;
+        }
+        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_pairs.len());
+        for (id, addr) in &new_pairs {
+            if let Some((k, p)) = crate::federation::sync::build_node_sync_entry(*id, *addr) {
+                built.push((k, p));
+            }
+        }
+        self.propagate(repo_type::NODE, built);
+    }
+
+    /// 同步加入单个节点（本地爬虫路径）：写入后更新 Merkle + 提交 Gossip。
+    /// 返回 true 表示是新节点。
+    pub fn add_node_sync(&self, id: NodeId, addr: SocketAddr) -> bool {
+        let new_pairs = self.add_nodes_batch_internal(&[(id, addr)]);
+        let is_new = !new_pairs.is_empty();
+        self.propagate_nodes(new_pairs);
+        is_new
+    }
+
+    /// 批量加入节点（一次写锁），返回新加入数。
+    /// 本地写入路径：新节点更新 Merkle + 提交 Gossip。
+    /// 联邦同步入站（apply_node_sync）请改用 add_nodes_batch_internal，避免回环。
+    pub fn add_nodes_sync_batch(&self, items: &[(NodeId, SocketAddr)]) -> usize {
+        let new_pairs = self.add_nodes_batch_internal(items);
+        let count = new_pairs.len();
+        self.propagate_nodes(new_pairs);
+        count
     }
 
     pub fn contains_sync(&self, addr: SocketAddr) -> bool {

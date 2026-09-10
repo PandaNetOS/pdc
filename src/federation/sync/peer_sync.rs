@@ -16,6 +16,7 @@ use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
+use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::PeerRepoImpl;
 use crate::types::{Event, Infohash, PeerInfo, PeerSource};
 
@@ -28,11 +29,33 @@ struct PeerSyncPayload {
     source: String,
 }
 
+/// 构建 Peer 同步条目的 (key, payload_bytes)。
+/// 格式与 collect_all_entries 完全一致，供 PeerRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
+pub(crate) fn build_peer_sync_entry(
+    infohash: Infohash,
+    addr: std::net::SocketAddr,
+    first_seen_secs: u64,
+    source: &str,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let payload = PeerSyncPayload {
+        infohash,
+        addr,
+        first_seen_secs,
+        source: source.to_string(),
+    };
+    let payload_bytes = bincode::serialize(&payload).ok()?;
+    let mut key = Vec::with_capacity(20 + 8);
+    key.extend_from_slice(&infohash);
+    key.extend_from_slice(&addr.to_string().into_bytes());
+    Some((key, payload_bytes))
+}
+
 /// PeerRepo 同步服务
 pub struct PeerSync {
     peer_repo: Arc<PeerRepoImpl>,
     gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
+    merkle_queue: Arc<MerkleUpdateQueue>,
     local_node_id: NodeId,
     metrics: Arc<FederationMetrics>,
     enabled: bool,
@@ -44,6 +67,7 @@ impl PeerSync {
         peer_repo: Arc<PeerRepoImpl>,
         gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
+        merkle_queue: Arc<MerkleUpdateQueue>,
         local_node_id: NodeId,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
@@ -52,6 +76,7 @@ impl PeerSync {
             peer_repo,
             gossip_engine,
             merkle,
+            merkle_queue,
             local_node_id,
             metrics,
             enabled: true,
@@ -94,65 +119,10 @@ impl PeerSync {
         debug!("[federation] PeerSync 事件消费者已启动");
     }
 
-    /// 处理事件
-    fn handle_event(self: Arc<Self>, event: Event) {
-        if let Event::PeerDiscovered { infohash, peers, source } = event {
-            if peers.is_empty() {
-                return;
-            }
-
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let mut entries = Vec::with_capacity(peers.len());
-            let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(peers.len());
-            for peer in &peers {
-                let payload = PeerSyncPayload {
-                    infohash,
-                    addr: peer.addr,
-                    first_seen_secs: peer
-                        .first_seen
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    source: source.clone(),
-                };
-                let payload_bytes = match bincode::serialize(&payload) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                // key = infohash(20) + addr 序列化
-                let mut key = Vec::with_capacity(20 + 8);
-                key.extend_from_slice(&infohash);
-                key.extend_from_slice(&peer.addr.to_string().into_bytes());
-
-                // 收集到批量 Merkle 更新列表，循环结束后一次 update_batch
-                merkle_batch.push((key.clone(), payload_bytes.clone()));
-
-                entries.push(SyncEntry {
-                    key,
-                    operation: operation::UPSERT,
-                    version: now,
-                    payload: payload_bytes,
-                });
-            }
-
-            // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
-            if !merkle_batch.is_empty() {
-                let refs: Vec<(&[u8], &[u8])> = merkle_batch
-                    .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                    .collect();
-                self.merkle.update_batch(&refs);
-            }
-
-            if !entries.is_empty() {
-                self.gossip_engine.submit_gossip(repo_type::PEER, entries);
-            }
-        }
-    }
+    /// 处理事件（已退役）：本地 peer 写入已由 PeerRepoImpl.add_peers_sync 统一更新
+    /// Merkle + 提交 Gossip（payload 使用 peer.source，与 collect_all_entries 一致），
+    /// 此处不再重复传播，避免双发与 payload source 不一致导致的 Merkle 抖动。
+    fn handle_event(self: Arc<Self>, _event: Event) {}
 
     /// 应用收到的 Peer 同步数据
     pub fn apply_peer_sync(&self, entries: &[SyncEntry]) {
@@ -204,18 +174,18 @@ impl PeerSync {
             applied += 1;
         }
 
-        // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
         if !merkle_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = merkle_batch
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            let items: Vec<_> = merkle_batch
+                .into_iter()
+                .map(|(k, v)| (repo_type::PEER, k, v))
                 .collect();
-            self.merkle.update_batch(&refs);
+            self.merkle_queue.push_batch(items);
         }
 
-        // 第二遍：一次写锁批量写入，替代逐条 add_peers_sync
+        // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
         if !items.is_empty() {
-            self.peer_repo.add_peers_sync_batch(&items);
+            self.peer_repo.add_peers_sync_internal(&items);
         }
 
         if applied > 0 {
@@ -335,10 +305,12 @@ mod tests {
             shutdown_tx.clone(),
         ));
         let merkle = Arc::new(MerkleTree::new(16));
+        let queue = Arc::new(MerkleUpdateQueue::new());
         let peer_sync = PeerSync::new(
             peer_repo.clone(),
             gossip,
             merkle,
+            queue,
             NodeId([1; 20]),
             metrics,
             shutdown_tx,

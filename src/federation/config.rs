@@ -111,7 +111,7 @@ pub struct FederationConfig {
     #[serde(default = "default_receive_pending_threshold")]
     pub receive_pending_threshold: u32,
     /// 初始全量同步每批条目数（发送端 submit_gossip_batch 的 batch_size）。
-    /// 默认 1000，比旧的硬编码 100 减少 10 倍消息开销。
+    /// 默认 5000，比旧的硬编码 100 减少 50 倍消息开销。
     #[serde(default = "default_initial_sync_batch_size")]
     pub initial_sync_batch_size: usize,
     /// 接收端 GossipBatch 攒批刷新间隔（毫秒）。
@@ -134,6 +134,14 @@ pub struct FederationConfig {
     /// 全量同步期间 Gossip 每秒最多发送字节数（临时放开限流）。
     #[serde(default = "default_full_sync_gossip_max_bytes_per_second")]
     pub full_sync_gossip_max_bytes_per_second: u64,
+    /// Merkle 树异步批量更新间隔（毫秒）。
+    /// 联邦同步 apply 时仅入队，后台任务每此间隔批量 flush 到 Merkle 树，降低 apply 路径 CPU 占用。
+    #[serde(default = "default_merkle_async_update_interval_ms")]
+    pub merkle_async_update_interval_ms: u64,
+    /// Merkle 树异步批量更新触发阈值（条数）。
+    /// 队列累计达到此条数时通过 Notify 立即唤醒后台 flush，无需等待间隔。
+    #[serde(default = "default_merkle_async_update_batch_size")]
+    pub merkle_async_update_batch_size: usize,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -168,13 +176,15 @@ fn default_heavy_task_max_concurrency() -> usize { 8 }
 fn default_gossip_max_bytes_per_second() -> u64 { 5 * 1024 * 1024 }
 fn default_gossip_max_messages_per_second() -> u32 { 100 }
 fn default_receive_pending_threshold() -> u32 { 1000 }
-fn default_initial_sync_batch_size() -> usize { 1000 }
+fn default_initial_sync_batch_size() -> usize { 5000 }
 fn default_gossip_flush_interval_ms() -> u64 { 50 }
 fn default_gossip_flush_max_batches() -> usize { 10 }
 fn default_full_sync_batch_size() -> usize { 5000 }
 fn default_full_sync_window_size() -> usize { 3 }
-fn default_full_sync_gossip_max_messages_per_second() -> u32 { 500 }
-fn default_full_sync_gossip_max_bytes_per_second() -> u64 { 20 * 1024 * 1024 }
+fn default_full_sync_gossip_max_messages_per_second() -> u32 { 1000 }
+fn default_full_sync_gossip_max_bytes_per_second() -> u64 { 50 * 1024 * 1024 }
+fn default_merkle_async_update_interval_ms() -> u64 { 1000 }
+fn default_merkle_async_update_batch_size() -> usize { 10000 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -218,6 +228,8 @@ impl Default for FederationConfig {
             full_sync_window_size: default_full_sync_window_size(),
             full_sync_gossip_max_messages_per_second: default_full_sync_gossip_max_messages_per_second(),
             full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
+            merkle_async_update_interval_ms: default_merkle_async_update_interval_ms(),
+            merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
         }
     }
 }

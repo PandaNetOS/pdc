@@ -14,6 +14,7 @@ use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
+use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::TrackerRepoImpl;
 
 /// Tracker 同步负载
@@ -23,11 +24,24 @@ struct TrackerSyncPayload {
     disabled: bool,
 }
 
+/// 构建 Tracker 同步条目的 (key, payload_bytes)。
+/// 格式与 collect_all_entries 一致，供 TrackerRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
+pub(crate) fn build_tracker_sync_entry(url: &str, disabled: bool) -> Option<(Vec<u8>, Vec<u8>)> {
+    let payload = TrackerSyncPayload {
+        url: url.to_string(),
+        disabled,
+    };
+    let payload_bytes = bincode::serialize(&payload).ok()?;
+    let key = url.as_bytes().to_vec();
+    Some((key, payload_bytes))
+}
+
 /// TrackerRepo 同步服务
 pub struct TrackerSync {
     tracker_repo: Arc<TrackerRepoImpl>,
     gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
+    merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
     last_full_sync: parking_lot::RwLock<Instant>,
     enabled: bool,
@@ -39,6 +53,7 @@ impl TrackerSync {
         tracker_repo: Arc<TrackerRepoImpl>,
         gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
+        merkle_queue: Arc<MerkleUpdateQueue>,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
@@ -46,6 +61,7 @@ impl TrackerSync {
             tracker_repo,
             gossip_engine,
             merkle,
+            merkle_queue,
             metrics,
             last_full_sync: parking_lot::RwLock::new(Instant::now()),
             enabled: true,
@@ -190,18 +206,18 @@ impl TrackerSync {
             applied += 1;
         }
 
-        // 批量更新 Merkle
+        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
         if !merkle_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = merkle_batch
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            let items: Vec<_> = merkle_batch
+                .into_iter()
+                .map(|(k, v)| (repo_type::TRACKER, k, v))
                 .collect();
-            self.merkle.update_batch(&refs);
+            self.merkle_queue.push_batch(items);
         }
 
-        // 第二遍：一次写锁批量写入，替代逐条 add_tracker_sync
+        // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
         if !urls.is_empty() {
-            self.tracker_repo.add_trackers_sync_batch(&urls);
+            self.tracker_repo.add_trackers_batch_internal(&urls);
         }
 
         if applied > 0 {
@@ -349,10 +365,12 @@ use crate::federation::node_id::NodeIdentity;
         let gossip = make_gossip_engine(shutdown_tx.clone());
         let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
+        let queue = Arc::new(MerkleUpdateQueue::new());
         let tracker_sync = TrackerSync::new(
             repo.clone(),
             gossip,
             merkle,
+            queue,
             metrics,
             shutdown_tx,
         );
@@ -383,10 +401,12 @@ use crate::federation::node_id::NodeIdentity;
         let gossip = make_gossip_engine(shutdown_tx.clone());
         let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
+        let queue = Arc::new(MerkleUpdateQueue::new());
         let tracker_sync = TrackerSync::new(
             repo,
             gossip.clone(),
             merkle,
+            queue,
             metrics,
             shutdown_tx,
         );
@@ -405,10 +425,12 @@ use crate::federation::node_id::NodeIdentity;
         let gossip = make_gossip_engine(shutdown_tx.clone());
         let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
+        let queue = Arc::new(MerkleUpdateQueue::new());
         let tracker_sync = TrackerSync::new(
             repo,
             gossip,
             merkle.clone(),
+            queue,
             metrics,
             shutdown_tx,
         );

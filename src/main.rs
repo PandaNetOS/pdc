@@ -187,6 +187,24 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // 6.8.1 注入联邦引用到各 Repo：本地写入后统一更新 Merkle + 提交 Gossip
+    // （FederationService 已创建，Merkl/Gossip 句柄此时可用；联邦未启用时跳过）
+    if let Some(ref fed) = federation_service {
+        let sm = &fed.sync_manager;
+        let gossip = fed.gossip_engine.clone();
+        if let Some(merkle) = sm.peer_merkle() {
+            peer_repo.set_federation_refs(merkle, gossip.clone());
+        }
+        if let Some(merkle) = sm.infohash_merkle() {
+            infohash_repo.set_federation_refs(merkle, gossip.clone());
+        }
+        if let Some(merkle) = sm.tracker_merkle() {
+            tracker_repo.set_federation_refs(merkle, gossip.clone());
+        }
+        node_repo.set_federation_refs(sm.node_merkle(), gossip);
+        info!("[main] 联邦引用已注入各 Repo（本地写入 -> Merkle + Gossip）");
+    }
+
     // 6.9 提取全量同步暂停门（联邦启用时），供非核心模块在全量同步期间暂停主动工作
     let full_sync_gate: Option<Arc<AtomicBool>> =
         federation_service.as_ref().map(|s| s.full_sync_gate());

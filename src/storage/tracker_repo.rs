@@ -4,11 +4,15 @@
 //! 使用 parking_lot::RwLock（同步），与 NodeRepo/PeerRepo 一致。
 //! 千万级性能优化：FxHashMap 替代 std::HashMap。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+
+use crate::federation::gossip::GossipEngine;
+use crate::federation::merkle::MerkleTree;
+use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::{TrackerEntry, TrackerRepository};
@@ -29,6 +33,9 @@ impl TrackerCacheInner {
 pub struct TrackerRepoImpl {
     cache: RwLock<TrackerCacheInner>,
     storage: Arc<Storage>,
+    /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
+    merkle: OnceLock<Arc<MerkleTree>>,
+    gossip: OnceLock<Arc<GossipEngine>>,
 }
 
 impl TrackerRepoImpl {
@@ -36,42 +43,59 @@ impl TrackerRepoImpl {
         Self {
             cache: RwLock::new(TrackerCacheInner::new()),
             storage,
+            merkle: OnceLock::new(),
+            gossip: OnceLock::new(),
         }
+    }
+
+    /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
+    /// 未调用时（如单元测试），本地写入不触发传播，repo 行为完全不变。
+    pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
+        let _ = self.merkle.set(merkle);
+        let _ = self.gossip.set(gossip);
+    }
+
+    /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
+    /// merkle/gossip 未注入时直接跳过，不 panic。
+    #[inline]
+    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>)>) {
+        if built.is_empty() {
+            return;
+        }
+        let Some(merkle) = self.merkle.get() else { return; };
+        let Some(gossip) = self.gossip.get() else { return; };
+        let refs: Vec<(&[u8], &[u8])> = built
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        merkle.update_batch(&refs);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries: Vec<SyncEntry> = built
+            .into_iter()
+            .map(|(key, payload)| SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: now,
+                payload,
+            })
+            .collect();
+        gossip.submit_gossip(rt, entries);
     }
 
     // ── 同步便捷方法（高频调用，避免 async 开销）──
 
-    pub fn add_tracker_sync(&self, url: String) {
-        let mut cache = self.cache.write();
-        if !cache.entries.contains_key(&url) {
-            cache.entries.insert(
-                url.clone(),
-                TrackerEntry {
-                    url,
-                    score: 15.0,
-                    disabled: false,
-                    total_requests: 0,
-                    success_requests: 0,
-                    failed_requests: 0,
-                    total_peers_discovered: 0,
-                    avg_response_time_ms: 0.0,
-                    consecutive_failures: 0,
-                    last_used: None,
-                },
-            );
-        }
-    }
-
-    /// 批量加入 tracker（一次 cache 写锁），返回新加入的 tracker 数。
-    ///
-    /// 联邦同步批量应用时使用：原本逐条 add_tracker_sync 每条都 acquire/release
-    /// 一次 cache 写锁；本方法在一次写锁内完成全部插入，锁竞争从 N 次降到 1 次。
-    pub fn add_trackers_sync_batch(&self, urls: &[String]) -> usize {
+    /// 内部写入：批量新增 tracker，不触发 Merkle/Gossip。
+    /// 返回真正新增的 url 列表。
+    /// 联邦同步入站（apply_tracker_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    pub(crate) fn add_trackers_batch_internal(&self, urls: &[String]) -> Vec<String> {
         if urls.is_empty() {
-            return 0;
+            return Vec::new();
         }
         let mut cache = self.cache.write();
-        let mut new_count = 0;
+        let mut new_urls: Vec<String> = Vec::new();
         for url in urls {
             if !cache.entries.contains_key(url) {
                 cache.entries.insert(
@@ -89,10 +113,42 @@ impl TrackerRepoImpl {
                         last_used: None,
                     },
                 );
-                new_count += 1;
+                new_urls.push(url.clone());
             }
         }
-        new_count
+        new_urls
+    }
+
+    /// 把新 tracker 列表构建成 merkle/gossip 条目并传播（新 tracker disabled=false）。
+    fn propagate_trackers(&self, new_urls: Vec<String>) {
+        if new_urls.is_empty() {
+            return;
+        }
+        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_urls.len());
+        for url in &new_urls {
+            if let Some((k, p)) =
+                crate::federation::sync::tracker_sync::build_tracker_sync_entry(url, false)
+            {
+                built.push((k, p));
+            }
+        }
+        self.propagate(repo_type::TRACKER, built);
+    }
+
+    /// 同步加入单个 tracker（本地路径）：新 tracker 更新 Merkle + 提交 Gossip。
+    pub fn add_tracker_sync(&self, url: String) {
+        let new_urls = self.add_trackers_batch_internal(&[url]);
+        self.propagate_trackers(new_urls);
+    }
+
+    /// 批量加入 tracker（一次 cache 写锁），返回新加入的 tracker 数。
+    /// 本地写入路径：新 tracker 更新 Merkle + 提交 Gossip。
+    /// 联邦同步入站（apply_tracker_sync）请改用 add_trackers_batch_internal，避免回环。
+    pub fn add_trackers_sync_batch(&self, urls: &[String]) -> usize {
+        let new_urls = self.add_trackers_batch_internal(urls);
+        let count = new_urls.len();
+        self.propagate_trackers(new_urls);
+        count
     }
 
     pub fn get_tracker_sync(&self, url: &str) -> Option<TrackerEntry> {

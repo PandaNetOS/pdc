@@ -4,6 +4,7 @@
 //! 阶段1的 NodeRepo 同步保留。
 
 pub mod infohash_sync;
+pub mod merkle_updater;
 pub mod peer_sync;
 pub mod tracker_sync;
 
@@ -27,6 +28,7 @@ use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
 use crate::federation::sync::infohash_sync::InfohashSync;
 use crate::federation::relay::RelayManager;
+use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::federation::sync::peer_sync::PeerSync;
 use crate::federation::sync::tracker_sync::TrackerSync;
 use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoImpl};
@@ -36,6 +38,18 @@ use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoIm
 struct NodeSyncPayload {
     node_id: [u8; 20],
     addr: SocketAddr,
+}
+
+/// 构建 Node 同步条目的 (key, payload_bytes)。
+/// 格式与 collect_node_entries 一致，供 NodeRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
+pub(crate) fn build_node_sync_entry(
+    node_id: [u8; 20],
+    addr: SocketAddr,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let payload = NodeSyncPayload { node_id, addr };
+    let payload_bytes = bincode::serialize(&payload).ok()?;
+    let key = addr.to_string().into_bytes();
+    Some((key, payload_bytes))
 }
 
 /// 同步管理器
@@ -48,6 +62,8 @@ pub struct SyncManager {
     node_merkle: Arc<MerkleTree>,
     tracker_sync: Option<Arc<TrackerSync>>,
     relay_manager: Option<Arc<RelayManager>>,
+    /// Merkle 树异步批量更新队列（apply 时入队，后台任务定期 flush）
+    merkle_queue: Arc<MerkleUpdateQueue>,
     config: FederationConfig,
     metrics: Arc<FederationMetrics>,
     shutdown: broadcast::Sender<()>,
@@ -72,6 +88,7 @@ impl SyncManager {
         relay_manager: Option<Arc<RelayManager>>,
     ) -> Self {
         let node_merkle = Arc::new(MerkleTree::new(256));
+        let merkle_queue = Arc::new(MerkleUpdateQueue::new());
 
         // PeerSync
         let peer_sync = if config.sync_peer_enabled {
@@ -80,6 +97,7 @@ impl SyncManager {
                     pr,
                     gossip_engine.clone(),
                     Arc::new(MerkleTree::new(256)),
+                    merkle_queue.clone(),
                     local_node_id,
                     metrics.clone(),
                     shutdown.clone(),
@@ -102,6 +120,7 @@ impl SyncManager {
                     ir,
                     gossip_engine.clone(),
                     Arc::new(MerkleTree::new(256)),
+                    merkle_queue.clone(),
                     metrics.clone(),
                     shutdown.clone(),
                 ));
@@ -123,6 +142,7 @@ impl SyncManager {
                     tr,
                     gossip_engine.clone(),
                     Arc::new(MerkleTree::new(256)),
+                    merkle_queue.clone(),
                     metrics.clone(),
                     shutdown.clone(),
                 ));
@@ -144,6 +164,7 @@ impl SyncManager {
             node_merkle,
             tracker_sync,
             relay_manager,
+            merkle_queue,
             config,
             metrics,
             shutdown,
@@ -178,58 +199,118 @@ impl SyncManager {
         debug!("[federation] Node 同步任务已启动（间隔 {}s）", interval_secs);
     }
 
-    /// 执行一次 Node 同步（通过 Gossip 提交）
-    async fn do_node_sync(self: Arc<Self>) {
-        let dirty_addrs = self.node_repo.take_dirty_sync();
-        if dirty_addrs.is_empty() {
+    /// 启动 Merkle 异步批量 flush 后台任务
+    ///
+    /// apply_*_sync 只入队，本任务每 `merkle_async_update_interval_ms` 毫秒或被 Notify
+    /// 唤醒（入队时触发）后将队列中条目按 repo_type 分组调用 merkle.update_batch。
+    /// 关闭信号到达时先 flush 一次再退出，保证退出前数据不丢失。
+    pub fn spawn_merkle_flusher(self: Arc<Self>) {
+        let interval_ms = self.config.merkle_async_update_interval_ms;
+        let batch_threshold = self.config.merkle_async_update_batch_size;
+        let queue = self.merkle_queue.clone();
+        let mut shutdown_rx = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+            ticker.tick().await; // 跳过首次立即触发
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        self.clone().flush_merkle_queue(batch_threshold);
+                    }
+                    _ = queue.notify().notified() => {
+                        // 入队通知唤醒：即使未达阈值也 flush（apply 批量本身已攒批）
+                        self.clone().flush_merkle_queue(batch_threshold);
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("[federation] Merkle flush 任务收到关闭信号，退出前 flush");
+                        self.flush_merkle_queue(batch_threshold);
+                        break;
+                    }
+                }
+            }
+        });
+        debug!(
+            "[federation] Merkle 异步批量 flush 任务已启动（间隔 {}ms, 阈值 {} 条）",
+            interval_ms, batch_threshold
+        );
+    }
+
+    /// 批量 flush 队列中的 Merkle 更新：按 repo_type 分组后调用对应 merkle.update_batch
+    fn flush_merkle_queue(&self, _batch_threshold: usize) {
+        let items = self.merkle_queue.drain();
+        if items.is_empty() {
             return;
         }
 
-        let all_nodes = self.node_repo.all_nodes_sync();
-        let dirty_set: std::collections::HashSet<SocketAddr> =
-            dirty_addrs.iter().cloned().collect();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // 按 repo_type 分组
+        let mut node_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut peer_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut infohash_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut tracker_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-        let mut entries = Vec::new();
-        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for entry in &all_nodes {
-            if dirty_set.contains(&entry.addr) {
-                let payload = NodeSyncPayload {
-                    node_id: entry.id,
-                    addr: entry.addr,
-                };
-                let payload_bytes = match bincode::serialize(&payload) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                let key = entry.addr.to_string().into_bytes();
-                merkle_batch.push((key.clone(), payload_bytes.clone()));
-                entries.push(SyncEntry {
-                    key,
-                    operation: operation::UPSERT,
-                    version: now,
-                    payload: payload_bytes,
-                });
+        for (repo_type, key, payload) in items {
+            match repo_type {
+                repo_type::NODE => node_batch.push((key, payload)),
+                repo_type::PEER => peer_batch.push((key, payload)),
+                repo_type::INFOHASH => infohash_batch.push((key, payload)),
+                repo_type::TRACKER => tracker_batch.push((key, payload)),
+                other => {
+                    warn!("[federation] Merkle flush: 未知 repo_type={}, 丢弃", other);
+                }
             }
         }
 
-        // 批量更新 Merkle：一次写锁插入所有条目
-        if !merkle_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = merkle_batch
+        // 逐 repo 调用 update_batch（一次写锁批量插入，只重算受影响分片）
+        if !node_batch.is_empty() {
+            let refs: Vec<(&[u8], &[u8])> = node_batch
                 .iter()
                 .map(|(k, v)| (k.as_slice(), v.as_slice()))
                 .collect();
             self.node_merkle.update_batch(&refs);
         }
-
-        if !entries.is_empty() {
-            self.gossip_engine
-                .submit_gossip(repo_type::NODE, entries);
+        if !peer_batch.is_empty() {
+            if let Some(ps) = &self.peer_sync {
+                let refs: Vec<(&[u8], &[u8])> = peer_batch
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
+                ps.merkle().update_batch(&refs);
+            }
         }
+        if !infohash_batch.is_empty() {
+            if let Some(ihs) = &self.infohash_sync {
+                let refs: Vec<(&[u8], &[u8])> = infohash_batch
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
+                ihs.merkle().update_batch(&refs);
+            }
+        }
+        if !tracker_batch.is_empty() {
+            if let Some(ts) = &self.tracker_sync {
+                let refs: Vec<(&[u8], &[u8])> = tracker_batch
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
+                ts.merkle().update_batch(&refs);
+            }
+        }
+
+        debug!(
+            "[federation] Merkle 批量 flush: total={}, node={}, peer={}, infohash={}, tracker={}",
+            node_batch.len() + peer_batch.len() + infohash_batch.len() + tracker_batch.len(),
+            node_batch.len(),
+            peer_batch.len(),
+            infohash_batch.len(),
+            tracker_batch.len()
+        );
     }
+
+    /// 执行一次 Node 同步（已退役）：本地新节点已由 NodeRepoImpl.add_node_sync 统一更新
+    /// Merkle + 提交 Gossip，此处不再轮询传播，也不再 take_dirty（避免与 save_all 抢脏标记）。
+    async fn do_node_sync(self: Arc<Self>) {}
 
     /// 处理收到的同步批量消息（阶段1 SyncBatch 协议）
     pub fn handle_sync_batch(&self, repo_type: u8, entries: &[SyncEntry]) {
@@ -285,18 +366,18 @@ impl SyncManager {
             applied += 1;
         }
 
-        // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
         if !merkle_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = merkle_batch
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            let items: Vec<_> = merkle_batch
+                .into_iter()
+                .map(|(k, v)| (repo_type::NODE, k, v))
                 .collect();
-            self.node_merkle.update_batch(&refs);
+            self.merkle_queue.push_batch(items);
         }
 
-        // 第二遍：一次写锁批量写入，替代逐条 add_node_sync（2N 次锁竞争 → 2 次）
+        // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
         if !items.is_empty() {
-            self.node_repo.add_nodes_sync_batch(&items);
+            self.node_repo.add_nodes_batch_internal(&items);
         }
 
         if applied > 0 {
@@ -333,6 +414,26 @@ impl SyncManager {
     /// 获取 TrackerSync 引用
     pub fn tracker_sync(&self) -> Option<Arc<TrackerSync>> {
         self.tracker_sync.clone()
+    }
+
+    /// 获取 Node Merkle 树引用（main.rs 注入 NodeRepo 联邦引用用）
+    pub fn node_merkle(&self) -> Arc<MerkleTree> {
+        self.node_merkle.clone()
+    }
+
+    /// 获取 Peer Merkle 树引用（main.rs 注入 PeerRepo 联邦引用用）
+    pub fn peer_merkle(&self) -> Option<Arc<MerkleTree>> {
+        self.peer_sync.as_ref().map(|ps| ps.merkle())
+    }
+
+    /// 获取 Infohash Merkle 树引用（main.rs 注入 InfohashRepo 联邦引用用）
+    pub fn infohash_merkle(&self) -> Option<Arc<MerkleTree>> {
+        self.infohash_sync.as_ref().map(|ihs| ihs.merkle())
+    }
+
+    /// 获取 Tracker Merkle 树引用（main.rs 注入 TrackerRepo 联邦引用用）
+    pub fn tracker_merkle(&self) -> Option<Arc<MerkleTree>> {
+        self.tracker_sync.as_ref().map(|ts| ts.merkle())
     }
 
     /// 触发初始全量同步（连接建立后调用，异步执行不阻塞）
@@ -748,6 +849,12 @@ impl SyncManager {
 /// MerkleProvider 实现：为 GossipEngine 反熵任务提供各 repo 的 Merkle 摘要和分片数据
 impl MerkleProvider for SyncManager {
     fn get_digest(&self, repo_type: u8) -> MerkleDigestMessage {
+        // 反熵对账前等待 Merkle 更新队列排空（最多 500ms），
+        // 避免用尚未 flush 的旧 Merkle 值对账导致误判；超时未排空则直接用当前值对账。
+        if !self.merkle_queue.is_empty() {
+            self.merkle_queue
+                .wait_drain(Duration::from_millis(500));
+        }
         if let Some(merkle) = self.merkle_for_repo(repo_type) {
             merkle.digest(repo_type)
         } else {

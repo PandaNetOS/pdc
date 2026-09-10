@@ -4,11 +4,15 @@
 //! 内存 FxHashMap + SQLite 增量持久化。
 //! 千万级性能优化：FxHashMap 替代 std::HashMap，新 infohash 批量写入。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+
+use crate::federation::gossip::GossipEngine;
+use crate::federation::merkle::MerkleTree;
+use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::InfohashRepository;
@@ -32,6 +36,9 @@ pub struct InfohashRepoImpl {
     storage: Arc<Storage>,
     /// 待持久化的新 infohash 缓冲区（批量写入，避免频繁 SQLite IO）
     pending: RwLock<Vec<(Infohash, String)>>,
+    /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
+    merkle: OnceLock<Arc<MerkleTree>>,
+    gossip: OnceLock<Arc<GossipEngine>>,
 }
 
 impl InfohashRepoImpl {
@@ -40,7 +47,46 @@ impl InfohashRepoImpl {
             cache: RwLock::new(InfohashCacheInner::new()),
             storage,
             pending: RwLock::new(Vec::new()),
+            merkle: OnceLock::new(),
+            gossip: OnceLock::new(),
         }
+    }
+
+    /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
+    /// 未调用时（如单元测试），本地写入不触发传播，repo 行为完全不变。
+    pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
+        let _ = self.merkle.set(merkle);
+        let _ = self.gossip.set(gossip);
+    }
+
+    /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
+    /// merkle/gossip 未注入时直接跳过，不 panic。
+    #[inline]
+    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>)>) {
+        if built.is_empty() {
+            return;
+        }
+        let Some(merkle) = self.merkle.get() else { return; };
+        let Some(gossip) = self.gossip.get() else { return; };
+        let refs: Vec<(&[u8], &[u8])> = built
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        merkle.update_batch(&refs);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries: Vec<SyncEntry> = built
+            .into_iter()
+            .map(|(key, payload)| SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: now,
+                payload,
+            })
+            .collect();
+        gossip.submit_gossip(rt, entries);
     }
 
     /// 同步获取 infohash 数量
@@ -53,37 +99,14 @@ impl InfohashRepoImpl {
         self.cache.read().entries.keys().cloned().collect()
     }
 
-    /// 同步注册 infohash（引用计数+1），新 infohash 写入 pending 缓冲区批量持久化
-    pub fn register_sync(&self, infohash: Infohash, source: &str) {
-        let is_new = {
-            let mut cache = self.cache.write();
-            let entry = cache
-                .entries
-                .entry(infohash)
-                .or_insert((0, source.to_string(), 0.0));
-            entry.0 += 1;
-            entry.0 == 1
-        };
-
-        // 新 infohash 写入 pending 缓冲区，由 flush_pending 批量写入 SQLite
-        if is_new {
-            self.pending.write().push((infohash, source.to_string()));
-        }
-    }
-
-    /// 批量 flush pending 缓冲区到 SQLite
-    /// 批量注册 infohash（一次 cache 写锁 + 一次 pending 写锁），返回新注册数。
-    ///
-    /// 联邦同步批量应用时使用：原本逐条 register_sync 每条都 acquire/release
-    /// 一次 cache 写锁（新 infohash 还需一次 pending 写锁）；本方法在一次 cache
-    /// 写锁内完成全部引用计数+1，再一次 pending 写锁批量入队，锁竞争从最多 2N
-    /// 次降到 2 次。
-    pub fn register_batch_sync(&self, items: &[(Infohash, String)]) -> usize {
+    /// 内部批量注册：更新引用计数 + 新 infohash 入 pending 缓冲区，不触发 Merkle/Gossip。
+    /// 返回真正新增的 (infohash, source)（引用计数 0→1）。
+    /// 联邦同步入站（apply_infohash_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    pub(crate) fn register_batch_internal(&self, items: &[(Infohash, String)]) -> Vec<(Infohash, String)> {
         if items.is_empty() {
-            return 0;
+            return Vec::new();
         }
         let mut cache = self.cache.write();
-        let mut new_count = 0;
         let mut new_items: Vec<(Infohash, String)> = Vec::new();
         for (infohash, source) in items {
             let entry = cache
@@ -92,7 +115,6 @@ impl InfohashRepoImpl {
                 .or_insert((0, source.clone(), 0.0));
             entry.0 += 1;
             if entry.0 == 1 {
-                new_count += 1;
                 new_items.push((*infohash, source.clone()));
             }
         }
@@ -101,9 +123,49 @@ impl InfohashRepoImpl {
         // 新 infohash 批量写入 pending 缓冲区，由 flush_pending 批量写入 SQLite
         if !new_items.is_empty() {
             let mut pending = self.pending.write();
-            pending.append(&mut new_items);
+            for item in &new_items {
+                pending.push(item.clone());
+            }
         }
-        new_count
+        new_items
+    }
+
+    /// 同步注册 infohash（引用计数+1），新 infohash 写入 pending 缓冲区批量持久化。
+    /// 本地写入路径：新 infohash 更新 Merkle + 提交 Gossip。
+    pub fn register_sync(&self, infohash: Infohash, source: &str) {
+        let items = [(infohash, source.to_string())];
+        let new_items = self.register_batch_internal(&items);
+        self.propagate_infohash(new_items);
+    }
+
+    /// 批量注册 infohash（一次 cache 写锁 + 一次 pending 写锁），返回新注册数。
+    /// 本地写入路径：新 infohash 更新 Merkle + 提交 Gossip。
+    /// 联邦同步入站（apply_infohash_sync）请改用 register_batch_internal，避免回环。
+    pub fn register_batch_sync(&self, items: &[(Infohash, String)]) -> usize {
+        let new_items = self.register_batch_internal(items);
+        let count = new_items.len();
+        self.propagate_infohash(new_items);
+        count
+    }
+
+    /// 把新 infohash 列表构建成 merkle/gossip 条目并传播。
+    fn propagate_infohash(&self, new_items: Vec<(Infohash, String)>) {
+        if new_items.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_items.len());
+        for (infohash, source) in &new_items {
+            if let Some((k, p)) = crate::federation::sync::infohash_sync::build_infohash_sync_entry(
+                *infohash, now, source,
+            ) {
+                built.push((k, p));
+            }
+        }
+        self.propagate(repo_type::INFOHASH, built);
     }
 
     pub async fn flush_pending(&self) -> anyhow::Result<usize> {

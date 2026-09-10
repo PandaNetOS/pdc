@@ -15,6 +15,7 @@ use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
+use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::InfohashRepoImpl;
 use crate::types::{Event, Infohash};
 
@@ -26,11 +27,29 @@ struct InfohashSyncPayload {
     source: String,
 }
 
+/// 构建 Infohash 同步条目的 (key, payload_bytes)。
+/// 格式与 collect_all_entries 一致，供 InfohashRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
+pub(crate) fn build_infohash_sync_entry(
+    infohash: Infohash,
+    seen_at_secs: u64,
+    source: &str,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let payload = InfohashSyncPayload {
+        infohash,
+        seen_at_secs,
+        source: source.to_string(),
+    };
+    let payload_bytes = bincode::serialize(&payload).ok()?;
+    let key = infohash.to_vec();
+    Some((key, payload_bytes))
+}
+
 /// InfohashRepo 同步服务
 pub struct InfohashSync {
     infohash_repo: Arc<InfohashRepoImpl>,
     gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
+    merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
     enabled: bool,
     shutdown: broadcast::Sender<()>,
@@ -41,6 +60,7 @@ impl InfohashSync {
         infohash_repo: Arc<InfohashRepoImpl>,
         gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
+        merkle_queue: Arc<MerkleUpdateQueue>,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
@@ -48,6 +68,7 @@ impl InfohashSync {
             infohash_repo,
             gossip_engine,
             merkle,
+            merkle_queue,
             metrics,
             enabled: true,
             shutdown,
@@ -88,41 +109,9 @@ impl InfohashSync {
         debug!("[federation] InfohashSync 事件消费者已启动");
     }
 
-    fn handle_event(self: Arc<Self>, event: Event) {
-        if let Event::InfohashSeen { infohash, source, seen_at } = event {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let seen_at_secs = seen_at
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let payload = InfohashSyncPayload {
-                infohash,
-                seen_at_secs,
-                source: source.clone(),
-            };
-            let payload_bytes = match bincode::serialize(&payload) {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-
-            let key = infohash.to_vec();
-            let entry = SyncEntry {
-                key,
-                operation: operation::UPSERT,
-                version: now,
-                payload: payload_bytes.clone(),
-            };
-
-            self.merkle.update(&infohash, &payload_bytes);
-            self.gossip_engine
-                .submit_gossip(repo_type::INFOHASH, vec![entry]);
-        }
-    }
+    /// 处理事件（已退役）：本地 infohash 写入已由 InfohashRepoImpl.register_sync 统一更新
+    /// Merkle + 提交 Gossip，此处不再重复传播，避免双发。
+    fn handle_event(self: Arc<Self>, _event: Event) {}
 
     /// 应用收到的 Infohash 同步数据
     pub fn apply_infohash_sync(&self, entries: &[SyncEntry]) {
@@ -144,18 +133,18 @@ impl InfohashSync {
             applied += 1;
         }
 
-        // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
         if !merkle_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = merkle_batch
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            let items: Vec<_> = merkle_batch
+                .into_iter()
+                .map(|(k, v)| (repo_type::INFOHASH, k, v))
                 .collect();
-            self.merkle.update_batch(&refs);
+            self.merkle_queue.push_batch(items);
         }
 
-        // 第二遍：一次写锁批量注册，替代逐条 register_sync
+        // 第二遍：一次写锁批量注册（调用内部方法，不触发 Merkle/Gossip，避免回环）
         if !items.is_empty() {
-            self.infohash_repo.register_batch_sync(&items);
+            self.infohash_repo.register_batch_internal(&items);
         }
 
         if applied > 0 {
@@ -253,10 +242,12 @@ mod tests {
             shutdown_tx.clone(),
         ));
         let merkle = Arc::new(MerkleTree::new(16));
+        let queue = Arc::new(MerkleUpdateQueue::new());
         let ih_sync = InfohashSync::new(
             repo.clone(),
             gossip,
             merkle,
+            queue,
             metrics,
             shutdown_tx,
         );

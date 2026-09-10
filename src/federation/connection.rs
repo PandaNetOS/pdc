@@ -580,10 +580,10 @@ impl ConnectionManager {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        cm_flush.clone().flush_gossip_buffer(&conn_flush, max_batches).await;
+                        cm_flush.clone().flush_gossip_buffer(conn_flush.clone(), max_batches).await;
                     }
                     _ = conn_flush.gossip_flush_notify.notified() => {
-                        cm_flush.clone().flush_gossip_buffer(&conn_flush, max_batches).await;
+                        cm_flush.clone().flush_gossip_buffer(conn_flush.clone(), max_batches).await;
                     }
                     _ = flush_shutdown_rx.recv() => {
                         debug!("[federation] Gossip flush 任务 {} 收到关闭信号", conn_id);
@@ -895,11 +895,13 @@ impl ConnectionManager {
         });
     }
 
-    /// P1: 刷新 per-connection GossipBatch 缓冲区
+    /// P0-1: 刷新 per-connection GossipBatch 缓冲区（按 repo_type 并行分流）。
     ///
-    /// 一次性 drain 所有缓冲的 GossipBatch，获取 1 个 semaphore permit 后
-    /// 在同一个 async task 内顺序处理所有 batch。N 个 batch 只需 1 次 spawn + 1 个 permit。
-    async fn flush_gossip_buffer(self: Arc<Self>, conn: &Connection, _max_batches: usize) {
+    /// 一次性 drain 所有缓冲的 GossipBatch，按 `repo_type` 分成最多 4 组
+    /// （NODE/PEER/INFOHASH/TRACKER）。每个非空组独立 spawn 一个 tokio task，
+    /// 各自获取 1 个 `heavy_task_semaphore` permit 后顺序处理本组 batch。
+    /// 组间并行，组内顺序；每个 task 完成后按本组 batch 数递减 `conn.pending`。
+    async fn flush_gossip_buffer(self: Arc<Self>, conn: Arc<Connection>, _max_batches: usize) {
         // 一次性 drain 所有缓冲的 batch
         let batches: Vec<GossipBatchMessage> = {
             let mut buf = conn.gossip_buffer.lock();
@@ -908,27 +910,56 @@ impl ConnectionManager {
             }
             buf.drain(..).collect()
         };
-        let batch_count = batches.len();
-
-        // 获取 semaphore permit（与 GossipBatch/MerkleRepair 共用）
-        let sem = self.heavy_task_semaphore.clone();
-        let _permit = match sem.acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                conn.pending.fetch_sub(batch_count as u32, Ordering::Relaxed);
-                return;
-            }
-        };
-
-        // 顺序处理所有 batch（纯内存操作，不经过 spawn_blocking）
-        if let Some(sync_mgr) = self.sync_manager.get() {
-            for batch in batches {
-                sync_mgr.handle_gossip_batch(batch);
-            }
+        if batches.is_empty() {
+            return;
         }
 
-        drop(_permit);
-        conn.pending.fetch_sub(batch_count as u32, Ordering::Relaxed);
+        // 按 repo_type 分流到最多 4 组（使用 protocol::repo_type 常量，不硬编码数值）
+        let mut node_group: Vec<GossipBatchMessage> = Vec::new();
+        let mut peer_group: Vec<GossipBatchMessage> = Vec::new();
+        let mut infohash_group: Vec<GossipBatchMessage> = Vec::new();
+        let mut tracker_group: Vec<GossipBatchMessage> = Vec::new();
+        for batch in batches {
+            match batch.repo_type {
+                repo_type::NODE => node_group.push(batch),
+                repo_type::PEER => peer_group.push(batch),
+                repo_type::INFOHASH => infohash_group.push(batch),
+                repo_type::TRACKER => tracker_group.push(batch),
+                _ => {
+                    debug!("[federation] flush GossipBatch 遇到未知 repo_type={}, 丢弃", batch.repo_type);
+                }
+            }
+        }
+        let groups = [node_group, peer_group, infohash_group, tracker_group];
+
+        // 每个非空组 spawn 独立 task，各自获取 1 个 permit（与 GossipBatch/MerkleRepair 共用）
+        for group in groups {
+            let group_len = group.len();
+            if group_len == 0 {
+                continue;
+            }
+            let sem = self.heavy_task_semaphore.clone();
+            let conn_task = conn.clone();
+            let self_task = self.clone();
+            tokio::spawn(async move {
+                // 等待 permit：信号量饱和时在此排队，对应 batch 计入 pending（背压可见）
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        conn_task.pending.fetch_sub(group_len as u32, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                // 顺序处理本组 batch（纯内存操作，不经过 spawn_blocking）
+                if let Some(sync_mgr) = self_task.sync_manager.get().cloned() {
+                    for batch in group {
+                        sync_mgr.handle_gossip_batch(batch);
+                    }
+                }
+                drop(_permit);
+                conn_task.pending.fetch_sub(group_len as u32, Ordering::Relaxed);
+            });
+        }
     }
 
     /// 获取指定节点的连接
