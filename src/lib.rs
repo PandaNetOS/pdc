@@ -93,8 +93,17 @@ pub use types::{
     TrackerAnnounceResponse, TrackerScrapeResponse,
 };
 
-/// 库版本
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 库版本（包含 git commit hash）
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
+
+/// 纯版本号（不含 git hash）
+pub const VERSION_PURE: &str = env!("CARGO_PKG_VERSION");
+
+/// Git commit hash
+pub const GIT_HASH: &str = env!("GIT_HASH");
+
+/// Git branch
+pub const GIT_BRANCH: &str = env!("GIT_BRANCH");
 
 /// 库名称
 pub const NAME: &str = "PeerDiscoveryCenter";
