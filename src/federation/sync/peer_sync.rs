@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::event_bus::EventBus;
 use crate::federation::gossip::GossipEngine;
@@ -209,17 +209,26 @@ impl PeerSync {
     /// 遍历所有 infohash 及其关联的 peer，构建 SyncEntry 列表。
     /// 注意：此方法不更新 Merkle 树，避免在遍历大量数据时持有锁导致死锁。
     pub fn collect_all_entries(&self) -> Vec<SyncEntry> {
+        // 确保 PeerRepo 数据已加载（联邦模块可能拿到独立实例，cache 为空）
+        self.peer_repo.ensure_loaded();
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let infohashes = self.peer_repo.infohashes();
-        let mut entries = Vec::new();
+        // 高效方式：一次读锁获取所有 peer 及其关联的 infohashes
+        // 避免遍历 2741 个 infohash 时每次都加锁+排序导致的性能问题
+        let all_peers = self.peer_repo.all_peers_with_infohashes_sync();
+        info!(
+            "[federation] Peer collect_all_entries: all_peers={}",
+            all_peers.len()
+        );
 
-        for infohash in &infohashes {
-            let peers = self.peer_repo.get_peers_sync(infohash, usize::MAX);
-            for peer in &peers {
+        let mut entries = Vec::with_capacity(all_peers.len());
+
+        for (peer, infohashes) in &all_peers {
+            for infohash in infohashes {
                 let payload = PeerSyncPayload {
                     infohash: *infohash,
                     addr: peer.addr,
@@ -247,6 +256,7 @@ impl PeerSync {
             }
         }
 
+        info!("[federation] Peer collect_all_entries 完成: {} 条 entries", entries.len());
         entries
     }
 }

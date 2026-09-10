@@ -1,8 +1,8 @@
-//! PeerRepository 实现
+﻿//! PeerRepository 瀹炵幇
 //!
-//! 合并 PeerCache + PEX池 + Probe队列 + SuperTracker peers，作为 BT Peer 的唯一归口。
-//! 内存缓存 + SQLite 历史双写。
-//! 使用 parking_lot::RwLock（同步），与 NodeRepo 一致，便于替换原 PeerCache。
+//! 鍚堝苟 PeerCache + PEX姹?+ Probe闃熷垪 + SuperTracker peers锛屼綔涓?BT Peer 鐨勫敮涓€褰掑彛銆?
+//! 鍐呭瓨缂撳瓨 + SQLite 鍘嗗彶鍙屽啓銆?
+//! 浣跨敤 parking_lot::RwLock锛堝悓姝ワ級锛屼笌 NodeRepo 涓€鑷达紝渚夸簬鏇挎崲鍘?PeerCache銆?
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -11,18 +11,19 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use tracing::{info, warn};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::PeerRepository;
 use crate::types::{Infohash, PeerInfo, PeerSource};
 
-/// 内存中的 peer 缓存（按 infohash 分组）
+/// 鍐呭瓨涓殑 peer 缂撳瓨锛堟寜 infohash 鍒嗙粍锛?
 struct PeerMemoryStore {
-    /// infohash -> peer addr 集合
+    /// infohash -> peer addr 闆嗗悎
     by_infohash: HashMap<Infohash, HashSet<SocketAddr>>,
-    /// 全局 peer addr -> PeerInfo（跨 infohash 去重）
+    /// 鍏ㄥ眬 peer addr -> PeerInfo锛堣法 infohash 鍘婚噸锛?
     global: HashMap<SocketAddr, PeerInfo>,
-    /// peer addr -> 出现在哪些 infohash 下
+    /// peer addr -> 鍑虹幇鍦ㄥ摢浜?infohash 涓?
     infohash_refs: HashMap<SocketAddr, HashSet<Infohash>>,
 }
 
@@ -39,7 +40,7 @@ impl PeerMemoryStore {
 pub struct PeerRepoImpl {
     cache: RwLock<PeerMemoryStore>,
     storage: Arc<Storage>,
-    /// peer_history 写入缓冲区（攒批写入，减少 fsync）
+    /// peer_history 鍐欏叆缂撳啿鍖猴紙鏀掓壒鍐欏叆锛屽噺灏?fsync锛?
     history_buffer: RwLock<Vec<crate::storage::db::PeerHistoryEntry>>,
 }
 
@@ -52,7 +53,52 @@ impl PeerRepoImpl {
         }
     }
 
-    // ── 同步便捷方法（_sync 后缀，与 async trait 方法区分）──
+    // 鈹€鈹€ 鍚屾渚挎嵎鏂规硶锛坃sync 鍚庣紑锛屼笌 async trait 鏂规硶鍖哄垎锛夆攢鈹€
+
+    /// 确保数据已加载（如果 cache 为空，从 SQLite 同步加载）
+    pub fn ensure_loaded(&self) {
+        if self.cache.read().global.is_empty() {
+            info!("[federation] PeerRepo cache 为空，重新从 SQLite 加载...");
+            match self.storage.load_peers() {
+                Ok(rows) => {
+                    let mut cache = self.cache.write();
+                    let mut count = 0;
+                    for row in &rows {
+                        let addr = SocketAddr::new(
+                            row.ip.parse().unwrap_or([127, 0, 0, 1].into()),
+                            row.port,
+                        );
+                        let source = match row.source.as_str() {
+                            "tracker" => PeerSource::Tracker,
+                            "dht" => PeerSource::Dht,
+                            "pex" => PeerSource::Pex,
+                            "super_tracker" => PeerSource::SuperTracker,
+                            "lpd" => PeerSource::Lpd,
+                            "webseed" => PeerSource::WebSeed,
+                            _ => PeerSource::Manual,
+                        };
+                        let mut peer = PeerInfo::new(addr, source);
+                        peer.priority_score = row.score;
+                        peer.connection_attempts = row.connection_attempts;
+                        peer.connection_successes = row.connection_successes;
+                        if row.last_active > 0 {
+                            peer.last_active = std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.last_active as u64);
+                        } else {
+                            peer.last_active = SystemTime::now();
+                        }
+                        cache.global.insert(addr, peer);
+                        cache.by_infohash.entry(row.infohash).or_default().insert(addr);
+                        cache.infohash_refs.entry(addr).or_default().insert(row.infohash);
+                        count += 1;
+                    }
+                    info!("[federation] PeerRepo 重新加载完成: {} 个 peer", count);
+                }
+                Err(e) => {
+                    warn!("[federation] PeerRepo 重新加载失败: {}", e);
+                }
+            }
+        }
+    }
 
     pub fn add_peers_sync(&self, infohash: &Infohash, new_peers: &[PeerInfo]) {
         let mut cache = self.cache.write();
@@ -60,7 +106,7 @@ impl PeerRepoImpl {
             let addr = peer.addr;
             if let Some(existing) = cache.global.get_mut(&addr) {
                 existing.last_active = peer.last_active;
-                existing.source = peer.source;  // 直接更新来源（数据层不做评分决策）
+                existing.source = peer.source;  // 鐩存帴鏇存柊鏉ユ簮锛堟暟鎹眰涓嶅仛璇勫垎鍐崇瓥锛?
                 if peer.peer_id.is_some() {
                     existing.peer_id = peer.peer_id;
                 }
@@ -70,7 +116,7 @@ impl PeerRepoImpl {
             cache.by_infohash.entry(*infohash).or_default().insert(addr);
             cache.infohash_refs.entry(addr).or_default().insert(*infohash);
         }
-        // 写入 peer_history 缓冲区（攒批写入，减少 fsync）
+        // 鍐欏叆 peer_history 缂撳啿鍖猴紙鏀掓壒鍐欏叆锛屽噺灏?fsync锛?
         let now = chrono::Utc::now().timestamp();
         let mut buffer = self.history_buffer.write();
         for p in new_peers {
@@ -83,7 +129,7 @@ impl PeerRepoImpl {
                 discovered_at: now,
             });
         }
-        // 缓冲区满 100 条时自动 flush
+        // 缂撳啿鍖烘弧 100 鏉℃椂鑷姩 flush
         if buffer.len() >= 100 {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
@@ -94,7 +140,7 @@ impl PeerRepoImpl {
         }
     }
 
-    /// 手动 flush peer_history 缓冲区
+    /// 鎵嬪姩 flush peer_history 缂撳啿鍖?
     pub async fn flush_history(&self) -> anyhow::Result<usize> {
         let batch: Vec<_> = self.history_buffer.write().drain(..).collect();
         if batch.is_empty() {
@@ -125,7 +171,7 @@ impl PeerRepoImpl {
             peer.connection_successes += 1;
             peer.last_active = SystemTime::now();
         }
-        let _ = infohash; // 兼容接口
+        let _ = infohash; // 鍏煎鎺ュ彛
     }
 
     pub fn mark_connection_failure_sync(&self, infohash: &Infohash, addr: &SocketAddr) {
@@ -137,7 +183,7 @@ impl PeerRepoImpl {
     }
 
     pub fn cleanup_expired_sync(&self) {
-        let ttl = Duration::from_secs(3600); // 默认1小时
+        let ttl = Duration::from_secs(3600); // 榛樿1灏忔椂
         let now = SystemTime::now();
         let mut cache = self.cache.write();
         let expired: Vec<SocketAddr> = cache
@@ -194,10 +240,25 @@ impl PeerRepoImpl {
         self.cache.read().global.values().cloned().collect()
     }
 
-    /// 全量保存到 SQLite
-    /// 注意：冷热判定统一由 intelligence 层的 TierSystem 负责，这里全量保存所有 peer
+    /// 高效获取所有 peer 及其关联的 infohashes（一次读锁）
+    pub fn all_peers_with_infohashes_sync(&self) -> Vec<(PeerInfo, Vec<Infohash>)> {
+        let cache = self.cache.read();
+        let mut result = Vec::with_capacity(cache.global.len());
+        for (addr, peer) in &cache.global {
+            let infohashes = cache
+                .infohash_refs
+                .get(addr)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            result.push((peer.clone(), infohashes));
+        }
+        result
+    }
+
+    /// 鍏ㄩ噺淇濆瓨鍒?SQLite
+    /// 娉ㄦ剰锛氬喎鐑垽瀹氱粺涓€鐢?intelligence 灞傜殑 TierSystem 璐熻矗锛岃繖閲屽叏閲忎繚瀛樻墍鏈?peer
     pub async fn save_all(&self) -> anyhow::Result<()> {
-        // 用内部作用域确保 cache 锁在 spawn_blocking 之前释放
+        // 鐢ㄥ唴閮ㄤ綔鐢ㄥ煙纭繚 cache 閿佸湪 spawn_blocking 涔嬪墠閲婃斁
         let batch = {
             let cache = self.cache.read();
             let mut batch = Vec::with_capacity(cache.global.len());
@@ -229,7 +290,7 @@ impl PeerRepoImpl {
         Ok(())
     }
 
-    /// 从 SQLite 加载全部 peer（运行时活跃 peer）
+    /// 浠?SQLite 鍔犺浇鍏ㄩ儴 peer锛堣繍琛屾椂娲昏穬 peer锛?
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_peers()?;
         let mut cache = self.cache.write();
@@ -254,6 +315,8 @@ impl PeerRepoImpl {
             peer.connection_successes = row.connection_successes;
             if row.last_active > 0 {
                 peer.last_active = std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.last_active as u64);
+            } else {
+                peer.last_active = SystemTime::now();
             }
             cache.global.insert(addr, peer);
             cache.by_infohash.entry(row.infohash).or_default().insert(addr);
@@ -372,7 +435,7 @@ impl PeerRepository for PeerRepoImpl {
             score: peer.priority_score,
             discovered_at: now,
         });
-        // 缓冲区满 100 条时自动 flush
+        // 缂撳啿鍖烘弧 100 鏉℃椂鑷姩 flush
         if buffer.len() >= 100 {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);

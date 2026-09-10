@@ -270,6 +270,7 @@ impl SyncManager {
             applied += 1;
         }
         if applied > 0 {
+            self.metrics.record_sync_entries(applied as u64);
             self.metrics.record_node_sync(applied as u64);
             debug!("[federation] Node 同步应用 {} 条", applied);
         }
@@ -338,8 +339,13 @@ impl SyncManager {
 
             // Peer 全量同步
             if self.config.sync_peer_enabled {
+                info!(
+                    "[federation] 初始同步 Peer 检查: peer_sync={}",
+                    if self.peer_sync.is_some() { "Some" } else { "None" }
+                );
                 if let Some(ref ps) = self.peer_sync {
                     let entries = ps.collect_all_entries();
+                    info!("[federation] 初始同步 Peer 收集完成: {} 条", entries.len());
                     if !entries.is_empty() {
                         let count = entries.len();
                         self.gossip_engine
