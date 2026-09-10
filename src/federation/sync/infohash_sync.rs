@@ -126,6 +126,8 @@ impl InfohashSync {
 
     /// 应用收到的 Infohash 同步数据
     pub fn apply_infohash_sync(&self, entries: &[SyncEntry]) {
+        // 第一遍：过滤 DELETE / 反序列化失败，收集 (infohash, source) 并更新 Merkle
+        let mut items: Vec<(Infohash, String)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -136,13 +138,14 @@ impl InfohashSync {
                 Err(_) => continue,
             };
 
-            self.infohash_repo
-                .register_sync(payload.infohash, &payload.source);
-
-            self.merkle
-                .update(&payload.infohash, &entry.payload);
-
+            self.merkle.update(&payload.infohash, &entry.payload);
+            items.push((payload.infohash, payload.source));
             applied += 1;
+        }
+
+        // 第二遍：一次写锁批量注册，替代逐条 register_sync
+        if !items.is_empty() {
+            self.infohash_repo.register_batch_sync(&items);
         }
 
         if applied > 0 {
@@ -229,6 +232,7 @@ mod tests {
             Arc::new(identity),
             crate::federation::config::FederationConfig::default(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(

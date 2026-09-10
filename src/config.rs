@@ -266,6 +266,9 @@ pub struct SuperTrackerConfig {
     /// UDP Tracker 端口（None 则与 HTTP 端口相同）
     #[serde(default)]
     pub udp_port: Option<u16>,
+    /// 中继服务器端口（UDP+TCP，打洞失败时流量转发）
+    #[serde(default = "default_relay_port")]
+    pub relay_port: u16,
 }
 
 fn default_true() -> bool {
@@ -289,6 +292,9 @@ fn default_numwant() -> usize {
 fn default_peer_ttl() -> u64 {
     3600
 }
+fn default_relay_port() -> u16 {
+    6881
+}
 
 impl Default for SuperTrackerConfig {
     fn default() -> Self {
@@ -302,6 +308,7 @@ impl Default for SuperTrackerConfig {
             peer_ttl_secs: default_peer_ttl(),
             trigger_backend_discovery: default_true(),
             udp_port: None,
+            relay_port: default_relay_port(),
         }
     }
 }
@@ -348,6 +355,9 @@ pub struct DiscoverersConfig {
     /// DHT 监听端口
     #[serde(default = "default_dht_port")]
     pub dht_listen_port: u16,
+    /// LPD 多播端口（局域网发现，默认禁用）
+    #[serde(default = "default_lpd_multicast_port")]
+    pub lpd_multicast_port: u16,
     /// 发现超时（Duration，供聚合器使用）
     #[serde(skip)]
     pub discovery_timeout: Duration,
@@ -361,6 +371,9 @@ fn default_max_concurrent() -> usize {
 }
 fn default_dht_port() -> u16 {
     6881
+}
+fn default_lpd_multicast_port() -> u16 {
+    6771
 }
 fn default_remote_tracker_url() -> String {
     "https://cdn.jsdelivr.net/gh/adysec/tracker@main/trackers_best.txt".to_string()
@@ -384,6 +397,7 @@ impl Default for DiscoverersConfig {
             remote_tracker_url: default_remote_tracker_url(),
             remote_tracker_refresh_secs: default_remote_tracker_refresh(),
             dht_listen_port: default_dht_port(),
+            lpd_multicast_port: default_lpd_multicast_port(),
             discovery_timeout: Duration::from_secs(default_discovery_timeout()),
         }
     }
@@ -484,6 +498,12 @@ pub struct CrawlerConfig {
     /// 爬虫监听的 UDP 端口
     #[serde(default = "default_crawler_listen_port")]
     pub listen_port: u16,
+    /// uTP 服务端监听端口（UDP）
+    #[serde(default = "default_utp_port")]
+    pub utp_port: u16,
+    /// TCP-PEX 服务端监听端口（TCP）
+    #[serde(default = "default_tcp_pex_port")]
+    pub tcp_pex_port: u16,
     /// Bootstrap 节点列表
     #[serde(default = "default_crawler_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<(String, u16)>,
@@ -600,6 +620,12 @@ fn default_max_infohashes() -> usize {
 fn default_crawler_listen_port() -> u16 {
     6882
 }
+fn default_utp_port() -> u16 {
+    6883
+}
+fn default_tcp_pex_port() -> u16 {
+    6884
+}
 fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
         // 主流公共 DHT 路由器
@@ -627,6 +653,8 @@ impl Default for CrawlerConfig {
             max_nodes: default_max_crawl_nodes(),
             max_infohashes: default_max_infohashes(),
             listen_port: default_crawler_listen_port(),
+            utp_port: default_utp_port(),
+            tcp_pex_port: default_tcp_pex_port(),
             bootstrap_nodes: default_crawler_bootstrap_nodes(),
         }
     }

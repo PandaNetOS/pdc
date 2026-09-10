@@ -14,6 +14,10 @@ pub struct FederationMetrics {
     pub total_messages_sent: AtomicU64,
     /// 接收消息总数
     pub total_messages_recv: AtomicU64,
+    /// 发送字节总数（序列化后的完整帧字节数，含帧头）
+    pub bytes_sent: AtomicU64,
+    /// 接收字节总数（序列化后的完整帧字节数，含帧头）
+    pub bytes_recv: AtomicU64,
     /// Gossip 传播次数
     pub gossip_propagations: AtomicU64,
     /// Gossip 接收次数
@@ -34,6 +38,12 @@ pub struct FederationMetrics {
     pub hole_punch_successes: AtomicU64,
     /// 中继转发字节数
     pub relay_bytes_forwarded: AtomicU64,
+    /// 中继通道被接受次数
+    pub relay_channels_accepted: AtomicU64,
+    /// 中继通道被拒绝次数（过载）
+    pub relay_channels_rejected: AtomicU64,
+    /// 中继通道关闭次数
+    pub relay_channels_closed: AtomicU64,
     /// Merkle 修复次数
     pub merkle_repairs: AtomicU64,
     /// 签名验证失败次数
@@ -55,6 +65,16 @@ impl FederationMetrics {
 
     pub fn record_message_recv(&self) {
         self.total_messages_recv.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 累加发送字节数（序列化后的完整帧字节长度）
+    pub fn record_bytes_sent(&self, bytes: u64) {
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 累加接收字节数（序列化后的完整帧字节长度）
+    pub fn record_bytes_recv(&self, bytes: u64) {
+        self.bytes_recv.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn record_gossip_propagation(&self) {
@@ -101,6 +121,18 @@ impl FederationMetrics {
         self.relay_bytes_forwarded.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn record_relay_channel_accepted(&self) {
+        self.relay_channels_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_relay_channel_rejected(&self) {
+        self.relay_channels_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_relay_channel_closed(&self) {
+        self.relay_channels_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_merkle_repair(&self) {
         self.merkle_repairs.fetch_add(1, Ordering::Relaxed);
     }
@@ -122,6 +154,8 @@ impl FederationMetrics {
         FederationMetricsSnapshot {
             total_messages_sent: self.total_messages_sent.load(Ordering::Relaxed),
             total_messages_recv: self.total_messages_recv.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_recv: self.bytes_recv.load(Ordering::Relaxed),
             gossip_propagations: self.gossip_propagations.load(Ordering::Relaxed),
             gossip_received: self.gossip_received.load(Ordering::Relaxed),
             sync_entries_applied: self.sync_entries_applied.load(Ordering::Relaxed),
@@ -132,6 +166,9 @@ impl FederationMetrics {
             hole_punch_attempts: self.hole_punch_attempts.load(Ordering::Relaxed),
             hole_punch_successes: self.hole_punch_successes.load(Ordering::Relaxed),
             relay_bytes_forwarded: self.relay_bytes_forwarded.load(Ordering::Relaxed),
+            relay_channels_accepted: self.relay_channels_accepted.load(Ordering::Relaxed),
+            relay_channels_rejected: self.relay_channels_rejected.load(Ordering::Relaxed),
+            relay_channels_closed: self.relay_channels_closed.load(Ordering::Relaxed),
             merkle_repairs: self.merkle_repairs.load(Ordering::Relaxed),
             signature_verification_failures: self.signature_verification_failures.load(Ordering::Relaxed),
             connections_established: self.connections_established.load(Ordering::Relaxed),
@@ -145,6 +182,8 @@ impl FederationMetrics {
 pub struct FederationMetricsSnapshot {
     pub total_messages_sent: u64,
     pub total_messages_recv: u64,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
     pub gossip_propagations: u64,
     pub gossip_received: u64,
     pub sync_entries_applied: u64,
@@ -155,6 +194,9 @@ pub struct FederationMetricsSnapshot {
     pub hole_punch_attempts: u64,
     pub hole_punch_successes: u64,
     pub relay_bytes_forwarded: u64,
+    pub relay_channels_accepted: u64,
+    pub relay_channels_rejected: u64,
+    pub relay_channels_closed: u64,
     pub merkle_repairs: u64,
     pub signature_verification_failures: u64,
     pub connections_established: u64,
@@ -166,6 +208,8 @@ impl Default for FederationMetricsSnapshot {
         Self {
             total_messages_sent: 0,
             total_messages_recv: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
             gossip_propagations: 0,
             gossip_received: 0,
             sync_entries_applied: 0,
@@ -176,6 +220,9 @@ impl Default for FederationMetricsSnapshot {
             hole_punch_attempts: 0,
             hole_punch_successes: 0,
             relay_bytes_forwarded: 0,
+            relay_channels_accepted: 0,
+            relay_channels_rejected: 0,
+            relay_channels_closed: 0,
             merkle_repairs: 0,
             signature_verification_failures: 0,
             connections_established: 0,
@@ -209,6 +256,9 @@ mod tests {
         m.record_hole_punch_attempt();
         m.record_hole_punch_success();
         m.record_relay_bytes(1024);
+        m.record_relay_channel_accepted();
+        m.record_relay_channel_rejected();
+        m.record_relay_channel_closed();
         m.record_merkle_repair();
         m.record_signature_failure();
         m.record_connection_established();
@@ -221,6 +271,9 @@ mod tests {
         assert_eq!(s.hole_punch_attempts, 1);
         assert_eq!(s.hole_punch_successes, 1);
         assert_eq!(s.relay_bytes_forwarded, 1024);
+        assert_eq!(s.relay_channels_accepted, 1);
+        assert_eq!(s.relay_channels_rejected, 1);
+        assert_eq!(s.relay_channels_closed, 1);
         assert_eq!(s.merkle_repairs, 1);
         assert_eq!(s.signature_verification_failures, 1);
         assert_eq!(s.connections_established, 1);

@@ -305,6 +305,12 @@ pub fn stun_binding_request_multi(
             }
         }
     }
+    warn!(
+        "[stun] 所有 {} 个 STUN 服务器均无响应（local_addr={}, timeout={:?}）",
+        servers.len(),
+        local_addr,
+        timeout
+    );
     None
 }
 

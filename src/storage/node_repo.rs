@@ -70,6 +70,36 @@ impl NodeRepoImpl {
         }
     }
 
+    pub fn add_nodes_sync_batch(&self, items: &[(NodeId, SocketAddr)]) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let mut nodes = self.nodes.write();
+        let mut new_addrs: Vec<SocketAddr> = Vec::new();
+        for (id, addr) in items {
+            if let Some(existing) = nodes.get_mut(addr) {
+                existing.id = *id;
+                existing.last_active = Instant::now();
+            } else {
+                let mut entry = KBucketEntry::new(*id, *addr);
+                // 新节点初始评分 45.0（中性分），与单条 add_node_sync 一致
+                entry.score = 45.0;
+                nodes.insert(*addr, entry);
+                new_addrs.push(*addr);
+            }
+        }
+        drop(nodes);
+
+        // 新节点统一标记 dirty（需要增量持久化），一次写锁
+        if !new_addrs.is_empty() {
+            let mut dirty = self.dirty.write();
+            for addr in &new_addrs {
+                dirty.insert(*addr);
+            }
+        }
+        new_addrs.len()
+    }
+
     pub fn contains_sync(&self, addr: SocketAddr) -> bool {
         self.nodes.read().contains_key(&addr)
     }

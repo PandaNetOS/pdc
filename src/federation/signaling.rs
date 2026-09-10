@@ -353,6 +353,7 @@ mod tests {
             identity.clone(),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
             .await

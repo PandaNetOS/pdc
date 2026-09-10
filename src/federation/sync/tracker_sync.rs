@@ -161,6 +161,8 @@ impl TrackerSync {
 
     /// 应用收到的 Tracker 同步数据
     pub fn apply_tracker_sync(&self, entries: &[SyncEntry]) {
+        // 第一遍：过滤 DELETE / 反序列化失败，收集 url 并更新 Merkle
+        let mut urls: Vec<String> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -172,9 +174,14 @@ impl TrackerSync {
                 Err(_) => continue,
             };
 
-            self.tracker_repo.add_tracker_sync(payload.url.clone());
             self.merkle.update(&entry.key, &entry.payload);
+            urls.push(payload.url);
             applied += 1;
+        }
+
+        // 第二遍：一次写锁批量写入，替代逐条 add_tracker_sync
+        if !urls.is_empty() {
+            self.tracker_repo.add_trackers_sync_batch(&urls);
         }
 
         if applied > 0 {
@@ -291,6 +298,7 @@ use crate::federation::node_id::NodeIdentity;
             identity,
             FederationConfig::default(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         Arc::new(GossipEngine::new(

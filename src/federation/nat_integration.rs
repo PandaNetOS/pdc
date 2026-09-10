@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
 use crate::federation::node_id::{NodeAddress, NodeIdentity, Reachability};
-use crate::nat::stun::{stun_binding_request, StunResult};
+use crate::nat::stun::{detect_nat_type_multi, stun_binding_request_multi, StunResult};
 use crate::nat::NatManager;
 
 /// NAT 集成服务
@@ -47,29 +47,57 @@ impl NatIntegration {
     }
 
     /// 执行 STUN 探测
+    ///
+    /// 使用多服务器绑定请求获取公网映射地址，并用双服务器对比检测 NAT 类型。
+    /// 如果所有 STUN 服务器都不可达，返回 None。
     pub fn stun_probe(&self) -> Option<StunResult> {
         if self.config.stun_servers.is_empty() {
-            debug!("[federation] 未配置 STUN 服务器，跳过探测");
+            warn!("[federation] 未配置 STUN 服务器，跳过探测，可达性将保持 Unknown");
             return None;
         }
 
-        let server = &self.config.stun_servers[0];
-        let local_addr = format!("0.0.0.0:{}", self.config.listen_port);
+        // 绑定临时端口，不要绑定联邦 listen_port：
+        // udp_transport 已在构造时占用 UDP listen_port（mod.rs 中 UdpTransport::try_bind），
+        // 再次 bind 同一端口会直接 EADDRINUSE，导致所有 STUN 服务器看似全部失败。
+        // STUN 只需要公网 IP 和 NAT 类型，映射端口后续由 UPnP/默认端口决定。
+        let local_addr = "0.0.0.0:0";
+        let timeout = Duration::from_secs(5);
 
-        match stun_binding_request(server, &local_addr, Duration::from_secs(5)) {
-            Ok(result) => {
-                info!(
-                    "[federation] STUN 探测成功: mapped={:?}, nat_type={:?}, rtt={}ms",
-                    result.mapped_addr, result.nat_type, result.rtt_ms
+        info!(
+            "[federation] STUN 探测开始: 服务器数={}, 列表={:?}, 本地绑定={}",
+            self.config.stun_servers.len(),
+            self.config.stun_servers,
+            local_addr
+        );
+
+        // 1. 多服务器绑定请求：获取公网映射地址（第一个成功的服务器）
+        let binding = stun_binding_request_multi(&self.config.stun_servers, local_addr, timeout);
+        let binding = match binding {
+            Some(b) => b,
+            None => {
+                warn!(
+                    "[federation] STUN 探测失败: 所有 {} 个服务器均无响应（检查网络/防火墙/服务器列表）",
+                    self.config.stun_servers.len()
                 );
-                *self.last_stun.write() = Some(result.clone());
-                Some(result)
+                return None;
             }
-            Err(e) => {
-                warn!("[federation] STUN 探测失败 ({}): {}", server, e);
-                None
-            }
-        }
+        };
+
+        // 2. 双服务器 NAT 类型检测：区分 Full Cone / Symmetric / Open Internet
+        let nat_type = detect_nat_type_multi(&self.config.stun_servers, local_addr, timeout);
+
+        info!(
+            "[federation] STUN 探测成功: mapped={:?}, nat_type={:?}, rtt={}ms, server={}",
+            binding.mapped_addr, nat_type, binding.rtt_ms, binding.server
+        );
+
+        let result = StunResult {
+            nat_type,
+            ..binding
+        };
+
+        *self.last_stun.write() = Some(result.clone());
+        Some(result)
     }
 
     /// 设置端口映射（从 NatManager.status() 读取映射结果和公网IP，更新 identity.addresses）
@@ -213,18 +241,36 @@ impl NatIntegration {
         // 优先使用 STUN 探测的 NAT 类型
         let nat_type = stun.map(|s| s.nat_type).unwrap_or(status.nat_type);
 
-        match nat_type {
+        let result = match nat_type {
             NatType::OpenInternet | NatType::FullCone => Reachability::HolePunchable,
             NatType::RestrictedCone | NatType::PortRestrictedCone => Reachability::HolePunchable,
             NatType::Symmetric => Reachability::OutboundOnly,
             NatType::Unknown => {
                 if status.external_ip.is_some() {
                     Reachability::Mapped
+                } else if stun_succeeded(stun) {
+                    // STUN 成功收到响应，说明出站 UDP 可达，
+                    // 但无法确定具体 NAT 类型（可能单服务器不足或网络受限）。
+                    // 至少是 OutboundOnly，不应降级为 Unknown。
+                    Reachability::OutboundOnly
                 } else {
+                    // STUN 完全不可达且无公网 IP，真正的未知状态
                     Reachability::Unknown
                 }
             }
-        }
+        };
+
+        debug!(
+            "[federation] 可达性判定: has_mapping={}, external_ip={:?}, stun_nat_type={:?}, stun_succeeded={}, status_nat_type={:?} => {}",
+            has_mapping,
+            status.external_ip,
+            stun.map(|s| s.nat_type),
+            stun_succeeded(stun),
+            status.nat_type,
+            result
+        );
+
+        result
     }
 
     /// 启动地址刷新后台任务（每5分钟重新探测公网地址 + STUN）
@@ -273,6 +319,11 @@ impl NatIntegration {
             debug!("[federation] 地址刷新完成，公网地址未变: {:?}", new_public);
         }
     }
+}
+
+/// 检查 STUN 探测是否成功（收到了有效响应）
+fn stun_succeeded(stun: Option<&StunResult>) -> bool {
+    stun.map(|s| s.success && s.mapped_addr.is_some()).unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -256,6 +256,9 @@ impl SyncManager {
 
     /// 应用 Node 同步数据
     pub fn apply_node_sync(&self, entries: &[SyncEntry]) {
+        // 第一遍：过滤 DELETE / 反序列化失败的条目，收集有效 payload，
+        // 并同步更新 Merkle 树（Merkle 自身锁，与 repo 锁无关，不竞争）。
+        let mut items: Vec<([u8; 20], SocketAddr)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -265,10 +268,16 @@ impl SyncManager {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            self.node_repo.add_node_sync(payload.node_id, payload.addr);
+            items.push((payload.node_id, payload.addr));
             self.node_merkle.update(&entry.key, &entry.payload);
             applied += 1;
         }
+
+        // 第二遍：一次写锁批量写入，替代逐条 add_node_sync（2N 次锁竞争 → 2 次）
+        if !items.is_empty() {
+            self.node_repo.add_nodes_sync_batch(&items);
+        }
+
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
             self.metrics.record_node_sync(applied as u64);
@@ -307,9 +316,9 @@ impl SyncManager {
 
     /// 触发初始全量同步（连接建立后调用，异步执行不阻塞）
     ///
-    /// 遍历 Node/Peer/Infohash/Tracker 四个 repo，获取全量数据，
-    /// 每批 100 条通过 Gossip 批量提交。入站和出站连接建立后都会触发，
-    /// 但通过 initial_sync_triggered 标志确保只触发一次。
+    /// Node/Peer/Infohash/Tracker 四个 repo 并行执行全量同步，
+    /// 每个 repo 独立 spawn_blocking 收集数据，每批 100 条通过 Gossip 批量提交。
+    /// 入站和出站连接建立后都会触发，但通过 initial_sync_triggered 标志确保只触发一次。
     /// 注意：使用 spawn_blocking 将 CPU 密集型操作移到阻塞线程池，
     /// 避免遍历大量数据时阻塞异步运行时导致 API 无响应。
     pub fn trigger_initial_sync(self: Arc<Self>) {
@@ -323,66 +332,66 @@ impl SyncManager {
             return;
         }
 
-        tokio::task::spawn_blocking(move || {
-            info!("[federation] 开始初始全量同步...");
+        info!("[federation] 开始初始全量同步（4 repo 并行）...");
 
-            // Node 全量同步
-            if self.config.sync_node_enabled {
-                let entries = self.collect_node_entries();
+        // Node 全量同步（独立任务）
+        if self.config.sync_node_enabled {
+            let s = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let entries = s.collect_node_entries();
                 if !entries.is_empty() {
                     let count = entries.len();
-                    self.gossip_engine
+                    s.gossip_engine
                         .submit_gossip_batch(repo_type::NODE, entries, 100);
                     info!("[federation] 初始同步 Node: {} 条（分批提交）", count);
                 }
-            }
+            });
+        }
 
-            // Peer 全量同步
-            if self.config.sync_peer_enabled {
-                info!(
-                    "[federation] 初始同步 Peer 检查: peer_sync={}",
-                    if self.peer_sync.is_some() { "Some" } else { "None" }
-                );
-                if let Some(ref ps) = self.peer_sync {
+        // Peer 全量同步（独立任务）
+        if self.config.sync_peer_enabled {
+            if let Some(ps) = self.peer_sync.clone() {
+                let gossip = self.gossip_engine.clone();
+                tokio::task::spawn_blocking(move || {
                     let entries = ps.collect_all_entries();
-                    info!("[federation] 初始同步 Peer 收集完成: {} 条", entries.len());
                     if !entries.is_empty() {
                         let count = entries.len();
-                        self.gossip_engine
-                            .submit_gossip_batch(repo_type::PEER, entries, 100);
+                        gossip.submit_gossip_batch(repo_type::PEER, entries, 100);
                         info!("[federation] 初始同步 Peer: {} 条（分批提交）", count);
                     }
-                }
+                });
             }
+        }
 
-            // Infohash 全量同步
-            if self.config.sync_infohash_enabled {
-                if let Some(ref ihs) = self.infohash_sync {
+        // Infohash 全量同步（独立任务）
+        if self.config.sync_infohash_enabled {
+            if let Some(ihs) = self.infohash_sync.clone() {
+                let gossip = self.gossip_engine.clone();
+                tokio::task::spawn_blocking(move || {
                     let entries = ihs.collect_all_entries();
                     if !entries.is_empty() {
                         let count = entries.len();
-                        self.gossip_engine
-                            .submit_gossip_batch(repo_type::INFOHASH, entries, 100);
+                        gossip.submit_gossip_batch(repo_type::INFOHASH, entries, 100);
                         info!("[federation] 初始同步 Infohash: {} 条（分批提交）", count);
                     }
-                }
+                });
             }
+        }
 
-            // Tracker 全量同步
-            if self.config.sync_tracker_enabled {
-                if let Some(ref ts) = self.tracker_sync {
+        // Tracker 全量同步（独立任务）
+        if self.config.sync_tracker_enabled {
+            if let Some(ts) = self.tracker_sync.clone() {
+                let gossip = self.gossip_engine.clone();
+                tokio::task::spawn_blocking(move || {
                     let entries = ts.collect_all_entries();
                     if !entries.is_empty() {
                         let count = entries.len();
-                        self.gossip_engine
-                            .submit_gossip_batch(repo_type::TRACKER, entries, 100);
+                        gossip.submit_gossip_batch(repo_type::TRACKER, entries, 100);
                         info!("[federation] 初始同步 Tracker: {} 条（分批提交）", count);
                     }
-                }
+                });
             }
-
-            info!("[federation] 初始全量同步完成");
-        });
+        }
     }
 
     /// 收集全量 Node 同步条目（内部辅助方法）
@@ -611,6 +620,7 @@ mod tests {
             Arc::new(identity),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
@@ -663,6 +673,7 @@ mod tests {
             Arc::new(identity),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
@@ -706,6 +717,7 @@ mod tests {
             Arc::new(identity),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(

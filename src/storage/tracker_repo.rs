@@ -62,6 +62,39 @@ impl TrackerRepoImpl {
         }
     }
 
+    /// 批量加入 tracker（一次 cache 写锁），返回新加入的 tracker 数。
+    ///
+    /// 联邦同步批量应用时使用：原本逐条 add_tracker_sync 每条都 acquire/release
+    /// 一次 cache 写锁；本方法在一次写锁内完成全部插入，锁竞争从 N 次降到 1 次。
+    pub fn add_trackers_sync_batch(&self, urls: &[String]) -> usize {
+        if urls.is_empty() {
+            return 0;
+        }
+        let mut cache = self.cache.write();
+        let mut new_count = 0;
+        for url in urls {
+            if !cache.entries.contains_key(url) {
+                cache.entries.insert(
+                    url.clone(),
+                    TrackerEntry {
+                        url: url.clone(),
+                        score: 15.0,
+                        disabled: false,
+                        total_requests: 0,
+                        success_requests: 0,
+                        failed_requests: 0,
+                        total_peers_discovered: 0,
+                        avg_response_time_ms: 0.0,
+                        consecutive_failures: 0,
+                        last_used: None,
+                    },
+                );
+                new_count += 1;
+            }
+        }
+        new_count
+    }
+
     pub fn get_tracker_sync(&self, url: &str) -> Option<TrackerEntry> {
         self.cache.read().entries.get(url).cloned()
     }

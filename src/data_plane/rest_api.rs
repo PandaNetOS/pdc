@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
+use tower_http::cors::CorsLayer;
 use std::net::SocketAddr;
 use tracing::debug;
 
@@ -221,10 +222,13 @@ pub fn routes(state: AppState) -> Router {
         .route("/api/v1/federation/nodes", get(federation_nodes_handler))
         .route("/api/v1/federation/connections", get(federation_connections_handler))
         .route("/api/v1/federation/sync-stats", get(federation_sync_stats_handler))
+        .route("/api/v1/federation/relay/setup", get(federation_relay_setup_handler))
+        .route("/api/v1/relay/stats", get(relay_stats_handler))
         .route("/metrics", get(crate::data_plane::metrics::metrics_handler))
         .route("/ws", get(crate::data_plane::ws::ws_handler))
         .with_state(state)
         .layer(Extension(event_bus))
+        .layer(CorsLayer::permissive())
 }
 
 // ---------------------------------------------------------------------------
@@ -861,6 +865,79 @@ async fn federation_sync_stats_handler(State(state): State<AppState>) -> Respons
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "federation not enabled" })),
+        )
+            .into_response(),
+    }
+}
+
+/// 手动触发与指定已连接节点建立联邦中继通道（运维/验证用）。
+/// GET /api/v1/federation/relay/setup?target=<40 位 hex node_id>
+/// 前提：本节点与 target 已有直连控制连接（联邦中继建立在已有直连之上）。
+async fn federation_relay_setup_handler(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fed = match &state.federation {
+        Some(f) => f,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "federation not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    let target_hex = match params.get("target") {
+        Some(t) => t.trim(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "missing query param 'target' (40-char hex node_id)"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let node_id = match crate::federation::node_id::NodeId::from_hex(target_hex) {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid node_id hex, expect 40 hex chars" })),
+            )
+                .into_response();
+        }
+    };
+
+    match fed.relay_manager.setup_relay(node_id) {
+        Ok(channel_id) => Json(serde_json::json!({
+            "status": "initiated",
+            "channel_id": channel_id,
+            "active_channels": fed.relay_manager.active_channel_count(),
+            "total_bytes_forwarded": fed.relay_manager.total_bytes_forwarded(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// 中继服务器统计（data_plane RelayServer）
+async fn relay_stats_handler(State(state): State<AppState>) -> Response {
+    match &state.relay_server {
+        Some(server) => {
+            let stats = server.stats();
+            Json(serde_json::to_value(&stats).unwrap_or(serde_json::json!({}))).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "relay server not started" })),
         )
             .into_response(),
     }

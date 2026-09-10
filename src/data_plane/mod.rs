@@ -78,6 +78,8 @@ pub struct AppState {
     pub active_pex: Option<Arc<crate::crawler::active_pex::ActivePexRequester>>,
     /// 联邦网络服务（可选）
     pub federation: Option<Arc<crate::federation::FederationService>>,
+    /// 中继服务器（UDP+TCP 流量转发，打洞失败时使用）
+    pub relay_server: Option<Arc<crate::data_plane::relay::RelayServer>>,
 }
 
 /// 数据面

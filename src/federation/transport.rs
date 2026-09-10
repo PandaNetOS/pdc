@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::federation::metrics::FederationMetrics;
 use crate::federation::protocol::{
     decode_frame, encode_message, frame_size_in_buffer, MessageType, FRAME_HEADER_SIZE,
 };
@@ -36,6 +37,10 @@ pub struct TcpTransport {
     writer: TokioMutex<TcpWriter>,
     peer: Option<SocketAddr>,
     local: Option<SocketAddr>,
+    /// 字节级传输统计（可选，由连接管理器注入）
+    metrics: Option<Arc<FederationMetrics>>,
+    /// 写入超时（防止对端接收慢导致永久阻塞）
+    write_timeout: Duration,
 }
 
 impl TcpTransport {
@@ -52,7 +57,21 @@ impl TcpTransport {
             writer: TokioMutex::new(TcpWriter { writer }),
             peer,
             local,
+            metrics: None,
+            write_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// 注入字节级传输统计句柄（链式调用，连接建立时由管理器挂载）
+    pub fn with_metrics(mut self, metrics: Arc<FederationMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// 配置写入超时（链式调用，由 ConnectionManager 根据配置注入）
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
     }
 
     /// 主动连接到远端
@@ -83,22 +102,29 @@ impl TcpTransport {
         msg: &T,
     ) -> anyhow::Result<()> {
         let frame = encode_message(msg_type, msg)?;
+        let frame_len = frame.len();
         let mut writer = self.writer.lock().await;
-        writer
-            .writer
-            .write_all(&frame)
+        tokio::time::timeout(self.write_timeout, writer.writer.write_all(&frame))
             .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout")
+            })?
             .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
+        // 累加序列化后的完整帧字节数（含帧头）
+        if let Some(metrics) = &self.metrics {
+            metrics.record_bytes_sent(frame_len as u64);
+        }
         Ok(())
     }
 
     /// 发送原始帧字节
     pub async fn send_raw(&self, frame: &[u8]) -> anyhow::Result<()> {
         let mut writer = self.writer.lock().await;
-        writer
-            .writer
-            .write_all(frame)
+        tokio::time::timeout(self.write_timeout, writer.writer.write_all(frame))
             .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout")
+            })?
             .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
         Ok(())
     }
@@ -113,6 +139,10 @@ impl TcpTransport {
             if let Some(frame_len) = frame_size_in_buffer(&reader.read_buf) {
                 let frame = reader.read_buf.split_to(frame_len);
                 let (msg_type, payload) = decode_frame(&frame)?;
+                // 累加接收的完整帧字节数（含帧头）
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_bytes_recv(frame_len as u64);
+                }
                 return Ok((msg_type, payload.to_vec()));
             }
 

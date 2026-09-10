@@ -24,6 +24,7 @@ use PeerDiscoveryCenter::control_plane::ControlPlane;
 use PeerDiscoveryCenter::crawler::Crawler;
 use PeerDiscoveryCenter::crawler::CrawlerEngine;
 use PeerDiscoveryCenter::data_plane::http_tracker::SuperTrackerState;
+use PeerDiscoveryCenter::data_plane::relay::RelayServer;
 use PeerDiscoveryCenter::data_plane::{AppState, DataPlane};
 use PeerDiscoveryCenter::discoverers::DiscovererRegistry;
 use PeerDiscoveryCenter::event_bus::EventBus;
@@ -128,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let nat = Arc::new(NatManager::new(nat_config));
     let udp_port = config.super_tracker.udp_port.unwrap_or(config.server.port);
+    let relay_port = config.super_tracker.relay_port;
+    let utp_port = config.crawler.utp_port;
+    let tcp_pex_port = config.crawler.tcp_pex_port;
     let crawler_port = if config.crawler.enabled {
         config.crawler.listen_port
     } else {
@@ -138,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         let nat_clone = nat.clone();
         let http_port = config.server.port;
         tokio::spawn(async move {
-            match nat_clone.init(http_port, udp_port, crawler_port, 6881, 6883, 6884, if config.federation.enabled { config.federation.listen_port } else { 0 }).await {
+            match nat_clone.init(http_port, udp_port, crawler_port, relay_port, utp_port, tcp_pex_port, if config.federation.enabled { config.federation.listen_port } else { 0 }).await {
                 Err(e) => {
                     warn!("[main] NAT/UPnP 初始化失败: {}", e);
                     warn!("[main] 如果处于 NAT 网络后，请手动配置端口转发或启用路由器 UPnP");
@@ -331,8 +335,8 @@ async fn main() -> anyhow::Result<()> {
             .with_peer_repo(peer_repo.clone()),
     );
 
-    // uTP 服务端（UDP 6883）
-    let utp_server = match tokio::net::UdpSocket::bind("0.0.0.0:6883").await {
+    // uTP 服务端（UDP）
+    let utp_server = match tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", utp_port)).await {
         Ok(socket) => {
             let server = PeerDiscoveryCenter::crawler::utp_server::UtpServer::new(
                 Arc::new(socket),
@@ -345,18 +349,18 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 s.run().await;
             });
-            info!("[main] uTP 服务端已启动（UDP 6883）");
+            info!("[main] uTP 服务端已启动（UDP {}）", utp_port);
             Some(server)
         }
         Err(e) => {
-            warn!("[main] uTP 服务端启动失败（UDP 6883）: {}", e);
+            warn!("[main] uTP 服务端启动失败（UDP {}）: {}", utp_port, e);
             None
         }
     };
 
-    // TCP-PEX 服务端（TCP 6884）
+    // TCP-PEX 服务端（TCP）
     let tcp_pex_server = {
-        let listen_addr = "0.0.0.0:6884".parse().unwrap();
+        let listen_addr = format!("0.0.0.0:{}", tcp_pex_port).parse().unwrap();
         let server = PeerDiscoveryCenter::crawler::tcp_pex_server::TcpPexServer::new(
             listen_addr,
             node_id,
@@ -370,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
                 warn!("[main] TCP-PEX 服务端运行错误: {}", e);
             }
         });
-        info!("[main] TCP-PEX 服务端已启动（TCP 6884）");
+        info!("[main] TCP-PEX 服务端已启动（TCP {}）", tcp_pex_port);
         Some(server)
     };
 
@@ -405,6 +409,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 7.6 创建 AppState
+    // 7.6a 创建中继服务器（UDP+TCP，监听 relay_port，为打洞失败的节点提供流量转发）
+    let relay_server: Option<Arc<RelayServer>> = {
+        let addr = format!("0.0.0.0:{}", relay_port).parse().unwrap();
+        let server = Arc::new(RelayServer::new(addr));
+        let server_clone = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server_clone.start().await {
+                warn!("[main] 中继服务器启动失败: {}", e);
+            }
+        });
+        info!("[main] 中继服务器已启动: {} (UDP+TCP)", addr);
+        Some(server)
+    };
+
     let app_state = AppState {
         control_plane: control_plane.clone(),
         super_tracker: super_tracker.clone(),
@@ -428,6 +446,7 @@ async fn main() -> anyhow::Result<()> {
         tcp_pex_server,
         active_pex,
         federation: federation_service.clone(),
+        relay_server,
     };
 
     // 8. 启动健康检查任务

@@ -505,6 +505,7 @@ impl DiscoveryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::metrics::FederationMetrics;
     use crate::federation::node_table::NodeTable;
 
     fn make_test_config() -> FederationConfig {
@@ -548,6 +549,7 @@ mod tests {
             identity.clone(),
             make_test_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), shutdown_tx, &dir);
 
@@ -578,6 +580,7 @@ mod tests {
             identity.clone(),
             make_test_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), shutdown_tx, &dir);
 
@@ -600,6 +603,7 @@ mod tests {
             identity.clone(),
             make_test_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let discovery = DiscoveryService::new(cm, node_table.clone(), identity.clone(), make_test_config(), shutdown_tx, &dir);
 
@@ -627,6 +631,7 @@ mod tests {
             identity.clone(),
             make_test_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let discovery = Arc::new(DiscoveryService::new(cm, node_table, identity, make_test_config(), shutdown_tx, &dir));
 
@@ -648,6 +653,7 @@ mod tests {
             identity.clone(),
             make_test_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), shutdown_tx, &dir);
 

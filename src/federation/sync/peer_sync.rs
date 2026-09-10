@@ -146,6 +146,8 @@ impl PeerSync {
 
     /// 应用收到的 Peer 同步数据
     pub fn apply_peer_sync(&self, entries: &[SyncEntry]) {
+        // 第一遍：过滤 DELETE / 反序列化失败，构建 (infohash, peer) 并更新 Merkle
+        let mut items: Vec<(Infohash, PeerInfo)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -181,15 +183,19 @@ impl PeerSync {
                 metadata: Default::default(),
             };
 
-            self.peer_repo.add_peers_sync(&payload.infohash, &[peer]);
-
             // 更新 Merkle
             let mut key = Vec::with_capacity(20 + 8);
             key.extend_from_slice(&payload.infohash);
             key.extend_from_slice(&payload.addr.to_string().into_bytes());
             self.merkle.update(&key, &entry.payload);
 
+            items.push((payload.infohash, peer));
             applied += 1;
+        }
+
+        // 第二遍：一次写锁批量写入，替代逐条 add_peers_sync
+        if !items.is_empty() {
+            self.peer_repo.add_peers_sync_batch(&items);
         }
 
         if applied > 0 {
@@ -298,6 +304,7 @@ mod tests {
             Arc::new(identity),
             crate::federation::config::FederationConfig::default(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(

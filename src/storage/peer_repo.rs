@@ -141,6 +141,57 @@ impl PeerRepoImpl {
     }
 
     /// 鎵嬪姩 flush peer_history 缂撳啿鍖?
+    /// 批量写入 peer（一次 cache 写锁 + 一次 history_buffer 写锁），返回处理条数。
+    ///
+    /// 联邦同步批量应用时使用：原本逐条 add_peers_sync 每条都 acquire/release
+    /// 一次 cache 写锁和 history_buffer 写锁；本方法在一次 cache 写锁内完成全部
+    /// 内存更新，再一次 history_buffer 写锁批量入队，锁竞争从 2N 次降到 2 次。
+    pub fn add_peers_sync_batch(&self, items: &[(Infohash, PeerInfo)]) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let mut cache = self.cache.write();
+        for (infohash, peer) in items {
+            let addr = peer.addr;
+            if let Some(existing) = cache.global.get_mut(&addr) {
+                existing.last_active = peer.last_active;
+                existing.source = peer.source;
+                if peer.peer_id.is_some() {
+                    existing.peer_id = peer.peer_id.clone();
+                }
+            } else {
+                cache.global.insert(addr, peer.clone());
+            }
+            cache.by_infohash.entry(*infohash).or_default().insert(addr);
+            cache.infohash_refs.entry(addr).or_default().insert(*infohash);
+        }
+        drop(cache);
+
+        // 批量写入 peer_history 缓冲区（节流写入，减少 fsync）
+        let now = chrono::Utc::now().timestamp();
+        let mut buffer = self.history_buffer.write();
+        for (infohash, p) in items {
+            buffer.push(crate::storage::db::PeerHistoryEntry {
+                infohash: *infohash,
+                ip: p.addr.ip().to_string(),
+                port: p.addr.port(),
+                source: p.source.as_str().to_string(),
+                score: p.priority_score,
+                discovered_at: now,
+            });
+        }
+        // 缓冲区满 100 条时自动 flush（与单条 add_peers_sync 行为一致）
+        if buffer.len() >= 100 {
+            let batch: Vec<_> = buffer.drain(..).collect();
+            drop(buffer);
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                let _ = storage.save_peer_history_batch(&batch);
+            });
+        }
+        items.len()
+    }
+
     pub async fn flush_history(&self) -> anyhow::Result<usize> {
         let batch: Vec<_> = self.history_buffer.write().drain(..).collect();
         if batch.is_empty() {

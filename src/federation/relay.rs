@@ -231,6 +231,7 @@ impl RelayManager {
     fn handle_relay_request(&self, from_node: NodeId, msg: RelaySetupMessage) {
         // 过载检查
         if self.active_channel_count() >= self.config.relay_max_connections {
+            self.metrics.record_relay_channel_rejected();
             warn!(
                 "[federation] 中继请求被拒（过载）: channel={}, from={}",
                 msg.channel_id, from_node
@@ -252,6 +253,7 @@ impl RelayManager {
         // 接受中继
         let channel = Arc::new(RelayChannel::new(msg.channel_id, from_node, NodeId(msg.target_node)));
         self.channels.write().insert(msg.channel_id, channel);
+        self.metrics.record_relay_channel_accepted();
 
         let accept = RelaySetupMessage {
             channel_id: msg.channel_id,
@@ -292,6 +294,7 @@ impl RelayManager {
     fn handle_relay_close(&self, _from_node: NodeId, msg: RelaySetupMessage) {
         if let Some(channel) = self.channels.write().remove(&msg.channel_id) {
             let bytes = channel.bytes_forwarded.load(Ordering::Relaxed);
+            self.metrics.record_relay_channel_closed();
             info!(
                 "[federation] 中继关闭: channel={}, 转发 {} 字节",
                 msg.channel_id, bytes
@@ -364,6 +367,7 @@ impl RelayManager {
     /// 关闭中继通道
     pub fn close_channel(&self, channel_id: u64) {
         if let Some(channel) = self.channels.write().remove(&channel_id) {
+            self.metrics.record_relay_channel_closed();
             let close_msg = RelaySetupMessage {
                 channel_id,
                 target_node: channel.target_node.0,
@@ -483,6 +487,7 @@ mod tests {
             identity.clone(),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         Arc::new(RelayManager::new(cm, identity, make_config(), metrics, shutdown_tx))
@@ -536,6 +541,7 @@ mod tests {
             identity.clone(),
             config.clone(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let relay = RelayManager::new(cm, identity, config, metrics, shutdown_tx);

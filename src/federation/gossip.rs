@@ -5,13 +5,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
 use parking_lot::RwLock;
 use rand::SeedableRng;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::{Connection, ConnectionManager};
@@ -38,7 +39,20 @@ pub struct GossipEngine {
     metrics: Arc<FederationMetrics>,
     /// 关闭信号
     shutdown: broadcast::Sender<()>,
+    /// 每个 batch 的重试次数计数（按 msg_id），超过 MAX_RETRIES 则丢弃
+    retry_counts: RwLock<FxHashMap<u64, u32>>,
+    /// 每个节点的 Gossip 连续发送失败计数，达到阈值则断开连接
+    consecutive_failures: RwLock<FxHashMap<NodeId, u32>>,
+    /// 发送端速率限制：当前统计窗口的起始 unix 秒（固定窗口计数器，全局维度）
+    rate_window_secs: AtomicU64,
+    /// 当前窗口已发送字节数（含帧头估算）
+    bytes_in_window: AtomicU64,
+    /// 当前窗口已发送消息条数
+    msgs_in_window: AtomicU64,
 }
+
+/// 单个 batch 最大重试次数，超过则丢弃
+const MAX_RETRIES: u32 = 3;
 
 impl GossipEngine {
     /// 创建 Gossip 引擎
@@ -60,6 +74,11 @@ impl GossipEngine {
             local_node_id,
             metrics,
             shutdown,
+            retry_counts: RwLock::new(FxHashMap::default()),
+            consecutive_failures: RwLock::new(FxHashMap::default()),
+            rate_window_secs: AtomicU64::new(0),
+            bytes_in_window: AtomicU64::new(0),
+            msgs_in_window: AtomicU64::new(0),
         }
     }
 
@@ -145,6 +164,40 @@ impl GossipEngine {
         debug!("[federation] Gossip 传播任务已启动（间隔 {}ms, fanout={}）", interval.as_millis(), fanout);
     }
 
+    /// 发送端全局速率限制：尝试在当前秒级窗口内计入 `bytes` 字节 / `msgs` 条消息。
+    ///
+    /// 采用固定窗口计数器（AtomicU64，全局维度统计总出口带宽）：
+    /// 窗口跨秒时自动滚动重置；若计入后会超过配置的字节数或消息数上限则返回 false。
+    /// 对 2 节点测试场景，单连接流量即全局流量，天然受限。
+    fn rate_try_consume(&self, bytes: u64, msgs: u64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window = self.rate_window_secs.load(Ordering::Relaxed);
+        if window != now {
+            // 跨秒：滚动窗口（CAS 抢占复位，最坏情况多算一次，对限流可接受）
+            let _ = self.rate_window_secs.compare_exchange(
+                window,
+                now,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            self.bytes_in_window.store(0, Ordering::Relaxed);
+            self.msgs_in_window.store(0, Ordering::Relaxed);
+        }
+        let max_bytes = self.config.gossip_max_bytes_per_second;
+        let max_msgs = self.config.gossip_max_messages_per_second as u64;
+        let cur_bytes = self.bytes_in_window.load(Ordering::Relaxed);
+        let cur_msgs = self.msgs_in_window.load(Ordering::Relaxed);
+        if cur_bytes + bytes > max_bytes || cur_msgs + msgs > max_msgs {
+            return false;
+        }
+        self.bytes_in_window.fetch_add(bytes, Ordering::Relaxed);
+        self.msgs_in_window.fetch_add(msgs, Ordering::Relaxed);
+        true
+    }
+
     /// 单次传播：从 outbox 取一批，随机选 fanout 个邻居发送
     async fn propagation_tick(self: Arc<Self>, fanout: usize) {
         let now = std::time::SystemTime::now()
@@ -211,13 +264,108 @@ impl GossipEngine {
             targets
         };
 
+        // 记录发送失败的 batch msg_id，用于回退 outbox
+        let mut failed_msg_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // 记录因发送端限流跳过的 batch msg_id，回退 outbox 待下 tick（不计入失败/重试）
+        let mut rate_skipped_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // 按节点跟踪本次 tick 的发送结果
+        let mut failed_nodes: FxHashSet<NodeId> = FxHashSet::default();
+        let mut successful_nodes: FxHashSet<NodeId> = FxHashSet::default();
+
         for (conn, batch) in send_targets {
+            let node_id = conn.node_id;
+            // 发送端速率限制：按全局出口字节数/消息数限流，超限则跳过（不视为失败）
+            let batch_bytes = bincode::serialized_size(batch).unwrap_or(0) + FRAME_HEADER_SIZE as u64;
+            if !self.rate_try_consume(batch_bytes, 1) {
+                debug!(
+                    "[federation] Gossip 速率超限，跳过发送 msg_id={} 到 {}（{} 字节）",
+                    batch.msg_id, node_id, batch_bytes
+                );
+                rate_skipped_ids.insert(batch.msg_id);
+                continue;
+            }
             if let Err(e) = conn.send_message(MessageType::GossipBatch, batch).await {
-                debug!("[federation] Gossip 发送到 {} 失败: {}", conn.node_id, e);
+                warn!("[federation] Gossip 发送到 {} 失败: {}", node_id, e);
+                failed_msg_ids.insert(batch.msg_id);
+                failed_nodes.insert(node_id);
             } else {
                 self.metrics.record_gossip_propagation();
                 self.metrics.record_message_sent();
+                successful_nodes.insert(node_id);
             }
+        }
+
+        // 更新节点连续失败计数：成功清零，失败递增，达到阈值则断开连接
+        let max_failures = self.config.gossip_max_consecutive_failures;
+        let mut to_disconnect: Vec<NodeId> = Vec::new();
+        {
+            let mut failures = self.consecutive_failures.write();
+            // 发送成功的节点清零计数
+            for node_id in &successful_nodes {
+                failures.remove(node_id);
+            }
+            // 发送失败的节点递增计数
+            for node_id in &failed_nodes {
+                let count = failures.entry(*node_id).or_insert(0);
+                *count += 1;
+                if *count >= max_failures {
+                    to_disconnect.push(*node_id);
+                    failures.remove(node_id);
+                }
+            }
+        }
+        // 在锁外执行断开连接
+        for node_id in to_disconnect {
+            warn!(
+                "[federation] 节点 {} Gossip 连续失败 {} 次，主动断开连接",
+                node_id, max_failures
+            );
+            self.connection_manager.remove_connection(&node_id);
+        }
+
+        // 将发送失败的 batch 放回 outbox，带重试次数限制
+        if !failed_msg_ids.is_empty() {
+            let mut retry_guard = self.retry_counts.write();
+            let mut returned: Vec<GossipBatchMessage> = Vec::new();
+
+            for batch in &batches {
+                if !failed_msg_ids.contains(&batch.msg_id) {
+                    // 发送成功，清理重试计数
+                    retry_guard.remove(&batch.msg_id);
+                    continue;
+                }
+                let count = retry_guard.entry(batch.msg_id).or_insert(0);
+                *count += 1;
+                if *count >= MAX_RETRIES {
+                    error!(
+                        "[federation] Gossip 批次 msg_id={} 重试 {} 次仍失败，丢弃",
+                        batch.msg_id, count
+                    );
+                    retry_guard.remove(&batch.msg_id);
+                } else {
+                    warn!(
+                        "[federation] Gossip 批次 msg_id={} 发送失败（第 {} 次），放回 outbox 重试",
+                        batch.msg_id, count
+                    );
+                    returned.push(batch.clone());
+                }
+            }
+            drop(retry_guard);
+
+            if !returned.is_empty() {
+                self.outbox.write().extend(returned);
+            }
+        }
+
+        // 限流跳过的 batch 回退 outbox（不计重试、不计连续失败），下 tick 再发
+        if !rate_skipped_ids.is_empty() {
+            let mut outbox = self.outbox.write();
+            for batch in &batches {
+                if rate_skipped_ids.contains(&batch.msg_id) {
+                    outbox.push(batch.clone());
+                }
+            }
+            debug!("[federation] 限流跳过 {} 条 batch 回退 outbox", rate_skipped_ids.len());
         }
 
         debug!("[federation] Gossip 传播: {} 条消息发送到 {} 个邻居", batches.len(), fanout);
@@ -357,6 +505,7 @@ mod tests {
             Arc::new(identity),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let engine = GossipEngine::new(
@@ -408,6 +557,7 @@ mod tests {
             Arc::new(identity),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let engine = GossipEngine::new(
@@ -433,6 +583,7 @@ mod tests {
             Arc::new(identity),
             make_config(),
             cm_shutdown,
+            Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
         let engine = GossipEngine::new(

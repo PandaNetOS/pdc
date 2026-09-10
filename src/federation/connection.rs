@@ -3,12 +3,13 @@
 //! 管理联邦网络中的所有 TCP 连接，包括监听、主动连接、握手、心跳和消息分发。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
-use tokio::sync::{broadcast, Mutex as TokioMutex, OnceCell};
+use tokio::sync::{broadcast, Mutex as TokioMutex, OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
@@ -31,6 +32,9 @@ pub struct Connection {
     pub connected_at: Instant,
     /// 最后活跃时间
     pub last_active: RwLock<Instant>,
+    /// 待处理消息计数（接收端背压监控）：dispatch 前 +1，处理完成 -1。
+    /// 超过配置阈值时输出背压告警日志。
+    pub pending: AtomicU32,
 }
 
 impl Connection {
@@ -42,6 +46,7 @@ impl Connection {
             addr,
             connected_at: Instant::now(),
             last_active: RwLock::new(Instant::now()),
+            pending: AtomicU32::new(0),
         }
     }
 
@@ -104,8 +109,15 @@ pub struct ConnectionManager {
     sync_manager: OnceCell<Arc<crate::federation::sync::SyncManager>>,
     /// 打洞信令服务（延迟注入）
     signaling_service: OnceCell<Arc<SignalingService>>,
+    /// 中继管理器（延迟注入）
+    relay_manager: OnceCell<Arc<crate::federation::relay::RelayManager>>,
     /// 监控指标
     metrics: Arc<FederationMetrics>,
+    /// 重连冷却到期时间（NodeId -> 冷却截止时刻），断开后在此时间内不主动重连
+    cooldown_until: RwLock<FxHashMap<NodeId, Instant>>,
+    /// 重量级消息处理的有界并发信号量（GossipBatch/MerkleRepair 经 spawn_blocking 执行，
+    /// 先 acquire permit 再 spawn，避免无界生成阻塞任务导致内存暴涨）
+    heavy_task_semaphore: Arc<Semaphore>,
 }
 
 impl ConnectionManager {
@@ -115,18 +127,24 @@ impl ConnectionManager {
         identity: Arc<crate::federation::node_id::NodeIdentity>,
         config: FederationConfig,
         shutdown: broadcast::Sender<()>,
+        metrics: Arc<FederationMetrics>,
     ) -> Self {
         Self {
             connections: RwLock::new(FxHashMap::default()),
             connecting: RwLock::new(FxHashSet::default()),
             node_table,
             identity,
-            config,
+            config: config.clone(),
             shutdown,
             discovery: OnceCell::new(),
             sync_manager: OnceCell::new(),
             signaling_service: OnceCell::new(),
-            metrics: Arc::new(FederationMetrics::new()),
+            relay_manager: OnceCell::new(),
+            metrics,
+            cooldown_until: RwLock::new(FxHashMap::default()),
+            heavy_task_semaphore: Arc::new(Semaphore::new(
+                config.heavy_task_max_concurrency.max(1),
+            )),
         }
     }
 
@@ -143,6 +161,11 @@ impl ConnectionManager {
     /// 注入打洞信令服务（由 FederationService 调用）
     pub fn set_signaling_service(&self, signaling: Arc<SignalingService>) {
         let _ = self.signaling_service.set(signaling);
+    }
+
+    /// 注入中继管理器（由 FederationService 调用）
+    pub fn set_relay_manager(&self, relay: Arc<crate::federation::relay::RelayManager>) {
+        let _ = self.relay_manager.set(relay);
     }
 
     /// 启动 TCP 监听
@@ -199,7 +222,10 @@ impl ConnectionManager {
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let _ = stream.set_nodelay(true);
-        let transport = TcpTransport::new(stream);
+        let transport_write_timeout = Duration::from_secs(self.config.transport_write_timeout_secs);
+        let transport = TcpTransport::new(stream)
+            .with_metrics(self.metrics.clone())
+            .with_write_timeout(transport_write_timeout);
 
         // 入站握手
         let (node_id, _hello) = self.handshake_inbound(&transport).await?;
@@ -253,6 +279,23 @@ impl ConnectionManager {
             return Ok(conn);
         }
 
+        // 检查重连冷却期：断开后 N 秒内不主动重连同一节点
+        let now = Instant::now();
+        if let Some(until) = self.cooldown_until.read().get(&node_id) {
+            if now < *until {
+                let remaining = *until - now;
+                debug!(
+                    "[federation] 节点 {} 在重连冷却期内（剩余 {:?}），跳过连接",
+                    node_id, remaining
+                );
+                anyhow::bail!(
+                    "节点 {} 在重连冷却期内（剩余 {:?}）",
+                    node_id,
+                    remaining
+                );
+            }
+        }
+
         // 检查是否正在连接中（用地址，防止并发重复连接）
         if !self.connecting.write().insert(addr) {
             anyhow::bail!("地址 {} 正在连接中，跳过重复连接", addr);
@@ -267,7 +310,10 @@ impl ConnectionManager {
         self.node_table.mark_connecting(&node_id);
 
         let transport = match TcpTransport::connect(addr).await {
-            Ok(t) => t,
+            Ok(t) => {
+                t.with_metrics(self.metrics.clone())
+                    .with_write_timeout(Duration::from_secs(self.config.transport_write_timeout_secs))
+            }
             Err(e) => {
                 self.connecting.write().remove(&addr);
                 self.node_table.mark_failed(&node_id);
@@ -308,6 +354,25 @@ impl ConnectionManager {
 
         // 连接建立成功，移除 connecting 标记
         self.connecting.write().remove(&addr);
+
+        // 出站直连建立后，若启用中继且开启自动协商，则在该控制连接上发起中继通道。
+        // 注意：联邦中继是建立在“已有直连”之上的数据隧道，不能在打洞失败（无直连）时
+        // 作为 NAT 回退；此处仅在出站连接成功后触发，此时 get_connection 必然命中。
+        if self.config.enable_relay && self.config.relay_auto_setup_on_connect {
+            if let Some(relay) = self.relay_manager.get() {
+                match relay.setup_relay(peer_id) {
+                    Ok(channel_id) => {
+                        info!(
+                            "[federation] 出站连接后自动建立中继 channel={}, peer={}",
+                            channel_id, peer_id
+                        );
+                    }
+                    Err(e) => {
+                        debug!("[federation] 出站连接后自动建立中继失败 peer={}: {}", peer_id, e);
+                    }
+                }
+            }
+        }
 
         Ok(connection)
     }
@@ -392,10 +457,21 @@ impl ConnectionManager {
             .insert(connection.node_id, connection);
     }
 
-    /// 移除连接
-    fn remove_connection(&self, node_id: &NodeId) {
-        if self.connections.write().remove(node_id).is_some() {
+    /// 移除连接（主动关闭 TCP socket，并记录重连冷却时间）
+    pub fn remove_connection(&self, node_id: &NodeId) {
+        // 记录重连冷却到期时间，防止立即重连形成循环
+        let cooldown = Duration::from_secs(self.config.reconnect_cooldown_secs);
+        self.cooldown_until.write().insert(*node_id, Instant::now() + cooldown);
+
+        let conn = self.connections.write().remove(node_id);
+        if let Some(conn) = conn {
             self.metrics.record_connection_closed();
+            // 主动关闭 TCP 传输，解除消息处理任务在 recv_message() 上的阻塞
+            // 避免半开连接导致 task 泄漏
+            let conn_clone = conn.clone();
+            tokio::spawn(async move {
+                let _ = conn_clone.transport.close().await;
+            });
         }
         self.node_table.mark_disconnected(node_id);
     }
@@ -453,12 +529,29 @@ impl ConnectionManager {
         let conn_id = connection.node_id;
 
         tokio::spawn(async move {
+            let pending_threshold = self.config.receive_pending_threshold;
             loop {
                 tokio::select! {
                     result = connection.recv_message() => {
                         match result {
                             Ok((msg_type, payload)) => {
-                                self.clone().dispatch_message(connection.clone(), msg_type, payload).await;
+                                // 接收端背压监控：计入待处理消息
+                                connection.pending.fetch_add(1, Ordering::Relaxed);
+                                // dispatch 返回 true 表示已异步卸载（重量级任务），
+                                // pending 计数由卸载任务完成后自行递减；
+                                // 返回 false 表示同步处理已完成，此处立即递减。
+                                let offloaded = self.clone().dispatch_message(connection.clone(), msg_type, payload).await;
+                                if !offloaded {
+                                    connection.pending.fetch_sub(1, Ordering::Relaxed);
+                                }
+                                // 背压告警：单连接待处理积压超过阈值
+                                let pending = connection.pending.load(Ordering::Relaxed);
+                                if pending > pending_threshold {
+                                    warn!(
+                                        "[federation] 连接 {} 待处理消息积压 {} 超过阈值 {}，接收端处理慢（背压）",
+                                        conn_id, pending, pending_threshold
+                                    );
+                                }
                             }
                             Err(e) => {
                                 debug!("[federation] 连接 {} 读取失败: {}", conn_id, e);
@@ -476,16 +569,18 @@ impl ConnectionManager {
         });
     }
 
-    /// 分发消息
+    /// 分发消息。
+    /// 返回值：true 表示本次消息已被异步卸载（重量级处理在后台执行，pending 计数由
+    /// 卸载任务负责递减）；false 表示同步处理已完成（调用方负责递减 pending 计数）。
     async fn dispatch_message(
         self: Arc<Self>,
         connection: Arc<Connection>,
         msg_type: MessageType,
         payload: Vec<u8>,
-    ) {
+    ) -> bool {
         connection.touch();
 
-        match msg_type {
+        let offloaded = match msg_type {
             MessageType::Ping => {
                 if let Ok(ping) = bincode::deserialize::<PingMessage>(&payload) {
                     let pong = PongMessage {
@@ -494,12 +589,14 @@ impl ConnectionManager {
                     };
                     let _ = connection.send_message(MessageType::Pong, &pong).await;
                 }
+                false
             }
             MessageType::Pong => {
                 if let Ok(pong) = bincode::deserialize::<PongMessage>(&payload) {
                     self.node_table.update_rtt(&connection.node_id, pong.rtt_estimate_ms);
                     debug!("[federation] 收到 Pong from {} (rtt={}ms)", connection.node_id, pong.rtt_estimate_ms);
                 }
+                false
             }
             MessageType::GetNodes => {
                 if let Ok(req) = bincode::deserialize::<GetNodesMessage>(&payload) {
@@ -507,6 +604,7 @@ impl ConnectionManager {
                         discovery.handle_get_nodes(&connection, req.count).await;
                     }
                 }
+                false
             }
             MessageType::Nodes => {
                 if let Ok(msg) = bincode::deserialize::<NodesMessage>(&payload) {
@@ -514,6 +612,7 @@ impl ConnectionManager {
                         discovery.handle_nodes_received(msg.nodes);
                     }
                 }
+                false
             }
             MessageType::ExchangeNodes => {
                 if let Ok(msg) = bincode::deserialize::<ExchangeNodesMessage>(&payload) {
@@ -521,20 +620,33 @@ impl ConnectionManager {
                         discovery.handle_exchange_nodes(msg.nodes);
                     }
                 }
+                false
             }
             MessageType::SyncBatch => {
+                // TODO(P1): handle_sync_batch 涉及大量 DB 写入，后续批量写入优化时一并异步化。
+                // 当前为旧 stage-1 协议，主路径已走 GossipBatch（已异步卸载）。
                 if let Ok(msg) = bincode::deserialize::<SyncBatchMessage>(&payload) {
                     if let Some(sync_mgr) = self.sync_manager.get() {
                         sync_mgr.handle_sync_batch(msg.repo_type, &msg.entries);
                     }
                 }
+                false
             }
             MessageType::GossipBatch => {
                 self.metrics.record_message_recv();
-                if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        sync_mgr.handle_gossip_batch(batch);
-                    }
+                // 重量级处理（去重 + outbox 转发 + 多 repo DB 写入）异步卸载，
+                // 避免阻塞消息接收循环导致 TCP 接收缓冲区打满。
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    self.spawn_heavy_handler(conn, move || {
+                        if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
+                            sync_mgr.handle_gossip_batch(batch);
+                        }
+                    });
+                    true
+                } else {
+                    false
                 }
             }
             MessageType::MerkleDigest => {
@@ -548,6 +660,7 @@ impl ConnectionManager {
                         });
                     }
                 }
+                false
             }
             MessageType::MerkleRequest => {
                 self.metrics.record_message_recv();
@@ -560,13 +673,22 @@ impl ConnectionManager {
                         });
                     }
                 }
+                false
             }
             MessageType::MerkleRepair => {
                 self.metrics.record_message_recv();
-                if let Ok(repair) = bincode::deserialize::<MerkleRepairMessage>(&payload) {
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        sync_mgr.handle_merkle_repair(repair);
-                    }
+                // 重量级处理（分片对比 + 多 repo DB 写入）异步卸载，复用同一 Semaphore。
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    self.spawn_heavy_handler(conn, move || {
+                        if let Ok(repair) = bincode::deserialize::<MerkleRepairMessage>(&payload) {
+                            sync_mgr.handle_merkle_repair(repair);
+                        }
+                    });
+                    true
+                } else {
+                    false
                 }
             }
             MessageType::Signaling => {
@@ -576,6 +698,7 @@ impl ConnectionManager {
                         signaling.handle_signaling(connection.node_id, msg);
                     }
                 }
+                false
             }
             MessageType::RelaySetup => {
                 self.metrics.record_message_recv();
@@ -584,6 +707,7 @@ impl ConnectionManager {
                         sync_mgr.handle_relay_setup(connection.node_id, msg);
                     }
                 }
+                false
             }
             MessageType::RelayData => {
                 self.metrics.record_message_recv();
@@ -592,15 +716,46 @@ impl ConnectionManager {
                         sync_mgr.handle_relay_data(connection.node_id, msg);
                     }
                 }
+                false
             }
             MessageType::Goodbye => {
                 debug!("[federation] 收到 Goodbye from {}", connection.node_id);
                 self.remove_connection(&connection.node_id);
+                false
             }
             _ => {
                 debug!("[federation] 收到未处理消息类型 {:?} from {}", msg_type, connection.node_id);
+                false
             }
-        }
+        };
+
+        offloaded
+    }
+
+    /// 异步执行重量级消息处理（GossipBatch / MerkleRepair）。
+    ///
+    /// 先从 `heavy_task_semaphore` 获取 permit（有界并发，默认 4），再用
+    /// `spawn_blocking` 把阻塞型 DB 写入移出异步运行时线程，避免消息接收循环被卡住。
+    /// 任务完成（或信号量关闭）后递减该连接的 pending 待处理计数。
+    fn spawn_heavy_handler<F>(&self, conn: Arc<Connection>, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let sem = self.heavy_task_semaphore.clone();
+        tokio::spawn(async move {
+            // 等待 permit：信号量饱和时在此排队，对应消息计入 pending（背压可见）
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    conn.pending.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            // 阻塞型处理移入 blocking 线程池
+            let _ = tokio::task::spawn_blocking(f).await;
+            drop(_permit);
+            conn.pending.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 
     /// 获取指定节点的连接
@@ -654,7 +809,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let mgr = ConnectionManager::new(node_table, identity, make_test_config(), shutdown_tx);
+        let mgr = ConnectionManager::new(node_table, identity, make_test_config(), shutdown_tx, Arc::new(FederationMetrics::new()));
         assert_eq!(mgr.connection_count(), 0);
         assert!(mgr.all_connections().is_empty());
     }
@@ -725,12 +880,14 @@ mod tests {
             identity1.clone(),
             make_test_config(),
             shutdown_tx.clone(),
+            Arc::new(FederationMetrics::new()),
         ));
         let mgr2 = Arc::new(ConnectionManager::new(
             node_table2.clone(),
             identity2.clone(),
             make_test_config(),
             shutdown_tx,
+            Arc::new(FederationMetrics::new()),
         ));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -185,12 +185,13 @@ impl FederationService {
         // 4. 创建节点表
         let node_table = Arc::new(NodeTable::new(config.max_connections * 4));
 
-        // 5. 创建连接管理器
+        // 5. 创建连接管理器（传入共享 metrics，确保 transport 层字节统计与 REST API 返回同一实例）
         let connection_manager = Arc::new(ConnectionManager::new(
             node_table.clone(),
             identity.clone(),
             config.clone(),
             shutdown_tx.clone(),
+            metrics.clone(),
         ));
 
         // 6. 创建 Gossip 引擎
@@ -266,6 +267,7 @@ impl FederationService {
         connection_manager.set_discovery(discovery.clone());
         connection_manager.set_sync_manager(sync_manager.clone());
         connection_manager.set_signaling_service(signaling_service.clone());
+        connection_manager.set_relay_manager(relay_manager.clone());
 
         info!(
             "[federation] 联邦服务已创建: node_id={}, listen_port={}, ed25519_pubkey={}",
@@ -313,6 +315,10 @@ impl FederationService {
 
         // 4. 启动 NAT 地址刷新任务（含 STUN 探测）
         self.nat_integration.clone().spawn_address_refresh();
+
+        // 4.1 启动时先执行一次 STUN 探测，确保 setup_mapping 能拿到 STUN 结果
+        //     否则首次 setup_mapping 时 last_stun 为 None，reachability 会误判为 Unknown
+        self.nat_integration.stun_probe();
 
         // 5. 设置 NAT 映射
         self.nat_integration.setup_mapping();

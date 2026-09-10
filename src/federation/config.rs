@@ -35,7 +35,7 @@ pub struct FederationConfig {
     #[serde(default = "default_true")]
     pub nat_mapping_enabled: bool,
     /// STUN 服务器列表
-    #[serde(default)]
+    #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<String>,
     /// 是否启用中继（阶段3实现）
     #[serde(default = "default_true")]
@@ -46,6 +46,11 @@ pub struct FederationConfig {
     /// 中继最大连接数
     #[serde(default = "default_relay_max_connections")]
     pub relay_max_connections: usize,
+    /// 出站直连建立后是否自动与对端协商中继通道。
+    /// 注意：联邦中继是建立在“已有直连控制连接”之上的数据隧道，
+    /// 无法在打洞失败（无直连）时作为 NAT 回退手段。
+    #[serde(default = "default_relay_auto_setup_on_connect")]
+    pub relay_auto_setup_on_connect: bool,
     /// Gossip 间隔（毫秒，阶段2实现）
     #[serde(default = "default_gossip_interval")]
     pub gossip_interval_ms: u64,
@@ -79,6 +84,32 @@ pub struct FederationConfig {
     /// 最大缓存节点数
     #[serde(default = "default_peer_cache_max")]
     pub peer_cache_max_nodes: usize,
+    /// TCP 传输写入超时（秒），超过此时间 write_all 未完成则报错
+    #[serde(default = "default_transport_write_timeout")]
+    pub transport_write_timeout_secs: u64,
+    /// Gossip 连续发送失败断开阈值，达到此次数则主动断开连接
+    #[serde(default = "default_gossip_max_consecutive_failures")]
+    pub gossip_max_consecutive_failures: u32,
+    /// 重连冷却时间（秒），断开后此时间内不主动重连同一节点
+    #[serde(default = "default_reconnect_cooldown_secs")]
+    pub reconnect_cooldown_secs: u64,
+    /// 重量级消息处理（GossipBatch/MerkleRepair）的最大并发数。
+    /// 这些处理涉及大量 DB 写入，通过 Semaphore 限制 spawn_blocking 并发，
+    /// 避免无界生成任务导致内存暴涨，同时不阻塞消息接收循环。
+    #[serde(default = "default_heavy_task_max_concurrency")]
+    pub heavy_task_max_concurrency: usize,
+    /// Gossip 发送端全局出口速率限制：每秒最多发送字节数（含帧头）。
+    /// 超限则跳过本 tick 的后续发送，消息留待下 tick 重试，
+    /// 防止对端接收缓冲区打满导致 write_all 超时断连。
+    #[serde(default = "default_gossip_max_bytes_per_second")]
+    pub gossip_max_bytes_per_second: u64,
+    /// Gossip 发送端全局出口速率限制：每秒最多发送消息条数。
+    #[serde(default = "default_gossip_max_messages_per_second")]
+    pub gossip_max_messages_per_second: u32,
+    /// 接收端单连接待处理消息数阈值，超过则输出背压告警日志。
+    /// 仅监控告警（TCP 流控 + 发送端限流为主要手段）。
+    #[serde(default = "default_receive_pending_threshold")]
+    pub receive_pending_threshold: u32,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -87,13 +118,32 @@ fn default_target_neighbors() -> usize { 8 }
 fn default_heartbeat_interval() -> u64 { 30 }
 fn default_heartbeat_timeout() -> u64 { 90 }
 fn default_true() -> bool { true }
+fn default_stun_servers() -> Vec<String> {
+    // 国内可达的 STUN 服务器优先（小米/B站/腾讯），其次 Cloudflare，
+    // 最后 Google（国内默认被墙，仅在有代理环境时作为兜底）。
+    vec![
+        "stun.miwifi.com:3478".to_string(),
+        "stun.chat.bilibili.com:3478".to_string(),
+        "stun.qq.com:3478".to_string(),
+        "stun.cloudflare.com:3478".to_string(),
+        "stun.l.google.com:19302".to_string(),
+    ]
+}
 fn default_relay_bandwidth() -> u32 { 10 }
 fn default_relay_max_connections() -> usize { 5 }
+fn default_relay_auto_setup_on_connect() -> bool { true }
 fn default_gossip_interval() -> u64 { 1000 }
 fn default_gossip_fanout() -> usize { 3 }
 fn default_sync_node_interval() -> u64 { 300 }
 fn default_dht_interval() -> u64 { 300 }
 fn default_peer_cache_max() -> usize { 100 }
+fn default_transport_write_timeout() -> u64 { 5 }
+fn default_gossip_max_consecutive_failures() -> u32 { 3 }
+fn default_reconnect_cooldown_secs() -> u64 { 30 }
+fn default_heavy_task_max_concurrency() -> usize { 4 }
+fn default_gossip_max_bytes_per_second() -> u64 { 5 * 1024 * 1024 }
+fn default_gossip_max_messages_per_second() -> u32 { 100 }
+fn default_receive_pending_threshold() -> u32 { 1000 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -107,10 +157,11 @@ impl Default for FederationConfig {
             heartbeat_interval_secs: default_heartbeat_interval(),
             heartbeat_timeout_secs: default_heartbeat_timeout(),
             nat_mapping_enabled: default_true(),
-            stun_servers: Vec::new(),
+            stun_servers: default_stun_servers(),
             enable_relay: default_true(),
             relay_bandwidth_limit_mbps: default_relay_bandwidth(),
             relay_max_connections: default_relay_max_connections(),
+            relay_auto_setup_on_connect: default_relay_auto_setup_on_connect(),
             gossip_interval_ms: default_gossip_interval(),
             gossip_fanout: default_gossip_fanout(),
             sync_peer_enabled: default_true(),
@@ -122,6 +173,13 @@ impl Default for FederationConfig {
             dht_discovery_interval_secs: default_dht_interval(),
             peer_cache_enabled: default_true(),
             peer_cache_max_nodes: default_peer_cache_max(),
+            transport_write_timeout_secs: default_transport_write_timeout(),
+            gossip_max_consecutive_failures: default_gossip_max_consecutive_failures(),
+            reconnect_cooldown_secs: default_reconnect_cooldown_secs(),
+            heavy_task_max_concurrency: default_heavy_task_max_concurrency(),
+            gossip_max_bytes_per_second: default_gossip_max_bytes_per_second(),
+            gossip_max_messages_per_second: default_gossip_max_messages_per_second(),
+            receive_pending_threshold: default_receive_pending_threshold(),
         }
     }
 }

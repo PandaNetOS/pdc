@@ -72,6 +72,40 @@ impl InfohashRepoImpl {
     }
 
     /// 批量 flush pending 缓冲区到 SQLite
+    /// 批量注册 infohash（一次 cache 写锁 + 一次 pending 写锁），返回新注册数。
+    ///
+    /// 联邦同步批量应用时使用：原本逐条 register_sync 每条都 acquire/release
+    /// 一次 cache 写锁（新 infohash 还需一次 pending 写锁）；本方法在一次 cache
+    /// 写锁内完成全部引用计数+1，再一次 pending 写锁批量入队，锁竞争从最多 2N
+    /// 次降到 2 次。
+    pub fn register_batch_sync(&self, items: &[(Infohash, String)]) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let mut cache = self.cache.write();
+        let mut new_count = 0;
+        let mut new_items: Vec<(Infohash, String)> = Vec::new();
+        for (infohash, source) in items {
+            let entry = cache
+                .entries
+                .entry(*infohash)
+                .or_insert((0, source.clone(), 0.0));
+            entry.0 += 1;
+            if entry.0 == 1 {
+                new_count += 1;
+                new_items.push((*infohash, source.clone()));
+            }
+        }
+        drop(cache);
+
+        // 新 infohash 批量写入 pending 缓冲区，由 flush_pending 批量写入 SQLite
+        if !new_items.is_empty() {
+            let mut pending = self.pending.write();
+            pending.append(&mut new_items);
+        }
+        new_count
+    }
+
     pub async fn flush_pending(&self) -> anyhow::Result<usize> {
         let pending = {
             let mut p = self.pending.write();

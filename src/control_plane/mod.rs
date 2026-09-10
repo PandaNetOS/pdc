@@ -136,6 +136,7 @@ impl ControlPlane {
         if config.discoverers.enable_lpd {
             let lpd_config = crate::discoverers::lpd::LpdConfig {
                 listen_port: config.discoverers.dht_listen_port,
+                multicast_port: config.discoverers.lpd_multicast_port,
                 ..Default::default()
             };
             self.registry
