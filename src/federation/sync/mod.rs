@@ -8,18 +8,19 @@ pub mod peer_sync;
 pub mod tracker_sync;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::ConnectionManager;
+use crate::federation::connection::{Connection, ConnectionManager};
 use crate::federation::gossip::GossipEngine;
-use crate::federation::merkle::MerkleTree;
+use crate::federation::merkle::{MerkleProvider, MerkleTree};
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
@@ -47,7 +48,10 @@ pub struct SyncManager {
     tracker_sync: Option<Arc<TrackerSync>>,
     relay_manager: Option<Arc<RelayManager>>,
     config: FederationConfig,
+    metrics: Arc<FederationMetrics>,
     shutdown: broadcast::Sender<()>,
+    /// 初始全量同步是否已触发（确保只触发一次，避免重复同步）
+    initial_sync_triggered: AtomicBool,
 }
 
 impl SyncManager {
@@ -140,7 +144,9 @@ impl SyncManager {
             tracker_sync,
             relay_manager,
             config,
+            metrics,
             shutdown,
+            initial_sync_triggered: AtomicBool::new(false),
         }
     }
 
@@ -264,6 +270,7 @@ impl SyncManager {
             applied += 1;
         }
         if applied > 0 {
+            self.metrics.record_node_sync(applied as u64);
             debug!("[federation] Node 同步应用 {} 条", applied);
         }
     }
@@ -295,6 +302,257 @@ impl SyncManager {
     /// 获取 TrackerSync 引用
     pub fn tracker_sync(&self) -> Option<Arc<TrackerSync>> {
         self.tracker_sync.clone()
+    }
+
+    /// 触发初始全量同步（连接建立后调用，异步执行不阻塞）
+    ///
+    /// 遍历 Node/Peer/Infohash/Tracker 四个 repo，获取全量数据，
+    /// 每批 100 条通过 Gossip 批量提交。入站和出站连接建立后都会触发，
+    /// 但通过 initial_sync_triggered 标志确保只触发一次。
+    /// 注意：使用 spawn_blocking 将 CPU 密集型操作移到阻塞线程池，
+    /// 避免遍历大量数据时阻塞异步运行时导致 API 无响应。
+    pub fn trigger_initial_sync(self: Arc<Self>) {
+        // 防重复：初始全量同步只触发一次
+        if self
+            .initial_sync_triggered
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            debug!("[federation] 初始全量同步已触发过，跳过");
+            return;
+        }
+
+        tokio::task::spawn_blocking(move || {
+            info!("[federation] 开始初始全量同步...");
+
+            // Node 全量同步
+            if self.config.sync_node_enabled {
+                let entries = self.collect_node_entries();
+                if !entries.is_empty() {
+                    let count = entries.len();
+                    self.gossip_engine
+                        .submit_gossip_batch(repo_type::NODE, entries, 100);
+                    info!("[federation] 初始同步 Node: {} 条（分批提交）", count);
+                }
+            }
+
+            // Peer 全量同步
+            if self.config.sync_peer_enabled {
+                if let Some(ref ps) = self.peer_sync {
+                    let entries = ps.collect_all_entries();
+                    if !entries.is_empty() {
+                        let count = entries.len();
+                        self.gossip_engine
+                            .submit_gossip_batch(repo_type::PEER, entries, 100);
+                        info!("[federation] 初始同步 Peer: {} 条（分批提交）", count);
+                    }
+                }
+            }
+
+            // Infohash 全量同步
+            if self.config.sync_infohash_enabled {
+                if let Some(ref ihs) = self.infohash_sync {
+                    let entries = ihs.collect_all_entries();
+                    if !entries.is_empty() {
+                        let count = entries.len();
+                        self.gossip_engine
+                            .submit_gossip_batch(repo_type::INFOHASH, entries, 100);
+                        info!("[federation] 初始同步 Infohash: {} 条（分批提交）", count);
+                    }
+                }
+            }
+
+            // Tracker 全量同步
+            if self.config.sync_tracker_enabled {
+                if let Some(ref ts) = self.tracker_sync {
+                    let entries = ts.collect_all_entries();
+                    if !entries.is_empty() {
+                        let count = entries.len();
+                        self.gossip_engine
+                            .submit_gossip_batch(repo_type::TRACKER, entries, 100);
+                        info!("[federation] 初始同步 Tracker: {} 条（分批提交）", count);
+                    }
+                }
+            }
+
+            info!("[federation] 初始全量同步完成");
+        });
+    }
+
+    /// 收集全量 Node 同步条目（内部辅助方法）
+    ///
+    /// 注意：此方法不更新 Merkle 树，避免在遍历大量数据时持有锁导致死锁。
+    /// Merkle 树应在数据写入时更新，或在启动时一次性重建。
+    fn collect_node_entries(&self) -> Vec<SyncEntry> {
+        let all_nodes = self.node_repo.all_nodes_sync();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut entries = Vec::with_capacity(all_nodes.len());
+        for entry in &all_nodes {
+            let payload = NodeSyncPayload {
+                node_id: entry.id,
+                addr: entry.addr,
+            };
+            let payload_bytes = match bincode::serialize(&payload) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let key = entry.addr.to_string().into_bytes();
+            entries.push(SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: now,
+                payload: payload_bytes,
+            });
+        }
+        entries
+    }
+
+    /// 获取同步统计（各 repo 同步计数 + Gossip 传播次数）
+    pub fn sync_stats(&self) -> crate::federation::SyncStats {
+        let snap = self.metrics.snapshot();
+        crate::federation::SyncStats {
+            node_sync_count: snap.node_sync_count,
+            peer_sync_count: snap.peer_sync_count,
+            infohash_sync_count: snap.infohash_sync_count,
+            tracker_sync_count: snap.tracker_sync_count,
+            gossip_propagations: snap.gossip_propagations,
+        }
+    }
+
+    /// 根据 repo_type 获取对应的 Merkle 树（内部辅助方法）
+    fn merkle_for_repo(&self, repo_type: u8) -> Option<Arc<MerkleTree>> {
+        match repo_type {
+            repo_type::NODE => Some(self.node_merkle.clone()),
+            repo_type::PEER => self.peer_sync.as_ref().map(|ps| ps.merkle()),
+            repo_type::INFOHASH => self.infohash_sync.as_ref().map(|ihs| ihs.merkle()),
+            repo_type::TRACKER => self.tracker_sync.as_ref().map(|ts| ts.merkle()),
+            _ => None,
+        }
+    }
+
+    /// 处理收到的 MerkleDigest：对比本地 Merkle 树，发现差异后请求修复
+    ///
+    /// 收到对端的 MerkleDigest 后，对比本地对应 repo 的 Merkle 树，
+    /// 找出根哈希不同的分片，向对端发送 MerkleRequest 请求差异分片数据。
+    pub async fn handle_merkle_digest(&self, conn: &Connection, digest: MerkleDigestMessage) {
+        let merkle = match self.merkle_for_repo(digest.repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let diffs = merkle.diff(&digest);
+        if diffs.is_empty() {
+            debug!(
+                "[federation] Merkle 对账无差异: repo_type={}, from={}",
+                digest.repo_type, conn.node_id
+            );
+            return;
+        }
+
+        debug!(
+            "[federation] Merkle 对账发现 {} 个差异分片: repo_type={}, from={}",
+            diffs.len(),
+            digest.repo_type,
+            conn.node_id
+        );
+
+        let request = MerkleRequestMessage {
+            repo_type: digest.repo_type,
+            shards: diffs,
+        };
+
+        if let Err(e) = conn.send_message(MessageType::MerkleRequest, &request).await {
+            debug!("[federation] 发送 MerkleRequest 失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// 处理收到的 MerkleRequest：返回指定分片的全量条目（MerkleRepair）
+    ///
+    /// 收到对端的分片请求后，从本地 Merkle 树收集指定分片的所有条目，
+    /// 打包成 MerkleRepair 消息发送回对端。
+    pub async fn handle_merkle_request(&self, conn: &Connection, request: MerkleRequestMessage) {
+        let merkle = match self.merkle_for_repo(request.repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let mut entries = Vec::new();
+        for shard in &request.shards {
+            let shard_entries = merkle.get_shard_entries(*shard);
+            for (key, payload) in shard_entries {
+                entries.push(SyncEntry {
+                    key,
+                    operation: operation::UPSERT,
+                    version: 0,
+                    payload,
+                });
+            }
+        }
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let repair = MerkleRepairMessage {
+            repo_type: request.repo_type,
+            entries,
+        };
+
+        if let Err(e) = conn.send_message(MessageType::MerkleRepair, &repair).await {
+            debug!("[federation] 发送 MerkleRepair 失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+            debug!(
+                "[federation] Merkle 修复发送: repo_type={}, entries={}, to={}",
+                request.repo_type,
+                repair.entries.len(),
+                conn.node_id
+            );
+        }
+    }
+
+    /// 处理收到的 MerkleRepair：应用修复数据到本地 repo
+    ///
+    /// 收到对端返回的差异分片数据后，通过 handle_sync_batch 应用到本地，
+    /// 并记录 merkle_repairs 计数。
+    pub fn handle_merkle_repair(&self, repair: MerkleRepairMessage) {
+        self.metrics.record_merkle_repair();
+        debug!(
+            "[federation] Merkle 修复接收: repo_type={}, entries={}",
+            repair.repo_type,
+            repair.entries.len()
+        );
+        self.handle_sync_batch(repair.repo_type, &repair.entries);
+    }
+}
+
+/// MerkleProvider 实现：为 GossipEngine 反熵任务提供各 repo 的 Merkle 摘要和分片数据
+impl MerkleProvider for SyncManager {
+    fn get_digest(&self, repo_type: u8) -> MerkleDigestMessage {
+        if let Some(merkle) = self.merkle_for_repo(repo_type) {
+            merkle.digest(repo_type)
+        } else {
+            MerkleDigestMessage {
+                repo_type,
+                shard_count: 0,
+                roots: Vec::new(),
+                entry_counts: Vec::new(),
+            }
+        }
+    }
+
+    fn get_shard_entries(&self, repo_type: u8, shard: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if let Some(merkle) = self.merkle_for_repo(repo_type) {
+            merkle.get_shard_entries(shard)
+        } else {
+            Vec::new()
+        }
     }
 }
 

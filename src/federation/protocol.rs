@@ -42,6 +42,8 @@ pub enum MessageType {
     SyncBatch = 13,
     /// 断开通知
     Goodbye = 14,
+    /// Merkle 修复数据
+    MerkleRepair = 15,
 }
 
 impl MessageType {
@@ -63,6 +65,7 @@ impl MessageType {
             12 => Some(MessageType::MerkleRequest),
             13 => Some(MessageType::SyncBatch),
             14 => Some(MessageType::Goodbye),
+            15 => Some(MessageType::MerkleRepair),
             _ => None,
         }
     }
@@ -267,6 +270,24 @@ pub struct MerkleDigestMessage {
     pub roots: Vec<[u8; 32]>,
     /// 各分片条目数
     pub entry_counts: Vec<u32>,
+}
+
+/// Merkle 分片请求（对账发现差异后，请求指定分片的全量条目）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerkleRequestMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 请求的分片索引列表
+    pub shards: Vec<u16>,
+}
+
+/// Merkle 修复数据（响应分片请求，携带指定分片的所有条目）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerkleRepairMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 修复的同步条目
+    pub entries: Vec<SyncEntry>,
 }
 
 /// 仓库类型常量

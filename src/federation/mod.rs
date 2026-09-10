@@ -8,6 +8,7 @@
 pub mod config;
 pub mod connection;
 pub mod discovery;
+pub mod dht_discovery;
 pub mod gossip;
 pub mod merkle;
 pub mod metrics;
@@ -15,6 +16,7 @@ pub mod nat_integration;
 pub mod relay;
 pub mod node_id;
 pub mod node_table;
+pub mod peer_cache;
 pub mod protocol;
 pub mod signaling;
 pub mod sync;
@@ -207,6 +209,7 @@ impl FederationService {
             identity.clone(),
             config.clone(),
             shutdown_tx.clone(),
+            data_dir,
         ));
 
         // 8. 创建中继管理器
@@ -320,6 +323,11 @@ impl FederationService {
         // 7. 启动 Gossip 传播任务
         self.gossip_engine.clone().spawn_gossip_propagation();
 
+        // 7.1 启动 Merkle 反熵任务（定期对账，发现差异自动修复）
+        self.gossip_engine
+            .clone()
+            .spawn_anti_entropy(self.sync_manager.clone());
+
         // 8. 启动中继通道清理
         self.relay_manager.clone().spawn_channel_cleanup();
 
@@ -389,11 +397,7 @@ impl FederationService {
             .collect();
 
         // 同步统计
-        let metrics_snap = self.metrics.snapshot();
-        let sync_stats = SyncStats {
-            gossip_propagations: metrics_snap.gossip_propagations,
-            ..Default::default()
-        };
+        let sync_stats = self.sync_manager.sync_stats();
 
         // 中继统计
         let relay_stats = RelayStats {

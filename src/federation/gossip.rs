@@ -89,6 +89,37 @@ impl GossipEngine {
         debug!("[federation] Gossip 提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, entry_count);
     }
 
+    /// 批量提交同步数据到 outbox（将大量 entries 按 batch_size 拆分成多批提交）
+    ///
+    /// 适用于初始全量同步等场景，避免单条消息过大。每批生成独立的 msg_id，
+    /// 分别加入 outbox 等待传播。
+    pub fn submit_gossip_batch(&self, repo_type: u8, entries: Vec<SyncEntry>, batch_size: usize) {
+        if entries.is_empty() || batch_size == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // 先构建所有 batch（获取 seen_msgs 锁），再统一写入 outbox，避免锁顺序反转
+        let mut batches = Vec::new();
+        for chunk in entries.chunks(batch_size) {
+            let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+            self.seen_msgs.write().put(msg_id, ());
+            batches.push(GossipBatchMessage {
+                msg_id,
+                origin: self.local_node_id.0,
+                repo_type,
+                entries: chunk.to_vec(),
+                timestamp: now,
+            });
+            debug!("[federation] Gossip 批量提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, chunk.len());
+        }
+
+        self.outbox.write().extend(batches);
+    }
+
     /// 启动 Gossip 传播后台任务
     pub fn spawn_gossip_propagation(self: Arc<Self>) {
         let interval = Duration::from_millis(self.config.gossip_interval_ms);
@@ -116,13 +147,33 @@ impl GossipEngine {
 
     /// 单次传播：从 outbox 取一批，随机选 fanout 个邻居发送
     async fn propagation_tick(self: Arc<Self>, fanout: usize) {
-        // 取出最多 10 条待传播消息
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // 取出待传播消息
         let batches: Vec<GossipBatchMessage> = {
             let mut outbox = self.outbox.write();
             if outbox.is_empty() {
                 return;
             }
-            let count = outbox.len().min(10);
+            // 限制 outbox 最大长度，避免初始全量同步时队列过大导致内存溢出和性能问题
+            const MAX_OUTBOX_LEN: usize = 5000;
+            if outbox.len() > MAX_OUTBOX_LEN {
+                let drop_count = outbox.len() - MAX_OUTBOX_LEN;
+                outbox.drain(..drop_count);
+                debug!("[federation] outbox 队列过长，丢弃 {} 条旧消息", drop_count);
+            }
+            // 过滤过期消息（超过 300 秒的消息不再传播，避免 2 节点场景下队列积压）
+            outbox.retain(|b| now.saturating_sub(b.timestamp) < 300);
+            if outbox.is_empty() {
+                return;
+            }
+            // 单连接场景：一次性取出所有消息，加快传播速度
+            let conn_count = self.connection_manager.connection_count();
+            let batch_size = if conn_count <= 1 { 500 } else { 100 };
+            let count = outbox.len().min(batch_size);
             outbox.drain(..count).collect()
         };
 
@@ -197,8 +248,25 @@ impl GossipEngine {
             entries.len()
         );
 
-        // 加入 outbox 继续传播（流行病协议）
-        self.outbox.write().push(batch);
+        // 单连接场景优化：如果只有1个连接，且消息来自该连接，则不需要加入outbox
+        // 因为传播不出去（只会发回给发送方，而发送方已经处理过这条消息了）
+        let conn_count = self.connection_manager.connection_count();
+        let should_propagate = if conn_count <= 1 {
+            let conns = self.connection_manager.all_connections();
+            if conns.len() == 1 {
+                // 消息origin不是唯一连接的node_id时才需要传播（本地产生的消息）
+                NodeId(batch.origin) != conns[0].node_id
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        if should_propagate {
+            // 加入 outbox 继续传播（流行病协议）
+            self.outbox.write().push(batch);
+        }
 
         entries
     }

@@ -194,8 +194,60 @@ impl PeerSync {
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
+            self.metrics.record_peer_sync(applied as u64);
             debug!("[federation] PeerSync 应用 {} 条", applied);
         }
+    }
+
+    /// 获取 Merkle 树引用（用于反熵对账）
+    pub fn merkle(&self) -> Arc<MerkleTree> {
+        self.merkle.clone()
+    }
+
+    /// 收集全量 Peer 同步条目（用于初始全量同步）
+    ///
+    /// 遍历所有 infohash 及其关联的 peer，构建 SyncEntry 列表。
+    /// 注意：此方法不更新 Merkle 树，避免在遍历大量数据时持有锁导致死锁。
+    pub fn collect_all_entries(&self) -> Vec<SyncEntry> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let infohashes = self.peer_repo.infohashes();
+        let mut entries = Vec::new();
+
+        for infohash in &infohashes {
+            let peers = self.peer_repo.get_peers_sync(infohash, usize::MAX);
+            for peer in &peers {
+                let payload = PeerSyncPayload {
+                    infohash: *infohash,
+                    addr: peer.addr,
+                    first_seen_secs: peer
+                        .first_seen
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    source: peer.source.as_str().to_string(),
+                };
+                let payload_bytes = match bincode::serialize(&payload) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let mut key = Vec::with_capacity(20 + 8);
+                key.extend_from_slice(infohash);
+                key.extend_from_slice(&peer.addr.to_string().into_bytes());
+
+                entries.push(SyncEntry {
+                    key,
+                    operation: operation::UPSERT,
+                    version: now,
+                    payload: payload_bytes,
+                });
+            }
+        }
+
+        entries
     }
 }
 

@@ -67,6 +67,18 @@ pub struct FederationConfig {
     /// 是否启用 Tracker 同步（阶段3实现）
     #[serde(default = "default_true")]
     pub sync_tracker_enabled: bool,
+    /// 是否启用 DHT 魔法 infohash 自动发现
+    #[serde(default = "default_true")]
+    pub dht_discovery_enabled: bool,
+    /// DHT 发现间隔（秒）
+    #[serde(default = "default_dht_interval")]
+    pub dht_discovery_interval_secs: u64,
+    /// 是否启用节点缓存持久化（重启后自动重连历史节点）
+    #[serde(default = "default_true")]
+    pub peer_cache_enabled: bool,
+    /// 最大缓存节点数
+    #[serde(default = "default_peer_cache_max")]
+    pub peer_cache_max_nodes: usize,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -80,6 +92,8 @@ fn default_relay_max_connections() -> usize { 5 }
 fn default_gossip_interval() -> u64 { 1000 }
 fn default_gossip_fanout() -> usize { 3 }
 fn default_sync_node_interval() -> u64 { 300 }
+fn default_dht_interval() -> u64 { 300 }
+fn default_peer_cache_max() -> usize { 100 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -104,6 +118,10 @@ impl Default for FederationConfig {
             sync_node_interval_secs: default_sync_node_interval(),
             sync_infohash_enabled: default_true(),
             sync_tracker_enabled: default_true(),
+            dht_discovery_enabled: default_true(),
+            dht_discovery_interval_secs: default_dht_interval(),
+            peer_cache_enabled: default_true(),
+            peer_cache_max_nodes: default_peer_cache_max(),
         }
     }
 }
@@ -129,6 +147,10 @@ mod tests {
         assert_eq!(cfg.gossip_fanout, 3);
         assert!(cfg.sync_node_enabled);
         assert_eq!(cfg.sync_node_interval_secs, 300);
+        assert!(cfg.dht_discovery_enabled);
+        assert_eq!(cfg.dht_discovery_interval_secs, 300);
+        assert!(cfg.peer_cache_enabled);
+        assert_eq!(cfg.peer_cache_max_nodes, 100);
     }
 
     #[test]

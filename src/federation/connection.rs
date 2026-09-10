@@ -221,8 +221,24 @@ impl ConnectionManager {
 
         info!("[federation] 入站连接建立: {} ({})", node_id, addr);
 
+        // 入站连接建立后也触发初始全量同步（双向同步，确保双方历史数据都能同步）
+        // 注意：必须在 spawn_message_handler 消费 self 之前获取 sync_manager
+        let sync_mgr = self.sync_manager.get().cloned();
+        info!(
+            "[federation] 入站连接初始同步检查: sync_manager={}",
+            if sync_mgr.is_some() { "Some" } else { "None" }
+        );
+
         // 启动消息处理循环
         self.spawn_message_handler(connection).await;
+
+        if let Some(mgr) = sync_mgr {
+            info!("[federation] 入站连接触发初始全量同步");
+            mgr.trigger_initial_sync();
+        } else {
+            warn!("[federation] 入站连接 sync_manager 为 None，无法触发初始全量同步");
+        }
+
         Ok(())
     }
 
@@ -284,6 +300,11 @@ impl ConnectionManager {
 
         // 启动消息处理循环
         self.clone().spawn_message_handler(connection.clone()).await;
+
+        // 出站连接建立成功后触发初始全量同步（只触发一次，入站连接不触发）
+        if let Some(sync_mgr) = self.sync_manager.get() {
+            sync_mgr.clone().trigger_initial_sync();
+        }
 
         // 连接建立成功，移除 connecting 标记
         self.connecting.write().remove(&addr);
@@ -518,9 +539,34 @@ impl ConnectionManager {
             }
             MessageType::MerkleDigest => {
                 self.metrics.record_message_recv();
-                if let Ok(_digest) = bincode::deserialize::<MerkleDigestMessage>(&payload) {
-                    // 阶段2：Merkle 对账由 sync 模块处理，此处记录日志
-                    debug!("[federation] 收到 MerkleDigest from {}", connection.node_id);
+                if let Ok(digest) = bincode::deserialize::<MerkleDigestMessage>(&payload) {
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_merkle_digest(&conn, digest).await;
+                        });
+                    }
+                }
+            }
+            MessageType::MerkleRequest => {
+                self.metrics.record_message_recv();
+                if let Ok(request) = bincode::deserialize::<MerkleRequestMessage>(&payload) {
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_merkle_request(&conn, request).await;
+                        });
+                    }
+                }
+            }
+            MessageType::MerkleRepair => {
+                self.metrics.record_message_recv();
+                if let Ok(repair) = bincode::deserialize::<MerkleRepairMessage>(&payload) {
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        sync_mgr.handle_merkle_repair(repair);
+                    }
                 }
             }
             MessageType::Signaling => {

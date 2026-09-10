@@ -147,8 +147,50 @@ impl InfohashSync {
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
+            self.metrics.record_infohash_sync(applied as u64);
             debug!("[federation] InfohashSync 应用 {} 条", applied);
         }
+    }
+
+    /// 获取 Merkle 树引用（用于反熵对账）
+    pub fn merkle(&self) -> Arc<MerkleTree> {
+        self.merkle.clone()
+    }
+
+    /// 收集全量 Infohash 同步条目（用于初始全量同步）
+    ///
+    /// 遍历所有已注册的 infohash，构建 SyncEntry 列表。
+    /// 注意：此方法不更新 Merkle 树，Merkle 树应在数据写入时更新，
+    /// 避免在遍历大量数据时持有锁导致死锁。
+    pub fn collect_all_entries(&self) -> Vec<SyncEntry> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let infohashes = self.infohash_repo.all_sync();
+        let mut entries = Vec::with_capacity(infohashes.len());
+
+        for infohash in &infohashes {
+            let payload = InfohashSyncPayload {
+                infohash: *infohash,
+                seen_at_secs: now,
+                source: "federation_init".to_string(),
+            };
+            let payload_bytes = match bincode::serialize(&payload) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let key = infohash.to_vec();
+            entries.push(SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: now,
+                payload: payload_bytes,
+            });
+        }
+
+        entries
     }
 }
 

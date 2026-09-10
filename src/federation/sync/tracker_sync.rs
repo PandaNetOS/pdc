@@ -179,8 +179,47 @@ impl TrackerSync {
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
+            self.metrics.record_tracker_sync(applied as u64);
             debug!("[federation] Tracker 同步应用 {} 条", applied);
         }
+    }
+
+    /// 获取 Merkle 树引用（用于反熵对账）
+    pub fn merkle(&self) -> Arc<MerkleTree> {
+        self.merkle.clone()
+    }
+
+    /// 收集全量 Tracker 同步条目（用于初始全量同步）
+    ///
+    /// 遍历所有 tracker，构建 SyncEntry 列表。
+    /// 注意：此方法不更新 Merkle 树，避免在遍历大量数据时持有锁导致死锁。
+    pub fn collect_all_entries(&self) -> Vec<SyncEntry> {
+        let trackers = self.tracker_repo.all_trackers_sync();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut entries = Vec::with_capacity(trackers.len());
+        for tracker in &trackers {
+            let payload = TrackerSyncPayload {
+                url: tracker.url.clone(),
+                disabled: tracker.disabled,
+            };
+            let payload_bytes = match bincode::serialize(&payload) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let key = tracker.url.as_bytes().to_vec();
+            entries.push(SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: now,
+                payload: payload_bytes,
+            });
+        }
+
+        entries
     }
 
     /// 处理 Merkle 摘要（对账）
