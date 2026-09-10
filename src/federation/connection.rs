@@ -276,6 +276,9 @@ impl ConnectionManager {
 
         info!("[federation] 入站连接建立: {} ({})", node_id, addr);
 
+        // 入站连接也需要更新 node_table 状态，否则连接维护任务会认为该节点未连接而反复重连
+        self.node_table.mark_connected(&node_id, None);
+
         // 入站连接建立后也触发初始全量同步（双向同步，确保双方历史数据都能同步）
         // 注意：必须在 spawn_message_handler 消费 self 之前获取 sync_manager
         let sync_mgr = self.sync_manager.get().cloned();

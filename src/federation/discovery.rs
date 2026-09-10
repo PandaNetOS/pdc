@@ -437,12 +437,21 @@ impl DiscoveryService {
         }
 
         // 3. 连接节点表中其他未连接的节点
+        // 双重检查：node_table 状态 + connections map，避免入站连接未更新状态时被误重连
+        let connected_ids: std::collections::HashSet<NodeId> = self
+            .connection_manager
+            .all_connections()
+            .iter()
+            .map(|c| c.node_id)
+            .collect();
+
         let candidates = self.node_table
             .all_nodes()
             .into_iter()
             .filter(|e| {
                 e.status != crate::federation::node_table::NodeStatus::Connected
                     && e.info.preferred_addr().is_some()
+                    && !connected_ids.contains(&NodeId(e.info.node_id))
             })
             .take(need)
             .collect::<Vec<_>>();
