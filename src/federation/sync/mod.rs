@@ -64,6 +64,10 @@ pub struct SyncManager {
     node_merkle: Arc<MerkleTree>,
     tracker_sync: Option<Arc<TrackerSync>>,
     relay_manager: Option<Arc<RelayManager>>,
+    /// 各 repo 直接引用（用于 local_entry_counts 统计真实数据量，而非 Merkle 树中的条目数）
+    peer_repo: Option<Arc<PeerRepoImpl>>,
+    infohash_repo: Option<Arc<InfohashRepoImpl>>,
+    tracker_repo: Option<Arc<TrackerRepoImpl>>,
     /// Merkle 树异步批量更新队列（apply 时入队，后台任务定期 flush）
     merkle_queue: Arc<MerkleUpdateQueue>,
     config: FederationConfig,
@@ -97,6 +101,11 @@ impl SyncManager {
     ) -> Self {
         let node_merkle = Arc::new(MerkleTree::new(256));
         let merkle_queue = Arc::new(MerkleUpdateQueue::new());
+
+        // 保留 repo 引用供 local_entry_counts 使用（后续 if let 会 move 原始变量）
+        let peer_repo_clone = peer_repo.clone();
+        let infohash_repo_clone = infohash_repo.clone();
+        let tracker_repo_clone = tracker_repo.clone();
 
         // PeerSync
         let peer_sync = if config.sync_peer_enabled {
@@ -172,6 +181,9 @@ impl SyncManager {
             node_merkle,
             tracker_sync,
             relay_manager,
+            peer_repo: peer_repo_clone,
+            infohash_repo: infohash_repo_clone,
+            tracker_repo: tracker_repo_clone,
             merkle_queue,
             config,
             metrics,
@@ -658,11 +670,29 @@ impl SyncManager {
         });
     }
 
+    /// 处理收到的 PeerInfo（握手后对端立即发送的本地条目数）。
+    ///
+    /// 将对端各 repo 条目数记录到 peer_digests，供全量同步数据源选择时
+    /// 判断哪个节点数据最完整。PeerInfo 在握手后立即到达，远早于 60s 反熵
+    /// 的 MerkleDigest，确保数据源选择时有真实数据可用。
+    pub fn handle_peer_info(&self, from_node_id: NodeId, counts: Vec<u32>) {
+        let mut digests = self.peer_digests.write();
+        let entry = digests.entry(from_node_id).or_insert_with(|| vec![0u32; 4]);
+        for (i, &c) in counts.iter().take(4).enumerate() {
+            entry[i] = c;
+        }
+        let total: u64 = entry.iter().map(|c| *c as u64).sum();
+        debug!(
+            "[federation] 收到 PeerInfo from={}, 条目总数={}",
+            from_node_id, total
+        );
+    }
+
     /// 选择全量数据源并发起拉取（接收方）。
     ///
-    /// 遍历所有已连接对等节点，按「数据最完整（与本地差异最大）+ 延迟最低」打分，
-    /// 只向得分最高的一个发送 FullSyncRequest；其他节点不触发全量推送，从根上消除重复。
-    /// 打分：优先对端条目数显著多于本地者（数据更完整），其次 RTT 更低者（延迟更低）。
+    /// 遍历所有已连接对等节点，按「数据量降序为主，RTT 升序为平局决胜」排序，
+    /// 只向数据量严格多于本地的一个节点发送 FullSyncRequest。
+    /// 两个空节点（数据量相等）不会互选，从根上避免双向无效推送。
     async fn select_full_sync_source_and_request(self: Arc<Self>) {
         let conns = self.connection_manager.all_connections();
         if conns.is_empty() {
@@ -674,42 +704,52 @@ impl SyncManager {
         let local_total: u64 = local_counts.iter().map(|c| *c as u64).sum();
         let peer_digests = self.peer_digests.read().clone();
 
-        // 为每个对端打分：分数越高越优。
-        //  - 对端已知条目总数 > 本地：差值越大越优（数据更完整）。
-        //  - RTT 越低越优（延迟最低）；未知 RTT 记为较大值。
-        let mut best: Option<(NodeId, u64)> = None;
+        // 收集候选：(node_id, peer_total, rtt_ms)
+        let mut candidates: Vec<(NodeId, u64, u64)> = Vec::with_capacity(conns.len());
         for conn in &conns {
+            let peer_total = peer_digests
+                .get(&conn.node_id)
+                .map(|counts| counts.iter().map(|c| *c as u64).sum())
+                .unwrap_or(0);
             let rtt_ms = self.connection_manager.peer_rtt_ms(&conn.node_id) as u64;
-            let mut score: i128 = 0;
-            if let Some(peer_counts) = peer_digests.get(&conn.node_id) {
-                let peer_total: u64 = peer_counts.iter().map(|c| *c as u64).sum();
-                // 数据更完整者加分；本地为空（新节点）时此项最大，天然选最完整源
-                score += (peer_total as i128 - local_total as i128);
-            }
-            // 延迟项：RTT 越低越好。1000000 为 RTT 上限保护，未知 RTT 记 1000ms。
-            score -= (rtt_ms.min(1_000_000)).max(1_000) as i128;
-            let score_u = score.max(0) as u64;
-            match &best {
-                None => best = Some((conn.node_id, score_u)),
-                Some((_, bs)) => {
-                    if score_u > *bs {
-                        best = Some((conn.node_id, score_u));
-                    }
-                }
-            }
+            candidates.push((conn.node_id, peer_total, rtt_ms));
         }
 
-        let source = match best {
-            Some((nid, _)) => nid,
-            None => {
-                debug!("[federation] 选择数据源：无候选，放弃拉取");
-                return;
-            }
-        };
+        // 过滤：只保留数据量严格多于本地的候选（数据源必须有更多数据）
+        let eligible: Vec<(NodeId, u64, u64)> = candidates
+            .iter()
+            .filter(|(_, peer_total, _)| *peer_total > local_total)
+            .copied()
+            .collect();
 
+        // 日志：打印所有候选及过滤结果
+        for (nid, peer_total, rtt) in &candidates {
+            let status = if *peer_total > local_total { "候选" } else { "过滤(数据量<=本地)" };
+            info!(
+                "[federation] 数据源候选: {} 条目={} RTT={}ms [{}]",
+                nid, peer_total, rtt, status
+            );
+        }
+
+        if eligible.is_empty() {
+            info!(
+                "[federation] 选择数据源：无合格候选（本地条目 {}，所有对端数据量均不超过本地），跳过全量拉取",
+                local_total
+            );
+            return;
+        }
+
+        // 排序：数据量降序为主，RTT 升序为平局决胜
+        let mut sorted = eligible;
+        sorted.sort_by(|a, b| {
+            b.1.cmp(&a.1) // peer_total 降序
+                .then(a.2.cmp(&b.2)) // RTT 升序
+        });
+
+        let (source, source_total, source_rtt) = sorted[0];
         info!(
-            "[federation] 选择全量数据源: {}（本地条目总数 {}，候选 {} 个）",
-            source, local_total, conns.len()
+            "[federation] 选择全量数据源: {}（条目={}, RTT={}ms；本地条目={}, 候选 {} 个, 合格 {} 个）",
+            source, source_total, source_rtt, local_total, candidates.len(), sorted.len()
         );
 
         // 进入接收态：此后收到的 Gossip 只本地写入、不转发（P0-3）。
@@ -766,20 +806,23 @@ impl SyncManager {
     }
 
     /// 统计本节点各 repo 的当前条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
-    fn local_entry_counts(&self) -> Vec<u32> {
+    ///
+    /// 直接从各 Repo 实现获取真实数据量，而非从 Merkle 树获取（Merkle 树启动时为空，
+    /// 只有通过 Gossip 收到的少量条目会被计入，导致 super_node 报告的条目数远低于实际）。
+    pub(crate) fn local_entry_counts(&self) -> Vec<u32> {
         vec![
-            self.node_merkle.total_entries() as u32,
-            self.peer_sync
+            self.node_repo.len_sync() as u32,
+            self.peer_repo
                 .as_ref()
-                .map(|p| p.merkle().total_entries() as u32)
+                .map(|r| r.len() as u32)
                 .unwrap_or(0),
-            self.infohash_sync
+            self.infohash_repo
                 .as_ref()
-                .map(|i| i.merkle().total_entries() as u32)
+                .map(|r| r.count_sync() as u32)
                 .unwrap_or(0),
-            self.tracker_sync
+            self.tracker_repo
                 .as_ref()
-                .map(|t| t.merkle().total_entries() as u32)
+                .map(|r| r.count_sync() as u32)
                 .unwrap_or(0),
         ]
     }

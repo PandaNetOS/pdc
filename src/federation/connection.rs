@@ -198,6 +198,20 @@ impl ConnectionManager {
         let _ = self.relay_manager.set(relay);
     }
 
+    /// 握手后向对端发送 PeerInfo（本地各 repo 条目数），供对端在全量同步数据源选择时
+    /// 判断哪个节点数据最完整。轻量消息，不等待响应，发送失败仅记录 debug 日志。
+    async fn send_peer_info(&self, connection: &Arc<Connection>) {
+        if let Some(sync_mgr) = self.sync_manager.get() {
+            let counts = sync_mgr.local_entry_counts();
+            let msg = PeerInfoMessage {
+                local_entry_counts: counts,
+            };
+            if let Err(e) = connection.send_message(MessageType::PeerInfo, &msg).await {
+                debug!("[federation] PeerInfo 发送到 {} 失败: {}", connection.node_id, e);
+            }
+        }
+    }
+
     /// 启动 TCP 监听
     pub async fn start_listen(self: Arc<Self>) -> anyhow::Result<()> {
         let listen_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), self.config.listen_port);
@@ -297,7 +311,10 @@ impl ConnectionManager {
         );
 
         // 启动消息处理循环
-        self.spawn_message_handler(connection).await;
+        self.clone().spawn_message_handler(connection.clone()).await;
+
+        // 握手后立即发送 PeerInfo（携带本地条目数），供对端在数据源选择时判断数据完整度
+        self.send_peer_info(&connection).await;
 
         Ok(())
     }
@@ -389,6 +406,9 @@ impl ConnectionManager {
 
         // 启动消息处理循环
         self.clone().spawn_message_handler(connection.clone()).await;
+
+        // 握手后立即发送 PeerInfo（携带本地条目数），供对端在数据源选择时判断数据完整度
+        self.send_peer_info(&connection).await;
 
         // 出站连接建立成功：作为纯对等拉取入口（P0-2）。
         // 新节点（数据较少者）主动选择最佳数据源并发送 FullSyncRequest；
@@ -863,6 +883,17 @@ impl ConnectionManager {
                         tokio::spawn(async move {
                             sync_mgr.handle_full_sync_request(conn.node_id, req).await;
                         });
+                    }
+                }
+                false
+            }
+            MessageType::PeerInfo => {
+                // 握手后对端发来的节点信息（本地各 repo 条目数），记录到 peer_digests
+                // 供全量同步数据源选择时判断数据完整度。
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<PeerInfoMessage>(&payload) {
+                        sync_mgr.handle_peer_info(connection.node_id, msg.local_entry_counts);
                     }
                 }
                 false

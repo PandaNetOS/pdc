@@ -58,6 +58,9 @@ pub enum MessageType {
     /// 全量同步请求（纯对等拉取：新节点向选中的数据源请求全量数据，
     /// 数据源收到后才推送，否则不主动发，避免多节点重复推送）。
     FullSyncRequest = 21,
+    /// 节点信息（握手后立即双向发送，携带本地各 repo 条目数，
+    /// 供对端在数据源选择时判断哪个节点数据最完整）。
+    PeerInfo = 22,
 }
 
 impl MessageType {
@@ -86,6 +89,7 @@ impl MessageType {
             19 => Some(MessageType::FullSyncComplete),
             20 => Some(MessageType::GossipBatchBulk),
             21 => Some(MessageType::FullSyncRequest),
+            22 => Some(MessageType::PeerInfo),
             _ => None,
         }
     }
@@ -368,6 +372,16 @@ pub struct FullSyncCompleteMessage {
 pub struct FullSyncRequestMessage {
     /// 发起方本地各 repo 的总条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致），
     /// 0 表示未知/为空。
+    pub local_entry_counts: Vec<u32>,
+}
+
+/// 节点信息消息（握手后立即双向发送）
+///
+/// 携带发送方本地各 repo 的总条目数，供对端在全量同步数据源选择时
+/// 判断哪个节点数据最完整。轻量（仅 4 个 u32），不等待响应。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerInfoMessage {
+    /// 发送方本地各 repo 的总条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
     pub local_entry_counts: Vec<u32>,
 }
 
