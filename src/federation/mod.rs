@@ -18,6 +18,7 @@ pub mod node_id;
 pub mod node_table;
 pub mod peer_cache;
 pub mod protocol;
+pub mod sharded_lru;
 pub mod signaling;
 pub mod sync;
 pub mod transport;

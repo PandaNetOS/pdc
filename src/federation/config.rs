@@ -57,6 +57,11 @@ pub struct FederationConfig {
     /// Gossip 扇出数（阶段2实现）
     #[serde(default = "default_gossip_fanout")]
     pub gossip_fanout: usize,
+    /// Gossip 已处理消息去重缓存（seen_msgs）的分片数。
+    /// 每片独立一把读写锁，消除多 repo 并行 flush 时的全局写锁竞争。
+    /// 总去重容量固定为 10000，每片容量 = 总容量 / 分片数。
+    #[serde(default = "default_gossip_seen_shards")]
+    pub gossip_seen_shards: usize,
     /// 是否启用 Peer 同步（阶段2实现）
     #[serde(default = "default_true")]
     pub sync_peer_enabled: bool,
@@ -142,6 +147,14 @@ pub struct FederationConfig {
     /// 队列累计达到此条数时通过 Notify 立即唤醒后台 flush，无需等待间隔。
     #[serde(default = "default_merkle_async_update_batch_size")]
     pub merkle_async_update_batch_size: usize,
+    /// 发送端 GossipBatch 合并为 bulk 帧的最大 batch 数量。
+    /// 同一连接的多个 batch 合并为一个 GossipBatchBulk 发送，减少网络往返。
+    #[serde(default = "default_gossip_bulk_max_batches")]
+    pub gossip_bulk_max_batches: usize,
+    /// 发送端 GossipBatch 合并为 bulk 帧的最大总字节数（不含帧头）。
+    /// 达到此限制立即发送当前 bulk，开始下一个。
+    #[serde(default = "default_gossip_bulk_max_bytes")]
+    pub gossip_bulk_max_bytes: usize,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -166,6 +179,7 @@ fn default_relay_max_connections() -> usize { 5 }
 fn default_relay_auto_setup_on_connect() -> bool { true }
 fn default_gossip_interval() -> u64 { 1000 }
 fn default_gossip_fanout() -> usize { 3 }
+fn default_gossip_seen_shards() -> usize { 16 }
 fn default_sync_node_interval() -> u64 { 300 }
 fn default_dht_interval() -> u64 { 300 }
 fn default_peer_cache_max() -> usize { 100 }
@@ -181,10 +195,12 @@ fn default_gossip_flush_interval_ms() -> u64 { 50 }
 fn default_gossip_flush_max_batches() -> usize { 10 }
 fn default_full_sync_batch_size() -> usize { 5000 }
 fn default_full_sync_window_size() -> usize { 3 }
-fn default_full_sync_gossip_max_messages_per_second() -> u32 { 1000 }
+fn default_full_sync_gossip_max_messages_per_second() -> u32 { 5000 }
 fn default_full_sync_gossip_max_bytes_per_second() -> u64 { 50 * 1024 * 1024 }
 fn default_merkle_async_update_interval_ms() -> u64 { 1000 }
 fn default_merkle_async_update_batch_size() -> usize { 10000 }
+fn default_gossip_bulk_max_batches() -> usize { 50 }
+fn default_gossip_bulk_max_bytes() -> usize { 2 * 1024 * 1024 } // 2MB
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -205,6 +221,7 @@ impl Default for FederationConfig {
             relay_auto_setup_on_connect: default_relay_auto_setup_on_connect(),
             gossip_interval_ms: default_gossip_interval(),
             gossip_fanout: default_gossip_fanout(),
+            gossip_seen_shards: default_gossip_seen_shards(),
             sync_peer_enabled: default_true(),
             sync_node_enabled: default_true(),
             sync_node_interval_secs: default_sync_node_interval(),
@@ -230,6 +247,8 @@ impl Default for FederationConfig {
             full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
             merkle_async_update_interval_ms: default_merkle_async_update_interval_ms(),
             merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
+            gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
+            gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
         }
     }
 }

@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -127,6 +127,12 @@ pub struct ConnectionManager {
     /// 重量级消息处理的有界并发信号量（GossipBatch/MerkleRepair 经 spawn_blocking 执行，
     /// 先 acquire permit 再 spawn，避免无界生成阻塞任务导致内存暴涨）
     heavy_task_semaphore: Arc<Semaphore>,
+    /// 种子节点配置地址 → 握手后获知的真实 node_id 映射
+    /// 用于连接维护任务：入站连接对端端口不固定，地址精确匹配永远失败，
+    /// 需通过已记录的真实 node_id 判断种子节点是否已连接。
+    seed_node_ids: RwLock<FxHashMap<SocketAddr, NodeId>>,
+    /// 上次触发自动重连的 unix 秒（冷却限流，由 GossipEngine 在无连接时调用）
+    last_reconnect_attempt: AtomicU64,
 }
 
 impl ConnectionManager {
@@ -155,6 +161,8 @@ impl ConnectionManager {
             heavy_task_semaphore: Arc::new(Semaphore::new(
                 config.heavy_task_max_concurrency.max(1),
             )),
+            seed_node_ids: RwLock::new(FxHashMap::default()),
+            last_reconnect_attempt: AtomicU64::new(0),
         }
     }
 
@@ -446,6 +454,11 @@ impl ConnectionManager {
         }
 
         let peer_id = NodeId(ack.node_id);
+        // 自连接过滤：不允许连接自己（通过 PEX/DHT 发现到自身地址后误连）
+        if peer_id == self.identity.node_id {
+            warn!("[federation] 检测到自连接（出站），已拒绝: node_id={}", peer_id);
+            anyhow::bail!("拒绝自连接: {}", peer_id);
+        }
         debug!(
             "[federation] 握手成功: 本地 {} <-> 远端 {}",
             self.identity.node_id, peer_id
@@ -473,6 +486,12 @@ impl ConnectionManager {
 
         let peer_id = NodeId(hello.node_id);
 
+        // 自连接过滤：不允许连接自己（入站方向）
+        if peer_id == self.identity.node_id {
+            warn!("[federation] 检测到自连接（入站），已拒绝: node_id={}", peer_id);
+            anyhow::bail!("拒绝自连接: {}", peer_id);
+        }
+
         // 回复 HelloAck（签名）
         let ack = HelloMessage::sign_and_build(
             &self.identity,
@@ -495,7 +514,23 @@ impl ConnectionManager {
         self.metrics.record_connection_established();
         self.connections
             .write()
-            .insert(connection.node_id, connection);
+            .insert(connection.node_id, connection.clone());
+
+        // 记录种子节点映射：若连接对端 IP 与某个配置种子节点 IP 一致，
+        // 则记录 seed_addr -> real_node_id，供连接维护任务用 node_id 判断是否已连接
+        // （入站连接对端端口为临时端口，地址精确匹配永远失败）
+        let conn_ip = connection.addr.ip();
+        for seed in &self.config.seed_nodes {
+            if let Ok(seed_addr) = seed.parse::<SocketAddr>() {
+                if seed_addr.ip() == conn_ip {
+                    self.seed_node_ids.write().insert(seed_addr, connection.node_id);
+                    debug!(
+                        "[federation] 记录种子节点映射: {} -> {}",
+                        seed_addr, connection.node_id
+                    );
+                }
+            }
+        }
     }
 
     /// 移除连接（主动关闭 TCP socket，并记录重连冷却时间）
@@ -703,11 +738,40 @@ impl ConnectionManager {
                 // 由后台 flush 任务统一处理。N 个 batch 只需要 1 次 permit + 1 次 spawn。
                 // P0-2: flush 任务内不使用 spawn_blocking（纯内存操作）。
                 if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
+                    warn!("[federation][perf] 收到 GossipBatch: entries={}", batch.entries.len());
                     {
                         let mut buf = connection.gossip_buffer.lock();
+                        let diag_repo_type = batch.repo_type;
+                        let diag_entries = batch.entries.len();
                         buf.push_back(batch);
+                        warn!("[federation][DIAG] GossipBatch received: repo_type={}, entries={}, buffer_len={}", diag_repo_type, diag_entries, buf.len());
                     }
                     // 通知 flush 任务（达到 max_batches 时立即刷新，否则等定时 tick）
+                    connection.gossip_flush_notify.notify_one();
+                }
+                true
+            }
+            MessageType::GossipBatchBulk => {
+                // 批量合并帧：将多个 batch 拆出后逐个加入 per-connection 缓冲，
+                // 复用现有攒批 flush 机制，无需额外处理逻辑。
+                self.metrics.record_message_recv();
+                if let Ok(bulk) = bincode::deserialize::<GossipBatchBulkMessage>(&payload) {
+                    let count = bulk.batches.len();
+                    // 计算所有 batch 的 entries 总数（在 move 进 buffer 之前）
+                    let total_entries: usize = bulk.batches.iter().map(|b| b.entries.len()).sum();
+                    warn!("[federation][perf] 收到 GossipBatchBulk: {} 个 batch, 总条目 {}", count, total_entries);
+                    {
+                        let mut buf = connection.gossip_buffer.lock();
+                        for batch in bulk.batches {
+                            buf.push_back(batch);
+                        }
+                        warn!("[federation][DIAG] GossipBatchBulk received: batches={}, buffer_len={}", count, buf.len());
+                    }
+                    // 主循环已对每条消息 +1，Bulk 包含 N 个 batch，需补 +(N-1) 使计数与
+                    // flush_gossip_buffer 按 batch 数 -group_len 递减匹配，避免 pending 下溢为巨大值触发虚假背压。
+                    if count > 1 {
+                        connection.pending.fetch_add((count - 1) as u32, Ordering::Relaxed);
+                    }
                     connection.gossip_flush_notify.notify_one();
                 }
                 true
@@ -902,7 +966,20 @@ impl ConnectionManager {
     /// 各自获取 1 个 `heavy_task_semaphore` permit 后顺序处理本组 batch。
     /// 组间并行，组内顺序；每个 task 完成后按本组 batch 数递减 `conn.pending`。
     async fn flush_gossip_buffer(self: Arc<Self>, conn: Arc<Connection>, _max_batches: usize) {
+        warn!("[federation][DIAG] flush_gossip_buffer ENTER, buffer_len={}", conn.gossip_buffer.lock().len());
+        // 限频：每10次 flush tick 输出1次，用于确认 flush task 存活并观察 buffer 积压。
+        // 放在 drain/early-return 之前，即使 buffer 为空也能看到 tick。
+        static FLUSH_TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tick = FLUSH_TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if tick % 10 == 0 {
+            let buffer_len = conn.gossip_buffer.lock().len();
+            warn!("[federation][perf] flush tick: buffer_len={}", buffer_len);
+        }
+
+        let total_start = Instant::now();
+
         // 一次性 drain 所有缓冲的 batch
+        let drain_start = Instant::now();
         let batches: Vec<GossipBatchMessage> = {
             let mut buf = conn.gossip_buffer.lock();
             if buf.is_empty() {
@@ -910,9 +987,12 @@ impl ConnectionManager {
             }
             buf.drain(..).collect()
         };
+        let drain_elapsed = drain_start.elapsed();
         if batches.is_empty() {
             return;
         }
+        let batch_count = batches.len();
+        warn!("[federation][perf] flush drain: batches={}", batches.len());
 
         // 按 repo_type 分流到最多 4 组（使用 protocol::repo_type 常量，不硬编码数值）
         let mut node_group: Vec<GossipBatchMessage> = Vec::new();
@@ -931,6 +1011,7 @@ impl ConnectionManager {
             }
         }
         let groups = [node_group, peer_group, infohash_group, tracker_group];
+        let group_count = groups.iter().filter(|g| !g.is_empty()).count();
 
         // 每个非空组 spawn 独立 task，各自获取 1 个 permit（与 GossipBatch/MerkleRepair 共用）
         for group in groups {
@@ -960,6 +1041,15 @@ impl ConnectionManager {
                 conn_task.pending.fetch_sub(group_len as u32, Ordering::Relaxed);
             });
         }
+
+        let total_elapsed = total_start.elapsed();
+        warn!(
+            "[federation][perf] flush_gossip_buffer: batches={} groups={} drain={}ms total={}ms",
+            batch_count,
+            group_count,
+            drain_elapsed.as_millis(),
+            total_elapsed.as_millis()
+        );
     }
 
     /// 获取指定节点的连接
@@ -975,6 +1065,83 @@ impl ConnectionManager {
     /// 当前连接数
     pub fn connection_count(&self) -> usize {
         self.connections.read().len()
+    }
+
+    /// 无连接时自动重连：遍历种子节点与节点表中 Disconnected/Failed 且有地址的节点，逐个尝试 dial。
+    /// 带冷却（reconnect_cooldown_secs），且仅在当前确实无连接时触发，避免与正常传播并发抢连接。
+    pub async fn reconnect_discovered(self: Arc<Self>) {
+        // 有连接时由正常传播兜底，不主动重连
+        if self.connection_count() > 0 {
+            return;
+        }
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_reconnect_attempt.load(Ordering::Relaxed);
+        let cooldown = self.config.reconnect_cooldown_secs;
+        if now_secs.saturating_sub(last) < cooldown {
+            return;
+        }
+        self.last_reconnect_attempt.store(now_secs, Ordering::Relaxed);
+
+        let mut targets: Vec<(NodeId, SocketAddr)> = Vec::new();
+        // 1) 种子节点已记录的真实 node_id + 地址（握手后获知，可信）
+        for (addr, node_id) in self.seed_node_ids.read().iter() {
+            if self.get_connection(node_id).is_none() {
+                targets.push((*node_id, *addr));
+            }
+        }
+        // 2) 节点表中 Disconnected/Failed 且有 preferred 地址的已知节点（最多再补到 8 个）
+        for entry in self.node_table.all_nodes() {
+            if targets.len() >= 8 {
+                break;
+            }
+            if !matches!(entry.status, NodeStatus::Disconnected | NodeStatus::Failed) {
+                continue;
+            }
+            if let Some(addr) = entry.info.preferred_addr() {
+                let node_id = NodeId(entry.info.node_id);
+                if self.get_connection(&node_id).is_none() {
+                    targets.push((node_id, addr));
+                }
+            }
+        }
+
+        if targets.is_empty() {
+            debug!("[federation] reconnect_discovered: 无候选节点可重连");
+            return;
+        }
+        warn!("[federation] 无连接，尝试重连 {} 个候选节点", targets.len());
+
+        for (node_id, addr) in targets {
+            if self.connection_count() > 0 {
+                break; // 已连上任意节点即停
+            }
+            if let Err(e) = self.clone().connect_to(node_id, addr).await {
+                debug!("[federation] 重连节点 {}@{} 失败: {}", node_id, addr, e);
+            }
+        }
+    }
+
+    /// 检查指定种子节点是否已连接
+    ///
+    /// 优先使用握手后记录的真实 node_id 匹配（入站连接对端端口为临时端口，
+    /// 地址精确匹配永远失败）；若映射尚未建立（首次连接前），则退回 IP 匹配。
+    pub fn is_seed_connected(&self, seed_addr: SocketAddr) -> bool {
+        // 1. 优先用已记录的真实 node_id 检查
+        if let Some(&real_node_id) = self.seed_node_ids.read().get(&seed_addr) {
+            if self.connections.read().contains_key(&real_node_id) {
+                return true;
+            }
+        }
+
+        // 2. 退回 IP 匹配（首次连接前或映射未建立时）
+        let seed_ip = seed_addr.ip();
+        self.connections
+            .read()
+            .values()
+            .any(|c| c.addr.ip() == seed_ip)
     }
 
     /// 关闭所有连接

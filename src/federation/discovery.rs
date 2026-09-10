@@ -420,10 +420,8 @@ impl DiscoveryService {
                 break;
             }
             if let Ok(addr) = seed.parse::<SocketAddr>() {
-                // 检查是否已连接（通过地址匹配）
-                let already_connected = self.connection_manager.all_connections()
-                    .iter()
-                    .any(|c| c.addr == addr);
+                // 检查是否已连接（优先 node_id 匹配，兼容入站连接临时端口场景）
+                let already_connected = self.connection_manager.is_seed_connected(addr);
                 if !already_connected {
                     let cm = self.connection_manager.clone();
                     let temp_id = NodeId::random();

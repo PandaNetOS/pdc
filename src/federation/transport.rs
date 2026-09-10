@@ -58,7 +58,7 @@ impl TcpTransport {
             peer,
             local,
             metrics: None,
-            write_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(30),
         }
     }
 

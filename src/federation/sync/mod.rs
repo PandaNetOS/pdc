@@ -11,7 +11,7 @@ pub mod tracker_sync;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -339,7 +339,9 @@ impl SyncManager {
 
     /// 处理收到的 Gossip 消息
     pub fn handle_gossip_batch(&self, batch: GossipBatchMessage) {
+        warn!("[federation][DIAG] SyncManager::handle_gossip_batch ENTER: repo_type={}, entries={}", batch.repo_type, batch.entries.len());
         let entries = self.gossip_engine.handle_gossip_batch(batch.clone());
+        warn!("[federation][perf] handle_gossip_batch returned: entries_len={}, repo_type={}", entries.len(), batch.repo_type);
         if entries.is_empty() {
             return;
         }
@@ -348,8 +350,15 @@ impl SyncManager {
 
     /// 应用 Node 同步数据
     pub fn apply_node_sync(&self, entries: &[SyncEntry]) {
+        warn!("[federation][perf] apply_node_sync ENTER: entries_len={}", entries.len());
+        if entries.len() > 100 {
+            warn!("[federation][perf] apply_node_sync start: entries={}", entries.len());
+        }
+        let total_start = Instant::now();
+
         // 第一遍：过滤 DELETE / 反序列化失败的条目，收集有效 payload，
         // 并批量收集 Merkle 更新（循环结束后一次 update_batch）。
+        let deserialize_start = Instant::now();
         let mut items: Vec<([u8; 20], SocketAddr)> = Vec::new();
         let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
@@ -365,8 +374,10 @@ impl SyncManager {
             merkle_batch.push((entry.key.clone(), entry.payload.clone()));
             applied += 1;
         }
+        let deserialize_elapsed = deserialize_start.elapsed();
 
         // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
+        let merkle_start = Instant::now();
         if !merkle_batch.is_empty() {
             let items: Vec<_> = merkle_batch
                 .into_iter()
@@ -374,11 +385,25 @@ impl SyncManager {
                 .collect();
             self.merkle_queue.push_batch(items);
         }
+        let merkle_elapsed = merkle_start.elapsed();
 
         // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
+        let repo_start = Instant::now();
         if !items.is_empty() {
             self.node_repo.add_nodes_batch_internal(&items);
         }
+        let repo_elapsed = repo_start.elapsed();
+
+        let total_elapsed = total_start.elapsed();
+
+        warn!(
+            "[federation][perf] apply_node_sync: count={} deserialize={}ms merkle={}ms repo_write={}ms total={}ms",
+            entries.len(),
+            deserialize_elapsed.as_millis(),
+            merkle_elapsed.as_millis(),
+            repo_elapsed.as_millis(),
+            total_elapsed.as_millis()
+        );
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
@@ -474,14 +499,16 @@ impl SyncManager {
         let mut handles = Vec::new();
         if self.config.sync_node_enabled {
             let s = self.clone();
-            handles.push(tokio::task::spawn_blocking(move || {
+            handles.push(tokio::task::spawn_blocking(move || -> usize {
                 let entries = s.collect_node_entries();
-                if !entries.is_empty() {
-                    let count = entries.len();
-                    s.gossip_engine
-                        .submit_gossip_batch(repo_type::NODE, entries, batch_size);
-                    info!("[federation] 初始同步 Node: {} 条（分批提交）", count);
+                if entries.is_empty() {
+                    return 0;
                 }
+                let count = entries.len();
+                s.gossip_engine
+                    .submit_gossip_batch(repo_type::NODE, entries, batch_size);
+                info!("[federation] 初始同步 Node: {} 条（分批提交）", count);
+                count
             }));
         }
 
@@ -489,13 +516,15 @@ impl SyncManager {
         if self.config.sync_peer_enabled {
             if let Some(ps) = self.peer_sync.clone() {
                 let gossip = self.gossip_engine.clone();
-                handles.push(tokio::task::spawn_blocking(move || {
+                handles.push(tokio::task::spawn_blocking(move || -> usize {
                     let entries = ps.collect_all_entries();
-                    if !entries.is_empty() {
-                        let count = entries.len();
-                        gossip.submit_gossip_batch(repo_type::PEER, entries, batch_size);
-                        info!("[federation] 初始同步 Peer: {} 条（分批提交）", count);
+                    if entries.is_empty() {
+                        return 0;
                     }
+                    let count = entries.len();
+                    gossip.submit_gossip_batch(repo_type::PEER, entries, batch_size);
+                    info!("[federation] 初始同步 Peer: {} 条（分批提交）", count);
+                    count
                 }));
             }
         }
@@ -504,13 +533,15 @@ impl SyncManager {
         if self.config.sync_infohash_enabled {
             if let Some(ihs) = self.infohash_sync.clone() {
                 let gossip = self.gossip_engine.clone();
-                handles.push(tokio::task::spawn_blocking(move || {
+                handles.push(tokio::task::spawn_blocking(move || -> usize {
                     let entries = ihs.collect_all_entries();
-                    if !entries.is_empty() {
-                        let count = entries.len();
-                        gossip.submit_gossip_batch(repo_type::INFOHASH, entries, batch_size);
-                        info!("[federation] 初始同步 Infohash: {} 条（分批提交）", count);
+                    if entries.is_empty() {
+                        return 0;
                     }
+                    let count = entries.len();
+                    gossip.submit_gossip_batch(repo_type::INFOHASH, entries, batch_size);
+                    info!("[federation] 初始同步 Infohash: {} 条（分批提交）", count);
+                    count
                 }));
             }
         }
@@ -519,13 +550,15 @@ impl SyncManager {
         if self.config.sync_tracker_enabled {
             if let Some(ts) = self.tracker_sync.clone() {
                 let gossip = self.gossip_engine.clone();
-                handles.push(tokio::task::spawn_blocking(move || {
+                handles.push(tokio::task::spawn_blocking(move || -> usize {
                     let entries = ts.collect_all_entries();
-                    if !entries.is_empty() {
-                        let count = entries.len();
-                        gossip.submit_gossip_batch(repo_type::TRACKER, entries, batch_size);
-                        info!("[federation] 初始同步 Tracker: {} 条（分批提交）", count);
+                    if entries.is_empty() {
+                        return 0;
                     }
+                    let count = entries.len();
+                    gossip.submit_gossip_batch(repo_type::TRACKER, entries, batch_size);
+                    info!("[federation] 初始同步 Tracker: {} 条（分批提交）", count);
+                    count
                 }));
             }
         }
@@ -533,10 +566,25 @@ impl SyncManager {
         // P2-1: 等待所有任务完成后，恢复 Merkle 正常模式并一次性重建
         let self_clone = self.clone();
         tokio::spawn(async move {
+            let mut total_entries: usize = 0;
             for h in handles {
-                let _ = h.await;
+                if let Ok(n) = h.await {
+                    total_entries += n;
+                }
             }
-            // 全量同步数据已全部入队，关闭 GossipEngine 全量同步标志（恢复正常丢弃/限流）
+            // 数据收集已全部入队，但 outbox 中可能仍积压大量待传播 batch。
+            // 先等待 outbox 排空，再关闭全量同步标志，避免洪峰未发完就回退到常规限流拖慢收尾。
+            // 超时按总条目数动态估算：按 1万条/秒，下限 30s，上限 1800s（30分钟）。
+            let timeout_secs = std::cmp::max(30, std::cmp::min(1800, (total_entries / 10000) as u64));
+            info!("[federation] 初始同步总条目 {}, wait_outbox_empty 超时 {}s", total_entries, timeout_secs);
+            if !self_clone
+                .gossip_engine
+                .wait_outbox_empty(Duration::from_secs(timeout_secs))
+                .await
+            {
+                warn!("[federation] initial sync outbox not empty after {}s timeout, forcing full_sync_in_progress=false", timeout_secs);
+            }
+            // outbox 已排空，关闭 GossipEngine 全量同步标志（恢复正常丢弃/限流）
             self_clone.gossip_engine.set_full_sync_in_progress(false);
             // 恢复 Merkle 正常模式并重建所有分片
             self_clone.node_merkle.set_full_sync_in_progress(false);

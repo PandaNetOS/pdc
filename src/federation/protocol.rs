@@ -52,6 +52,9 @@ pub enum MessageType {
     FullSyncAck = 18,
     /// 全量同步完成
     FullSyncComplete = 19,
+    /// Gossip 批量合并帧（多个 GossipBatch 合并为一个大帧发送，减少网络往返）。
+    /// 假设对端支持此消息类型（当前所有对端同版本），未来需加能力协商。
+    GossipBatchBulk = 20,
 }
 
 impl MessageType {
@@ -78,6 +81,7 @@ impl MessageType {
             17 => Some(MessageType::FullSyncBatch),
             18 => Some(MessageType::FullSyncAck),
             19 => Some(MessageType::FullSyncComplete),
+            20 => Some(MessageType::GossipBatchBulk),
             _ => None,
         }
     }
@@ -260,6 +264,18 @@ pub struct GossipBatchMessage {
     pub entries: Vec<SyncEntry>,
     /// 时间戳
     pub timestamp: u64,
+    /// 本地缓存的序列化大小（不含帧头），submit 时计算一次，发送时直接读取。
+    /// 不参与线网序列化（serde skip），仅用于限流和 bulk 大小统计。
+    #[serde(skip)]
+    pub serialized_size: u64,
+}
+
+/// Gossip 批量合并帧：将多个 GossipBatch 合并为一个大帧发送，
+/// 减少网络往返次数和序列化/反序列化开销。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GossipBatchBulkMessage {
+    /// 合并的多个 batch
+    pub batches: Vec<GossipBatchMessage>,
 }
 
 /// 同步批量消息

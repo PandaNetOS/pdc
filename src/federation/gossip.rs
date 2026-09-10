@@ -4,10 +4,9 @@
 //! 后台任务定期随机选择 fanout 个邻居传播。已处理消息通过 LRU 去重。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lru::LruCache;
 use parking_lot::RwLock;
 use rand::SeedableRng;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -20,13 +19,15 @@ use crate::federation::merkle::MerkleProvider;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
+use crate::federation::sharded_lru::ShardedLruCache;
 
 /// Gossip 引擎
 pub struct GossipEngine {
     /// 待传播队列
     outbox: RwLock<Vec<GossipBatchMessage>>,
-    /// 已处理消息 ID 去重（按 (origin_node, msg_id) 全局唯一去重）
-    seen_msgs: RwLock<LruCache<(NodeId, u64), ()>>,
+    /// 已处理消息 ID 去重（按 (origin_node, msg_id) 全局唯一去重）。
+    /// 分片 LRU：按 key 哈希分片，消除多 repo 并行 flush 时的全局写锁竞争。
+    seen_msgs: ShardedLruCache<(NodeId, u64), ()>,
     /// 连接管理器
     connection_manager: Arc<ConnectionManager>,
     /// 配置
@@ -49,12 +50,36 @@ pub struct GossipEngine {
     bytes_in_window: AtomicU64,
     /// 当前窗口已发送消息条数
     msgs_in_window: AtomicU64,
+    /// 正在发送中的 batch 数量（已从 outbox 取出但未完成发送）。
+    /// wait_outbox_empty 需把它计入，避免 outbox 暂时为空时误判同步完成。
+    in_flight_count: AtomicUsize,
     /// 全量同步进行中标记，为 true 时临时放开 Gossip 发送限流
     full_sync_in_progress: Arc<AtomicBool>,
 }
 
+/// 单个连接的发送结果集合（并行 spawn 后由主任务合并）
+#[derive(Default)]
+struct ConnSendResult {
+    failed_msg_ids: std::collections::HashSet<u64>,
+    rate_skipped_ids: std::collections::HashSet<u64>,
+    failed_nodes: FxHashSet<NodeId>,
+    successful_nodes: FxHashSet<NodeId>,
+}
+
 /// 单个 batch 最大重试次数，超过则丢弃
 const MAX_RETRIES: u32 = 3;
+
+/// 本地序列化辅助结构：与线网格式 GossipBatchBulkMessage 字段布局完全一致，
+/// 但持有引用而非所有权，避免发送 bulk 时深拷贝 batch 数据。
+/// bincode 按字段顺序序列化，&T 与 T 产出相同字节。
+#[derive(serde::Serialize)]
+struct BulkRef<'a> {
+    batches: Vec<&'a GossipBatchMessage>,
+}
+
+/// seen_msgs 去重缓存总容量（与改造前硬编码值一致）。
+/// 每片容量 = 总容量 / 分片数（向上取整，至少为 1）。
+const SEEN_MSGS_TOTAL_CAPACITY: usize = 10000;
 
 impl GossipEngine {
     /// 创建 Gossip 引擎
@@ -65,11 +90,11 @@ impl GossipEngine {
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
+        let shards = config.gossip_seen_shards.max(1);
+        let cap_per_shard = (SEEN_MSGS_TOTAL_CAPACITY + shards - 1) / shards;
         Self {
             outbox: RwLock::new(Vec::new()),
-            seen_msgs: RwLock::new(LruCache::new(
-                std::num::NonZeroUsize::new(10000).unwrap(),
-            )),
+            seen_msgs: ShardedLruCache::new(shards, cap_per_shard),
             connection_manager,
             config,
             next_msg_id: AtomicU64::new(1),
@@ -81,6 +106,7 @@ impl GossipEngine {
             rate_window_secs: AtomicU64::new(0),
             bytes_in_window: AtomicU64::new(0),
             msgs_in_window: AtomicU64::new(0),
+            in_flight_count: AtomicUsize::new(0),
             full_sync_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -116,12 +142,17 @@ impl GossipEngine {
             msg_id,
             origin: self.local_node_id.0,
             repo_type,
+            serialized_size: 0, // placeholder, computed below
             entries,
             timestamp: now,
         };
+        // 计算序列化大小（一次性，发送时直接读取避免重复计算）
+        let serialized_size = bincode::serialized_size(&batch).unwrap_or(0);
+        let mut batch = batch;
+        batch.serialized_size = serialized_size;
 
         // 标记自己发出的消息为已处理（避免回环）
-        self.seen_msgs.write().put((self.local_node_id, msg_id), ());
+        self.seen_msgs.put((self.local_node_id, msg_id), ());
         self.outbox.write().push(batch);
         debug!("[federation] Gossip 提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, entry_count);
     }
@@ -139,18 +170,22 @@ impl GossipEngine {
             .unwrap_or_default()
             .as_secs();
 
-        // 先构建所有 batch（获取 seen_msgs 锁），再统一写入 outbox，避免锁顺序反转
+        // 逐批标记 seen 并构建 batch，最后统一写入 outbox。
+        // seen_msgs 已分片，此处不再持有全局写锁。
         let mut batches = Vec::new();
         for chunk in entries.chunks(batch_size) {
             let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
-            self.seen_msgs.write().put((self.local_node_id, msg_id), ());
-            batches.push(GossipBatchMessage {
+            self.seen_msgs.put((self.local_node_id, msg_id), ());
+            let mut batch = GossipBatchMessage {
                 msg_id,
                 origin: self.local_node_id.0,
                 repo_type,
+                serialized_size: 0,
                 entries: chunk.to_vec(),
                 timestamp: now,
-            });
+            };
+            batch.serialized_size = bincode::serialized_size(&batch).unwrap_or(0);
+            batches.push(batch);
             debug!("[federation] Gossip 批量提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, chunk.len());
         }
 
@@ -279,17 +314,33 @@ impl GossipEngine {
         // 随机选择 fanout 个已连接邻居（先完成所有随机选择，避免 rng 跨 await）
         let conns = self.connection_manager.all_connections();
         if conns.is_empty() {
-            // 无连接，把消息放回 outbox（下次重试）
+            // 无连接，把消息放回 outbox（下次重试），并尝试重连已知节点（带冷却）
             self.outbox.write().extend(batches);
+            self.connection_manager.clone().reconnect_discovered().await;
             return;
         }
 
-        // 收集所有待发送的 (connection, batch) 对（rng 在此作用域内使用完毕）
-        let send_targets: Vec<(Arc<Connection>, &GossipBatchMessage)> = {
+        // 多个连接并行发送：把 batches 包进 Arc 供各 spawn task 共享只读
+        let batches = Arc::new(batches);
+
+        // 标记 in-flight：这些 batch 已从 outbox 取出但发送尚未完成（含阻塞中的 write_all）。
+        // 此处之后无 early return，函数末尾统一 fetch_sub，保证配对。
+        let in_flight_added = batches.len();
+        self.in_flight_count.fetch_add(in_flight_added, Ordering::Relaxed);
+        warn!(
+            "[federation][DIAG] propagation_tick: took={} batches, outbox_remaining={}, in_flight_after_add={}",
+            batches.len(),
+            self.outbox_size(),
+            self.in_flight_count.load(Ordering::Relaxed)
+        );
+
+        // 收集所有待发送的 (connection, batch_index) 对，按连接分组。
+        // 使用索引而非引用，便于后续按连接分组和 bulk 合并。
+        let mut by_conn: FxHashMap<NodeId, (Arc<Connection>, Vec<usize>)> = FxHashMap::default();
+        {
             use rand::seq::SliceRandom;
             let mut rng = rand::rngs::StdRng::from_entropy();
-            let mut targets = Vec::new();
-            for batch in &batches {
+            for (batch_idx, batch) in batches.iter().enumerate() {
                 let filtered: Vec<_> = conns
                     .iter()
                     .filter(|c| NodeId(batch.origin) != c.node_id)
@@ -300,13 +351,12 @@ impl GossipEngine {
                     .cloned()
                     .collect();
                 for conn in selected {
-                    targets.push((conn, batch));
+                    by_conn.entry(conn.node_id).or_insert_with(|| (conn, Vec::new())).1.push(batch_idx);
                 }
             }
-            targets
-        };
+        }
 
-        // 记录发送失败的 batch msg_id，用于回退 outbox
+        // 主任务汇总用的结果集合（各连接 task 并行发送后合并）
         let mut failed_msg_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         // 记录因发送端限流跳过的 batch msg_id，回退 outbox 待下 tick（不计入失败/重试）
         let mut rate_skipped_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -314,33 +364,27 @@ impl GossipEngine {
         let mut failed_nodes: FxHashSet<NodeId> = FxHashSet::default();
         let mut successful_nodes: FxHashSet<NodeId> = FxHashSet::default();
 
-        for (conn, batch) in send_targets {
-            let node_id = conn.node_id;
-            // 发送端速率限制：按全局出口字节数/消息数限流，超限则跳过（不视为失败）
-            let batch_bytes = bincode::serialized_size(batch).unwrap_or(0) + FRAME_HEADER_SIZE as u64;
-            if !self.rate_try_consume(batch_bytes, 1) {
-                debug!(
-                    "[federation] Gossip 速率超限，跳过发送 msg_id={} 到 {}（{} 字节）",
-                    batch.msg_id, node_id, batch_bytes
-                );
-                rate_skipped_ids.insert(batch.msg_id);
-                continue;
+        // 记录所有被分配到连接发送的 batch msg_id（用于识别未分配到任何连接的孤儿 batch）
+        let mut assigned_msg_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_node_id, (_, batch_indices)) in &by_conn {
+            for &idx in batch_indices {
+                assigned_msg_ids.insert(batches[idx].msg_id);
             }
-            if let Err(e) = conn.send_message(MessageType::GossipBatch, batch).await {
-                warn!("[federation] Gossip 发送到 {} 失败: {}", node_id, e);
-                failed_msg_ids.insert(batch.msg_id);
-                failed_nodes.insert(node_id);
-                // 连接已关闭类错误（os 10058/ECONNRESET/BrokenPipe）：立即移除，不等连续失败计数
-                let err_str = e.to_string();
-                if err_str.contains("10058") || err_str.contains("Connection reset") || err_str.contains("Broken pipe") || err_str.contains("closed") {
-                    warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
-                    self.connection_manager.remove_connection(&node_id);
-                }
-            } else {
-                self.metrics.record_gossip_propagation();
-                self.metrics.record_message_sent();
-                successful_nodes.insert(node_id);
-            }
+        }
+
+        let bulk_max_batches = self.config.gossip_bulk_max_batches;
+        let bulk_max_bytes = self.config.gossip_bulk_max_bytes;
+
+        // 串行发送各连接（单连接 localhost 场景并行无收益，并行反而放大 write timeout；
+        // 旧版串行已稳定 55,000 条/s）。保留 assigned_msg_ids 跟踪与孤儿回退。
+        for (_node_id, (conn, batch_indices)) in by_conn {
+            let res = self
+                .send_to_conn(conn, batch_indices, batches.clone(), bulk_max_batches, bulk_max_bytes)
+                .await;
+            failed_msg_ids.extend(res.failed_msg_ids);
+            rate_skipped_ids.extend(res.rate_skipped_ids);
+            failed_nodes.extend(res.failed_nodes);
+            successful_nodes.extend(res.successful_nodes);
         }
 
         // 更新节点连续失败计数：成功清零，失败递增，达到阈值则断开连接
@@ -376,7 +420,7 @@ impl GossipEngine {
             let mut retry_guard = self.retry_counts.write();
             let mut returned: Vec<GossipBatchMessage> = Vec::new();
 
-            for batch in &batches {
+            for batch in batches.iter() {
                 if !failed_msg_ids.contains(&batch.msg_id) {
                     // 发送成功，清理重试计数
                     retry_guard.remove(&batch.msg_id);
@@ -408,7 +452,7 @@ impl GossipEngine {
         // 限流跳过的 batch 回退 outbox（不计重试、不计连续失败），下 tick 再发
         if !rate_skipped_ids.is_empty() {
             let mut outbox = self.outbox.write();
-            for batch in &batches {
+            for batch in batches.iter() {
                 if rate_skipped_ids.contains(&batch.msg_id) {
                     outbox.push(batch.clone());
                 }
@@ -416,7 +460,152 @@ impl GossipEngine {
             debug!("[federation] 限流跳过 {} 条 batch 回退 outbox", rate_skipped_ids.len());
         }
 
+        // 未被分配到任何连接的孤儿 batch（fanout 选不到邻居时产生），回退 outbox 避免丢失
+        let orphan_count = batches.iter().filter(|b| !assigned_msg_ids.contains(&b.msg_id)).count();
+        if orphan_count > 0 {
+            warn!("[federation][DIAG] propagation_tick: {} 条 batch 未分配到连接，回退 outbox", orphan_count);
+            let orphans: Vec<GossipBatchMessage> = batches.iter()
+                .filter(|b| !assigned_msg_ids.contains(&b.msg_id))
+                .cloned()
+                .collect();
+            self.outbox.write().extend(orphans);
+        }
+
         debug!("[federation] Gossip 传播: {} 条消息发送到 {} 个邻居", batches.len(), fanout);
+        warn!(
+            "[federation][DIAG] propagation_tick: sent={} batches, failed={}, rate_skipped={}, in_flight_before_sub={}",
+            batches.len(),
+            failed_msg_ids.len(),
+            rate_skipped_ids.len(),
+            self.in_flight_count.load(Ordering::Relaxed)
+        );
+        self.in_flight_count.fetch_sub(in_flight_added, Ordering::Relaxed);
+    }
+
+    /// 向单个连接串行发送该连接的所有 batch（内部按 bulk 分组，保证单连接顺序）。
+    /// 并行化后每个连接一个 task；限流计数器为原子，多 task 并发安全。
+    async fn send_to_conn(
+        self: &Arc<Self>,
+        conn: Arc<Connection>,
+        batch_indices: Vec<usize>,
+        batches: Arc<Vec<GossipBatchMessage>>,
+        bulk_max_batches: usize,
+        bulk_max_bytes: usize,
+    ) -> ConnSendResult {
+        let mut result = ConnSendResult::default();
+        let mut pending: Vec<usize> = Vec::new();
+        let mut pending_bytes: u64 = 0;
+
+        for &batch_idx in &batch_indices {
+            let batch = &batches[batch_idx];
+            // 若 serialized_size 未设置（如从对端接收后转发的 batch），现场计算
+            let batch_size = if batch.serialized_size > 0 {
+                batch.serialized_size
+            } else {
+                bincode::serialized_size(batch).unwrap_or(0)
+            };
+
+            let would_exceed_batches = pending.len() >= bulk_max_batches;
+            let would_exceed_bytes = !pending.is_empty()
+                && pending_bytes + batch_size > bulk_max_bytes as u64;
+
+            if would_exceed_batches || would_exceed_bytes {
+                Self::send_bulk_or_single(
+                    self, &conn, batches.as_slice(), &pending, pending_bytes,
+                    &mut result.failed_msg_ids, &mut result.rate_skipped_ids,
+                    &mut result.failed_nodes, &mut result.successful_nodes,
+                )
+                .await;
+                pending.clear();
+                pending_bytes = 0;
+            }
+            pending.push(batch_idx);
+            pending_bytes += batch_size;
+        }
+
+        if !pending.is_empty() {
+            Self::send_bulk_or_single(
+                self, &conn, batches.as_slice(), &pending, pending_bytes,
+                &mut result.failed_msg_ids, &mut result.rate_skipped_ids,
+                &mut result.failed_nodes, &mut result.successful_nodes,
+            )
+            .await;
+        }
+        result
+    }
+
+    /// 发送一组（可能仅1个）batch 到指定连接。
+    /// 单个 batch 直接发 GossipBatch；多个 batch 合并为 GossipBatchBulk 发送。
+    /// 限流按 batch 数量扣减 msgs，按总字节数扣减 bytes。
+    async fn send_bulk_or_single(
+        self: &Arc<Self>,
+        conn: &Connection,
+        batches: &[GossipBatchMessage],
+        indices: &[usize],
+        total_batch_bytes: u64,
+        failed_msg_ids: &mut std::collections::HashSet<u64>,
+        rate_skipped_ids: &mut std::collections::HashSet<u64>,
+        failed_nodes: &mut FxHashSet<NodeId>,
+        successful_nodes: &mut FxHashSet<NodeId>,
+    ) {
+        let node_id = conn.node_id;
+        let batch_count = indices.len();
+
+        // 限流：按总字节数（含1个帧头）和 batch 条数扣减
+        let frame_overhead = FRAME_HEADER_SIZE as u64;
+        let total_bytes = total_batch_bytes + frame_overhead;
+        if !self.rate_try_consume(total_bytes, batch_count as u64) {
+            debug!(
+                "[federation] Gossip 速率超限，跳过 {} 条 batch 到 {}（{} 字节）",
+                batch_count, node_id, total_bytes
+            );
+            for &idx in indices {
+                rate_skipped_ids.insert(batches[idx].msg_id);
+            }
+            return;
+        }
+
+        if batch_count == 1 {
+            // 单个 batch：直接发 GossipBatch
+            let batch = &batches[indices[0]];
+            if let Err(e) = conn.send_message(MessageType::GossipBatch, batch).await {
+                warn!("[federation] Gossip 发送到 {} 失败: {}", node_id, e);
+                failed_msg_ids.insert(batch.msg_id);
+                failed_nodes.insert(node_id);
+                let err_str = e.to_string();
+                if err_str.contains("10058") || err_str.contains("Connection reset") || err_str.contains("Broken pipe") || err_str.contains("closed") {
+                    warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
+                    self.connection_manager.remove_connection(&node_id);
+                }
+            } else {
+                self.metrics.record_gossip_propagation();
+                self.metrics.record_message_sent();
+                successful_nodes.insert(node_id);
+            }
+        } else {
+            // 多个 batch：合并为 GossipBatchBulk 发送
+            let bulk_refs: Vec<&GossipBatchMessage> = indices.iter().map(|&i| &batches[i]).collect();
+            let bulk = BulkRef { batches: bulk_refs };
+            if let Err(e) = conn.send_message(MessageType::GossipBatchBulk, &bulk).await {
+                warn!("[federation] GossipBulk 发送 {} 条到 {} 失败: {}", batch_count, node_id, e);
+                for &idx in indices {
+                    failed_msg_ids.insert(batches[idx].msg_id);
+                }
+                failed_nodes.insert(node_id);
+                let err_str = e.to_string();
+                if err_str.contains("10058") || err_str.contains("Connection reset") || err_str.contains("Broken pipe") || err_str.contains("closed") {
+                    warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
+                    self.connection_manager.remove_connection(&node_id);
+                }
+            } else {
+                // 每个 batch 计一次传播指标
+                for _ in 0..batch_count {
+                    self.metrics.record_gossip_propagation();
+                }
+                self.metrics.record_message_sent();
+                successful_nodes.insert(node_id);
+            }
+        }
     }
 
     /// 处理收到的 Gossip 消息
@@ -424,26 +613,20 @@ impl GossipEngine {
     /// 检查 msg_id 去重，未处理则加入 seen_msgs，返回 entries 供上层写入本地，
     /// 并将 batch 加入 outbox 继续转发。
     pub fn handle_gossip_batch(&self, batch: GossipBatchMessage) -> Vec<SyncEntry> {
+        let total_start = Instant::now();
         self.metrics.record_gossip_received();
         self.metrics.record_message_recv();
 
-        let mut seen = self.seen_msgs.write();
+        let entry_count = batch.entries.len();
+
+        // 分片原子"检查并插入"：已处理过的消息直接丢弃，未处理则在同一分片锁内标记。
+        let seen_start = Instant::now();
         let dedup_key = (NodeId(batch.origin), batch.msg_id);
-        if seen.contains(&dedup_key) {
+        if !self.seen_msgs.check_and_put(dedup_key, ()) {
             debug!("[federation] Gossip 消息已处理，跳过: msg_id={}", batch.msg_id);
             return Vec::new();
         }
-        seen.put(dedup_key, ());
-        drop(seen);
-
-        let entries = batch.entries.clone();
-        debug!(
-            "[federation] Gossip 收到新消息: msg_id={}, origin={}, repo_type={}, entries={}",
-            batch.msg_id,
-            NodeId(batch.origin),
-            batch.repo_type,
-            entries.len()
-        );
+        let seen_elapsed = seen_start.elapsed();
 
         // 单连接场景优化：如果只有1个连接，且消息来自该连接，则不需要加入outbox
         // 因为传播不出去（只会发回给发送方，而发送方已经处理过这条消息了）
@@ -460,12 +643,44 @@ impl GossipEngine {
             true
         };
 
-        if should_propagate {
-            // 加入 outbox 继续传播（流行病协议）
+        let clone_start = Instant::now();
+        let result = if should_propagate {
+            // 多连接场景：需要同时返回 entries 给本地写入 + 保留 batch 转发，
+            // 必须 clone 一次（下游 DB 写入和网络传播各自需要所有权）。
+            let entries = batch.entries.clone();
+            debug!(
+                "[federation] Gossip 收到新消息: msg_id={}, origin={}, repo_type={}, entries={}",
+                batch.msg_id,
+                NodeId(batch.origin),
+                batch.repo_type,
+                entries.len()
+            );
             self.outbox.write().push(batch);
+            entries
+        } else {
+            // 单连接/无传播场景：直接 move entries，零 clone。
+            // 2 节点同步场景下这是常见路径，节省 5000 条 entries 的深拷贝。
+            let GossipBatchMessage { entries, msg_id, origin, repo_type, .. } = batch;
+            debug!(
+                "[federation] Gossip 收到新消息(不传播): msg_id={}, origin={}, repo_type={}, entries={}",
+                msg_id, NodeId(origin), repo_type, entries.len()
+            );
+            entries
+        };
+        let clone_elapsed = clone_start.elapsed();
+        let total_elapsed = total_start.elapsed();
+
+        if entry_count > 100 {
+            warn!(
+                "[federation][perf] handle_gossip_batch: entries={} seen={}ms clone={}ms total={}ms",
+                entry_count,
+                seen_elapsed.as_millis(),
+                clone_elapsed.as_millis(),
+                total_elapsed.as_millis()
+            );
         }
 
-        entries
+        result
     }
 
     /// 启动反熵（anti-entropy）后台任务
@@ -524,6 +739,41 @@ impl GossipEngine {
     pub fn outbox_size(&self) -> usize {
         self.outbox.read().len()
     }
+
+    /// 轮询等待 outbox 排空（剩余 <= 1 视为排空），最长等待 `timeout`。
+    ///
+    /// 在 async 上下文（SyncManager::trigger_initial_sync 的收尾任务）中调用：
+    /// 数据收集完成后，outbox 中仍可能积压大量待传播 batch，若立即关闭
+    /// `full_sync_in_progress` 会回退到常规限流（100 msg/s）拖慢收尾。
+    /// 此处轮询等待洪峰发完，再由调用方关闭标记。
+    /// 返回 true 表示已排空，false 表示超时。
+    pub async fn wait_outbox_empty(&self, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        // 连续检测到完全为空的次数（防抖），避免 propagation tick 间隙的瞬时空窗误判
+        let mut empty_streak: u32 = 0;
+        while start.elapsed() < timeout {
+            let outbox = self.outbox_size();
+            let in_flight = self.in_flight_count.load(Ordering::Relaxed);
+            warn!(
+                "[federation][DIAG] wait_outbox_empty: outbox_size={}, in_flight={}, elapsed={}ms",
+                outbox,
+                in_flight,
+                start.elapsed().as_millis()
+            );
+            // 把已取出但仍在发送中的 batch 计入；必须完全为 0（不再留 1 条），
+            // 且连续 3 次（~300ms）都为空才返回，避免 tick 间隙误判。
+            if outbox + in_flight == 0 {
+                empty_streak += 1;
+                if empty_streak >= 3 {
+                    return true;
+                }
+            } else {
+                empty_streak = 0;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +828,7 @@ mod tests {
             repo_type: repo_type::NODE,
             entries: entries.clone(),
             timestamp: 100,
+            serialized_size: 0,
         };
         let result = engine.handle_gossip_batch(batch);
         assert_eq!(result.len(), 1);
@@ -590,6 +841,7 @@ mod tests {
             repo_type: repo_type::NODE,
             entries,
             timestamp: 100,
+            serialized_size: 0,
         };
         let result2 = engine.handle_gossip_batch(batch2);
         assert!(result2.is_empty());
