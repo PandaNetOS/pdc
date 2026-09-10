@@ -53,8 +53,13 @@ pub struct GossipEngine {
     /// 正在发送中的 batch 数量（已从 outbox 取出但未完成发送）。
     /// wait_outbox_empty 需把它计入，避免 outbox 暂时为空时误判同步完成。
     in_flight_count: AtomicUsize,
-    /// 全量同步进行中标记，为 true 时临时放开 Gossip 发送限流
-    full_sync_in_progress: Arc<AtomicBool>,
+    /// 本节点正在接收全量数据（接收方）：为 true 时收到的 Gossip 只本地写入，
+    /// 不 push 到 outbox 转发（防多源重复洪峰）。不影响发送端限流/outbox 防护。
+    receiving_full_sync: AtomicBool,
+    /// 本节点正在向对端发送全量数据（发送方）：为 true 时临时放开 Gossip 发送限流、
+    /// 缩短传播 tick、跳过 outbox 截断。不影响接收端是否转发。
+    /// 用 Arc 包装以便 pause_gate() 向 crawler/dht/健康检查等外部模块共享同一信号。
+    sending_full_sync: Arc<AtomicBool>,
 }
 
 /// 单个连接的发送结果集合（并行 spawn 后由主任务合并）
@@ -107,18 +112,34 @@ impl GossipEngine {
             bytes_in_window: AtomicU64::new(0),
             msgs_in_window: AtomicU64::new(0),
             in_flight_count: AtomicUsize::new(0),
-            full_sync_in_progress: Arc::new(AtomicBool::new(false)),
+            receiving_full_sync: AtomicBool::new(false),
+            sending_full_sync: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// 设置全量同步进行中标记（由 SyncManager 在 trigger_initial_sync 期间调用）
-    pub fn set_full_sync_in_progress(&self, v: bool) {
-        self.full_sync_in_progress.store(v, Ordering::Relaxed);
+    /// 设置「接收全量数据」标记（接收方：由 SyncManager 在发起拉取 / 收到 FullSyncStart 时调用）
+    pub fn set_receiving_full_sync(&self, v: bool) {
+        self.receiving_full_sync.store(v, Ordering::Relaxed);
     }
 
-    /// 查询全量同步是否进行中
+    /// 查询是否正在接收全量数据
+    pub fn is_receiving_full_sync(&self) -> bool {
+        self.receiving_full_sync.load(Ordering::Relaxed)
+    }
+
+    /// 设置「发送全量数据」标记（发送方：由 SyncManager 在 trigger_initial_sync / start_full_sync 期间调用）
+    pub fn set_sending_full_sync(&self, v: bool) {
+        self.sending_full_sync.store(v, Ordering::Relaxed);
+    }
+
+    /// 查询是否正在发送全量数据
+    pub fn is_sending_full_sync(&self) -> bool {
+        self.sending_full_sync.load(Ordering::Relaxed)
+    }
+
+    /// 查询全量同步是否进行中（接收或发送任一）
     pub fn is_full_sync_in_progress(&self) -> bool {
-        self.full_sync_in_progress.load(Ordering::Relaxed)
+        self.is_receiving_full_sync() || self.is_sending_full_sync()
     }
 
     /// 仅检查 batch 是否已处理（只读，不插入 seen_msgs）。
@@ -131,9 +152,11 @@ impl GossipEngine {
         self.seen_msgs.contains(&(origin, msg_id))
     }
 
-    /// 获取全量同步标记的共享句柄（供非核心模块在全量同步期间暂停检查）
+    /// 获取全量同步标记的共享句柄（供非核心模块在全量同步期间暂停检查）。
+    /// 反映发送端状态：对外（crawler/dht/健康检查）在本节点推送全量期间暂停主动工作，
+    /// 把带宽/CPU 让给联邦同步；接收端是否暂停不通过此门控。
     pub fn pause_gate(&self) -> Arc<AtomicBool> {
-        self.full_sync_in_progress.clone()
+        self.sending_full_sync.clone()
     }
 
     /// 提交同步数据到 outbox
@@ -216,8 +239,8 @@ impl GossipEngine {
 
         tokio::spawn(async move {
             loop {
-                // 每轮循环开头根据全量同步标记动态计算下一次 tick 间隔
-                let tick_interval = if self.is_full_sync_in_progress() {
+                // 每轮循环开头根据发送端全量同步标记动态计算下一次 tick 间隔
+                let tick_interval = if self.is_sending_full_sync() {
                     FULL_SYNC_TICK_INTERVAL
                 } else {
                     interval
@@ -259,8 +282,8 @@ impl GossipEngine {
             self.bytes_in_window.store(0, Ordering::Relaxed);
             self.msgs_in_window.store(0, Ordering::Relaxed);
         }
-        // 根据全量同步标记选择限流值：全量同步期间临时放开到更高上限
-        let (max_bytes, max_msgs) = if self.is_full_sync_in_progress() {
+        // 根据发送端全量同步标记选择限流值：发送全量期间临时放开到更高上限
+        let (max_bytes, max_msgs) = if self.is_sending_full_sync() {
             (
                 self.config.full_sync_gossip_max_bytes_per_second,
                 self.config.full_sync_gossip_max_messages_per_second as u64,
@@ -296,8 +319,8 @@ impl GossipEngine {
             }
             // 全量同步期间跳过 outbox 长度截断和过期过滤：4 repo 并行洪峰（infohash/tracker
             // 百万级条目 → 数万 batch）会超过 5000 上限，drain 最老批次会导致先提交的 node
-            // 数据丢失。全量同步由 full_sync_in_progress flag 控制，完成后恢复正常防护。
-            if !self.is_full_sync_in_progress() {
+            // 数据丢失。全量同步由 sending_full_sync flag 控制，完成后恢复正常防护。
+            if !self.is_sending_full_sync() {
                 const MAX_OUTBOX_LEN: usize = 5000;
                 if outbox.len() > MAX_OUTBOX_LEN {
                     let drop_count = outbox.len() - MAX_OUTBOX_LEN;
@@ -675,14 +698,15 @@ impl GossipEngine {
 
         // 单连接场景优化：如果只有1个连接，且消息来自该连接，则不需要加入outbox
         // 因为传播不出去（只会发回给发送方，而发送方已经处理过这条消息了）
-        // 优化1：全量同步期间禁用转发 —— 普通节点同时从 super_node 和其他普通节点接收
-        // 重复数据，只 apply 本地写入（走零 clone 路径），不 push outbox 继续转发，
+        // 优化1：接收全量期间禁用转发 —— 纯对等单源拉取后，本节点只从选中的数据源
+        // 接收全量数据，只 apply 本地写入（走零 clone 路径），不 push outbox 继续转发，
         // 避免重复洪峰（测试中 node1 收到 408 batch 是实际数据的 2 倍）。
-        // 全量同步完成后 set_full_sync_in_progress(false) 自动恢复正常转发。
+        // 关键：只看 receiving_full_sync；sending_full_sync（本节点在向外推）不影响接收端转发，
+        // 否则发送方会被误伤、暂停 Gossip 转发。接收结束后自动恢复正常转发。
         // 超级节点不受影响：它通过 submit_gossip/submit_gossip_batch 直接写 outbox，不走本路径。
         let conn_count = self.connection_manager.connection_count();
-        let should_propagate = if self.is_full_sync_in_progress() {
-            // 全量同步期间：只本地写入，不转发
+        let should_propagate = if self.is_receiving_full_sync() {
+            // 接收全量期间：只本地写入，不转发
             false
         } else if conn_count <= 1 {
             let conns = self.connection_manager.all_connections();

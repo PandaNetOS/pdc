@@ -162,6 +162,14 @@ pub struct FederationConfig {
     /// false：串行发送（单连接 localhost 场景并行无收益且放大 write timeout，保留作为 fallback）。
     #[serde(default = "default_parallel_propagation")]
     pub parallel_propagation: bool,
+    /// 出站连接就绪后，等待多少毫秒再选择全量数据源并发送 FullSyncRequest。
+    /// 留出时间让其他对等节点也完成连接建立，便于在多个对端中选出最佳数据源。
+    #[serde(default = "default_full_sync_source_select_settle_ms")]
+    pub full_sync_source_select_settle_ms: u64,
+    /// 发起拉取后，接收全量期间保持「收到的 Gossip 只本地写入不转发」的稳态时长（毫秒）。
+    /// 超过此时长自动恢复正常转发（Gossip 拉取无显式完成信号，用可配置时长兜底）。
+    #[serde(default = "default_full_sync_receiving_settle_ms")]
+    pub full_sync_receiving_settle_ms: u64,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -209,6 +217,8 @@ fn default_merkle_async_update_batch_size() -> usize { 10000 }
 fn default_gossip_bulk_max_batches() -> usize { 50 }
 fn default_gossip_bulk_max_bytes() -> usize { 2 * 1024 * 1024 } // 2MB
 fn default_parallel_propagation() -> bool { true }
+fn default_full_sync_source_select_settle_ms() -> u64 { 2000 }
+fn default_full_sync_receiving_settle_ms() -> u64 { 60_000 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -258,6 +268,8 @@ impl Default for FederationConfig {
             gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
             gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
             parallel_propagation: default_parallel_propagation(),
+            full_sync_source_select_settle_ms: default_full_sync_source_select_settle_ms(),
+            full_sync_receiving_settle_ms: default_full_sync_receiving_settle_ms(),
         }
     }
 }

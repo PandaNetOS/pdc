@@ -22,9 +22,11 @@ pub struct MerkleTree {
     entry_counts: RwLock<Vec<u32>>,
     /// 所有条目 key -> data
     entries: RwLock<FxHashMap<Vec<u8>, Vec<u8>>>,
-    /// 全量同步进行中标志：为 true 时 update/update_batch 只写入 entries，
-    /// 跳过 recompute_shard，全量同步结束后由 rebuild_all 一次性重算。
-    full_sync_in_progress: AtomicBool,
+    /// 本节点正在接收全量数据（接收方）：为 true 时只写入 entries，
+    /// 跳过 recompute_shard，结束后由 rebuild_all 一次性重算。
+    receiving_full_sync: AtomicBool,
+    /// 本节点正在向对端发送全量数据（发送方）：同上，发送期间保证数据一致性。
+    sending_full_sync: AtomicBool,
 }
 
 impl MerkleTree {
@@ -36,7 +38,8 @@ impl MerkleTree {
             roots: RwLock::new(vec![[0u8; 32]; count]),
             entry_counts: RwLock::new(vec![0u32; count]),
             entries: RwLock::new(FxHashMap::default()),
-            full_sync_in_progress: AtomicBool::new(false),
+            receiving_full_sync: AtomicBool::new(false),
+            sending_full_sync: AtomicBool::new(false),
         }
     }
 
@@ -78,8 +81,8 @@ impl MerkleTree {
         self.entries
             .write()
             .insert(key.to_vec(), data.to_vec());
-        // 全量同步进行中时跳过单条重算，结束后由 rebuild_all 一次性重算
-        if !self.full_sync_in_progress.load(Ordering::SeqCst) {
+        // 收/发全量同步期间跳过单条重算，结束后由 rebuild_all 一次性重算
+        if !self.full_sync_active() {
             self.recompute_shard(shard);
         }
     }
@@ -102,8 +105,8 @@ impl MerkleTree {
         }
         drop(map); // 提前释放写锁
 
-        // 全量同步进行中时跳过重算
-        if self.full_sync_in_progress.load(Ordering::SeqCst) {
+        // 收/发全量同步期间跳过重算
+        if self.full_sync_active() {
             return;
         }
 
@@ -113,14 +116,25 @@ impl MerkleTree {
         }
     }
 
-    /// 设置全量同步进行中标志
-    pub fn set_full_sync_in_progress(&self, in_progress: bool) {
-        self.full_sync_in_progress.store(in_progress, Ordering::SeqCst);
+    /// 本节点是否正在接收全量数据（接收方）
+    pub fn set_receiving_full_sync(&self, v: bool) {
+        self.receiving_full_sync.store(v, Ordering::SeqCst);
     }
 
-    /// 查询全量同步是否进行中
+    /// 本节点是否正在向对端发送全量数据（发送方）
+    pub fn set_sending_full_sync(&self, v: bool) {
+        self.sending_full_sync.store(v, Ordering::SeqCst);
+    }
+
+    /// 收或发全量同步任一进行中（增量更新均暂停）
+    fn full_sync_active(&self) -> bool {
+        self.receiving_full_sync.load(Ordering::SeqCst)
+            || self.sending_full_sync.load(Ordering::SeqCst)
+    }
+
+    /// 查询全量同步是否进行中（接收或发送任一）
     pub fn is_full_sync_in_progress(&self) -> bool {
-        self.full_sync_in_progress.load(Ordering::SeqCst)
+        self.full_sync_active()
     }
 
     /// 全量重建所有分片（初始同步完成后调用一次）

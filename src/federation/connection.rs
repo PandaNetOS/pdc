@@ -287,23 +287,17 @@ impl ConnectionManager {
         // 入站连接也需要更新 node_table 状态，否则连接维护任务会认为该节点未连接而反复重连
         self.node_table.mark_connected(&node_id, None);
 
-        // 入站连接建立后也触发初始全量同步（双向同步，确保双方历史数据都能同步）
-        // 注意：必须在 spawn_message_handler 消费 self 之前获取 sync_manager
-        let sync_mgr = self.sync_manager.get().cloned();
+        // 纯对等拉取（P0-2）：入站连接不主动推送全量数据。
+        // 数据同步由出站方（数据较少者）选择数据源后发送 FullSyncRequest 触发；
+        // 本节点作为数据源，在收到 FullSyncRequest 时才推送（handle_full_sync_request）。
+        // 这消除了旧行为「每个入站连接都触发一次全量推送」导致的重复同步（旧 bug：每个节点触发 2 次全量）。
         info!(
-            "[federation] 入站连接初始同步检查: sync_manager={}",
-            if sync_mgr.is_some() { "Some" } else { "None" }
+            "[federation] 入站连接就绪（等待对端 FullSyncRequest，不主动推送）: {}",
+            node_id
         );
 
         // 启动消息处理循环
         self.spawn_message_handler(connection).await;
-
-        if let Some(mgr) = sync_mgr {
-            info!("[federation] 入站连接触发初始全量同步");
-            mgr.trigger_initial_sync(node_id);
-        } else {
-            warn!("[federation] 入站连接 sync_manager 为 None，无法触发初始全量同步");
-        }
 
         Ok(())
     }
@@ -396,9 +390,12 @@ impl ConnectionManager {
         // 启动消息处理循环
         self.clone().spawn_message_handler(connection.clone()).await;
 
-        // 出站连接建立成功后触发初始全量同步（只触发一次，入站连接不触发）
+        // 出站连接建立成功：作为纯对等拉取入口（P0-2）。
+        // 新节点（数据较少者）主动选择最佳数据源并发送 FullSyncRequest；
+        // SyncManager 内部按 initial_pull_done 去重，只发起一次。
+        // 旧行为出站即 trigger_initial_sync（双向各自推送）导致每个节点触发 2 次全量，已移除。
         if let Some(sync_mgr) = self.sync_manager.get() {
-            sync_mgr.clone().trigger_initial_sync(peer_id);
+            sync_mgr.clone().on_connection_ready(peer_id);
         }
 
         // 连接建立成功，移除 connecting 标记
@@ -855,6 +852,21 @@ impl ConnectionManager {
                 // 发送端接收 Ack，简化版不做流控等待
                 false
             }
+            MessageType::FullSyncRequest => {
+                // 纯对等拉取：对端（数据较少者）请求全量数据。本节点作为数据源，
+                // 异步判断本地数据是否更全，更全则推送。
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    if let Ok(req) = bincode::deserialize::<FullSyncRequestMessage>(&payload) {
+                        tokio::spawn(async move {
+                            sync_mgr.handle_full_sync_request(conn.node_id, req).await;
+                        });
+                    }
+                }
+                false
+            }
             MessageType::FullSyncComplete => {
                 self.metrics.record_message_recv();
                 if let Ok(msg) = bincode::deserialize::<FullSyncCompleteMessage>(&payload) {
@@ -1079,6 +1091,14 @@ impl ConnectionManager {
     /// 获取指定节点的连接
     pub fn get_connection(&self, node_id: &NodeId) -> Option<Arc<Connection>> {
         self.connections.read().get(node_id).cloned()
+    }
+
+    /// 查询指定对端的 RTT（毫秒），未知则返回 u32::MAX（供数据源选择延迟打分）。
+    pub fn peer_rtt_ms(&self, node_id: &NodeId) -> u32 {
+        self.node_table
+            .get(node_id)
+            .and_then(|e| e.rtt_ms)
+            .unwrap_or(u32::MAX)
     }
 
     /// 获取所有连接

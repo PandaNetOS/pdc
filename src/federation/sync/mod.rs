@@ -10,10 +10,12 @@ pub mod tracker_sync;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -69,6 +71,12 @@ pub struct SyncManager {
     shutdown: broadcast::Sender<()>,
     /// 已触发初始全量同步的对端节点集合（按对端去重，每个对端只同步一次）
     initial_sync_peers: RwLock<HashSet<NodeId>>,
+    /// 是否已发起过初始拉取（纯对等架构：本节点只主动选择一个数据源拉取一次，
+    /// 后续增量由反熵/Merkle 对账负责）。防止多连接时重复发起 FullSyncRequest。
+    initial_pull_done: AtomicBool,
+    /// 已见过的对端 Merkle 摘要（对端 node_id -> 各 repo 条目数），
+    /// 供数据源选择时按「数据最完整（与本地差异最大）」排序。
+    peer_digests: RwLock<FxHashMap<NodeId, Vec<u32>>>,
 }
 
 impl SyncManager {
@@ -169,6 +177,8 @@ impl SyncManager {
             metrics,
             shutdown,
             initial_sync_peers: RwLock::new(HashSet::new()),
+            initial_pull_done: AtomicBool::new(false),
+            peer_digests: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -469,42 +479,53 @@ impl SyncManager {
         self.tracker_sync.as_ref().map(|ts| ts.merkle())
     }
 
-    /// 触发初始全量同步（连接建立后调用，异步执行不阻塞）
+    /// 触发初始全量推送（本节点作为发送方，把本地数据通过 Gossip 推出去）。
     ///
-    /// Node/Peer/Infohash/Tracker 四个 repo 并行执行全量同步，
-    /// 每个 repo 独立 spawn_blocking 收集数据，按配置化 batch_size 通过 Gossip 批量提交。
-    /// 入站和出站连接建立后都会触发，按对端 node_id 去重，每个对端只触发一次。
+    /// Node/Peer/Infohash/Tracker 四个 repo 并行执行，每个 repo 独立 spawn_blocking
+    /// 收集数据，按配置化 batch_size 通过 Gossip 批量提交（fanout 到所有已连接邻居）。
     ///
-    /// P2-1 优化：同步开始时对所有 MerkleTree 设置 full_sync_in_progress=true，
-    /// 跳过逐条 recompute_shard；全部完成后 set false + rebuild_all 一次性重算。
+    /// 纯对等架构下，本方法只在收到对端的 FullSyncRequest（handle_full_sync_request）时
+    /// 被调用，或作为兼容入口由 on_connection_ready 在旧路径下触发；连接建立不再自动调用，
+    /// 避免每个节点对每个入站连接都重复推送（旧行为导致每个节点触发 2 次全量同步）。
+    ///
+    /// 标志拆分（P0-1）：发送端只设置 sending_full_sync，暂停 Merkle 增量更新以保证一致性，
+    /// 但**不影响**接收端的 Gossip 转发。
     pub fn trigger_initial_sync(self: Arc<Self>, peer_node_id: NodeId) {
-        // 防重复：按对端节点去重，同一对端只触发一次初始全量同步
+        // 防重复：按对端节点去重，同一对端只推送一次
         if !self.initial_sync_peers.write().insert(peer_node_id) {
-            info!("[federation] 初始全量同步已对 {:?} 触发过，跳过（去重生效）", peer_node_id);
+            info!("[federation] 初始全量推送已对 {:?} 触发过，跳过（去重生效）", peer_node_id);
             return;
         }
 
-        info!("[federation] 开始初始全量同步（4 repo 并行，对端: {:?}）...", peer_node_id);
+        info!("[federation] 开始初始全量推送（4 repo 并行，对端: {:?}）...", peer_node_id);
 
-        // 全量同步期间告知 GossipEngine：暂停 outbox 丢弃/限流，确保全量批次完整传播
-        self.gossip_engine.set_full_sync_in_progress(true);
+        self.mark_sending_full_sync(true);
+        self.run_full_sync_push();
+    }
 
-        // P2-1: 设置所有 MerkleTree 为全量同步模式（跳过 recompute_shard）
-        self.node_merkle.set_full_sync_in_progress(true);
+    /// 标记发送端全量同步状态（GossipEngine 放开限流/outbox 防护 + 所有 Merkle 暂停增量更新）。
+    fn mark_sending_full_sync(&self, v: bool) {
+        self.gossip_engine.set_sending_full_sync(v);
+        self.node_merkle.set_sending_full_sync(v);
         if let Some(ps) = &self.peer_sync {
-            ps.merkle().set_full_sync_in_progress(true);
+            ps.merkle().set_sending_full_sync(v);
         }
         if let Some(ihs) = &self.infohash_sync {
-            ihs.merkle().set_full_sync_in_progress(true);
+            ihs.merkle().set_sending_full_sync(v);
         }
         if let Some(ts) = &self.tracker_sync {
-            ts.merkle().set_full_sync_in_progress(true);
+            ts.merkle().set_sending_full_sync(v);
         }
+    }
 
+    /// 执行全量数据收集 + Gossip 批量推送（4 repo 并行），完成后等待 outbox 排空并恢复标志。
+    /// 与具体对端解耦：数据通过 Gossip fanout 传播给所有已连接邻居。
+    fn run_full_sync_push(self: Arc<Self>) {
         let batch_size = self.config.initial_sync_batch_size;
 
-        // Node 全量同步（独立任务）
         let mut handles = Vec::new();
+
+        // Node 全量同步（独立任务）
         if self.config.sync_node_enabled {
             let s = self.clone();
             handles.push(tokio::task::spawn_blocking(move || -> usize {
@@ -590,46 +611,199 @@ impl SyncManager {
                 .wait_outbox_empty(Duration::from_secs(timeout_secs))
                 .await
             {
-                warn!("[federation] initial sync outbox not empty after {}s timeout, forcing full_sync_in_progress=false", timeout_secs);
+                warn!("[federation] initial push outbox not empty after {}s timeout, forcing sending_full_sync=false", timeout_secs);
             }
-            // outbox 已排空，关闭 GossipEngine 全量同步标志（恢复正常丢弃/限流）
-            self_clone.gossip_engine.set_full_sync_in_progress(false);
-            // 恢复 Merkle 正常模式并重建所有分片
-            self_clone.node_merkle.set_full_sync_in_progress(false);
-            self_clone.node_merkle.rebuild_all();
-            if let Some(ps) = &self_clone.peer_sync {
-                ps.merkle().set_full_sync_in_progress(false);
-                ps.merkle().rebuild_all();
-            }
-            if let Some(ihs) = &self_clone.infohash_sync {
-                ihs.merkle().set_full_sync_in_progress(false);
-                ihs.merkle().rebuild_all();
-            }
-            if let Some(ts) = &self_clone.tracker_sync {
-                ts.merkle().set_full_sync_in_progress(false);
-                ts.merkle().rebuild_all();
-            }
-            info!("[federation] 初始全量同步完成，Merkle 树已重建");
+            // outbox 已排空，关闭发送端全量标志并重建所有 Merkle 分片
+            self_clone.clear_sending_and_rebuild_all();
         });
+    }
+
+    /// 关闭发送端全量标志并重建所有 Merkle 分片（推送完成后调用一次）。
+    fn clear_sending_and_rebuild_all(&self) {
+        self.gossip_engine.set_sending_full_sync(false);
+        self.node_merkle.set_sending_full_sync(false);
+        self.node_merkle.rebuild_all();
+        if let Some(ps) = &self.peer_sync {
+            ps.merkle().set_sending_full_sync(false);
+            ps.merkle().rebuild_all();
+        }
+        if let Some(ihs) = &self.infohash_sync {
+            ihs.merkle().set_sending_full_sync(false);
+            ihs.merkle().rebuild_all();
+        }
+        if let Some(ts) = &self.tracker_sync {
+            ts.merkle().set_sending_full_sync(false);
+            ts.merkle().rebuild_all();
+        }
+        info!("[federation] 初始全量推送完成，Merkle 树已重建");
+    }
+
+    /// 出站连接建立就绪（纯对等拉取入口）。
+    ///
+    /// 新节点（数据较少者）主动选择唯一数据源并请求全量数据，而不是被动接收每个入站连接的
+    /// 推送。本节点只主动发起一次初始拉取（initial_pull_done 去重）；后续增量由反熵/对账负责。
+    /// 入站连接不调用本方法（connection.rs 入站路径不再自动触发推送，等待对端 FullSyncRequest）。
+    pub fn on_connection_ready(self: Arc<Self>, _peer_node_id: NodeId) {
+        // 只发起一次初始拉取：用 swap 抢占式标记，避免多个出站连接并发重复选择/请求。
+        if self.initial_pull_done.swap(true, Ordering::SeqCst) {
+            debug!("[federation] 初始拉取已发起过，跳过");
+            return;
+        }
+        let settle_ms = self.config.full_sync_source_select_settle_ms;
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            // 给其他对等节点一点连接建立时间，便于在多个对端中选出最佳数据源。
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+            self_clone.select_full_sync_source_and_request().await;
+        });
+    }
+
+    /// 选择全量数据源并发起拉取（接收方）。
+    ///
+    /// 遍历所有已连接对等节点，按「数据最完整（与本地差异最大）+ 延迟最低」打分，
+    /// 只向得分最高的一个发送 FullSyncRequest；其他节点不触发全量推送，从根上消除重复。
+    /// 打分：优先对端条目数显著多于本地者（数据更完整），其次 RTT 更低者（延迟更低）。
+    async fn select_full_sync_source_and_request(self: Arc<Self>) {
+        let conns = self.connection_manager.all_connections();
+        if conns.is_empty() {
+            debug!("[federation] 选择数据源：无连接，放弃拉取");
+            return;
+        }
+
+        let local_counts = self.local_entry_counts();
+        let local_total: u64 = local_counts.iter().map(|c| *c as u64).sum();
+        let peer_digests = self.peer_digests.read().clone();
+
+        // 为每个对端打分：分数越高越优。
+        //  - 对端已知条目总数 > 本地：差值越大越优（数据更完整）。
+        //  - RTT 越低越优（延迟最低）；未知 RTT 记为较大值。
+        let mut best: Option<(NodeId, u64)> = None;
+        for conn in &conns {
+            let rtt_ms = self.connection_manager.peer_rtt_ms(&conn.node_id) as u64;
+            let mut score: i128 = 0;
+            if let Some(peer_counts) = peer_digests.get(&conn.node_id) {
+                let peer_total: u64 = peer_counts.iter().map(|c| *c as u64).sum();
+                // 数据更完整者加分；本地为空（新节点）时此项最大，天然选最完整源
+                score += (peer_total as i128 - local_total as i128);
+            }
+            // 延迟项：RTT 越低越好。1000000 为 RTT 上限保护，未知 RTT 记 1000ms。
+            score -= (rtt_ms.min(1_000_000)).max(1_000) as i128;
+            let score_u = score.max(0) as u64;
+            match &best {
+                None => best = Some((conn.node_id, score_u)),
+                Some((_, bs)) => {
+                    if score_u > *bs {
+                        best = Some((conn.node_id, score_u));
+                    }
+                }
+            }
+        }
+
+        let source = match best {
+            Some((nid, _)) => nid,
+            None => {
+                debug!("[federation] 选择数据源：无候选，放弃拉取");
+                return;
+            }
+        };
+
+        info!(
+            "[federation] 选择全量数据源: {}（本地条目总数 {}，候选 {} 个）",
+            source, local_total, conns.len()
+        );
+
+        // 进入接收态：此后收到的 Gossip 只本地写入、不转发（P0-3）。
+        self.gossip_engine.set_receiving_full_sync(true);
+
+        // 向选中的数据源发送 FullSyncRequest（携带本地条目数供其判断是否需要推送）
+        let req = FullSyncRequestMessage {
+            local_entry_counts: local_counts,
+        };
+        let sent = match self.connection_manager.get_connection(&source) {
+            Some(conn) => conn.send_message(MessageType::FullSyncRequest, &req).await.is_ok(),
+            None => false,
+        };
+        if !sent {
+            warn!("[federation] FullSyncRequest 发送到 {} 失败，放弃本次拉取", source);
+            self.gossip_engine.set_receiving_full_sync(false);
+            return;
+        }
+        self.metrics.record_message_sent();
+
+        // 接收洪峰到达期间保持接收态；超过接收稳态时长后恢复正常转发。
+        // （Gossip 拉取无显式完成信号，用可配置的接收稳态时长兜底，避免永久禁转发。）
+        let settle_ms = self.config.full_sync_receiving_settle_ms;
+        let gossip = self.gossip_engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+            gossip.set_receiving_full_sync(false);
+            info!("[federation] 接收稳态 {}ms 到期，恢复 Gossip 正常转发", settle_ms);
+        });
+    }
+
+    /// 处理收到的 FullSyncRequest（本节点作为数据源 / 服务端）。
+    ///
+    /// 只有收到对端的请求才推送全量数据，否则不主动发（纯对等拉取）。
+    /// 先比较请求方携带的本地条目数与本节点：仅当本节点数据明显更多时才推送，
+    /// 避免新节点向老节点空拉、或老节点向新节点无谓推送。
+    pub async fn handle_full_sync_request(self: Arc<Self>, from_node_id: NodeId, req: FullSyncRequestMessage) {
+        let local_counts = self.local_entry_counts();
+        let local_total: u64 = local_counts.iter().map(|c| *c as u64).sum();
+        let peer_total: u64 = req.local_entry_counts.iter().map(|c| *c as u64).sum();
+        info!(
+            "[federation] 收到 FullSyncRequest from={}, 本节点条目={}, 请求方条目={}",
+            from_node_id, local_total, peer_total
+        );
+
+        // 仅当本地数据比请求方明显更多时才推送（新节点本地为空 peer_total=0，必然满足）。
+        if local_total <= peer_total {
+            info!("[federation] 本节点数据未多于请求方，跳过全量推送");
+            return;
+        }
+
+        info!("[federation] 作为数据源向 {} 推送全量数据", from_node_id);
+        self.trigger_initial_sync(from_node_id);
+    }
+
+    /// 统计本节点各 repo 的当前条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
+    fn local_entry_counts(&self) -> Vec<u32> {
+        vec![
+            self.node_merkle.total_entries() as u32,
+            self.peer_sync
+                .as_ref()
+                .map(|p| p.merkle().total_entries() as u32)
+                .unwrap_or(0),
+            self.infohash_sync
+                .as_ref()
+                .map(|i| i.merkle().total_entries() as u32)
+                .unwrap_or(0),
+            self.tracker_sync
+                .as_ref()
+                .map(|t| t.merkle().total_entries() as u32)
+                .unwrap_or(0),
+        ]
     }
 
     /// 全量同步开始（接收端：由 FullSyncStart 消息触发）
     ///
-    /// 对指定 repo_type 的 MerkleTree 设置 full_sync_in_progress=true，
-    /// 跳过逐条 recompute_shard。
+    /// P0-1 标志拆分：对指定 repo_type 的 MerkleTree 设置 receiving_full_sync=true
+    /// （跳过逐条 recompute_shard），同时告知 GossipEngine 进入接收态——收到的
+    /// Gossip 只本地写入、不再转发，防止多源重复洪峰。
     pub fn handle_full_sync_start(&self, repo_type: u8) {
+        self.gossip_engine.set_receiving_full_sync(true);
         if let Some(merkle) = self.merkle_for_repo(repo_type) {
-            merkle.set_full_sync_in_progress(true);
-            info!("[federation] FullSync 开始: repo_type={}, Merkle 进入惰性模式", repo_type);
+            merkle.set_receiving_full_sync(true);
+            info!("[federation] FullSync 开始: repo_type={}, Merkle 进入接收惰性模式", repo_type);
         }
     }
 
     /// 全量同步完成（接收端：由 FullSyncComplete 消息触发）
     ///
-    /// 恢复 Merkle 正常模式，一次性 rebuild_all 重算所有分片。
+    /// 恢复 Merkle 正常模式并一次性 rebuild_all；关闭 Gossip 接收态，恢复正常转发。
     pub fn handle_full_sync_complete(&self, repo_type: u8) {
+        self.gossip_engine.set_receiving_full_sync(false);
         if let Some(merkle) = self.merkle_for_repo(repo_type) {
-            merkle.set_full_sync_in_progress(false);
+            merkle.set_receiving_full_sync(false);
             merkle.rebuild_all();
             info!("[federation] FullSync 完成: repo_type={}, Merkle 已重建", repo_type);
         }
@@ -657,8 +831,8 @@ impl SyncManager {
             }
         };
 
-        // 全量同步期间告知 GossipEngine：暂停 outbox 丢弃/限流
-        self.gossip_engine.set_full_sync_in_progress(true);
+        // 发送端全量期间告知 GossipEngine：放开 outbox 丢弃/限流（不影响接收端转发）
+        self.gossip_engine.set_sending_full_sync(true);
 
         let batch_size = self.config.full_sync_batch_size;
         let window = self.config.full_sync_window_size;
@@ -745,8 +919,8 @@ impl SyncManager {
             );
         }
 
-        // 全量同步结束，恢复 GossipEngine 正常丢弃/限流
-        self.gossip_engine.set_full_sync_in_progress(false);
+        // 发送端全量结束，恢复 GossipEngine 正常丢弃/限流
+        self.gossip_engine.set_sending_full_sync(false);
     }
 
     /// 收集全量 Node 同步条目（内部辅助方法）
@@ -813,6 +987,16 @@ impl SyncManager {
             Some(m) => m,
             None => return,
         };
+
+        // 记录对端该 repo 的条目总数，供后续数据源选择时判断「数据最完整」。
+        // digest.entry_counts 是每分片计数，求和得到该 repo 总数。
+        let idx = (digest.repo_type as usize).wrapping_sub(1);
+        if idx < 4 {
+            let total: u32 = digest.entry_counts.iter().sum();
+            let mut digests = self.peer_digests.write();
+            let entry = digests.entry(conn.node_id).or_insert_with(|| vec![0u32; 4]);
+            entry[idx] = total;
+        }
 
         let diffs = merkle.diff(&digest);
         if diffs.is_empty() {

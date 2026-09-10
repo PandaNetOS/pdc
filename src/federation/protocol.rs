@@ -55,6 +55,9 @@ pub enum MessageType {
     /// Gossip 批量合并帧（多个 GossipBatch 合并为一个大帧发送，减少网络往返）。
     /// 假设对端支持此消息类型（当前所有对端同版本），未来需加能力协商。
     GossipBatchBulk = 20,
+    /// 全量同步请求（纯对等拉取：新节点向选中的数据源请求全量数据，
+    /// 数据源收到后才推送，否则不主动发，避免多节点重复推送）。
+    FullSyncRequest = 21,
 }
 
 impl MessageType {
@@ -82,6 +85,7 @@ impl MessageType {
             18 => Some(MessageType::FullSyncAck),
             19 => Some(MessageType::FullSyncComplete),
             20 => Some(MessageType::GossipBatchBulk),
+            21 => Some(MessageType::FullSyncRequest),
             _ => None,
         }
     }
@@ -352,6 +356,19 @@ pub struct FullSyncAckMessage {
 pub struct FullSyncCompleteMessage {
     /// 仓库类型
     pub repo_type: u8,
+}
+
+/// 全量同步请求（纯对等拉取）
+///
+/// 新节点（数据较少者）连接多个对等节点后，按「数据最完整 + 延迟最低」
+/// 选出唯一数据源，仅向其发送本消息；数据源收到后才推送全量数据。
+/// 请求方携带本地各 repo 的条目数，供数据源判断是否需要推送
+/// （避免新节点向老节点无谓推送 / 老节点向新节点空拉）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FullSyncRequestMessage {
+    /// 发起方本地各 repo 的总条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致），
+    /// 0 表示未知/为空。
+    pub local_entry_counts: Vec<u32>,
 }
 
 /// 仓库类型常量
