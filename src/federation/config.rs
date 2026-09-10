@@ -155,6 +155,13 @@ pub struct FederationConfig {
     /// 达到此限制立即发送当前 bulk，开始下一个。
     #[serde(default = "default_gossip_bulk_max_bytes")]
     pub gossip_bulk_max_bytes: usize,
+    /// 多连接传播时是否并行发送到所有连接。
+    /// true（默认）：每个连接独立 tokio task 并行发送，多节点场景下超级节点带宽
+    /// 不被串行分摊（测试中 node2 仅 8,450 条/s vs node1 35,800 条/s 的主因）。
+    /// 限流计数器为 AtomicU64，多 task 并发安全。
+    /// false：串行发送（单连接 localhost 场景并行无收益且放大 write timeout，保留作为 fallback）。
+    #[serde(default = "default_parallel_propagation")]
+    pub parallel_propagation: bool,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -201,6 +208,7 @@ fn default_merkle_async_update_interval_ms() -> u64 { 1000 }
 fn default_merkle_async_update_batch_size() -> usize { 10000 }
 fn default_gossip_bulk_max_batches() -> usize { 50 }
 fn default_gossip_bulk_max_bytes() -> usize { 2 * 1024 * 1024 } // 2MB
+fn default_parallel_propagation() -> bool { true }
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -249,6 +257,7 @@ impl Default for FederationConfig {
             merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
             gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
             gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
+            parallel_propagation: default_parallel_propagation(),
         }
     }
 }

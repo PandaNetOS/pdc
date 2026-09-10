@@ -991,6 +991,30 @@ impl ConnectionManager {
         if batches.is_empty() {
             return;
         }
+
+        // 优化2：接收端提前去重 —— 在按 repo_type 分组 / spawn task 前，
+        // 一次性过滤掉已处理的重复 batch。重复 batch 此前仍消耗反序列化、缓冲、
+        // 分组、task spawn、clone 的 CPU；提前丢弃可降低 90%+ 重复消息开销。
+        // 只读检查（seen_msgs.contains），不插入；handle_gossip_batch 中的
+        // check_and_put 仍保留作为兜底（防止本检查与实际处理间的竞态）。
+        let batches: Vec<GossipBatchMessage> = if let Some(sync_mgr) = self.sync_manager.get() {
+            let before = batches.len();
+            let filtered: Vec<GossipBatchMessage> = batches
+                .into_iter()
+                .filter(|b| !sync_mgr.is_batch_seen(b))
+                .collect();
+            let dropped = before - filtered.len();
+            if dropped > 0 {
+                warn!("[federation][perf] flush 提前去重: 丢弃 {} 条重复 batch（剩余 {}）", dropped, filtered.len());
+            }
+            filtered
+        } else {
+            batches
+        };
+        if batches.is_empty() {
+            return;
+        }
+
         let batch_count = batches.len();
         warn!("[federation][perf] flush drain: batches={}", batches.len());
 

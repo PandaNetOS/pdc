@@ -121,6 +121,16 @@ impl GossipEngine {
         self.full_sync_in_progress.load(Ordering::Relaxed)
     }
 
+    /// 仅检查 batch 是否已处理（只读，不插入 seen_msgs）。
+    ///
+    /// 供 ConnectionManager::flush_gossip_buffer 在分组/spawn task 前提前过滤重复 batch，
+    /// 避免重复消息仍消耗反序列化、缓冲、分组、task spawn、clone 的 CPU。
+    /// 返回 true 表示已处理（调用方应丢弃）；false 表示未处理（可继续处理）。
+    /// handle_gossip_batch 中的 check_and_put 仍保留作为兜底（防止本检查与实际处理间的竞态）。
+    pub fn is_batch_seen(&self, origin: NodeId, msg_id: u64) -> bool {
+        self.seen_msgs.contains(&(origin, msg_id))
+    }
+
     /// 获取全量同步标记的共享句柄（供非核心模块在全量同步期间暂停检查）
     pub fn pause_gate(&self) -> Arc<AtomicBool> {
         self.full_sync_in_progress.clone()
@@ -375,16 +385,51 @@ impl GossipEngine {
         let bulk_max_batches = self.config.gossip_bulk_max_batches;
         let bulk_max_bytes = self.config.gossip_bulk_max_bytes;
 
-        // 串行发送各连接（单连接 localhost 场景并行无收益，并行反而放大 write timeout；
-        // 旧版串行已稳定 55,000 条/s）。保留 assigned_msg_ids 跟踪与孤儿回退。
-        for (_node_id, (conn, batch_indices)) in by_conn {
-            let res = self
-                .send_to_conn(conn, batch_indices, batches.clone(), bulk_max_batches, bulk_max_bytes)
-                .await;
-            failed_msg_ids.extend(res.failed_msg_ids);
-            rate_skipped_ids.extend(res.rate_skipped_ids);
-            failed_nodes.extend(res.failed_nodes);
-            successful_nodes.extend(res.successful_nodes);
+        // 发送到各连接：多节点场景按 config.parallel_propagation 并行发送，
+        // 避免串行 for 循环把超级节点带宽分摊到单个普通节点（测试 node2 仅 8,450 条/s）。
+        // 限流计数器为 AtomicU64，多 task 并发安全；单连接或关闭并行时走串行 fallback。
+        let parallel_enabled = self.config.parallel_propagation && by_conn.len() > 1;
+        if parallel_enabled {
+            // 并行：先全部 spawn（保证并发调度），再逐个 await 收集结果
+            let mut handles = Vec::with_capacity(by_conn.len());
+            for (_node_id, (conn, batch_indices)) in by_conn {
+                let this = self.clone();
+                let batches_arc = batches.clone();
+                handles.push(tokio::spawn(async move {
+                    this.send_to_conn(
+                        conn,
+                        batch_indices,
+                        batches_arc,
+                        bulk_max_batches,
+                        bulk_max_bytes,
+                    )
+                    .await
+                }));
+            }
+            for h in handles {
+                match h.await {
+                    Ok(res) => {
+                        failed_msg_ids.extend(res.failed_msg_ids);
+                        rate_skipped_ids.extend(res.rate_skipped_ids);
+                        failed_nodes.extend(res.failed_nodes);
+                        successful_nodes.extend(res.successful_nodes);
+                    }
+                    Err(e) => {
+                        warn!("[federation] 并行传播 task 异常: {}", e);
+                    }
+                }
+            }
+        } else {
+            // 串行发送（单连接 localhost 场景并行无收益，并行反而放大 write timeout）。
+            for (_node_id, (conn, batch_indices)) in by_conn {
+                let res = self
+                    .send_to_conn(conn, batch_indices, batches.clone(), bulk_max_batches, bulk_max_bytes)
+                    .await;
+                failed_msg_ids.extend(res.failed_msg_ids);
+                rate_skipped_ids.extend(res.rate_skipped_ids);
+                failed_nodes.extend(res.failed_nodes);
+                successful_nodes.extend(res.successful_nodes);
+            }
         }
 
         // 更新节点连续失败计数：成功清零，失败递增，达到阈值则断开连接
@@ -630,8 +675,16 @@ impl GossipEngine {
 
         // 单连接场景优化：如果只有1个连接，且消息来自该连接，则不需要加入outbox
         // 因为传播不出去（只会发回给发送方，而发送方已经处理过这条消息了）
+        // 优化1：全量同步期间禁用转发 —— 普通节点同时从 super_node 和其他普通节点接收
+        // 重复数据，只 apply 本地写入（走零 clone 路径），不 push outbox 继续转发，
+        // 避免重复洪峰（测试中 node1 收到 408 batch 是实际数据的 2 倍）。
+        // 全量同步完成后 set_full_sync_in_progress(false) 自动恢复正常转发。
+        // 超级节点不受影响：它通过 submit_gossip/submit_gossip_batch 直接写 outbox，不走本路径。
         let conn_count = self.connection_manager.connection_count();
-        let should_propagate = if conn_count <= 1 {
+        let should_propagate = if self.is_full_sync_in_progress() {
+            // 全量同步期间：只本地写入，不转发
+            false
+        } else if conn_count <= 1 {
             let conns = self.connection_manager.all_connections();
             if conns.len() == 1 {
                 // 消息origin不是唯一连接的node_id时才需要传播（本地产生的消息）

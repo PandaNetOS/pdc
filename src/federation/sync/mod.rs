@@ -348,6 +348,14 @@ impl SyncManager {
         self.handle_sync_batch(batch.repo_type, &entries);
     }
 
+    /// 供 ConnectionManager::flush_gossip_buffer 在分组/spawn task 前提前过滤重复 batch。
+    /// 只读检查 GossipEngine.seen_msgs（不插入），重复 batch 直接丢弃，避免后续
+    /// 分组、task spawn、clone 的 CPU 开销。handle_gossip_batch 中的 check_and_put
+    /// 仍保留作为兜底（防止本检查与实际处理之间的竞态）。
+    pub fn is_batch_seen(&self, batch: &GossipBatchMessage) -> bool {
+        self.gossip_engine.is_batch_seen(NodeId(batch.origin), batch.msg_id)
+    }
+
     /// 应用 Node 同步数据
     pub fn apply_node_sync(&self, entries: &[SyncEntry]) {
         warn!("[federation][perf] apply_node_sync ENTER: entries_len={}", entries.len());
