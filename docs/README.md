@@ -14,6 +14,9 @@
 | [03-intelligence.md](architecture/03-intelligence.md) | 智能层详细设计（评分/冷热/选择） | Level 3 |
 | [04-data-model.md](architecture/04-data-model.md) | 数据模型，SQLite 表结构与 Repo 设计 | — |
 | [05-runtime-flow.md](architecture/05-runtime-flow.md) | 运行时流程，关键业务时序图 | — |
+| [06-performance.md](architecture/06-performance.md) | 千万级性能优化设计 | — |
+| [07-federation.md](architecture/07-federation.md) | 联邦网络架构（多实例数据同步） | — |
+| [08-intelligent-control-center.md](architecture/08-intelligent-control-center.md) | 智能控制中心（ICC）详细设计 | Level 3 |
 
 ### 架构决策记录 (`docs/adr/`)
 
@@ -22,6 +25,8 @@
 | [001](adr/001-architecture-boundary.md) | 架构边界与分层原则 | ✅ 已采纳 | 2026-09-08 |
 | [002](adr/002-intelligence-layer.md) | 智能层统一收口（评分/冷热/选择） | ✅ 已采纳 | 2026-09-08 |
 | [003](adr/003-scoring-model.md) | 增量评分模型与脏标记机制 | ✅ 已采纳 | 2026-09-08 |
+| [004](adr/004-performance-targets.md) | 千万级数据性能目标与优化架构 | ✅ 已采纳 | 2026-09-08 |
+| [005](adr/005-intelligent-control-center.md) | 智能控制中心（ICC）设立与统一控制收口 | ✅ 已采纳 | 2026-09-10 |
 | [模板](adr/000-template.md) | ADR 编写模板 | — | — |
 
 ### 开发文档 (`docs/development/`)

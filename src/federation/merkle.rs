@@ -3,10 +3,11 @@
 //! 基于 blake3 的分片 Merkle Tree，用于联邦节点间的数据一致性对账。
 //! 将 key 空间按 shard_count 分片，每片维护独立的根哈希。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::federation::protocol::MerkleDigestMessage;
@@ -21,6 +22,9 @@ pub struct MerkleTree {
     entry_counts: RwLock<Vec<u32>>,
     /// 所有条目 key -> data
     entries: RwLock<FxHashMap<Vec<u8>, Vec<u8>>>,
+    /// 全量同步进行中标志：为 true 时 update/update_batch 只写入 entries，
+    /// 跳过 recompute_shard，全量同步结束后由 rebuild_all 一次性重算。
+    full_sync_in_progress: AtomicBool,
 }
 
 impl MerkleTree {
@@ -32,6 +36,7 @@ impl MerkleTree {
             roots: RwLock::new(vec![[0u8; 32]; count]),
             entry_counts: RwLock::new(vec![0u32; count]),
             entries: RwLock::new(FxHashMap::default()),
+            full_sync_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -73,7 +78,57 @@ impl MerkleTree {
         self.entries
             .write()
             .insert(key.to_vec(), data.to_vec());
-        self.recompute_shard(shard);
+        // 全量同步进行中时跳过单条重算，结束后由 rebuild_all 一次性重算
+        if !self.full_sync_in_progress.load(Ordering::SeqCst) {
+            self.recompute_shard(shard);
+        }
+    }
+
+    /// 批量更新/插入条目：一次写锁插入所有条目，最后只重算受影响的分片。
+    ///
+    /// 相比逐条 update（每次 1 次写锁 + 1 次 recompute_shard 的 O(N) 遍历），
+    /// 批量插入只需 1 次写锁，且只对实际受影响的分片重算。
+    pub fn update_batch(&self, entries: &[(&[u8], &[u8])]) {
+        if entries.is_empty() {
+            return;
+        }
+        // 1. 一次写锁批量插入
+        let mut map = self.entries.write();
+        let mut affected_shards: FxHashSet<u16> = FxHashSet::default();
+        for (key, data) in entries {
+            let shard = self.shard_for_key(key);
+            affected_shards.insert(shard);
+            map.insert(key.to_vec(), data.to_vec());
+        }
+        drop(map); // 提前释放写锁
+
+        // 全量同步进行中时跳过重算
+        if self.full_sync_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // 2. 只重算受影响分片（recompute_shard 内部用读锁）
+        for shard in affected_shards {
+            self.recompute_shard(shard);
+        }
+    }
+
+    /// 设置全量同步进行中标志
+    pub fn set_full_sync_in_progress(&self, in_progress: bool) {
+        self.full_sync_in_progress.store(in_progress, Ordering::SeqCst);
+    }
+
+    /// 查询全量同步是否进行中
+    pub fn is_full_sync_in_progress(&self) -> bool {
+        self.full_sync_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// 全量重建所有分片（初始同步完成后调用一次）
+    pub fn rebuild_all(&self) {
+        let shard_count = self.shard_count as usize;
+        for shard in 0..shard_count {
+            self.recompute_shard(shard as u16);
+        }
     }
 
     /// 删除条目

@@ -4,7 +4,7 @@
 //! 后台任务定期随机选择 fanout 个邻居传播。已处理消息通过 LRU 去重。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
@@ -25,8 +25,8 @@ use crate::federation::protocol::*;
 pub struct GossipEngine {
     /// 待传播队列
     outbox: RwLock<Vec<GossipBatchMessage>>,
-    /// 已处理消息 ID 去重
-    seen_msgs: RwLock<LruCache<u64, ()>>,
+    /// 已处理消息 ID 去重（按 (origin_node, msg_id) 全局唯一去重）
+    seen_msgs: RwLock<LruCache<(NodeId, u64), ()>>,
     /// 连接管理器
     connection_manager: Arc<ConnectionManager>,
     /// 配置
@@ -49,6 +49,8 @@ pub struct GossipEngine {
     bytes_in_window: AtomicU64,
     /// 当前窗口已发送消息条数
     msgs_in_window: AtomicU64,
+    /// 全量同步进行中标记，为 true 时临时放开 Gossip 发送限流
+    full_sync_in_progress: Arc<AtomicBool>,
 }
 
 /// 单个 batch 最大重试次数，超过则丢弃
@@ -79,7 +81,23 @@ impl GossipEngine {
             rate_window_secs: AtomicU64::new(0),
             bytes_in_window: AtomicU64::new(0),
             msgs_in_window: AtomicU64::new(0),
+            full_sync_in_progress: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 设置全量同步进行中标记（由 SyncManager 在 trigger_initial_sync 期间调用）
+    pub fn set_full_sync_in_progress(&self, v: bool) {
+        self.full_sync_in_progress.store(v, Ordering::Relaxed);
+    }
+
+    /// 查询全量同步是否进行中
+    pub fn is_full_sync_in_progress(&self) -> bool {
+        self.full_sync_in_progress.load(Ordering::Relaxed)
+    }
+
+    /// 获取全量同步标记的共享句柄（供非核心模块在全量同步期间暂停检查）
+    pub fn pause_gate(&self) -> Arc<AtomicBool> {
+        self.full_sync_in_progress.clone()
     }
 
     /// 提交同步数据到 outbox
@@ -103,7 +121,7 @@ impl GossipEngine {
         };
 
         // 标记自己发出的消息为已处理（避免回环）
-        self.seen_msgs.write().put(msg_id, ());
+        self.seen_msgs.write().put((self.local_node_id, msg_id), ());
         self.outbox.write().push(batch);
         debug!("[federation] Gossip 提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, entry_count);
     }
@@ -125,7 +143,7 @@ impl GossipEngine {
         let mut batches = Vec::new();
         for chunk in entries.chunks(batch_size) {
             let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
-            self.seen_msgs.write().put(msg_id, ());
+            self.seen_msgs.write().put((self.local_node_id, msg_id), ());
             batches.push(GossipBatchMessage {
                 msg_id,
                 origin: self.local_node_id.0,
@@ -186,8 +204,18 @@ impl GossipEngine {
             self.bytes_in_window.store(0, Ordering::Relaxed);
             self.msgs_in_window.store(0, Ordering::Relaxed);
         }
-        let max_bytes = self.config.gossip_max_bytes_per_second;
-        let max_msgs = self.config.gossip_max_messages_per_second as u64;
+        // 根据全量同步标记选择限流值：全量同步期间临时放开到更高上限
+        let (max_bytes, max_msgs) = if self.is_full_sync_in_progress() {
+            (
+                self.config.full_sync_gossip_max_bytes_per_second,
+                self.config.full_sync_gossip_max_messages_per_second as u64,
+            )
+        } else {
+            (
+                self.config.gossip_max_bytes_per_second,
+                self.config.gossip_max_messages_per_second as u64,
+            )
+        };
         let cur_bytes = self.bytes_in_window.load(Ordering::Relaxed);
         let cur_msgs = self.msgs_in_window.load(Ordering::Relaxed);
         if cur_bytes + bytes > max_bytes || cur_msgs + msgs > max_msgs {
@@ -211,15 +239,19 @@ impl GossipEngine {
             if outbox.is_empty() {
                 return;
             }
-            // 限制 outbox 最大长度，避免初始全量同步时队列过大导致内存溢出和性能问题
-            const MAX_OUTBOX_LEN: usize = 5000;
-            if outbox.len() > MAX_OUTBOX_LEN {
-                let drop_count = outbox.len() - MAX_OUTBOX_LEN;
-                outbox.drain(..drop_count);
-                debug!("[federation] outbox 队列过长，丢弃 {} 条旧消息", drop_count);
+            // 全量同步期间跳过 outbox 长度截断和过期过滤：4 repo 并行洪峰（infohash/tracker
+            // 百万级条目 → 数万 batch）会超过 5000 上限，drain 最老批次会导致先提交的 node
+            // 数据丢失。全量同步由 full_sync_in_progress flag 控制，完成后恢复正常防护。
+            if !self.is_full_sync_in_progress() {
+                const MAX_OUTBOX_LEN: usize = 5000;
+                if outbox.len() > MAX_OUTBOX_LEN {
+                    let drop_count = outbox.len() - MAX_OUTBOX_LEN;
+                    outbox.drain(..drop_count);
+                    debug!("[federation] outbox 队列过长，丢弃 {} 条旧消息", drop_count);
+                }
+                // 过滤过期消息（超过 300 秒的消息不再传播，避免 2 节点场景下队列积压）
+                outbox.retain(|b| now.saturating_sub(b.timestamp) < 300);
             }
-            // 过滤过期消息（超过 300 秒的消息不再传播，避免 2 节点场景下队列积压）
-            outbox.retain(|b| now.saturating_sub(b.timestamp) < 300);
             if outbox.is_empty() {
                 return;
             }
@@ -288,6 +320,12 @@ impl GossipEngine {
                 warn!("[federation] Gossip 发送到 {} 失败: {}", node_id, e);
                 failed_msg_ids.insert(batch.msg_id);
                 failed_nodes.insert(node_id);
+                // 连接已关闭类错误（os 10058/ECONNRESET/BrokenPipe）：立即移除，不等连续失败计数
+                let err_str = e.to_string();
+                if err_str.contains("10058") || err_str.contains("Connection reset") || err_str.contains("Broken pipe") || err_str.contains("closed") {
+                    warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
+                    self.connection_manager.remove_connection(&node_id);
+                }
             } else {
                 self.metrics.record_gossip_propagation();
                 self.metrics.record_message_sent();
@@ -380,11 +418,12 @@ impl GossipEngine {
         self.metrics.record_message_recv();
 
         let mut seen = self.seen_msgs.write();
-        if seen.contains(&batch.msg_id) {
+        let dedup_key = (NodeId(batch.origin), batch.msg_id);
+        if seen.contains(&dedup_key) {
             debug!("[federation] Gossip 消息已处理，跳过: msg_id={}", batch.msg_id);
             return Vec::new();
         }
-        seen.put(batch.msg_id, ());
+        seen.put(dedup_key, ());
         drop(seen);
 
         let entries = batch.entries.clone();

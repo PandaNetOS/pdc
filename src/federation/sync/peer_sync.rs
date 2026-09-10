@@ -107,6 +107,7 @@ impl PeerSync {
                 .as_secs();
 
             let mut entries = Vec::with_capacity(peers.len());
+            let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(peers.len());
             for peer in &peers {
                 let payload = PeerSyncPayload {
                     infohash,
@@ -127,8 +128,8 @@ impl PeerSync {
                 key.extend_from_slice(&infohash);
                 key.extend_from_slice(&peer.addr.to_string().into_bytes());
 
-                // 更新 Merkle（在 move 之前）
-                self.merkle.update(&key, &payload_bytes);
+                // 收集到批量 Merkle 更新列表，循环结束后一次 update_batch
+                merkle_batch.push((key.clone(), payload_bytes.clone()));
 
                 entries.push(SyncEntry {
                     key,
@@ -136,6 +137,15 @@ impl PeerSync {
                     version: now,
                     payload: payload_bytes,
                 });
+            }
+
+            // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+            if !merkle_batch.is_empty() {
+                let refs: Vec<(&[u8], &[u8])> = merkle_batch
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
+                self.merkle.update_batch(&refs);
             }
 
             if !entries.is_empty() {
@@ -146,8 +156,9 @@ impl PeerSync {
 
     /// 应用收到的 Peer 同步数据
     pub fn apply_peer_sync(&self, entries: &[SyncEntry]) {
-        // 第一遍：过滤 DELETE / 反序列化失败，构建 (infohash, peer) 并更新 Merkle
+        // 第一遍：过滤 DELETE / 反序列化失败，构建 (infohash, peer)，收集 Merkle 批量更新
         let mut items: Vec<(Infohash, PeerInfo)> = Vec::new();
+        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -183,14 +194,23 @@ impl PeerSync {
                 metadata: Default::default(),
             };
 
-            // 更新 Merkle
+            // key = infohash(20) + addr 序列化
             let mut key = Vec::with_capacity(20 + 8);
             key.extend_from_slice(&payload.infohash);
             key.extend_from_slice(&payload.addr.to_string().into_bytes());
-            self.merkle.update(&key, &entry.payload);
+            merkle_batch.push((key, entry.payload.clone()));
 
             items.push((payload.infohash, peer));
             applied += 1;
+        }
+
+        // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+        if !merkle_batch.is_empty() {
+            let refs: Vec<(&[u8], &[u8])> = merkle_batch
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.merkle.update_batch(&refs);
         }
 
         // 第二遍：一次写锁批量写入，替代逐条 add_peers_sync

@@ -2,14 +2,15 @@
 //!
 //! 管理联邦网络中的所有 TCP 连接，包括监听、主动连接、握手、心跳和消息分发。
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
-use tokio::sync::{broadcast, Mutex as TokioMutex, OnceCell, Semaphore};
+use tokio::sync::{broadcast, Mutex as TokioMutex, Notify, OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
@@ -35,6 +36,10 @@ pub struct Connection {
     /// 待处理消息计数（接收端背压监控）：dispatch 前 +1，处理完成 -1。
     /// 超过配置阈值时输出背压告警日志。
     pub pending: AtomicU32,
+    /// P1: 接收端 GossipBatch 攒批缓冲区
+    pub gossip_buffer: ParkingMutex<VecDeque<GossipBatchMessage>>,
+    /// P1: flush 任务唤醒通知
+    pub gossip_flush_notify: Arc<Notify>,
 }
 
 impl Connection {
@@ -47,6 +52,8 @@ impl Connection {
             connected_at: Instant::now(),
             last_active: RwLock::new(Instant::now()),
             pending: AtomicU32::new(0),
+            gossip_buffer: ParkingMutex::new(VecDeque::new()),
+            gossip_flush_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -95,6 +102,8 @@ pub struct ConnectionManager {
     connections: RwLock<FxHashMap<NodeId, Arc<Connection>>>,
     /// 正在连接中的地址（防止并发重复连接）
     connecting: RwLock<FxHashSet<SocketAddr>>,
+    /// 每个 node_id 一把连接锁，确保同一时刻只有一个方向在创建连接
+    connecting_locks: RwLock<FxHashMap<NodeId, Arc<TokioMutex<()>>>>,
     /// 节点表
     node_table: Arc<NodeTable>,
     /// 节点身份
@@ -132,6 +141,7 @@ impl ConnectionManager {
         Self {
             connections: RwLock::new(FxHashMap::default()),
             connecting: RwLock::new(FxHashSet::default()),
+            connecting_locks: RwLock::new(FxHashMap::default()),
             node_table,
             identity,
             config: config.clone(),
@@ -146,6 +156,18 @@ impl ConnectionManager {
                 config.heavy_task_max_concurrency.max(1),
             )),
         }
+    }
+
+    /// 获取指定 node_id 的连接锁（不存在则创建），用于串行化同节点的双向握手
+    fn get_connecting_lock(&self, node_id: NodeId) -> Arc<TokioMutex<()>> {
+        if let Some(lock) = self.connecting_locks.read().get(&node_id) {
+            return lock.clone();
+        }
+        self.connecting_locks
+            .write()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
     }
 
     /// 注入发现服务（由 FederationService 调用）
@@ -230,20 +252,27 @@ impl ConnectionManager {
         // 入站握手
         let (node_id, _hello) = self.handshake_inbound(&transport).await?;
 
-        // 检查是否已存在连接
-        if self.connections.read().contains_key(&node_id) {
-            debug!("[federation] 节点 {} 已存在连接，拒绝重复连接", node_id);
-            return Ok(());
-        }
+        // per-node 连接锁：与出站方向串行化，消除双向同时握手的重复连接竞态
+        let connection = {
+            let lock = self.get_connecting_lock(node_id);
+            let _guard = lock.lock().await;
 
-        // 检查连接数上限
-        if self.connection_count() >= self.config.max_connections {
-            debug!("[federation] 连接数已达上限，拒绝来自 {} 的连接", addr);
-            return Ok(());
-        }
+            // 获取锁后再次检查，避免竞态窗口内重复创建
+            if self.connections.read().contains_key(&node_id) {
+                debug!("[federation] 节点 {} 已存在连接，拒绝重复连接", node_id);
+                return Ok(());
+            }
 
-        let connection = Arc::new(Connection::new(transport, node_id, addr));
-        self.register_connection(connection.clone());
+            // 检查连接数上限
+            if self.connection_count() >= self.config.max_connections {
+                debug!("[federation] 连接数已达上限，拒绝来自 {} 的连接", addr);
+                return Ok(());
+            }
+
+            let connection = Arc::new(Connection::new(transport, node_id, addr));
+            self.register_connection(connection.clone());
+            connection
+        };
 
         info!("[federation] 入站连接建立: {} ({})", node_id, addr);
 
@@ -260,7 +289,7 @@ impl ConnectionManager {
 
         if let Some(mgr) = sync_mgr {
             info!("[federation] 入站连接触发初始全量同步");
-            mgr.trigger_initial_sync();
+            mgr.trigger_initial_sync(node_id);
         } else {
             warn!("[federation] 入站连接 sync_manager 为 None，无法触发初始全量同步");
         }
@@ -275,6 +304,15 @@ impl ConnectionManager {
         addr: SocketAddr,
     ) -> anyhow::Result<Arc<Connection>> {
         // 检查是否已连接（用实际节点ID）
+        if let Some(conn) = self.get_connection(&node_id) {
+            return Ok(conn);
+        }
+
+        // per-node 连接锁：持有至连接建立/失败，串行化出站与入站方向的握手
+        let lock = self.get_connecting_lock(node_id);
+        let _guard = lock.lock().await;
+
+        // 获取锁后再次检查，消除检查与插入之间的竞态窗口
         if let Some(conn) = self.get_connection(&node_id) {
             return Ok(conn);
         }
@@ -349,7 +387,7 @@ impl ConnectionManager {
 
         // 出站连接建立成功后触发初始全量同步（只触发一次，入站连接不触发）
         if let Some(sync_mgr) = self.sync_manager.get() {
-            sync_mgr.clone().trigger_initial_sync();
+            sync_mgr.clone().trigger_initial_sync(peer_id);
         }
 
         // 连接建立成功，移除 connecting 标记
@@ -528,6 +566,30 @@ impl ConnectionManager {
         let mut shutdown_rx = self.shutdown.subscribe();
         let conn_id = connection.node_id;
 
+        // P1: 启动 per-connection GossipBatch 攒批 flush 任务
+        let flush_interval_ms = self.config.gossip_flush_interval_ms;
+        let max_batches = self.config.gossip_flush_max_batches;
+        let conn_flush = connection.clone();
+        let cm_flush = self.clone();
+        let mut flush_shutdown_rx = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(flush_interval_ms));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        cm_flush.clone().flush_gossip_buffer(&conn_flush, max_batches).await;
+                    }
+                    _ = conn_flush.gossip_flush_notify.notified() => {
+                        cm_flush.clone().flush_gossip_buffer(&conn_flush, max_batches).await;
+                    }
+                    _ = flush_shutdown_rx.recv() => {
+                        debug!("[federation] Gossip flush 任务 {} 收到关闭信号", conn_id);
+                        break;
+                    }
+                }
+            }
+        });
+
         tokio::spawn(async move {
             let pending_threshold = self.config.receive_pending_threshold;
             loop {
@@ -634,20 +696,18 @@ impl ConnectionManager {
             }
             MessageType::GossipBatch => {
                 self.metrics.record_message_recv();
-                // 重量级处理（去重 + outbox 转发 + 多 repo DB 写入）异步卸载，
-                // 避免阻塞消息接收循环导致 TCP 接收缓冲区打满。
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = connection.clone();
-                    self.spawn_heavy_handler(conn, move || {
-                        if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
-                            sync_mgr.handle_gossip_batch(batch);
-                        }
-                    });
-                    true
-                } else {
-                    false
+                // P1: 接收端攒批缓冲 —— 不立即 spawn，而是 push 到 per-connection buffer，
+                // 由后台 flush 任务统一处理。N 个 batch 只需要 1 次 permit + 1 次 spawn。
+                // P0-2: flush 任务内不使用 spawn_blocking（纯内存操作）。
+                if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
+                    {
+                        let mut buf = connection.gossip_buffer.lock();
+                        buf.push_back(batch);
+                    }
+                    // 通知 flush 任务（达到 max_batches 时立即刷新，否则等定时 tick）
+                    connection.gossip_flush_notify.notify_one();
                 }
+                true
             }
             MessageType::MerkleDigest => {
                 self.metrics.record_message_recv();
@@ -677,11 +737,11 @@ impl ConnectionManager {
             }
             MessageType::MerkleRepair => {
                 self.metrics.record_message_recv();
-                // 重量级处理（分片对比 + 多 repo DB 写入）异步卸载，复用同一 Semaphore。
+                // P0-2: MerkleRepair 也是纯内存 + 批量 SQLite 写入，走 async handler（去掉 spawn_blocking 开销）
                 if let Some(sync_mgr) = self.sync_manager.get() {
                     let sync_mgr = sync_mgr.clone();
                     let conn = connection.clone();
-                    self.spawn_heavy_handler(conn, move || {
+                    self.spawn_async_handler(conn, move || async move {
                         if let Ok(repair) = bincode::deserialize::<MerkleRepairMessage>(&payload) {
                             sync_mgr.handle_merkle_repair(repair);
                         }
@@ -690,6 +750,56 @@ impl ConnectionManager {
                 } else {
                     false
                 }
+            }
+            MessageType::FullSyncStart => {
+                self.metrics.record_message_recv();
+                if let Ok(msg) = bincode::deserialize::<FullSyncStartMessage>(&payload) {
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        info!(
+                            "[federation] 收到 FullSyncStart: repo_type={}, total={}, from={}",
+                            msg.repo_type, msg.total_entries, connection.node_id
+                        );
+                        sync_mgr.handle_full_sync_start(msg.repo_type);
+                    }
+                }
+                false
+            }
+            MessageType::FullSyncBatch => {
+                self.metrics.record_message_recv();
+                if let Ok(msg) = bincode::deserialize::<FullSyncBatchMessage>(&payload) {
+                    let repo_type = msg.repo_type;
+                    let seq = msg.seq;
+                    let count = msg.entries.len();
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        // 直接应用到 repo（不经过 Gossip 去重）
+                        sync_mgr.handle_full_sync_batch(repo_type, &msg.entries);
+                        // 回复 Ack
+                        let ack = FullSyncAckMessage { repo_type, seq };
+                        let _ = connection.send_message(MessageType::FullSyncAck, &ack).await;
+                        debug!(
+                            "[federation] FullSyncBatch 应用: repo_type={}, seq={}, entries={}",
+                            repo_type, seq, count
+                        );
+                    }
+                }
+                false
+            }
+            MessageType::FullSyncAck => {
+                // 发送端接收 Ack，简化版不做流控等待
+                false
+            }
+            MessageType::FullSyncComplete => {
+                self.metrics.record_message_recv();
+                if let Ok(msg) = bincode::deserialize::<FullSyncCompleteMessage>(&payload) {
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        info!(
+                            "[federation] 收到 FullSyncComplete: repo_type={}, from={}",
+                            msg.repo_type, connection.node_id
+                        );
+                        sync_mgr.handle_full_sync_complete(msg.repo_type);
+                    }
+                }
+                false
             }
             MessageType::Signaling => {
                 self.metrics.record_message_recv();
@@ -734,9 +844,9 @@ impl ConnectionManager {
 
     /// 异步执行重量级消息处理（GossipBatch / MerkleRepair）。
     ///
-    /// 先从 `heavy_task_semaphore` 获取 permit（有界并发，默认 4），再用
-    /// `spawn_blocking` 把阻塞型 DB 写入移出异步运行时线程，避免消息接收循环被卡住。
-    /// 任务完成（或信号量关闭）后递减该连接的 pending 待处理计数。
+    /// 先从 `heavy_task_semaphore` 获取 permit（有界并发），再用
+    /// `spawn_blocking` 把阻塞型 DB 写入移出异步运行时线程。
+    /// 任务完成后递减该连接的 pending 待处理计数。
     fn spawn_heavy_handler<F>(&self, conn: Arc<Connection>, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -756,6 +866,66 @@ impl ConnectionManager {
             drop(_permit);
             conn.pending.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+
+    /// P0-2: 异步执行纯内存消息处理（不经过 spawn_blocking）。
+    ///
+    /// GossipBatch 处理是纯内存操作（HashMap + Merkle），不需要阻塞线程池。
+    /// 仍然通过 semaphore 限制并发，避免无界生成异步任务导致 CPU 飙升。
+    fn spawn_async_handler<F, Fut>(&self, conn: Arc<Connection>, f: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let sem = self.heavy_task_semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    conn.pending.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            f().await;
+            drop(_permit);
+            conn.pending.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// P1: 刷新 per-connection GossipBatch 缓冲区
+    ///
+    /// 一次性 drain 所有缓冲的 GossipBatch，获取 1 个 semaphore permit 后
+    /// 在同一个 async task 内顺序处理所有 batch。N 个 batch 只需 1 次 spawn + 1 个 permit。
+    async fn flush_gossip_buffer(self: Arc<Self>, conn: &Connection, _max_batches: usize) {
+        // 一次性 drain 所有缓冲的 batch
+        let batches: Vec<GossipBatchMessage> = {
+            let mut buf = conn.gossip_buffer.lock();
+            if buf.is_empty() {
+                return;
+            }
+            buf.drain(..).collect()
+        };
+        let batch_count = batches.len();
+
+        // 获取 semaphore permit（与 GossipBatch/MerkleRepair 共用）
+        let sem = self.heavy_task_semaphore.clone();
+        let _permit = match sem.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                conn.pending.fetch_sub(batch_count as u32, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // 顺序处理所有 batch（纯内存操作，不经过 spawn_blocking）
+        if let Some(sync_mgr) = self.sync_manager.get() {
+            for batch in batches {
+                sync_mgr.handle_gossip_batch(batch);
+            }
+        }
+
+        drop(_permit);
+        conn.pending.fetch_sub(batch_count as u32, Ordering::Relaxed);
     }
 
     /// 获取指定节点的连接

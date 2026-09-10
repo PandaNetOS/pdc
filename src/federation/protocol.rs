@@ -44,6 +44,14 @@ pub enum MessageType {
     Goodbye = 14,
     /// Merkle 修复数据
     MerkleRepair = 15,
+    /// 全量同步开始
+    FullSyncStart = 16,
+    /// 全量同步批次
+    FullSyncBatch = 17,
+    /// 全量同步确认
+    FullSyncAck = 18,
+    /// 全量同步完成
+    FullSyncComplete = 19,
 }
 
 impl MessageType {
@@ -66,6 +74,10 @@ impl MessageType {
             13 => Some(MessageType::SyncBatch),
             14 => Some(MessageType::Goodbye),
             15 => Some(MessageType::MerkleRepair),
+            16 => Some(MessageType::FullSyncStart),
+            17 => Some(MessageType::FullSyncBatch),
+            18 => Some(MessageType::FullSyncAck),
+            19 => Some(MessageType::FullSyncComplete),
             _ => None,
         }
     }
@@ -288,6 +300,42 @@ pub struct MerkleRepairMessage {
     pub repo_type: u8,
     /// 修复的同步条目
     pub entries: Vec<SyncEntry>,
+}
+
+/// 全量同步开始
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullSyncStartMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 总条目数
+    pub total_entries: u64,
+}
+
+/// 全量同步批次
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullSyncBatchMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 同步条目
+    pub entries: Vec<SyncEntry>,
+    /// 批次序号
+    pub seq: u64,
+}
+
+/// 全量同步确认
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullSyncAckMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 已确认的批次序号
+    pub seq: u64,
+}
+
+/// 全量同步完成
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullSyncCompleteMessage {
+    /// 仓库类型
+    pub repo_type: u8,
 }
 
 /// 仓库类型常量

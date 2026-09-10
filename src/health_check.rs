@@ -8,6 +8,7 @@
 //! 终极形态改造：从 DiscovererRegistry 获取发现器，不再依赖 aggregator。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -101,6 +102,8 @@ pub struct HealthCheckTask {
     config: HealthCheckConfig,
     storage: Option<Arc<crate::storage::Storage>>,
     health_scorer: HealthScorerImpl,
+    /// 全量同步暂停门：为 true 时跳过健康检查/缓存清理/统计输出
+    pause_gate: Option<Arc<AtomicBool>>,
 }
 
 impl HealthCheckTask {
@@ -123,6 +126,7 @@ impl HealthCheckTask {
             config,
             storage,
             health_scorer: HealthScorerImpl::new(),
+            pause_gate: None,
         }
     }
 
@@ -135,6 +139,12 @@ impl HealthCheckTask {
         infohash_repo: Option<Arc<InfohashRepoImpl>>,
     ) -> Self {
         Self::new(registry, cache, node_repo, tracker_repo, infohash_repo, HealthCheckConfig::default(), None)
+    }
+
+    /// 设置全量同步暂停门（为 true 时暂停健康检查工作）
+    pub fn with_pause_gate(mut self, gate: Option<Arc<AtomicBool>>) -> Self {
+        self.pause_gate = gate;
+        self
     }
 
     /// 启动健康检查任务
@@ -151,15 +161,19 @@ impl HealthCheckTask {
         );
 
         loop {
+            // 全量同步期间暂停健康检查等周期性工作，把带宽/CPU 让给联邦同步
+            let paused = self.pause_gate.as_ref()
+                .map(|g| g.load(Ordering::Relaxed))
+                .unwrap_or(false);
             tokio::select! {
                 _ = main_ticker.tick() => {
-                    self.check_discoverers_health().await;
+                    if !paused { self.check_discoverers_health().await; }
                 }
                 _ = cache_ticker.tick() => {
-                    self.cleanup_expired_peers().await;
+                    if !paused { self.cleanup_expired_peers().await; }
                 }
                 _ = stats_ticker.tick() => {
-                    self.output_stats().await;
+                    if !paused { self.output_stats().await; }
                 }
             }
         }

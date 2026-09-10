@@ -18,6 +18,7 @@ ADR (Architecture Decision Record) 是一种轻量级的文档，用于记录重
 | [002](002-intelligence-layer.md) | 智能层统一收口（评分/冷热/选择） | ✅ 已采纳 | 2026-09-08 |
 | [003](003-scoring-model.md) | 增量评分模型与脏标记机制 | ✅ 已采纳 | 2026-09-08 |
 | [004](004-performance-targets.md) | 千万级数据性能目标与优化架构 | ✅ 已采纳 | 2026-09-08 |
+| [005](005-intelligent-control-center.md) | 智能控制中心（ICC）设立与统一控制收口 | ✅ 已采纳 | 2026-09-10 |
 
 ## 如何编写新 ADR
 

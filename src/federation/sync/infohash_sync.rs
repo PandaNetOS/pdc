@@ -126,8 +126,9 @@ impl InfohashSync {
 
     /// 应用收到的 Infohash 同步数据
     pub fn apply_infohash_sync(&self, entries: &[SyncEntry]) {
-        // 第一遍：过滤 DELETE / 反序列化失败，收集 (infohash, source) 并更新 Merkle
+        // 第一遍：过滤 DELETE / 反序列化失败，收集 (infohash, source) 并批量更新 Merkle
         let mut items: Vec<(Infohash, String)> = Vec::new();
+        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -138,9 +139,18 @@ impl InfohashSync {
                 Err(_) => continue,
             };
 
-            self.merkle.update(&payload.infohash, &entry.payload);
+            merkle_batch.push((entry.key.clone(), entry.payload.clone()));
             items.push((payload.infohash, payload.source));
             applied += 1;
+        }
+
+        // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+        if !merkle_batch.is_empty() {
+            let refs: Vec<(&[u8], &[u8])> = merkle_batch
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.merkle.update_batch(&refs);
         }
 
         // 第二遍：一次写锁批量注册，替代逐条 register_sync

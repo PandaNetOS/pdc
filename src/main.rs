@@ -13,6 +13,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use parking_lot::RwLock;
 use rand::Rng;
@@ -186,13 +187,18 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // 6.9 提取全量同步暂停门（联邦启用时），供非核心模块在全量同步期间暂停主动工作
+    let full_sync_gate: Option<Arc<AtomicBool>> =
+        federation_service.as_ref().map(|s| s.full_sync_gate());
+
     // 7. 创建爬虫引擎（如果启用），在 AppState 之前创建以便共享状态
     let (crawler_state, crawler_routing_table) = if config.crawler.enabled {
         let crawler = CrawlerEngine::new(config.crawler.clone(), event_bus.clone())
             .with_peer_repo(peer_repo.clone())
             .with_storage(storage.clone())
             .with_infohash_repo(infohash_repo.clone())
-            .with_node_repo(node_repo.clone());
+            .with_node_repo(node_repo.clone())
+            .with_pause_gate(full_sync_gate.clone());
         let state_arc = crawler.state_arc();
         let routing_table = crawler.routing_table();
 
@@ -219,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             rt.clone(),
             Some(node_repo.clone()),
             Some(peer_repo.clone()),
+            full_sync_gate.clone(),
         ));
         probe_sender = Some(probe.sender());
         dht_probe_ref = Some(probe);
@@ -386,7 +393,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_pex_receiver(pex_receiver.clone())
         .with_interval(std::time::Duration::from_secs(30))
-        .with_batch_size(20);
+        .with_batch_size(20)
+        .with_pause_gate(full_sync_gate.clone());
         let requester = Arc::new(requester);
         let r = requester.clone();
         tokio::spawn(async move {
@@ -467,7 +475,7 @@ async fn main() -> anyhow::Result<()> {
         Some(infohash_repo.clone()),
         hc_config,
         Some(storage.clone()),
-    ));
+    ).with_pause_gate(full_sync_gate.clone()));
     tokio::spawn(async move {
         health_check.run().await;
     });
@@ -565,47 +573,6 @@ async fn main() -> anyhow::Result<()> {
             },
         );
         info!("[main] 资源监控任务已注册（每5秒）");
-    }
-
-    // 8.5.3 全量持久化任务（每300秒，P3后台，全量任务，错峰到T+240s）
-    {
-        let node_repo_clone = node_repo.clone();
-        let tracker_repo_clone = tracker_repo.clone();
-        let infohash_repo_clone = infohash_repo.clone();
-
-        task_scheduler.register(
-            TaskMetadata::new("full_persistence", "全量持久化", std::time::Duration::from_secs(300))
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::High,
-                    memory: ResourceLevel::Medium,
-                    io: ResourceLevel::Extreme,
-                    network: ResourceLevel::Low,
-                    is_full_task: true,
-                })
-                .with_initial_delay(std::time::Duration::from_secs(240))
-                .with_jitter(std::time::Duration::from_secs(15)),
-            move || {
-                let node_repo = node_repo_clone.clone();
-                let tracker_repo = tracker_repo_clone.clone();
-                let infohash_repo = infohash_repo_clone.clone();
-                async move {
-                    info!("[persistence] 开始全量持久化...");
-                    if let Err(e) = node_repo.save_all().await {
-                        warn!("[persistence] NodeRepo 全量保存失败: {}", e);
-                    }
-                    if let Err(e) = tracker_repo.save_all().await {
-                        warn!("[persistence] TrackerRepo 全量保存失败: {}", e);
-                    }
-                    if let Err(e) = infohash_repo.save_all().await {
-                        warn!("[persistence] InfohashRepo 全量保存失败: {}", e);
-                    }
-                    info!("[persistence] 全量持久化完成");
-                    Ok(())
-                }
-            },
-        );
-        info!("[main] 全量持久化任务已注册（每300秒，错峰T+240s）");
     }
 
     // 启动智能任务调度中心

@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -67,6 +68,8 @@ pub struct ActivePexRequester {
     max_concurrent: usize,
     /// 连接间隔（毫秒，避免瞬间建立大量连接）
     connect_interval_ms: u64,
+    /// 全量同步暂停门：为 true 时跳过 run_batch
+    pause_gate: Option<Arc<AtomicBool>>,
 }
 
 impl ActivePexRequester {
@@ -84,6 +87,7 @@ impl ActivePexRequester {
             pex_wait_time: Duration::from_secs(10),
             max_concurrent: 10,
             connect_interval_ms: 100,
+            pause_gate: None,
         }
     }
 
@@ -117,6 +121,12 @@ impl ActivePexRequester {
         self
     }
 
+    /// 设置全量同步暂停门（为 true 时暂停主动 PEX 请求）
+    pub fn with_pause_gate(mut self, gate: Option<Arc<AtomicBool>>) -> Self {
+        self.pause_gate = gate;
+        self
+    }
+
     /// 获取统计
     pub fn stats(&self) -> ActivePexStats {
         let s = self.stats.read();
@@ -145,6 +155,11 @@ impl ActivePexRequester {
         info!("[Active-PEX] 主动 PEX 请求器已启动（每 {} 秒连接 {} 个 peer）", self.interval.as_secs(), self.batch_size);
 
         while *self.running.read() {
+            // 全量同步期间暂停主动 PEX，把带宽/CPU 让给联邦同步
+            if self.pause_gate.as_ref().map(|g| g.load(Ordering::Relaxed)).unwrap_or(false) {
+                tokio::time::sleep(self.interval).await;
+                continue;
+            }
             if let Err(e) = self.run_batch().await {
                 warn!("[Active-PEX] 批量请求错误: {}", e);
                 {

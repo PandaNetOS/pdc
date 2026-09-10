@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -119,6 +120,8 @@ pub struct CrawlerEngine {
     virtual_node_ids: Vec<[u8; 20]>,
     /// DNS 解析池（5 个公共 DNS 并行查询）
     dns_pool: Arc<crate::dns_pool::DnsPool>,
+    /// 全量同步暂停门：为 true 时跳过主动爬行（让带宽/CPU 给联邦同步）
+    pause_gate: Option<Arc<AtomicBool>>,
 }
 
 impl CrawlerEngine {
@@ -157,6 +160,7 @@ impl CrawlerEngine {
             node_id,
             virtual_node_ids,
             dns_pool,
+            pause_gate: None,
         }
     }
 
@@ -187,6 +191,12 @@ impl CrawlerEngine {
     /// 设置 Infohash 数据仓库（发现新 infohash 时 register）
     pub fn with_infohash_repo(mut self, repo: Arc<crate::storage::InfohashRepoImpl>) -> Self {
         self.infohash_repo = Some(repo);
+        self
+    }
+
+    /// 设置全量同步暂停门（为 true 时暂停主动爬行）
+    pub fn with_pause_gate(mut self, gate: Option<Arc<AtomicBool>>) -> Self {
+        self.pause_gate = gate;
         self
     }
 
@@ -1216,6 +1226,10 @@ impl CrawlerEngine {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    // 全量同步期间暂停主动爬行，把带宽/CPU 让给联邦同步
+                    if self.pause_gate.as_ref().map(|g| g.load(Ordering::Relaxed)).unwrap_or(false) {
+                        continue;
+                    }
                     // 同步 known_nodes 到 state（API 读取的是 state.known_nodes）
                     {
                         let mut state = self.state.write();
@@ -1407,6 +1421,7 @@ impl CrawlerEngine {
             node_id: self.node_id,
             virtual_node_ids: self.virtual_node_ids.clone(),
             dns_pool: self.dns_pool.clone(),
+            pause_gate: self.pause_gate.clone(),
         }
     }
 }

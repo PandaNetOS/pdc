@@ -24,6 +24,7 @@ pub mod transport;
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -424,6 +425,13 @@ impl FederationService {
     /// 已知节点总数
     pub fn known_node_count(&self) -> usize {
         self.node_table.len()
+    }
+
+    /// 获取全量同步进行中标记的共享句柄。
+    /// 非核心模块（DHT 爬虫 / Active-PEX / 健康检查 / dht_probe）在全量同步期间
+    /// 通过此 flag 暂停主动工作，把带宽与 CPU 让给联邦增量/全量同步。
+    pub fn full_sync_gate(&self) -> Arc<AtomicBool> {
+        self.gossip_engine.pause_gate()
     }
 
     /// 获取联邦状态

@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +47,8 @@ pub struct DhtProbe {
     pub total_probed: Arc<AtomicU64>,
     pub total_success: Arc<AtomicU64>,
     pub total_added: Arc<AtomicU64>,
+    /// 全量同步暂停门：为 true 时暂停从 PeerRepo 拉取新探测任务
+    pause_gate: Option<Arc<AtomicBool>>,
 }
 
 impl DhtProbe {
@@ -55,6 +57,7 @@ impl DhtProbe {
         routing_table: Arc<RwLock<RoutingTable>>,
         node_repo: Option<Arc<NodeRepoImpl>>,
         peer_repo: Option<Arc<PeerRepoImpl>>,
+        pause_gate: Option<Arc<AtomicBool>>,
     ) -> Self {
         let mut node_id = [0u8; 20];
         rand::thread_rng().fill(&mut node_id);
@@ -69,6 +72,7 @@ impl DhtProbe {
             total_probed: Arc::new(AtomicU64::new(0)),
             total_success: Arc::new(AtomicU64::new(0)),
             total_added: Arc::new(AtomicU64::new(0)),
+            pause_gate,
         };
 
         probe.start(receiver);
@@ -84,6 +88,7 @@ impl DhtProbe {
     fn start_peer_repo_poller(&self, peer_repo: Arc<PeerRepoImpl>) {
         let probed = self.probed.clone();
         let sender = self.sender.clone();
+        let pause_gate = self.pause_gate.clone();
 
         tokio::spawn(async move {
             info!("[dht_probe] PeerRepo 拉取任务已启动（间隔 {:?}）", PEER_REPO_POLL_INTERVAL);
@@ -92,6 +97,11 @@ impl DhtProbe {
 
             loop {
                 interval.tick().await;
+
+                // 全量同步期间暂停拉取新探测任务，把带宽/CPU 让给联邦同步
+                if pause_gate.as_ref().map(|g| g.load(Ordering::Relaxed)).unwrap_or(false) {
+                    continue;
+                }
 
                 // 从 PeerRepo 获取所有 peer
                 let all_peers = peer_repo.all_peers_sync();
@@ -380,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_creation() {
         let rt = Arc::new(RwLock::new(RoutingTable::new([0u8; 20])));
-        let probe = DhtProbe::new(rt, None, None);
+        let probe = DhtProbe::new(rt, None, None, None);
         let _sender = probe.sender();
     }
 

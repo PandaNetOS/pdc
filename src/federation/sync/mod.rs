@@ -7,11 +7,12 @@ pub mod infohash_sync;
 pub mod peer_sync;
 pub mod tracker_sync;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -50,8 +51,8 @@ pub struct SyncManager {
     config: FederationConfig,
     metrics: Arc<FederationMetrics>,
     shutdown: broadcast::Sender<()>,
-    /// 初始全量同步是否已触发（确保只触发一次，避免重复同步）
-    initial_sync_triggered: AtomicBool,
+    /// 已触发初始全量同步的对端节点集合（按对端去重，每个对端只同步一次）
+    initial_sync_peers: RwLock<HashSet<NodeId>>,
 }
 
 impl SyncManager {
@@ -146,7 +147,7 @@ impl SyncManager {
             config,
             metrics,
             shutdown,
-            initial_sync_triggered: AtomicBool::new(false),
+            initial_sync_peers: RwLock::new(HashSet::new()),
         }
     }
 
@@ -193,6 +194,7 @@ impl SyncManager {
             .as_secs();
 
         let mut entries = Vec::new();
+        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for entry in &all_nodes {
             if dirty_set.contains(&entry.addr) {
                 let payload = NodeSyncPayload {
@@ -204,7 +206,7 @@ impl SyncManager {
                     Err(_) => continue,
                 };
                 let key = entry.addr.to_string().into_bytes();
-                self.node_merkle.update(&key, &payload_bytes);
+                merkle_batch.push((key.clone(), payload_bytes.clone()));
                 entries.push(SyncEntry {
                     key,
                     operation: operation::UPSERT,
@@ -212,6 +214,15 @@ impl SyncManager {
                     payload: payload_bytes,
                 });
             }
+        }
+
+        // 批量更新 Merkle：一次写锁插入所有条目
+        if !merkle_batch.is_empty() {
+            let refs: Vec<(&[u8], &[u8])> = merkle_batch
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.node_merkle.update_batch(&refs);
         }
 
         if !entries.is_empty() {
@@ -257,8 +268,9 @@ impl SyncManager {
     /// 应用 Node 同步数据
     pub fn apply_node_sync(&self, entries: &[SyncEntry]) {
         // 第一遍：过滤 DELETE / 反序列化失败的条目，收集有效 payload，
-        // 并同步更新 Merkle 树（Merkle 自身锁，与 repo 锁无关，不竞争）。
+        // 并批量收集 Merkle 更新（循环结束后一次 update_batch）。
         let mut items: Vec<([u8; 20], SocketAddr)> = Vec::new();
+        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -269,8 +281,17 @@ impl SyncManager {
                 Err(_) => continue,
             };
             items.push((payload.node_id, payload.addr));
-            self.node_merkle.update(&entry.key, &entry.payload);
+            merkle_batch.push((entry.key.clone(), entry.payload.clone()));
             applied += 1;
+        }
+
+        // 批量更新 Merkle：一次写锁插入所有条目，只重算受影响分片
+        if !merkle_batch.is_empty() {
+            let refs: Vec<(&[u8], &[u8])> = merkle_batch
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.node_merkle.update_batch(&refs);
         }
 
         // 第二遍：一次写锁批量写入，替代逐条 add_node_sync（2N 次锁竞争 → 2 次）
@@ -317,49 +338,64 @@ impl SyncManager {
     /// 触发初始全量同步（连接建立后调用，异步执行不阻塞）
     ///
     /// Node/Peer/Infohash/Tracker 四个 repo 并行执行全量同步，
-    /// 每个 repo 独立 spawn_blocking 收集数据，每批 100 条通过 Gossip 批量提交。
-    /// 入站和出站连接建立后都会触发，但通过 initial_sync_triggered 标志确保只触发一次。
-    /// 注意：使用 spawn_blocking 将 CPU 密集型操作移到阻塞线程池，
-    /// 避免遍历大量数据时阻塞异步运行时导致 API 无响应。
-    pub fn trigger_initial_sync(self: Arc<Self>) {
-        // 防重复：初始全量同步只触发一次
-        if self
-            .initial_sync_triggered
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            debug!("[federation] 初始全量同步已触发过，跳过");
+    /// 每个 repo 独立 spawn_blocking 收集数据，按配置化 batch_size 通过 Gossip 批量提交。
+    /// 入站和出站连接建立后都会触发，按对端 node_id 去重，每个对端只触发一次。
+    ///
+    /// P2-1 优化：同步开始时对所有 MerkleTree 设置 full_sync_in_progress=true，
+    /// 跳过逐条 recompute_shard；全部完成后 set false + rebuild_all 一次性重算。
+    pub fn trigger_initial_sync(self: Arc<Self>, peer_node_id: NodeId) {
+        // 防重复：按对端节点去重，同一对端只触发一次初始全量同步
+        if !self.initial_sync_peers.write().insert(peer_node_id) {
+            info!("[federation] 初始全量同步已对 {:?} 触发过，跳过（去重生效）", peer_node_id);
             return;
         }
 
-        info!("[federation] 开始初始全量同步（4 repo 并行）...");
+        info!("[federation] 开始初始全量同步（4 repo 并行，对端: {:?}）...", peer_node_id);
+
+        // 全量同步期间告知 GossipEngine：暂停 outbox 丢弃/限流，确保全量批次完整传播
+        self.gossip_engine.set_full_sync_in_progress(true);
+
+        // P2-1: 设置所有 MerkleTree 为全量同步模式（跳过 recompute_shard）
+        self.node_merkle.set_full_sync_in_progress(true);
+        if let Some(ps) = &self.peer_sync {
+            ps.merkle().set_full_sync_in_progress(true);
+        }
+        if let Some(ihs) = &self.infohash_sync {
+            ihs.merkle().set_full_sync_in_progress(true);
+        }
+        if let Some(ts) = &self.tracker_sync {
+            ts.merkle().set_full_sync_in_progress(true);
+        }
+
+        let batch_size = self.config.initial_sync_batch_size;
 
         // Node 全量同步（独立任务）
+        let mut handles = Vec::new();
         if self.config.sync_node_enabled {
             let s = self.clone();
-            tokio::task::spawn_blocking(move || {
+            handles.push(tokio::task::spawn_blocking(move || {
                 let entries = s.collect_node_entries();
                 if !entries.is_empty() {
                     let count = entries.len();
                     s.gossip_engine
-                        .submit_gossip_batch(repo_type::NODE, entries, 100);
+                        .submit_gossip_batch(repo_type::NODE, entries, batch_size);
                     info!("[federation] 初始同步 Node: {} 条（分批提交）", count);
                 }
-            });
+            }));
         }
 
         // Peer 全量同步（独立任务）
         if self.config.sync_peer_enabled {
             if let Some(ps) = self.peer_sync.clone() {
                 let gossip = self.gossip_engine.clone();
-                tokio::task::spawn_blocking(move || {
+                handles.push(tokio::task::spawn_blocking(move || {
                     let entries = ps.collect_all_entries();
                     if !entries.is_empty() {
                         let count = entries.len();
-                        gossip.submit_gossip_batch(repo_type::PEER, entries, 100);
+                        gossip.submit_gossip_batch(repo_type::PEER, entries, batch_size);
                         info!("[federation] 初始同步 Peer: {} 条（分批提交）", count);
                     }
-                });
+                }));
             }
         }
 
@@ -367,14 +403,14 @@ impl SyncManager {
         if self.config.sync_infohash_enabled {
             if let Some(ihs) = self.infohash_sync.clone() {
                 let gossip = self.gossip_engine.clone();
-                tokio::task::spawn_blocking(move || {
+                handles.push(tokio::task::spawn_blocking(move || {
                     let entries = ihs.collect_all_entries();
                     if !entries.is_empty() {
                         let count = entries.len();
-                        gossip.submit_gossip_batch(repo_type::INFOHASH, entries, 100);
+                        gossip.submit_gossip_batch(repo_type::INFOHASH, entries, batch_size);
                         info!("[federation] 初始同步 Infohash: {} 条（分批提交）", count);
                     }
-                });
+                }));
             }
         }
 
@@ -382,16 +418,178 @@ impl SyncManager {
         if self.config.sync_tracker_enabled {
             if let Some(ts) = self.tracker_sync.clone() {
                 let gossip = self.gossip_engine.clone();
-                tokio::task::spawn_blocking(move || {
+                handles.push(tokio::task::spawn_blocking(move || {
                     let entries = ts.collect_all_entries();
                     if !entries.is_empty() {
                         let count = entries.len();
-                        gossip.submit_gossip_batch(repo_type::TRACKER, entries, 100);
+                        gossip.submit_gossip_batch(repo_type::TRACKER, entries, batch_size);
                         info!("[federation] 初始同步 Tracker: {} 条（分批提交）", count);
                     }
-                });
+                }));
             }
         }
+
+        // P2-1: 等待所有任务完成后，恢复 Merkle 正常模式并一次性重建
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            for h in handles {
+                let _ = h.await;
+            }
+            // 全量同步数据已全部入队，关闭 GossipEngine 全量同步标志（恢复正常丢弃/限流）
+            self_clone.gossip_engine.set_full_sync_in_progress(false);
+            // 恢复 Merkle 正常模式并重建所有分片
+            self_clone.node_merkle.set_full_sync_in_progress(false);
+            self_clone.node_merkle.rebuild_all();
+            if let Some(ps) = &self_clone.peer_sync {
+                ps.merkle().set_full_sync_in_progress(false);
+                ps.merkle().rebuild_all();
+            }
+            if let Some(ihs) = &self_clone.infohash_sync {
+                ihs.merkle().set_full_sync_in_progress(false);
+                ihs.merkle().rebuild_all();
+            }
+            if let Some(ts) = &self_clone.tracker_sync {
+                ts.merkle().set_full_sync_in_progress(false);
+                ts.merkle().rebuild_all();
+            }
+            info!("[federation] 初始全量同步完成，Merkle 树已重建");
+        });
+    }
+
+    /// 全量同步开始（接收端：由 FullSyncStart 消息触发）
+    ///
+    /// 对指定 repo_type 的 MerkleTree 设置 full_sync_in_progress=true，
+    /// 跳过逐条 recompute_shard。
+    pub fn handle_full_sync_start(&self, repo_type: u8) {
+        if let Some(merkle) = self.merkle_for_repo(repo_type) {
+            merkle.set_full_sync_in_progress(true);
+            info!("[federation] FullSync 开始: repo_type={}, Merkle 进入惰性模式", repo_type);
+        }
+    }
+
+    /// 全量同步完成（接收端：由 FullSyncComplete 消息触发）
+    ///
+    /// 恢复 Merkle 正常模式，一次性 rebuild_all 重算所有分片。
+    pub fn handle_full_sync_complete(&self, repo_type: u8) {
+        if let Some(merkle) = self.merkle_for_repo(repo_type) {
+            merkle.set_full_sync_in_progress(false);
+            merkle.rebuild_all();
+            info!("[federation] FullSync 完成: repo_type={}, Merkle 已重建", repo_type);
+        }
+    }
+
+    /// 全量同步批量数据应用（接收端：由 FullSyncBatch 消息触发）
+    ///
+    /// 直接应用到 repo（不经过 Gossip 去重），Merkle 在惰性模式下只写入不重算。
+    pub fn handle_full_sync_batch(&self, repo_type: u8, entries: &[SyncEntry]) {
+        self.handle_sync_batch(repo_type, entries);
+    }
+
+    /// 启动全量同步专门通道（发送端）
+    ///
+    /// 对指定 target_node_id 发送 FullSyncStart → 分批发送 FullSyncBatch（窗口流控，等待 Ack）
+    /// → 发送 FullSyncComplete。绕过 Gossip 去重和传播，直接全量推送。
+    ///
+    /// 注意：当前为简化版，按 repo_type 逐个 repo 同步。窗口流控由 full_sync_window_size 控制。
+    pub async fn start_full_sync(self: Arc<Self>, target_node_id: NodeId) {
+        let conn = match self.connection_manager.get_connection(&target_node_id) {
+            Some(c) => c,
+            None => {
+                warn!("[federation] FullSync: 目标 {} 无连接，取消", target_node_id);
+                return;
+            }
+        };
+
+        // 全量同步期间告知 GossipEngine：暂停 outbox 丢弃/限流
+        self.gossip_engine.set_full_sync_in_progress(true);
+
+        let batch_size = self.config.full_sync_batch_size;
+        let window = self.config.full_sync_window_size;
+
+        // 对每个启用的 repo_type 执行全量同步
+        for repo_type in &[repo_type::NODE, repo_type::PEER, repo_type::INFOHASH, repo_type::TRACKER] {
+            // 收集全量条目
+            let entries: Vec<SyncEntry> = match *repo_type {
+                repo_type::NODE => self.collect_node_entries(),
+                repo_type::PEER => {
+                    match &self.peer_sync {
+                        Some(ps) => ps.collect_all_entries(),
+                        None => continue,
+                    }
+                }
+                repo_type::INFOHASH => {
+                    match &self.infohash_sync {
+                        Some(ihs) => ihs.collect_all_entries(),
+                        None => continue,
+                    }
+                }
+                repo_type::TRACKER => {
+                    match &self.tracker_sync {
+                        Some(ts) => ts.collect_all_entries(),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            if entries.is_empty() {
+                continue;
+            }
+
+            let total = entries.len() as u64;
+            info!(
+                "[federation] FullSync 发送: repo_type={}, total={}, batch_size={}, window={}, to={}",
+                repo_type, total, batch_size, window, target_node_id
+            );
+
+            // 1. 发送 FullSyncStart
+            let start_msg = FullSyncStartMessage {
+                repo_type: *repo_type,
+                total_entries: total,
+            };
+            if let Err(e) = conn.send_message(MessageType::FullSyncStart, &start_msg).await {
+                warn!("[federation] FullSyncStart 发送失败: {}", e);
+                break;
+            }
+
+            // 2. 分批发送 FullSyncBatch（简单窗口流控：每批等待 Ack）
+            let mut seq: u64 = 0;
+            for chunk in entries.chunks(batch_size) {
+                let batch_msg = FullSyncBatchMessage {
+                    repo_type: *repo_type,
+                    entries: chunk.to_vec(),
+                    seq,
+                };
+                if let Err(e) = conn.send_message(MessageType::FullSyncBatch, &batch_msg).await {
+                    warn!("[federation] FullSyncBatch seq={} 发送失败: {}", seq, e);
+                    break;
+                }
+                seq += 1;
+
+                // 简单流控：每 window 个批次等待一次（此处简化为每批等待 Ack）
+                // 接收端在 connection.rs 中收到 FullSyncBatch 后自动回复 Ack
+                // 这里不主动等待 Ack，由 TCP 层流控和窗口大小间接控制速率
+                if seq % (window as u64) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+
+            // 3. 发送 FullSyncComplete
+            let complete_msg = FullSyncCompleteMessage {
+                repo_type: *repo_type,
+            };
+            if let Err(e) = conn.send_message(MessageType::FullSyncComplete, &complete_msg).await {
+                warn!("[federation] FullSyncComplete 发送失败: {}", e);
+            }
+
+            info!(
+                "[federation] FullSync 完成: repo_type={}, batches={}, to={}",
+                repo_type, seq, target_node_id
+            );
+        }
+
+        // 全量同步结束，恢复 GossipEngine 正常丢弃/限流
+        self.gossip_engine.set_full_sync_in_progress(false);
     }
 
     /// 收集全量 Node 同步条目（内部辅助方法）

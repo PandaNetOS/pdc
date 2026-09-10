@@ -110,6 +110,30 @@ pub struct FederationConfig {
     /// 仅监控告警（TCP 流控 + 发送端限流为主要手段）。
     #[serde(default = "default_receive_pending_threshold")]
     pub receive_pending_threshold: u32,
+    /// 初始全量同步每批条目数（发送端 submit_gossip_batch 的 batch_size）。
+    /// 默认 1000，比旧的硬编码 100 减少 10 倍消息开销。
+    #[serde(default = "default_initial_sync_batch_size")]
+    pub initial_sync_batch_size: usize,
+    /// 接收端 GossipBatch 攒批刷新间隔（毫秒）。
+    /// 收到的 GossipBatch 先进入 per-connection 缓冲区，到期后一次性 flush。
+    #[serde(default = "default_gossip_flush_interval_ms")]
+    pub gossip_flush_interval_ms: u64,
+    /// 接收端 GossipBatch 攒批最大批次数，达到则立即刷新。
+    #[serde(default = "default_gossip_flush_max_batches")]
+    pub gossip_flush_max_batches: usize,
+    /// 全量同步专门通道每批条目数（FullSyncBatch 的 entries 数量）。
+    #[serde(default = "default_full_sync_batch_size")]
+    pub full_sync_batch_size: usize,
+    /// 全量同步窗口大小（发送方未确认的在途批次数）。
+    #[serde(default = "default_full_sync_window_size")]
+    pub full_sync_window_size: usize,
+    /// 全量同步期间 Gossip 每秒最多发送消息条数（临时放开限流）。
+    /// SyncManager 在 trigger_initial_sync 期间通过 GossipEngine flag 切换到此上限。
+    #[serde(default = "default_full_sync_gossip_max_messages_per_second")]
+    pub full_sync_gossip_max_messages_per_second: u32,
+    /// 全量同步期间 Gossip 每秒最多发送字节数（临时放开限流）。
+    #[serde(default = "default_full_sync_gossip_max_bytes_per_second")]
+    pub full_sync_gossip_max_bytes_per_second: u64,
 }
 
 fn default_listen_port() -> u16 { 6885 }
@@ -140,10 +164,17 @@ fn default_peer_cache_max() -> usize { 100 }
 fn default_transport_write_timeout() -> u64 { 5 }
 fn default_gossip_max_consecutive_failures() -> u32 { 3 }
 fn default_reconnect_cooldown_secs() -> u64 { 30 }
-fn default_heavy_task_max_concurrency() -> usize { 4 }
+fn default_heavy_task_max_concurrency() -> usize { 8 }
 fn default_gossip_max_bytes_per_second() -> u64 { 5 * 1024 * 1024 }
 fn default_gossip_max_messages_per_second() -> u32 { 100 }
 fn default_receive_pending_threshold() -> u32 { 1000 }
+fn default_initial_sync_batch_size() -> usize { 1000 }
+fn default_gossip_flush_interval_ms() -> u64 { 50 }
+fn default_gossip_flush_max_batches() -> usize { 10 }
+fn default_full_sync_batch_size() -> usize { 5000 }
+fn default_full_sync_window_size() -> usize { 3 }
+fn default_full_sync_gossip_max_messages_per_second() -> u32 { 500 }
+fn default_full_sync_gossip_max_bytes_per_second() -> u64 { 20 * 1024 * 1024 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -180,6 +211,13 @@ impl Default for FederationConfig {
             gossip_max_bytes_per_second: default_gossip_max_bytes_per_second(),
             gossip_max_messages_per_second: default_gossip_max_messages_per_second(),
             receive_pending_threshold: default_receive_pending_threshold(),
+            initial_sync_batch_size: default_initial_sync_batch_size(),
+            gossip_flush_interval_ms: default_gossip_flush_interval_ms(),
+            gossip_flush_max_batches: default_gossip_flush_max_batches(),
+            full_sync_batch_size: default_full_sync_batch_size(),
+            full_sync_window_size: default_full_sync_window_size(),
+            full_sync_gossip_max_messages_per_second: default_full_sync_gossip_max_messages_per_second(),
+            full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
         }
     }
 }
