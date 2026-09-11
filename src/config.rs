@@ -225,9 +225,12 @@ pub struct ServerConfig {
     /// 监听地址
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// 监听端口
+    /// 监听端口（超级 Tracker HTTP+UDP）
     #[serde(default = "default_port")]
     pub port: u16,
+    /// API/监控端口（绑定局域网，不映射公网，需 token 鉴权）
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
     /// API 鉴权 token（为空则不鉴权）
     #[serde(default)]
     pub token: Option<String>,
@@ -242,6 +245,10 @@ fn default_listen() -> String {
 fn default_port() -> u16 {
     6880
 }
+
+fn default_api_port() -> u16 {
+    6886
+}
 fn default_work_dir() -> String {
     "pdc-data".to_string()
 }
@@ -251,6 +258,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             port: default_port(),
+            api_port: default_api_port(),
             token: None,
             work_dir: default_work_dir(),
         }

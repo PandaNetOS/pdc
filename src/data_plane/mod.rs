@@ -22,7 +22,7 @@ use std::sync::Arc;
 use axum::Router;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::PdcConfig;
 use crate::control_plane::ControlPlane;
@@ -88,22 +88,97 @@ pub struct AppState {
 pub struct DataPlane;
 
 impl DataPlane {
-    /// 构建 axum Router
-    pub fn build_router(state: AppState) -> Router {
-        Router::new()
-            .merge(http_tracker::routes(state.clone()))
-            .merge(rest_api::routes(state))
+    /// 构建超级 Tracker 路由（/announce /scrape，公网公开，无需鉴权）
+    pub fn build_tracker_router(state: AppState) -> Router {
+        http_tracker::routes(state)
     }
 
-    /// 启动 HTTP 服务
-    pub async fn serve(state: AppState) -> anyhow::Result<()> {
+    /// 构建 API/监控路由（/api/v1/* /ws /metrics，需 token 鉴权）
+    pub fn build_api_router(state: AppState) -> Router {
+        use axum::http::{Request, StatusCode};
+        use axum::middleware::{from_fn, Next};
+        use axum::response::Response;
+
+        let token = state.config.read().server.token.clone();
+
+        let app = rest_api::routes(state);
+
+        // 配置了 token 时加鉴权中间件
+        if let Some(expected_token) = token {
+            if !expected_token.is_empty() {
+                let expected = expected_token.clone();
+                return app.layer(from_fn(move |req: Request<axum::body::Body>, next: Next| {
+                    let expected = expected.clone();
+                    async move {
+                        let auth_valid = req.headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v.trim_start_matches("Bearer ").trim() == expected)
+                            .unwrap_or(false)
+                            || req.headers()
+                                .get("x-api-key")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|v| v == expected)
+                                .unwrap_or(false);
+
+                        if auth_valid {
+                            Ok(next.run(req).await)
+                        } else {
+                            Err((StatusCode::UNAUTHORIZED, "Unauthorized: invalid or missing token"))
+                        }
+                    }
+                }));
+            }
+        }
+        app
+    }
+
+    /// 启动超级 Tracker HTTP 服务（6880，公网）
+    pub async fn serve_tracker(state: AppState) -> anyhow::Result<()> {
         let config = state.config.read().clone();
         let addr = format!("{}:{}", config.server.listen, config.server.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        info!("[data_plane] HTTP 服务启动，监听 {}", addr);
+        info!("[data_plane] 超级 Tracker HTTP 启动，监听 {}", addr);
 
-        let app = Self::build_router(state);
+        let app = Self::build_tracker_router(state);
         axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    /// 启动 API/监控 HTTP 服务（6886，局域网+token鉴权，不映射公网）
+    pub async fn serve_api(state: AppState) -> anyhow::Result<()> {
+        let config = state.config.read().clone();
+        let addr = format!("{}:{}", config.server.listen, config.server.api_port);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let has_token = config.server.token.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+        info!("[data_plane] API/监控 HTTP 启动，监听 {}（{}）", addr, if has_token { "token鉴权已启用" } else { "未配置token，无鉴权" });
+
+        let app = Self::build_api_router(state);
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    /// 启动全部 HTTP 服务（超级 Tracker + API/监控）
+    pub async fn serve(state: AppState) -> anyhow::Result<()> {
+        let tracker_state = state.clone();
+        let api_state = state.clone();
+
+        let tracker_handle = tokio::spawn(async move {
+            if let Err(e) = Self::serve_tracker(tracker_state).await {
+                warn!("[data_plane] 超级 Tracker HTTP 异常退出: {}", e);
+            }
+        });
+        let api_handle = tokio::spawn(async move {
+            if let Err(e) = Self::serve_api(api_state).await {
+                warn!("[data_plane] API/监控 HTTP 异常退出: {}", e);
+            }
+        });
+
+        // 等待任一退出
+        tokio::select! {
+            _ = tracker_handle => {},
+            _ = api_handle => {},
+        }
         Ok(())
     }
 

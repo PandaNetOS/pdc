@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 allocation.apply_to_config(&mut config);
                 // 同步 federation.api_port（与 API 端口一致）
-                config.federation.api_port = config.server.port;
+                config.federation.api_port = config.server.api_port;
                 // 释放探测 socket（实际监听器会立即重新绑定）
                 allocation.release_all();
             }
@@ -318,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or([0u8; 20]);
         let fw_manager = FirewallManager::new(&node_id_bytes, true);
         let fw_ports: Vec<(u16, &str, &str)> = vec![
-            (config.server.port, "TCP", "api"),
+            (config.server.api_port, "TCP", "api"),
             (
                 config.super_tracker.udp_port.unwrap_or(config.server.port),
                 "UDP",
@@ -812,34 +812,30 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 11. 启动 HTTP 服务（带优雅关闭）
+    // 11. 启动 HTTP 服务（超级 Tracker + API/监控 分离）
     info!(
-        "[main] HTTP 服务启动: http://{}:{}",
+        "[main] 超级 Tracker HTTP: http://{}:{}/announce (公网)",
         config.server.listen, config.server.port
     );
     info!(
-        "[main]   超级 Tracker: http://{}:{}/announce",
+        "[main]   Scrape:           http://{}:{}/scrape",
         config.server.listen, config.server.port
     );
     info!(
-        "[main]   Scrape:       http://{}:{}/scrape",
-        config.server.listen, config.server.port
+        "[main] API/监控 HTTP:    http://{}:{}/api/v1/stats (局域网+token鉴权，不映射公网)",
+        config.server.listen, config.server.api_port
     );
     info!(
-        "[main]   健康检查:     http://{}:{}/health",
-        config.server.listen, config.server.port
+        "[main]   健康检查:         http://{}:{}/health",
+        config.server.listen, config.server.api_port
     );
     info!(
-        "[main]   统计:         http://{}:{}/api/v1/stats",
-        config.server.listen, config.server.port
+        "[main]   联邦状态:         http://{}:{}/api/v1/federation/status",
+        config.server.listen, config.server.api_port
     );
     info!(
-        "[main]   发现器列表:   http://{}:{}/api/v1/discoverers",
-        config.server.listen, config.server.port
-    );
-    info!(
-        "[main]   Peer反馈:     POST http://{}:{}/api/v1/peer-feedback",
-        config.server.listen, config.server.port
+        "[main]   WebSocket:        ws://{}:{}/ws",
+        config.server.listen, config.server.api_port
     );
 
     // 优雅关闭：等待 Ctrl+C 或 HTTP 服务退出
