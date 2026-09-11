@@ -29,15 +29,36 @@ use PeerDiscoveryCenter::data_plane::relay::RelayServer;
 use PeerDiscoveryCenter::data_plane::{AppState, DataPlane};
 use PeerDiscoveryCenter::discoverers::DiscovererRegistry;
 use PeerDiscoveryCenter::event_bus::EventBus;
+use PeerDiscoveryCenter::firewall::FirewallManager;
 use PeerDiscoveryCenter::health_check::{HealthCheckConfig, HealthCheckTask};
 use PeerDiscoveryCenter::federation::FederationService;
 use PeerDiscoveryCenter::nat::NatManager;
+use PeerDiscoveryCenter::port_allocator::PortAllocator;
 use PeerDiscoveryCenter::storage::{InfohashRepository, NodeRepository, TrackerRepository};
 use PeerDiscoveryCenter::intelligence::{DhtActivityTracker, PeerHistoryManager, AvailabilityCalculator, TaskScheduler, TaskMetadata, TaskPriority, ResourceProfile, ResourceLevel};
 use PeerDiscoveryCenter::services::{ScrapeService, MetadataService};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> anyhow::Result<()> {
+    // 0. 初始化统一工作目录（pnos-spec WorkDir）
+    //    --work-dir 参数 → Standalone 模式；PNOS_APP_ID 环境变量 → Managed 模式；否则 Standalone(当前目录)
+    let work_dir = if let Some(dir) = parse_work_dir_arg() {
+        pnos::workdir::WorkDir::standalone(&dir, "pdc")
+    } else {
+        pnos::workdir::WorkDir::auto_detect("pdc")
+    };
+    if let Err(e) = work_dir.ensure_dirs() {
+        eprintln!("[main] 创建工作目录失败: {}", e);
+    }
+    eprintln!("[main] 工作目录: {}", work_dir.root.display());
+
+    // 0.1 安装崩溃捕获（panic hook + Windows SEH），日志写入 work_dir.logs_dir/
+    install_crash_handler(&work_dir.logs_dir);
+
+    // 0.2 安装 Windows 控制台控制处理器（防止后台运行时父控制台关闭导致 CTRL_CLOSE_EVENT 瞬间终止进程）
+    #[cfg(windows)]
+    install_console_ctrl_handler();
+
     // 1. 初始化日志
     init_logging();
 
@@ -49,18 +70,70 @@ async fn main() -> anyhow::Result<()> {
     info!("PeerDiscoveryCenter v{} 启动", PeerDiscoveryCenter::VERSION);
     info!("========================================");
 
-    // 2. 解析命令行参数，加载配置
-    let config_path = parse_config_path();
-    let config = match &config_path {
+    // 2. 加载配置
+    //    优先级：-c/--config 显式指定 > work_dir.config_file() > 自动生成默认配置
+    let explicit_config = parse_config_path();
+    let config_path = match explicit_config {
+        Some(p) => Some(p),
+        None => {
+            let p = work_dir.config_file();
+            if p.exists() {
+                info!("[main] 自动发现配置文件: {}", p.display());
+                Some(p.to_string_lossy().to_string())
+            } else {
+                // 自动生成默认配置文件
+                let default_config = PdcConfig::default();
+                match serde_yaml::to_string(&default_config) {
+                    Ok(yaml) => {
+                        let _ = std::fs::write(&p, &yaml);
+                        info!("[main] 未发现配置文件，已生成默认配置: {}", p.display());
+                    }
+                    Err(e) => warn!("[main] 生成默认配置文件失败: {}", e),
+                }
+                Some(p.to_string_lossy().to_string())
+            }
+        }
+    };
+    let mut config = match &config_path {
         Some(path) => {
             info!("[main] 从 {} 加载配置", path);
             PdcConfig::load_or_default(path)
         }
         None => {
-            info!("[main] 未指定配置文件，使用默认配置");
+            info!("[main] 使用默认配置");
             PdcConfig::default()
         }
     };
+
+    // 2.1 统一数据路径到 work_dir.db_file("pdc")（工作目录规范）
+    config.storage.path = work_dir.db_file("pdc").to_string_lossy().to_string();
+    info!("[main] 数据路径: {}", config.storage.path);
+
+    // 2.2 加载或生成 PEX/uTP 节点身份（持久化到 work_dir.node_id_file()）
+    let pex_node_id = load_or_generate_node_id(&work_dir.node_id_file());
+
+    // 2.5 端口自动探测（零配置核心：自动寻找可用端口组）
+    // 必须在创建任何服务/NAT/联邦/HTTP 之前完成，确保后续所有模块使用实际分配的端口。
+    if config.port_auto_alloc {
+        info!("[main] 启动端口自动探测（step={}）...", config.port_step);
+        let allocator = PortAllocator::from_config(&config);
+        match allocator.allocate() {
+            Ok(mut allocation) => {
+                info!(
+                    "[main] 端口探测成功，offset={}，API端口={}，联邦端口={}",
+                    allocation.offset, allocation.ports.api_port, allocation.ports.federation_port
+                );
+                allocation.apply_to_config(&mut config);
+                // 同步 federation.api_port（与 API 端口一致）
+                config.federation.api_port = config.server.port;
+                // 释放探测 socket（实际监听器会立即重新绑定）
+                allocation.release_all();
+            }
+            Err(e) => {
+                warn!("[main] 端口自动探测失败（{}），使用配置端口继续", e);
+            }
+        }
+    }
 
     info!(
         "[main] 配置: 监听 {}:{}, 超级Tracker={}, 爬虫={}",
@@ -162,7 +235,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 6.8 创建联邦网络服务（如果启用）
     let federation_service: Option<Arc<FederationService>> = if config.federation.enabled {
-        let data_dir = std::path::Path::new("target/data");
+        // 联邦数据目录从配置存储路径的父目录获取（零配置：不再硬编码 target/data）
+        let data_dir = std::path::Path::new(&config.storage.path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("./data"));
         match FederationService::new(
             config.federation.clone(),
             nat.clone(),
@@ -186,6 +262,48 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // 6.8.5 自动防火墙规则配置（零配置协同：确保局域网发现和联邦连接不被拦截）
+    // 失败时只记录 warning，不影响主流程启动。
+    if config.auto_firewall_rule {
+        let node_id_bytes = federation_service
+            .as_ref()
+            .map(|f| f.identity.node_id.0)
+            .unwrap_or([0u8; 20]);
+        let fw_manager = FirewallManager::new(&node_id_bytes, true);
+        let fw_ports: Vec<(u16, &str, &str)> = vec![
+            (config.server.port, "TCP", "api"),
+            (
+                config.super_tracker.udp_port.unwrap_or(config.server.port),
+                "UDP",
+                "super-tracker-udp",
+            ),
+            (config.super_tracker.relay_port, "TCP", "relay"),
+            (config.discoverers.dht_listen_port, "UDP", "dht"),
+            (config.crawler.listen_port, "UDP", "crawler"),
+            (config.crawler.utp_port, "UDP", "utp"),
+            (config.crawler.tcp_pex_port, "TCP", "tcp-pex"),
+            (config.federation.listen_port, "TCP", "federation"),
+            (config.federation.listen_port, "UDP", "federation-udp"),
+            (config.federation.lpd_multicast_port, "UDP", "lpd"),
+        ];
+        match fw_manager.add_rules(&fw_ports) {
+            Ok(result) => {
+                info!(
+                    "[main] 防火墙规则配置完成：新增{}条，跳过{}条，失败{}条",
+                    result.added.len(),
+                    result.skipped.len(),
+                    result.failed.len()
+                );
+                for (name, err) in &result.failed {
+                    warn!("[main] 防火墙规则添加失败 {}: {}", name, err);
+                }
+            }
+            Err(e) => {
+                warn!("[main] 防火墙规则配置异常（不影响主流程）: {}", e);
+            }
+        }
+    }
 
     // 6.8.1 注入联邦引用到各 Repo：本地写入后统一更新 Merkle + 提交 Gossip
     // （FederationService 已创建，Merkl/Gossip 句柄此时可用；联邦未启用时跳过）
@@ -348,11 +466,8 @@ async fn main() -> anyhow::Result<()> {
     info!("[main] 限流器已创建（单IP 100 QPS，突发 200）");
 
     // 7.5 初始化 PEX/uTP 服务（默认启用）
-    let node_id = {
-        let mut id = [0u8; 20];
-        rand::thread_rng().fill(&mut id);
-        id
-    };
+    // 使用持久化的节点身份（work_dir/data/node_id），重启后保持一致
+    let node_id = pex_node_id;
 
     // PEX 接收器（核心，被其他服务引用）
     let pex_receiver = Arc::new(
@@ -684,8 +799,9 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::select! {
         result = DataPlane::serve(app_state.clone()) => {
-            if let Err(e) = result {
-                warn!("[main] HTTP 服务异常: {}", e);
+            match result {
+                Ok(()) => warn!("[main] HTTP 服务正常退出（serve 返回 Ok），触发关闭流程"),
+                Err(e) => warn!("[main] HTTP 服务异常退出: {}，触发关闭流程", e),
             }
         }
         _ = shutdown => {
@@ -725,10 +841,172 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    info!("[main] 主函数正常返回，进程退出");
     Ok(())
 }
 
 /// 初始化日志
+/// 安装崩溃捕获：panic hook + Windows SEH 异常过滤器
+/// 捕获 Rust panic、栈溢出、access violation 等，写入 logs_dir/crash.log
+fn install_crash_handler(logs_dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(logs_dir);
+    let crash_log = logs_dir.join("crash.log");
+    let panic_log = logs_dir.join("crash-panic.log");
+    let seh_log = logs_dir.join("crash-seh.log");
+    let crash_log_str = crash_log.to_string_lossy().to_string();
+    let panic_log_str = panic_log.to_string_lossy().to_string();
+    let _seh_log_str = seh_log.to_string_lossy().to_string();
+
+    // 1. Rust panic hook（捕获 unwind panic，含 tokio task panic）
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "未知 panic 信息".to_string());
+        let location = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "未知位置".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let report = format!(
+            "===== PANIC CRASH REPORT =====\n\
+             时间: {}\n\
+             线程: {:?}\n\
+             位置: {}\n\
+             信息: {}\n\
+             堆栈:\n{}\n\
+             ===============================\n",
+            timestamp, std::thread::current().name(), location, msg, backtrace
+        );
+        eprintln!("{}", report);
+        let _ = std::fs::write(&crash_log_str, &report);
+        let _ = std::fs::write(&panic_log_str, &report);
+    }));
+
+    // 2. Windows SEH 异常过滤器（捕获 access violation、栈溢出等非 Rust panic）
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        type ExceptionFilter = unsafe extern "system" fn(*mut c_void) -> u32;
+        extern "system" {
+            fn SetUnhandledExceptionFilter(lpFilter: ExceptionFilter) -> ExceptionFilter;
+        }
+        unsafe extern "system" fn seh_filter(exception_ptrs: *mut c_void) -> u32 {
+            let code = if !exception_ptrs.is_null() {
+                let record_ptr = *(exception_ptrs as *const *const u32);
+                if !record_ptr.is_null() { *record_ptr } else { 0 }
+            } else { 0 };
+            let code_name = match code {
+                0xC0000005 => "ACCESS_VIOLATION",
+                0xC00000FD => "STACK_OVERFLOW",
+                0xC000001D => "ILLEGAL_INSTRUCTION",
+                0xC0000094 => "INTEGER_DIVIDE_BY_ZERO",
+                0xC0000095 => "INTEGER_OVERFLOW",
+                0xC000008C => "ARRAY_BOUNDS_EXCEEDED",
+                0xE06D7363 => "CPP_EXCEPTION",
+                _ => "UNKNOWN",
+            };
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let report = format!(
+                "===== SEH CRASH REPORT =====\n\
+                 时间: {}\n\
+                 异常码: 0x{:08X} ({})\n\
+                 ExceptionPointers: {:?}\n\
+                 =============================\n",
+                timestamp, code, code_name, exception_ptrs
+            );
+            eprintln!("{}", report);
+            // 注意：seh_filter 是 extern fn，不能直接捕获外部变量，用固定路径
+            let _ = std::fs::write("./logs/crash.log", &report);
+            let _ = std::fs::write("./logs/crash-seh.log", &report);
+            1 // EXCEPTION_EXECUTE_HANDLER
+        }
+        unsafe { SetUnhandledExceptionFilter(seh_filter); }
+        eprintln!("[crash-handler] Windows SEH 异常过滤器已安装（日志: {}）", logs_dir.display());
+    }
+}
+
+/// 安装 Windows 控制台控制处理器
+///
+/// 后台运行时，父控制台关闭会发送 CTRL_CLOSE_EVENT，默认处理器直接调用 ExitProcess
+/// 瞬间终止进程（无 panic、无日志、无优雅关闭）。本处理器忽略 CTRL_CLOSE_EVENT，
+/// 让进程在后台持续运行。CTRL_C_EVENT 和 CTRL_BREAK_EVENT 仍由默认处理器处理
+/// （tokio::signal::ctrl_c 会捕获）。
+#[cfg(windows)]
+fn install_console_ctrl_handler() {
+    use std::ffi::c_int;
+    type HandlerRoutine = unsafe extern "system" fn(c_int) -> i32;
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+    // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1, CTRL_CLOSE_EVENT = 2
+    unsafe extern "system" fn console_ctrl_handler(ctrl_type: c_int) -> i32 {
+        match ctrl_type {
+            2 => {
+                // CTRL_CLOSE_EVENT: 忽略，防止后台进程被父控制台关闭瞬间终止
+                eprintln!("[console] 收到 CTRL_CLOSE_EVENT，忽略（后台持续运行）");
+                1 // TRUE = 已处理，不调用后续处理器
+            }
+            _ => 0, // FALSE = 交给默认处理器（tokio::signal::ctrl_c 捕获 Ctrl+C）
+        }
+    }
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+    }
+    eprintln!("[console] Windows 控制台控制处理器已安装（忽略 CTRL_CLOSE_EVENT）");
+}
+
+/// 解析 --work-dir 命令行参数（返回 Some 时使用 Standalone 模式，否则由 WorkDir::auto_detect 决定）
+fn parse_work_dir_arg() -> Option<std::path::PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--work-dir" => {
+                if i + 1 < args.len() {
+                    return Some(std::path::PathBuf::from(&args[i + 1]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 加载或生成 PEX/uTP 节点身份（持久化到 node_id_path）
+/// 文件格式：十六进制字符串（40字符），一行
+fn load_or_generate_node_id(node_id_path: &std::path::Path) -> [u8; 20] {
+    if node_id_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(node_id_path) {
+            let hex_str = content.trim();
+            if hex_str.len() == 40 {
+                let mut bytes = [0u8; 20];
+                let mut ok = true;
+                for i in 0..20 {
+                    match u8::from_str_radix(&hex_str[i*2..i*2+2], 16) {
+                        Ok(b) => bytes[i] = b,
+                        Err(_) => { ok = false; break; }
+                    }
+                }
+                if ok {
+                    info!("[main] 已加载节点身份: {}", hex_str);
+                    return bytes;
+                }
+            }
+            warn!("[main] node_id 文件格式错误，重新生成");
+        }
+    }
+    // 生成新的随机节点身份
+    let mut id = [0u8; 20];
+    rand::thread_rng().fill(&mut id);
+    let hex_str: String = id.iter().map(|b| format!("{:02x}", b)).collect();
+    let _ = std::fs::write(node_id_path, &hex_str);
+    info!("[main] 已生成新节点身份: {}（持久化到 {}）", hex_str, node_id_path.display());
+    id
+}
+
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -759,8 +1037,15 @@ fn parse_config_path() -> Option<String> {
                 println!("  pdc [OPTIONS]");
                 println!();
                 println!("选项:");
-                println!("  -c, --config <FILE>  指定配置文件路径");
-                println!("  -h, --help           显示帮助信息");
+                println!("  -c, --config <FILE>     指定配置文件路径（优先级高于工作目录）");
+                println!("      --work-dir <DIR>    指定工作目录（默认当前目录，或 PDC_WORK_DIR 环境变量）");
+                println!("  -h, --help              显示帮助信息");
+                println!();
+                println!("工作目录结构:");
+                println!("  <work_dir>/pdc-agent/config/config.yaml  配置文件（不存在则自动生成）");
+                println!("  <work_dir>/pdc-agent/data/pdc.db         数据库文件");
+                println!("  <work_dir>/pdc-agent/data/node_id        节点身份（持久化）");
+                println!("  <work_dir>/pdc-agent/logs/               日志目录");
                 println!();
                 println!("默认配置:");
                 println!("  监听: 0.0.0.0:6880");

@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::{Connection, ConnectionManager};
 use crate::federation::dht_discovery::DhtDiscoveryService;
+use crate::federation::lpd_discovery::LpdDiscoveryService;
 use crate::federation::node_id::{NodeAddress, NodeIdentity, NodeId, Reachability};
 use crate::federation::node_table::NodeTable;
 use crate::federation::peer_cache::PeerCache;
@@ -35,6 +36,8 @@ pub struct DiscoveryService {
     identity: Arc<NodeIdentity>,
     /// 配置
     config: FederationConfig,
+    /// API/HTTP 监控端口（实际分配值，LPD 广播时携带）
+    api_port: u16,
     /// 关闭信号
     shutdown: broadcast::Sender<()>,
     /// 数据目录（用于缓存文件）
@@ -52,6 +55,7 @@ impl DiscoveryService {
         node_table: Arc<NodeTable>,
         identity: Arc<NodeIdentity>,
         config: FederationConfig,
+        api_port: u16,
         shutdown: broadcast::Sender<()>,
         data_dir: &Path,
     ) -> Self {
@@ -66,6 +70,7 @@ impl DiscoveryService {
             node_table,
             identity,
             config,
+            api_port,
             shutdown,
             data_dir: data_dir.to_path_buf(),
             peer_cache: RwLock::new(peer_cache),
@@ -150,13 +155,24 @@ impl DiscoveryService {
             dht_service.spawn();
         }
 
+        // 4.1 启动 LPD 局域网多播发现（零配置核心：同网段节点自动发现）
+        let lpd_service = Arc::new(LpdDiscoveryService::new(
+            self.node_table.clone(),
+            self.identity.clone(),
+            self.config.listen_port,   // 实际联邦端口
+            self.api_port,             // 实际 API 端口
+            self.config.lpd_multicast_port, // LPD 多播端口（配置化）
+            self.shutdown.clone(),
+        ));
+        lpd_service.spawn();
+
         // 5. 启动 peer_cache 定期保存任务
         if self.config.peer_cache_enabled {
             self.clone().spawn_peer_cache_saver();
         }
 
-        if self.config.seed_nodes.is_empty() && !self.config.peer_cache_enabled {
-            info!("[federation] 未配置种子节点且缓存未启用，仅依赖 DHT 自动发现");
+        if self.config.seed_nodes.is_empty() {
+            info!("[federation] 零配置模式：依赖 LPD 局域网多播 + DHT 魔法 infohash 自动发现（seed_nodes 为空）");
         }
     }
 
@@ -558,7 +574,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir);
 
         let nodes = vec![
             make_node_address(1, 6885),
@@ -589,7 +605,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir);
 
         let nodes = vec![make_node_address(5, 6890), make_node_address(6, 6891)];
         discovery.handle_exchange_nodes(nodes);
@@ -612,7 +628,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity.clone(), make_test_config(), shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity.clone(), make_test_config(), 0, shutdown_tx, &dir);
 
         // 包含自己的节点
         let mut self_addr = make_node_address(0, 6885);
@@ -640,7 +656,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = Arc::new(DiscoveryService::new(cm, node_table, identity, make_test_config(), shutdown_tx, &dir));
+        let discovery = Arc::new(DiscoveryService::new(cm, node_table, identity, make_test_config(), 0, shutdown_tx, &dir));
 
         // 没有种子节点，应该立即返回（但会启动 DHT 发现和缓存保存）
         discovery.bootstrap().await;
@@ -662,7 +678,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir);
 
         // 添加节点并标记为已连接
         node_table.add_or_update(make_node_address(1, 6885));

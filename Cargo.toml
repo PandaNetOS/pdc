@@ -49,6 +49,8 @@ blake3 = "1"
 lru = "0.12"
 bytes = "1"
 serde-big-array = "0.5"
+socket2 = "0.6"
+pnos = { path = "../pnos-spec" }
 
 [dev-dependencies]
 tokio-test = "0.4"

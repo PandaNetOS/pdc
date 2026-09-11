@@ -44,6 +44,15 @@ pub struct PdcConfig {
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// 是否启用端口自动探测（启动时自动探测一组可用端口）
+    #[serde(default = "default_port_auto_alloc")]
+    pub port_auto_alloc: bool,
+    /// 端口组之间的步长（端口 = 基础端口 + offset * step）
+    #[serde(default = "default_port_step")]
+    pub port_step: u16,
+    /// 是否自动添加 Windows 防火墙入站规则
+    #[serde(default = "default_auto_firewall_rule")]
+    pub auto_firewall_rule: bool,
 }
 
 /// 持久化存储配置
@@ -58,7 +67,7 @@ pub struct StorageConfig {
 }
 
 fn default_storage_path() -> String {
-    "target/data/pdc.db".to_string()
+    "./data/pdc.db".to_string()
 }
 
 fn default_storage_enabled() -> bool {
@@ -136,6 +145,18 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_port_auto_alloc() -> bool {
+    true
+}
+
+fn default_port_step() -> u16 {
+    10
+}
+
+fn default_auto_firewall_rule() -> bool {
+    true
+}
+
 impl Default for PdcConfig {
     fn default() -> Self {
         Self {
@@ -150,6 +171,9 @@ impl Default for PdcConfig {
             persistence: PersistenceConfig::default(),
             federation: Default::default(),
             log_level: default_log_level(),
+            port_auto_alloc: default_port_auto_alloc(),
+            port_step: default_port_step(),
+            auto_firewall_rule: default_auto_firewall_rule(),
         }
     }
 }

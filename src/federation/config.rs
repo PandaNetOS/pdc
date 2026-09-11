@@ -19,6 +19,12 @@ pub struct FederationConfig {
     /// 联邦监听端口
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    /// API/HTTP 监控端口（LPD 广播时告知对端，端口自动探测后为实际值）
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+    /// LPD 多播端口（局域网零配置发现，默认 6771，与 BitTorrent LPD 对齐）
+    #[serde(default = "default_lpd_multicast_port")]
+    pub lpd_multicast_port: u16,
     /// 最大连接数
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -173,6 +179,8 @@ pub struct FederationConfig {
 }
 
 fn default_listen_port() -> u16 { 6885 }
+fn default_api_port() -> u16 { 6880 }
+fn default_lpd_multicast_port() -> u16 { 6772 }
 fn default_max_connections() -> usize { 32 }
 fn default_target_neighbors() -> usize { 8 }
 fn default_heartbeat_interval() -> u64 { 30 }
@@ -227,6 +235,8 @@ impl Default for FederationConfig {
             node_id: None,
             seed_nodes: Vec::new(),
             listen_port: default_listen_port(),
+            api_port: default_api_port(),
+            lpd_multicast_port: default_lpd_multicast_port(),
             max_connections: default_max_connections(),
             target_neighbors: default_target_neighbors(),
             heartbeat_interval_secs: default_heartbeat_interval(),

@@ -9,6 +9,7 @@ pub mod config;
 pub mod connection;
 pub mod discovery;
 pub mod dht_discovery;
+pub mod lpd_discovery;
 pub mod gossip;
 pub mod merkle;
 pub mod metrics;
@@ -219,6 +220,7 @@ impl FederationService {
             node_table.clone(),
             identity.clone(),
             config.clone(),
+            config.api_port,
             shutdown_tx.clone(),
             data_dir,
         ));
