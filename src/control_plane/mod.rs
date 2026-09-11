@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use tracing::info;
 
 use crate::config::PdcConfig;
+use crate::discoverers::dht::DhtDiscoverer;
 use crate::discoverers::DiscovererRegistry;
 use crate::event_bus::EventBus;
 use crate::traits::PeerDiscoverer;
@@ -36,6 +37,8 @@ pub struct ControlPlane {
     event_bus: EventBus,
     /// TrackerRepo（可选，注入到 TrackerDiscoverer 实现统一数据归口）
     tracker_repo: Option<Arc<crate::storage::TrackerRepoImpl>>,
+    /// 主爬虫 DHT 发现器（共享给联邦 DHT 发现复用路由表）
+    dht_discoverer: Option<Arc<DhtDiscoverer>>,
 }
 
 impl ControlPlane {
@@ -46,6 +49,7 @@ impl ControlPlane {
             registry,
             event_bus,
             tracker_repo: None,
+            dht_discoverer: None,
         }
     }
 
@@ -96,7 +100,7 @@ impl ControlPlane {
     ///
     /// 根据配置中的 enable_tracker/enable_dht/enable_pex 等开关，
     /// 创建并注册对应的发现器。
-    pub fn init_default_discoverers(&self) {
+    pub fn init_default_discoverers(&mut self) {
         let config = self.config();
 
         if config.discoverers.enable_tracker {
@@ -121,10 +125,9 @@ impl ControlPlane {
                 listen_port: config.discoverers.dht_listen_port,
                 ..Default::default()
             };
-            self.registry
-                .register(Box::new(crate::discoverers::dht::DhtDiscoverer::new(
-                    dht_config,
-                )));
+            let dht = Arc::new(crate::discoverers::dht::DhtDiscoverer::new(dht_config));
+            self.dht_discoverer = Some(dht.clone());
+            self.registry.register(Box::new((*dht).clone()));
         }
 
         if config.discoverers.enable_pex {
@@ -158,6 +161,11 @@ impl ControlPlane {
     }
 
     /// 获取调度策略
+    /// 获取主爬虫 DHT 发现器（共享给联邦 DHT 发现复用路由表）
+    pub fn dht_discoverer(&self) -> Option<Arc<DhtDiscoverer>> {
+        self.dht_discoverer.clone()
+    }
+
     pub fn policy(&self) -> policy::DiscoveryPolicy {
         let config = self.config();
         policy::DiscoveryPolicy::from_config(&config)

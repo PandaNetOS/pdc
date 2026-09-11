@@ -9,7 +9,6 @@ pub mod config;
 pub mod connection;
 pub mod discovery;
 pub mod dht_discovery;
-pub mod lpd_discovery;
 pub mod gossip;
 pub mod merkle;
 pub mod metrics;
@@ -169,6 +168,7 @@ impl FederationService {
         nat_manager: Arc<NatManager>,
         node_repo: Arc<NodeRepoImpl>,
         data_dir: &Path,
+        dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
         event_bus: Option<EventBus>,
         peer_repo: Option<Arc<PeerRepoImpl>>,
         infohash_repo: Option<Arc<InfohashRepoImpl>>,
@@ -223,6 +223,8 @@ impl FederationService {
             config.api_port,
             shutdown_tx.clone(),
             data_dir,
+            Some(node_repo.clone()),
+            dht_discoverer,
         ));
 
         // 8. 创建中继管理器
@@ -330,7 +332,12 @@ impl FederationService {
 
         // 4.1 启动时先执行一次 STUN 探测，确保 setup_mapping 能拿到 STUN 结果
         //     否则首次 setup_mapping 时 last_stun 为 None，reachability 会误判为 Unknown
-        self.nat_integration.stun_probe();
+        //     使用 spawn_blocking + 3秒超时，避免 STUN 无响应时阻塞 tokio 运行时
+        let nat_clone = self.nat_integration.clone();
+        let stun_handle = tokio::task::spawn_blocking(move || {
+            nat_clone.stun_probe();
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(3), stun_handle).await;
 
         // 5. 设置 NAT 映射
         self.nat_integration.setup_mapping();
@@ -565,7 +572,7 @@ mod tests {
         let node_repo = Arc::new(NodeRepoImpl::new(storage));
 
         let service = Arc::new(
-            FederationService::new(make_test_config(), nat, node_repo, &dir, None, None, None, None)
+            FederationService::new(make_test_config(), nat, node_repo.clone(), &dir, None, None, None, None, None)
                 .unwrap(),
         );
 

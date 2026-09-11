@@ -161,7 +161,7 @@ pub struct ControlBus {
 - 现在 `ControlPlane.register_discoverer()` 只收 `Box<dyn PeerDiscoverer>`；升级后 crawler/probe/pex/nat/tracker 都实现 `Controllable` 并注册到 ControlBus。
 - **FederationService 例外**：仅注册为"可启停"模块（`start`/`stop`），不接 `apply_policy` 的资源参数，避免 ICC 越界动跨实例资源。
 
-## 5. 控制闭环（Observe-Decide-Act）
+## 5. 控制闭环（Observe-Decide-Act-Verify）
 
 ```
 ┌───────────────────────────────────────────────────────┐
@@ -183,8 +183,16 @@ pub struct ControlBus {
 │  ControlBus.apply_policy()                              │
 └──────────────────────────┬────────────────────────────┘
                            ▼
+┌───────────────────────────────────────────────────────┐
+│  VERIFY   校验指令是否真生效（控制契约核心）              │
+│  · snapshot 回读实际值 vs 期望值                         │
+│  · 未生效→重试；连续失败→标记失控+告警+上报 pk             │
+└──────────────────────────┬────────────────────────────┘
+                           ▼
                     （状态变化回流到 OBSERVE，闭环）
 ```
+
+> **核心原理：没有反馈回路的控制不是控制，只是发命令。** ICC 的每个指令都带版本号、可回读、可验证——把「信任式控制」换成「验证式控制」（详见 5.1–5.5）。
 
 **策略引擎形态锁定（不接模型）**：
 
@@ -199,6 +207,53 @@ struct Rule { when: Condition, then: Action }   // 阈值/评分/健康度 → �
 ```
 
 规则全部来自 TOML（延续"可配置 + 默认值"约束），**无模型/权重文件**。大模型只存在于 pk 侧（后期），产出的意图经 SDK 进来由规则引擎落地。
+
+### 5.1 控制契约：指令版本化 + 幂等（治"拒绝/滞后/冲突"）
+
+这是 4.3 中 `Controllable` 的契约化升级——`apply_policy` 返回应用版本号，`snapshot` 回读实际值：
+
+```rust
+#[async_trait]
+pub trait Controllable {
+    // 全局递增版本号：模块必须应用最新版本，重复下发幂等
+    async fn apply_policy(&self, policy: &ControlPolicy) -> Result<PolicyApplied>;
+    // 回读"实际值"——不是"我收到了"，而是"我当前真的是这个值"
+    async fn snapshot(&self) -> ModuleSnapshot;
+}
+
+pub struct PolicyApplied { pub applied_version: u64 }
+```
+
+- `PolicyApplied.applied_version` 与下发版本比对：**版本落后 = 未生效**。
+- 模块**启动时主动向 ICC 拉取当前控制状态**（ICC 是控制真相源），重启后自动同步，避免失联。
+
+### 5.2 结构性强制：从"约定"到"结构约束"（治"绕过通道"）
+
+- **资源配额 = 信号量本身**：crawler/probe 的并发控制直接用账本租约实现，模块内部**不允许存在第二个并发计数器**。`acquire()` 失败 = 拿不到信号量 = 自然阻塞/跳过——配额通道从"建议"升级为"必经之门"。
+- **禁止裸周期循环**：TaskScheduler 提供唯一的 `spawn_periodic` 收口 API，代码评审 + 单测检查禁止模块自行 `tokio::spawn` 周期任务——排程通道从"可绕过"升级为"唯一入口"。
+
+### 5.3 指令优先级仲裁（治"配置冲突"）
+
+裁决规则写死：**pk 意图 > ICC 策略 > 本地 TOML > 内置默认值**。
+
+- `ConfigChanged` 热更新与 `apply_policy` 冲突时，以 ICC 最近一次下发的 policy 为准。
+- 例外：用户显式配置 `control_center.override_lock` 可锁定某参数（管理员强锁，ICC 不得覆盖）。
+
+### 5.4 失控检测与处置（治"拒绝/卡死/漂移"）
+
+每个指令带 `request_id`，ICC 记录三级状态：**已下发 → 已确认 → 已生效**（通过 snapshot 回读比对期望值）。
+
+```
+单次未生效          → 重试（指数退避）
+连续 3 次未生效      → 标记模块「失控」+ 告警事件 pdc.control.module_unresponsive
+失控后              → ICC 对该模块改走「保守策略」并上报 pk，不再盲等
+```
+
+### 5.5 fail-open 分级（界定"有意不听话"的范围）
+
+降级只针对**软策略**（节奏、优先级、配额建议）；**硬约束永不降级**：announce 热路径 <100μs、数据安全、评分唯一性。
+
+> **结论**：ICC 的设计目标不是"让一切绝对听话"，而是——**不听话可被检测（Verify）、可被仲裁（优先级规则）、可被处置（失控阶梯）**，把不确定性变成可观测、可收敛的不确定性。
 
 ## 6. pk ↔ ICC 的 SDK 契约
 

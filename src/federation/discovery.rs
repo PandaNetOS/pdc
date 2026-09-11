@@ -20,10 +20,13 @@ use tracing::{debug, info, warn};
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::{Connection, ConnectionManager};
 use crate::federation::dht_discovery::DhtDiscoveryService;
-use crate::federation::lpd_discovery::LpdDiscoveryService;
+use pnos_net::discovery::lpd::LpdDiscoveryService;
+use pnos_net::discovery::mqtt::MqttDiscoveryService;
+use pnos_net::types::DiscoveredNode;
 use crate::federation::node_id::{NodeAddress, NodeIdentity, NodeId, Reachability};
 use crate::federation::node_table::NodeTable;
 use crate::federation::peer_cache::PeerCache;
+use crate::storage::node_repo::NodeRepoImpl;
 use crate::federation::protocol::*;
 
 /// 节点发现服务
@@ -32,6 +35,10 @@ pub struct DiscoveryService {
     connection_manager: Arc<ConnectionManager>,
     /// 节点表
     node_table: Arc<NodeTable>,
+    /// 主爬虫节点库
+    node_repo: Option<Arc<NodeRepoImpl>>,
+    /// 主爬虫 DHT 发现器
+    dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
     /// 节点身份
     identity: Arc<NodeIdentity>,
     /// 配置
@@ -58,6 +65,8 @@ impl DiscoveryService {
         api_port: u16,
         shutdown: broadcast::Sender<()>,
         data_dir: &Path,
+        node_repo: Option<Arc<NodeRepoImpl>>,
+        dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
     ) -> Self {
         let peer_cache = if config.peer_cache_enabled {
             PeerCache::load(data_dir)
@@ -74,6 +83,8 @@ impl DiscoveryService {
             shutdown,
             data_dir: data_dir.to_path_buf(),
             peer_cache: RwLock::new(peer_cache),
+            node_repo,
+            dht_discoverer,
         }
     }
 
@@ -151,20 +162,75 @@ impl DiscoveryService {
                 self.config.listen_port,
                 self.config.dht_discovery_interval_secs,
                 self.shutdown.clone(),
+                self.node_repo.clone(),
+                self.dht_discoverer.clone(),
             ));
             dht_service.spawn();
         }
 
         // 4.1 启动 LPD 局域网多播发现（零配置核心：同网段节点自动发现）
+        // pnos-net 的 LPD 通过事件输出发现结果，此处订阅后加入 NodeTable
+        let (discovered_tx, mut discovered_rx) = broadcast::channel::<DiscoveredNode>(64);
         let lpd_service = Arc::new(LpdDiscoveryService::new(
-            self.node_table.clone(),
-            self.identity.clone(),
-            self.config.listen_port,   // 实际联邦端口
-            self.api_port,             // 实际 API 端口
-            self.config.lpd_multicast_port, // LPD 多播端口（配置化）
+            self.identity.node_id.0,
+            self.config.listen_port,
+            self.api_port,
+            self.config.lpd_multicast_port,
+            discovered_tx.clone(),
             self.shutdown.clone(),
         ));
         lpd_service.spawn();
+
+        // 4.1.1 启动 MQTT Rendezvous 发现（公网零配置主通道）
+        // 通过 UDP connect 公共地址获取出站 IP
+        let mut my_addresses: Vec<SocketAddr> = Vec::new();
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if let Ok(()) = socket.connect("8.8.8.8:80") {
+                if let Ok(local_addr) = socket.local_addr() {
+                    my_addresses.push(SocketAddr::new(local_addr.ip(), self.config.listen_port));
+                }
+            }
+        }
+        let mqtt_service = Arc::new(MqttDiscoveryService::new(
+            self.identity.node_id.0,
+            self.config.listen_port,
+            self.api_port,
+            my_addresses.clone(),
+            discovered_tx.clone(),
+            self.shutdown.clone(),
+        ));
+        mqtt_service.spawn();
+        info!("[federation] MQTT Rendezvous 发现已启动，本地地址: {:?}", my_addresses);
+
+        // 4.2 订阅 LPD/MQTT 发现事件，加入节点表由 ConnectionManager 自动连接
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match discovered_rx.recv().await {
+                    Ok(node) => {
+                        info!("[federation] 收到发现事件: source={}, node_id={}, addrs={:?}", node.source, hex::encode(node.node_id.0), node.addresses);
+                        for addr in &node.addresses {
+                            let temp_id = crate::federation::node_id::NodeId::random();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let node_addr = crate::federation::node_id::NodeAddress {
+                                node_id: temp_id.0,
+                                ipv4_addr: if addr.is_ipv4() { Some(*addr) } else { None },
+                                ipv6_addr: if addr.is_ipv6() { Some(*addr) } else { None },
+                                reachability: crate::federation::node_id::Reachability::Unknown,
+                                last_seen: now,
+                                nat_type: None,
+                            };
+                            self_clone.node_table.add_or_update(node_addr);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
 
         // 5. 启动 peer_cache 定期保存任务
         if self.config.peer_cache_enabled {
@@ -574,7 +640,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir, None, None);
 
         let nodes = vec![
             make_node_address(1, 6885),
@@ -605,7 +671,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir, None, None);
 
         let nodes = vec![make_node_address(5, 6890), make_node_address(6, 6891)];
         discovery.handle_exchange_nodes(nodes);
@@ -628,7 +694,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity.clone(), make_test_config(), 0, shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity.clone(), make_test_config(), 0, shutdown_tx, &dir, None, None);
 
         // 包含自己的节点
         let mut self_addr = make_node_address(0, 6885);
@@ -656,7 +722,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = Arc::new(DiscoveryService::new(cm, node_table, identity, make_test_config(), 0, shutdown_tx, &dir));
+        let discovery = Arc::new(DiscoveryService::new(cm, node_table, identity, make_test_config(), 0, shutdown_tx, &dir, None, None));
 
         // 没有种子节点，应该立即返回（但会启动 DHT 发现和缓存保存）
         discovery.bootstrap().await;
@@ -678,7 +744,7 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir);
+        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir, None, None);
 
         // 添加节点并标记为已连接
         node_table.add_or_update(make_node_address(1, 6885));

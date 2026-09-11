@@ -38,14 +38,59 @@ use PeerDiscoveryCenter::storage::{InfohashRepository, NodeRepository, TrackerRe
 use PeerDiscoveryCenter::intelligence::{DhtActivityTracker, PeerHistoryManager, AvailabilityCalculator, TaskScheduler, TaskMetadata, TaskPriority, ResourceProfile, ResourceLevel};
 use PeerDiscoveryCenter::services::{ScrapeService, MetadataService};
 
+/// 工作目录管理（pnos-spec 未提供 workdir 模块，pdc 自实现）
+/// 目录结构：<root>/config/config.yaml, <root>/data/*.db, <root>/logs/
+#[derive(Debug, Clone)]
+struct WorkDir {
+    pub root: std::path::PathBuf,
+    pub logs_dir: std::path::PathBuf,
+}
+
+impl WorkDir {
+    fn standalone(dir: impl AsRef<std::path::Path>, _name: &str) -> Self {
+        let root = dir.as_ref().to_path_buf();
+        Self {
+            logs_dir: root.join("logs"),
+            root,
+        }
+    }
+
+    fn auto_detect(_name: &str) -> Self {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        Self {
+            logs_dir: root.join("logs"),
+            root,
+        }
+    }
+
+    fn ensure_dirs(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(self.root.join("config"))?;
+        std::fs::create_dir_all(self.root.join("data"))?;
+        std::fs::create_dir_all(&self.logs_dir)?;
+        Ok(())
+    }
+
+    fn config_file(&self) -> std::path::PathBuf {
+        self.root.join("config").join("config.yaml")
+    }
+
+    fn db_file(&self, name: &str) -> std::path::PathBuf {
+        self.root.join("data").join(format!("{}.db", name))
+    }
+
+    fn node_id_file(&self) -> std::path::PathBuf {
+        self.root.join("data").join("node_id")
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> anyhow::Result<()> {
     // 0. 初始化统一工作目录（pnos-spec WorkDir）
     //    --work-dir 参数 → Standalone 模式；PNOS_APP_ID 环境变量 → Managed 模式；否则 Standalone(当前目录)
     let work_dir = if let Some(dir) = parse_work_dir_arg() {
-        pnos::workdir::WorkDir::standalone(&dir, "pdc")
+        WorkDir::standalone(&dir, "pdc")
     } else {
-        pnos::workdir::WorkDir::auto_detect("pdc")
+        WorkDir::auto_detect("pdc")
     };
     if let Err(e) = work_dir.ensure_dirs() {
         eprintln!("[main] 创建工作目录失败: {}", e);
@@ -182,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 3.8 创建控制面（注入 tracker_repo，发现器初始化时自动同步）
-    let control_plane = ControlPlane::new(config.clone(), registry.clone(), event_bus.clone())
+    let mut control_plane = ControlPlane::new(config.clone(), registry.clone(), event_bus.clone())
         .with_tracker_repo(tracker_repo.clone());
 
     // 4. 初始化默认发现器（TrackerDiscoverer 会自动注入 tracker_repo）
@@ -244,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
             nat.clone(),
             node_repo.clone(),
             data_dir,
+            control_plane.dht_discoverer(),
             Some(event_bus.clone()),
             Some(peer_repo.clone()),
             Some(infohash_repo.clone()),

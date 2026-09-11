@@ -51,6 +51,7 @@ bytes = "1"
 serde-big-array = "0.5"
 socket2 = "0.6"
 pnos = { path = "../pnos-spec" }
+pnos-net = { path = "../pnos-sdk/crates/pnos-net" }
 
 [dev-dependencies]
 tokio-test = "0.4"

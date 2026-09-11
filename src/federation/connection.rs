@@ -120,6 +120,8 @@ pub struct ConnectionManager {
     signaling_service: OnceCell<Arc<SignalingService>>,
     /// 中继管理器（延迟注入）
     relay_manager: OnceCell<Arc<crate::federation::relay::RelayManager>>,
+    /// pnos-net 外部互联 Agent（延迟注入，用于替代原始 TCP 连接）
+    net_agent: OnceCell<Arc<pnos_net::NetAgent>>,
     /// 监控指标
     metrics: Arc<FederationMetrics>,
     /// 重连冷却到期时间（NodeId -> 冷却截止时刻），断开后在此时间内不主动重连
@@ -156,6 +158,7 @@ impl ConnectionManager {
             sync_manager: OnceCell::new(),
             signaling_service: OnceCell::new(),
             relay_manager: OnceCell::new(),
+            net_agent: OnceCell::new(),
             metrics,
             cooldown_until: RwLock::new(FxHashMap::default()),
             heavy_task_semaphore: Arc::new(Semaphore::new(
@@ -196,6 +199,14 @@ impl ConnectionManager {
     /// 注入中继管理器（由 FederationService 调用）
     pub fn set_relay_manager(&self, relay: Arc<crate::federation::relay::RelayManager>) {
         let _ = self.relay_manager.set(relay);
+    }
+
+    /// 注入 pnos-net 外部互联 Agent（由 FederationService 调用）
+    ///
+    /// 注入后，connect_to 会优先使用 NetAgent 的连接策略引擎
+    /// （TCP直连 → UDP打洞 → 中继），而非原始 TcpTransport::connect。
+    pub fn set_net_agent(&self, agent: Arc<pnos_net::NetAgent>) {
+        let _ = self.net_agent.set(agent);
     }
 
     /// 握手后向对端发送 PeerInfo（本地各 repo 条目数），供对端在全量同步数据源选择时
@@ -369,15 +380,61 @@ impl ConnectionManager {
 
         self.node_table.mark_connecting(&node_id);
 
-        let transport = match TcpTransport::connect(addr).await {
-            Ok(t) => {
-                t.with_metrics(self.metrics.clone())
-                    .with_write_timeout(Duration::from_secs(self.config.transport_write_timeout_secs))
+        // 建立 TCP 连接：优先使用 NetAgent（直连→打洞→中继），回退到原始连接
+        let transport = if let Some(agent) = self.net_agent.get() {
+            let net_node_id = pnos_net::types::NodeId(node_id.0);
+            let (reachability, nat_type) = self
+                .node_table
+                .get(&node_id)
+                .map(|e| {
+                    let r = match e.info.reachability {
+                        crate::federation::node_id::Reachability::PublicIpv6 => {
+                            pnos_net::types::Reachability::PublicIpv6
+                        }
+                        crate::federation::node_id::Reachability::Mapped => {
+                            pnos_net::types::Reachability::Mapped
+                        }
+                        crate::federation::node_id::Reachability::HolePunchable => {
+                            pnos_net::types::Reachability::HolePunchable
+                        }
+                        crate::federation::node_id::Reachability::OutboundOnly => {
+                            pnos_net::types::Reachability::OutboundOnly
+                        }
+                        crate::federation::node_id::Reachability::Unknown => {
+                            pnos_net::types::Reachability::Unknown
+                        }
+                    };
+                    (r, e.info.nat_type.clone())
+                })
+                .unwrap_or((pnos_net::types::Reachability::Unknown, None));
+
+            match agent
+                .connect_to(net_node_id, &[addr], reachability, nat_type)
+                .await
+            {
+                Ok(result) => TcpTransport::new(result.connection.stream)
+                    .with_metrics(self.metrics.clone())
+                    .with_write_timeout(Duration::from_secs(
+                        self.config.transport_write_timeout_secs,
+                    )),
+                Err(e) => {
+                    self.connecting.write().remove(&addr);
+                    self.node_table.mark_failed(&node_id);
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                self.connecting.write().remove(&addr);
-                self.node_table.mark_failed(&node_id);
-                return Err(e);
+        } else {
+            match TcpTransport::connect(addr).await {
+                Ok(t) => t
+                    .with_metrics(self.metrics.clone())
+                    .with_write_timeout(Duration::from_secs(
+                        self.config.transport_write_timeout_secs,
+                    )),
+                Err(e) => {
+                    self.connecting.write().remove(&addr);
+                    self.node_table.mark_failed(&node_id);
+                    return Err(e);
+                }
             }
         };
 

@@ -20,8 +20,10 @@ use tracing::{debug, info, warn};
 use crate::discoverers::dht::{DhtConfig, DhtDiscoverer};
 use crate::federation::node_id::{NodeAddress, NodeId, Reachability};
 use crate::federation::node_table::NodeTable;
+use crate::storage::node_repo::NodeRepoImpl;
 use crate::traits::{AnnounceEvent, PeerDiscoverer};
 use crate::types::Infohash;
+use pnos_net::types::{DiscoveredNode, DiscoverySource, Reachability as NetReachability};
 
 /// PDC 联邦网络魔法 infohash
 ///
@@ -35,16 +37,20 @@ pub const PDC_FEDERATION_MAGIC_INFOHASH: Infohash = [
 
 /// DHT 发现服务
 pub struct DhtDiscoveryService {
-    /// DHT 客户端（独立实例，不影响主爬虫）
-    dht: DhtDiscoverer,
+    /// DHT 客户端（优先复用主爬虫实例，路由表更健康）
+    dht: Arc<DhtDiscoverer>,
     /// 节点表
     node_table: Arc<NodeTable>,
+    /// 主爬虫节点库（用于注入种子节点）
+    node_repo: Option<Arc<NodeRepoImpl>>,
     /// 联邦监听端口（announce 时告知其他节点）
     federation_port: u16,
     /// 发现间隔（秒）
     interval_secs: u64,
     /// 关闭信号
     shutdown: broadcast::Sender<()>,
+    /// pnos-net 发现事件发送端
+    discovered_tx: Option<broadcast::Sender<DiscoveredNode>>,
 }
 
 impl DhtDiscoveryService {
@@ -60,14 +66,18 @@ impl DhtDiscoveryService {
         federation_port: u16,
         interval_secs: u64,
         shutdown: broadcast::Sender<()>,
+        node_repo: Option<Arc<NodeRepoImpl>>,
+        external_dht: Option<Arc<DhtDiscoverer>>,
     ) -> Self {
-        let dht = DhtDiscoverer::new(DhtConfig::default());
+        let dht = external_dht.unwrap_or_else(|| Arc::new(DhtDiscoverer::new(DhtConfig::default())));
         Self {
             dht,
             node_table,
+            node_repo,
             federation_port,
             interval_secs,
             shutdown,
+            discovered_tx: None,
         }
     }
 
@@ -75,22 +85,35 @@ impl DhtDiscoveryService {
     pub fn spawn(self: Arc<Self>) {
         let mut shutdown_rx = self.shutdown.subscribe();
         tokio::spawn(async move {
+            // 0. 从主爬虫 NodeRepo 注入种子节点（仅自建 DHT 时）
+            if let Some(repo) = &self.node_repo {
+                let seeds: Vec<(String, u16)> = repo.top_nodes_sync(2000).into_iter()
+                    .map(|e| (e.addr.ip().to_string(), e.addr.port()))
+                    .collect();
+                let injected = self.dht.seed_from_entries(&seeds);
+                info!("[dht] 从 NodeRepo 注入 {} 个种子节点", injected);
+            }
+
             // 先初始化 DHT（引导到公共 DHT 网络）
             if let Err(e) = self.dht.init().await {
                 warn!("[federation] DHT 初始化失败: {}", e);
                 return;
             }
             info!(
-                "[federation] DHT 魔法 infohash 发现已启动，联邦端口: {}, 间隔: {}s",
+                "[federation] DHT 魔法 infohash 发现已启动，联邦端口: {}, 间隔: {}s（冷启动前5次=30s）",
                 self.federation_port, self.interval_secs
             );
 
-            let mut ticker = tokio::time::interval(Duration::from_secs(self.interval_secs));
-            ticker.tick().await; // 跳过第一次立即触发
+            // 冷启动：立即执行第一次发现
+            self.clone().discovery_tick().await;
 
+            // 前 5 次短间隔 30s，之后长间隔
+            let mut tick_count = 0u32;
             loop {
+                let interval = if tick_count < 5 { 30 } else { self.interval_secs };
                 tokio::select! {
-                    _ = ticker.tick() => {
+                    _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+                        tick_count += 1;
                         self.clone().discovery_tick().await;
                     }
                     _ = shutdown_rx.recv() => {
@@ -104,23 +127,10 @@ impl DhtDiscoveryService {
 
     /// 单次发现：先 announce 自己，再 get_peers 发现其他节点
     async fn discovery_tick(self: Arc<Self>) {
-        // 1. announce 自己到魔法 infohash，让其他 PDC 节点能找到我们
-        if let Err(e) = self
-            .dht
-            .announce(
-                &PDC_FEDERATION_MAGIC_INFOHASH,
-                self.federation_port,
-                AnnounceEvent::Started,
-            )
-            .await
-        {
-            debug!("[federation] DHT announce 失败: {}", e);
-        }
-
-        // 2. get_peers 发现其他已 announce 的 PDC 节点
+        // 迭代式查找 + 同步 announce（保证 announce 与 discover 查询同一批节点，100% 重叠）
         match self
             .dht
-            .discover_peers(&PDC_FEDERATION_MAGIC_INFOHASH, 50)
+            .discover_and_announce(&PDC_FEDERATION_MAGIC_INFOHASH, self.federation_port)
             .await
         {
             Ok(peers) => {
@@ -151,7 +161,7 @@ impl DhtDiscoveryService {
                 }
             }
             Err(e) => {
-                debug!("[federation] DHT get_peers 失败: {}", e);
+                debug!("[federation] DHT discover+announce 失败: {}", e);
             }
         }
     }
@@ -163,4 +173,47 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 处理 DHT 发现的 peer 列表：加入节点表 + 发送到 pnos-net 事件通道
+fn process_peers(
+    peers: &[crate::types::PeerInfo],
+    node_table: &Arc<NodeTable>,
+    discovered_tx: Option<&broadcast::Sender<DiscoveredNode>>,
+) {
+    let now = current_unix_secs();
+    let mut new_count = 0;
+    for peer in peers {
+        let addr = peer.addr;
+        let temp_id = NodeId::random();
+        let node_addr = NodeAddress {
+            node_id: temp_id.0,
+            ipv4_addr: if addr.is_ipv4() { Some(addr) } else { None },
+            ipv6_addr: if addr.is_ipv6() { Some(addr) } else { None },
+            reachability: Reachability::Unknown,
+            last_seen: now,
+            nat_type: None,
+        };
+        if node_table.add_or_update(node_addr) {
+            new_count += 1;
+        }
+        if let Some(tx) = discovered_tx {
+            let discovered = DiscoveredNode {
+                node_id: pnos_net::types::NodeId(temp_id.0),
+                addresses: vec![addr],
+                reachability: NetReachability::Unknown,
+                nat_type: None,
+                source: DiscoverySource::Dht,
+                last_seen: now,
+            };
+            let _ = tx.send(discovered);
+        }
+    }
+    if new_count > 0 {
+        info!(
+            "[federation] DHT 发现 {} 个新 PDC 节点，节点表总数: {}",
+            new_count,
+            node_table.len()
+        );
+    }
 }

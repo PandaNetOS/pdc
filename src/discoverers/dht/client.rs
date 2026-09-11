@@ -79,9 +79,11 @@ struct QueryResult {
     peers: Vec<SocketAddr>,
     nodes: Vec<DhtNode>,
     responder_id: [u8; 20],
+    token: Option<Vec<u8>>,
 }
 
 /// DHT 发现器
+#[derive(Clone)]
 pub struct DhtDiscoverer {
     config: DhtConfig,
     /// Kademlia 路由表
@@ -213,6 +215,7 @@ impl DhtDiscoverer {
                 peers: response.values,
                 nodes: response.nodes,
                 responder_id: response.node_id,
+                token: response.token,
             });
         }
 
@@ -220,6 +223,7 @@ impl DhtDiscoverer {
             peers: vec![],
             nodes: vec![],
             responder_id: [0u8; 20],
+            token: None,
         })
     }
 
@@ -232,8 +236,134 @@ impl DhtDiscoverer {
             stats.record_failure();
         }
     }
-}
 
+    /// 迭代式查找 + 同步 announce（保证 announce 与 discover 查询同一批节点，100% 重叠）
+    ///
+    /// 在 Kademlia 迭代查找过程中，每收到一个节点的 get_peers 响应（含 token），
+    /// 立即向该节点发送 announce_peer。这样 discover 查询到的节点就是 announce 的节点，
+    /// 彻底解决"announce 到 A 节点、discover 查 B 节点"导致的互相发现不到问题。
+    pub async fn discover_and_announce(
+        &self,
+        infohash: &Infohash,
+        announce_port: u16,
+    ) -> anyhow::Result<Vec<PeerInfo>> {
+        self.init().await?;
+
+        let start = Instant::now();
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let our_id = self.config.node_id;
+
+        let mut all_peers: HashSet<SocketAddr> = HashSet::new();
+        let mut queried: HashSet<SocketAddr> = HashSet::new();
+        let mut closest_distance = [0xFFu8; 20];
+        let mut rounds_without_improvement = 0;
+        let mut announced_count = 0usize;
+
+        for round in 0..self.config.max_query_rounds {
+            let candidates = self.nearest_nodes(infohash, 20);
+            let to_query: Vec<_> = candidates
+                .into_iter()
+                .filter(|n| !queried.contains(&n.addr))
+                .take(self.config.max_concurrent_requests)
+                .collect();
+
+            if to_query.is_empty() {
+                break;
+            }
+
+            let nearest = &to_query[0];
+            let dist = DhtMessage::xor_distance(&nearest.id, infohash);
+            if DhtMessage::distance_less(&dist, &closest_distance) {
+                closest_distance = dist;
+                rounds_without_improvement = 0;
+            } else {
+                rounds_without_improvement += 1;
+                if rounds_without_improvement >= 2 {
+                    break;
+                }
+            }
+
+            let mut tasks = vec![];
+            for node in &to_query {
+                queried.insert(node.addr);
+                let socket = socket.clone();
+                let node_addr = node.addr;
+                let ih = *infohash;
+                let timeout = self.config.request_timeout;
+
+                tasks.push(tokio::spawn(async move {
+                    let result =
+                        DhtDiscoverer::query_node(&socket, node_addr, &our_id, &ih, timeout).await;
+                    (node_addr, result)
+                }));
+            }
+
+            for task in tasks {
+                if let Ok((node_addr, result)) = task.await {
+                    match result {
+                        Ok(qr) => {
+                            for peer in qr.peers {
+                                all_peers.insert(peer);
+                            }
+                            for node in &qr.nodes {
+                                if !queried.contains(&node.addr) {
+                                    self.add_node(node);
+                                }
+                            }
+                            // 关键：收到 token 后立即 announce，保证与 discover 节点 100% 重叠
+                            if let Some(token) = &qr.token {
+                                let tid = rand::thread_rng().gen::<[u8; 2]>();
+                                let announce_msg = DhtMessage::build_announce_peer(
+                                    &tid,
+                                    &our_id,
+                                    infohash,
+                                    announce_port,
+                                    token,
+                                );
+                                if socket.send_to(&announce_msg, node_addr).await.is_ok() {
+                                    announced_count += 1;
+                                }
+                            }
+                            self.mark_node_success(&node_addr, qr.responder_id, start.elapsed().as_millis() as u64);
+                        }
+                        Err(_) => {
+                            self.mark_node_failure(&node_addr);
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            "[dht] discover+announce: {} peers, announce {}/{} nodes (耗时 {:?})",
+            all_peers.len(),
+            announced_count,
+            queried.len(),
+            start.elapsed()
+        );
+
+        Ok(all_peers.into_iter().map(|addr| PeerInfo::new(addr, PeerSource::Dht)).collect())
+    }
+
+
+    /// 从 NodeRepo 条目批量注入种子节点到路由表
+    pub fn seed_from_entries(&self, entries: &[(String, u16)]) -> usize {
+        use rand::Rng;
+        let mut injected = 0;
+        for (ip_str, port) in entries {
+            if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                let addr = SocketAddr::new(ip, *port);
+                let mut id = [0u8; 20];
+                rand::thread_rng().fill(&mut id);
+                let entry = DhtNode { id, addr };
+                self.add_node(&entry);
+                injected += 1;
+            }
+        }
+        injected
+    }
+
+}
 #[async_trait]
 impl PeerDiscoverer for DhtDiscoverer {
     fn name(&self) -> &str {
