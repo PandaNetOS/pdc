@@ -76,6 +76,8 @@ pub struct FederationStatus {
     pub node_repo_total: u64,
     /// PeerRepo 实际总条目数（非联邦同步累计）
     pub peer_repo_total: u64,
+    /// PeerRepo 活跃 peer 数（最近1小时内有活跃）
+    pub peer_repo_active: u64,
     /// InfohashRepo 实际总条目数（非联邦同步累计）
     pub infohash_repo_total: u64,
     /// TrackerRepo 实际总条目数（非联邦同步累计）
@@ -342,11 +344,36 @@ impl FederationService {
         // 5. 设置 NAT 映射
         self.nat_integration.setup_mapping();
 
+        // 5.1 同步公网地址到 DiscoveryService（MQTT Rendezvous 上报时优先使用公网地址）
+        let public_addr = self.nat_integration.get_public_address();
+        self.discovery.set_public_addr(public_addr);
+
+        // 5.2 定期同步公网地址（NAT 映射可能变化）
+        let nat_clone = self.nat_integration.clone();
+        let discovery_clone = self.discovery.clone();
+        let mut shutdown_rx = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let addr = nat_clone.get_public_address();
+                        discovery_clone.set_public_addr(addr);
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        });
+
         // 6. 启动 Node 同步任务
         self.sync_manager.clone().spawn_node_sync();
 
         // 6.1 启动 Merkle 异步批量 flush 任务（apply 入队后后台批量更新 Merkle 树）
         self.sync_manager.clone().spawn_merkle_flusher();
+
+        // 6.2 启动时从 repo 全量重建 Merkle 树（修复启动时 Merkle 为空导致差量同步推不全）
+        self.sync_manager.clone().spawn_merkle_rebuilder();
 
         // 7. 启动 Gossip 传播任务
         self.gossip_engine.clone().spawn_gossip_propagation();
@@ -480,6 +507,7 @@ impl FederationService {
             // Repo 实际总数由 handler 从 AppState 填充，此处先置 0
             node_repo_total: 0,
             peer_repo_total: 0,
+            peer_repo_active: 0,
             infohash_repo_total: 0,
             tracker_repo_total: 0,
         }
@@ -652,6 +680,7 @@ mod tests {
             metrics: FederationMetricsSnapshot::default(),
             node_repo_total: 0,
             peer_repo_total: 0,
+            peer_repo_active: 0,
             infohash_repo_total: 0,
             tracker_repo_total: 0,
         };

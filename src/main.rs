@@ -707,7 +707,12 @@ async fn main() -> anyhow::Result<()> {
                         Ok(_) => saved += 1,
                         Err(e) => warn!("[persistence] InfohashRepo 保存失败: {}", e),
                     }
-                    // PeerRepo flush history buffer
+                    // PeerRepo 全量保存（当前 peer 状态到 peers 表）
+                    match peer_repo.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] PeerRepo 保存失败: {}", e),
+                    }
+                    // PeerRepo flush history buffer（历史记录到 peer_history 表）
                     match peer_repo.flush_history().await {
                         Ok(n) if n > 0 => debug!("[persistence] PeerRepo history flushed: {} records", n),
                         Err(e) => warn!("[persistence] PeerRepo history flush 失败: {}", e),

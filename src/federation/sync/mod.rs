@@ -74,10 +74,11 @@ pub struct SyncManager {
     shutdown: broadcast::Sender<()>,
     /// 已触发初始全量同步的对端节点集合（按对端去重，每个对端只同步一次）
     initial_sync_peers: RwLock<HashSet<NodeId>>,
-    /// 差量同步状态：全局最多1个并发。
-    /// Some((peer_id, start_time, last_progress_time))，None 表示空闲。
+    /// 差量同步状态：每 repo 独立并发，key=repo_type。
+    /// value=(peer_id, start_time, last_progress_time)。
     /// 大差异（Merkle 差异分片≥20%）时触发，只拉差异部分。
-    diff_sync_state: RwLock<Option<(NodeId, Instant, Instant)>>,
+    /// 全局最多4个并发（每repo1个）。
+    diff_sync_states: RwLock<FxHashMap<u8, (NodeId, Instant, Instant)>>,
     /// 最近变更缓冲区（Push-Pull Gossip 用）：(repo_type, key, version)
     /// 固定容量 500，写入时追加，超过容量弹出最旧。
     recent_changes: RwLock<VecDeque<(u8, Vec<u8>, u64)>>,
@@ -192,7 +193,7 @@ impl SyncManager {
             metrics,
             shutdown,
             initial_sync_peers: RwLock::new(HashSet::new()),
-            diff_sync_state: RwLock::new(None),
+            diff_sync_states: RwLock::new(FxHashMap::default()),
             recent_changes: RwLock::new(VecDeque::with_capacity(500)),
             peer_digests: RwLock::new(FxHashMap::default()),
         }
@@ -223,6 +224,50 @@ impl SyncManager {
             }
         });
         debug!("[federation] Node 同步任务已启动（间隔 {}s）", interval_secs);
+    }
+
+    /// 启动时从各 repo 全量重建 Merkle 树（延迟5秒）。
+    pub fn spawn_merkle_rebuilder(self: Arc<Self>) {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            info!("[federation] 开始从 repo 全量重建 Merkle 树");
+
+            let node_entries = self.collect_node_entries();
+            if !node_entries.is_empty() {
+                let batch: Vec<(&[u8], &[u8])> = node_entries.iter()
+                    .map(|e| (e.key.as_slice(), e.payload.as_slice())).collect();
+                self.node_merkle.update_batch(&batch);
+                info!("[federation] Node Merkle 重建: {} 条", node_entries.len());
+            }
+            if let Some(ps) = &self.peer_sync {
+                let entries = ps.collect_all_entries();
+                if !entries.is_empty() {
+                    let batch: Vec<(&[u8], &[u8])> = entries.iter()
+                        .map(|e| (e.key.as_slice(), e.payload.as_slice())).collect();
+                    ps.merkle().update_batch(&batch);
+                    info!("[federation] Peer Merkle 重建: {} 条", entries.len());
+                }
+            }
+            if let Some(ihs) = &self.infohash_sync {
+                let entries = ihs.collect_all_entries();
+                if !entries.is_empty() {
+                    let batch: Vec<(&[u8], &[u8])> = entries.iter()
+                        .map(|e| (e.key.as_slice(), e.payload.as_slice())).collect();
+                    ihs.merkle().update_batch(&batch);
+                    info!("[federation] Infohash Merkle 重建: {} 条", entries.len());
+                }
+            }
+            if let Some(ts) = &self.tracker_sync {
+                let entries = ts.collect_all_entries();
+                if !entries.is_empty() {
+                    let batch: Vec<(&[u8], &[u8])> = entries.iter()
+                        .map(|e| (e.key.as_slice(), e.payload.as_slice())).collect();
+                    ts.merkle().update_batch(&batch);
+                    info!("[federation] Tracker Merkle 重建: {} 条", entries.len());
+                }
+            }
+            info!("[federation] 所有 Merkle 树从 repo 重建完成");
+        });
     }
 
     /// 启动 Merkle 异步批量 flush 后台任务
@@ -682,110 +727,99 @@ impl SyncManager {
         );
     }
 
-    /// 触发差异全量同步（接收方）。
+    /// 触发差异全量同步（接收方），按 repo 独立触发、独立并发。
     ///
-    /// 由 Merkle 反熵驱动：当检测到与某对端的差异分片≥20%时调用。
-    /// 全局最多1个差量同步并发，通过 diff_sync_state 标志防止重复触发。
-    /// 发送 DiffSyncRequest（携带本地 Merkle 摘要），对端对比后只推送差异分片数据。
-    async fn trigger_diff_full_sync(self: Arc<Self>, peer: NodeId) {
-        // 尝试获取同步中标志（全局最多1个并发）
-        if !self.try_start_diff_sync(peer) {
+    /// 由 Merkle 反熵驱动：当检测到与某对端的某 repo 差异分片≥20%时调用。
+    /// 每 repo 最多1个差量同步并发，全局最多4个并行。
+    async fn trigger_diff_sync(self: Arc<Self>, peer: NodeId, repo_type: u8) {
+        if !self.try_start_diff_sync(peer, repo_type) {
             info!(
-                "[federation] 差异全量同步被跳过：已有同步进行中（请求对端={}）",
-                peer
+                "[federation] 差异全量同步被跳过：repo={} 已有同步进行中（请求对端={}）",
+                repo_type, peer
             );
             return;
         }
 
-        info!("[federation] 触发差异全量同步，对端={}", peer);
-
-        // 进入接收态：此后收到的 Gossip 只本地写入、不转发（防止洪峰放大）
+        info!("[federation] 触发差异全量同步，repo={}, 对端={}", repo_type, peer);
         self.gossip_engine.set_receiving_full_sync(true);
 
-        // 收集本地各 repo 的 Merkle 摘要，供对端计算差集
-        let digests: Vec<MerkleDigestMessage> = [repo_type::NODE, repo_type::PEER, repo_type::INFOHASH, repo_type::TRACKER]
-            .iter()
-            .map(|&rt| self.get_digest(rt))
-            .collect();
-
-        let req = DiffSyncRequestMessage { digests };
+        let digest = self.get_digest(repo_type);
+        let req = DiffSyncRequestMessage { digest };
         let sent = match self.connection_manager.get_connection(&peer) {
             Some(conn) => conn.send_message(MessageType::DiffSyncRequest, &req).await.is_ok(),
             None => false,
         };
         if !sent {
-            warn!("[federation] DiffSyncRequest 发送到 {} 失败，放弃本次差异全量", peer);
-            self.finish_diff_sync();
+            warn!("[federation] DiffSyncRequest 发送到 {} 失败（repo={}）", peer, repo_type);
+            self.finish_diff_sync(repo_type);
             return;
         }
         self.metrics.record_message_sent();
+        self.clone().spawn_diff_sync_watcher(repo_type);
 
-        // 启动超时监控任务（5分钟无进度 / 1小时硬超时）
-        self.clone().spawn_diff_sync_watcher();
-
-        // 接收稳态时长后认为同步完成（无显式完成信号，用时长兜底）
         let settle_ms = self.config.full_sync_receiving_settle_ms;
         let self_clone = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-            info!(
-                "[federation] 差异全量接收稳态 {}ms 到期，执行完成清理",
-                settle_ms
-            );
-            self_clone.finish_diff_sync();
+            info!("[federation] 差异全量接收稳态 {}ms 到期（repo={}）", settle_ms, repo_type);
+            self_clone.finish_diff_sync(repo_type);
         });
     }
 
-    /// 尝试开始差量同步：全局最多1个并发。
-    /// 返回 true 表示成功获取标志，false 表示已有同步进行中。
-    fn try_start_diff_sync(&self, peer: NodeId) -> bool {
-        let mut state = self.diff_sync_state.write();
-        if state.is_some() {
+    /// 尝试开始差量同步：每 repo 最多1个并发。
+    fn try_start_diff_sync(&self, peer: NodeId, repo_type: u8) -> bool {
+        let mut states = self.diff_sync_states.write();
+        if states.contains_key(&repo_type) {
             return false;
         }
         let now = Instant::now();
-        *state = Some((peer, now, now));
+        states.insert(repo_type, (peer, now, now));
         true
     }
 
     /// 更新差量同步进度（每收到一批 FullSyncBatch 时调用）。
     pub fn update_diff_progress(&self) {
-        let mut state = self.diff_sync_state.write();
-        if let Some((peer, start, _)) = state.take() {
-            *state = Some((peer, start, Instant::now()));
+        let mut states = self.diff_sync_states.write();
+        let now = Instant::now();
+        for (_, (_, _, last_progress)) in states.iter_mut() {
+            *last_progress = now;
         }
     }
 
-    /// 完成差量同步：清除标志、flush Merkle、恢复 Gossip 转发。
-    fn finish_diff_sync(&self) {
-        let had_sync = self.diff_sync_state.write().take().is_some();
+    /// 完成差量同步：清除该 repo 标志、重建该 repo Merkle。所有 repo 完成后才恢复 Gossip。
+    fn finish_diff_sync(&self, repo_type: u8) {
+        let had_sync = self.diff_sync_states.write().remove(&repo_type).is_some();
         if !had_sync {
             return;
         }
-        // 强制 flush Merkle 队列并重建，确保下一次对账准确
         self.flush_merkle_queue(usize::MAX);
-        self.node_merkle.rebuild_all();
-        if let Some(ps) = &self.peer_sync {
-            ps.merkle().rebuild_all();
+        match repo_type {
+            rt if rt == repo_type::NODE => self.node_merkle.rebuild_all(),
+            rt if rt == repo_type::PEER => {
+                if let Some(ps) = &self.peer_sync { ps.merkle().rebuild_all(); }
+            }
+            rt if rt == repo_type::INFOHASH => {
+                if let Some(ihs) = &self.infohash_sync { ihs.merkle().rebuild_all(); }
+            }
+            rt if rt == repo_type::TRACKER => {
+                if let Some(ts) = &self.tracker_sync { ts.merkle().rebuild_all(); }
+            }
+            _ => {}
         }
-        if let Some(ihs) = &self.infohash_sync {
-            ihs.merkle().rebuild_all();
+        let remaining = self.diff_sync_states.read().len();
+        if remaining == 0 {
+            let gossip = self.gossip_engine.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                gossip.set_receiving_full_sync(false);
+                info!("[federation] 所有差异全量完成，恢复 Gossip 转发");
+            });
         }
-        if let Some(ts) = &self.tracker_sync {
-            ts.merkle().rebuild_all();
-        }
-        // 延迟 30 秒恢复 Gossip 转发（给最后一批数据消化时间）
-        let gossip = self.gossip_engine.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            gossip.set_receiving_full_sync(false);
-            info!("[federation] 差异全量完成，延迟30秒后恢复 Gossip 正常转发");
-        });
-        info!("[federation] 差异全量同步完成，Merkle 树已重建");
+        info!("[federation] 差异全量完成（repo={}），剩余 {} 个 repo 同步中", repo_type, remaining);
     }
 
-    /// 差量同步超时监控任务：5分钟无进度或1小时硬超时则取消。
-    fn spawn_diff_sync_watcher(self: Arc<Self>) {
+    /// 差量同步超时监控（按repo独立）。
+    fn spawn_diff_sync_watcher(self: Arc<Self>, repo_type: u8) {
         let mut shutdown_rx = self.shutdown.subscribe();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -793,21 +827,19 @@ impl SyncManager {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let state = self.diff_sync_state.read().clone();
+                        let state = self.diff_sync_states.read().get(&repo_type).copied();
                         match state {
-                            None => break, // 同步已完成，监控退出
+                            None => break,
                             Some((peer, start, last_progress)) => {
                                 let now = Instant::now();
-                                let no_progress = now.duration_since(last_progress).as_secs() >= 300;
-                                let hard_timeout = now.duration_since(start).as_secs() >= 3600;
-                                if no_progress {
-                                    warn!("[federation] 差异全量同步5分钟无进度，取消（对端={}）", peer);
-                                    self.finish_diff_sync();
+                                if now.duration_since(last_progress).as_secs() >= 300 {
+                                    warn!("[federation] 差异全量5分钟无进度，取消（repo={}, 对端={}）", repo_type, peer);
+                                    self.finish_diff_sync(repo_type);
                                     break;
                                 }
-                                if hard_timeout {
-                                    warn!("[federation] 差异全量同步1小时硬超时，取消（对端={}）", peer);
-                                    self.finish_diff_sync();
+                                if now.duration_since(start).as_secs() >= 3600 {
+                                    warn!("[federation] 差异全量1小时硬超时，取消（repo={}, 对端={}）", repo_type, peer);
+                                    self.finish_diff_sync(repo_type);
                                     break;
                                 }
                             }
@@ -818,6 +850,7 @@ impl SyncManager {
             }
         });
     }
+
 
     // ========================================================================
     // Push-Pull Gossip（每30秒交换最近变更，兜底纯 Push 丢失的消息）
@@ -957,76 +990,76 @@ impl SyncManager {
         let window = self.config.full_sync_window_size;
         let mut total_pushed = 0usize;
 
-        // 对每个 repo，对比 Merkle 摘要，找出差异分片，只推送差异条目
-        for digest in &req.digests {
-            let merkle = match self.merkle_for_repo(digest.repo_type) {
-                Some(m) => m,
-                None => continue,
-            };
-
-            let diff_shards = merkle.diff(digest);
-            if diff_shards.is_empty() {
-                continue;
+        // 只处理请求中的单个 repo（按repo独立触发）
+        let digest = &req.digest;
+        let merkle = match self.merkle_for_repo(digest.repo_type) {
+            Some(m) => m,
+            None => {
+                self.gossip_engine.set_sending_full_sync(false);
+                return;
             }
+        };
 
-            // 从 MerkleTree 获取差异分片的所有条目
-            let raw_entries = merkle.entries_for_shards(&diff_shards);
-            if raw_entries.is_empty() {
-                continue;
-            }
+        let diff_shards = merkle.diff(digest);
+        if diff_shards.is_empty() {
+            self.gossip_engine.set_sending_full_sync(false);
+            return;
+        }
 
-            // 转换为 SyncEntry
-            let entries: Vec<SyncEntry> = raw_entries
-                .into_iter()
-                .map(|(key, payload)| SyncEntry {
-                    key,
-                    operation: operation::UPSERT,
-                    version: 0,
-                    payload,
-                })
-                .collect();
+        let raw_entries = merkle.entries_for_shards(&diff_shards);
+        if raw_entries.is_empty() {
+            self.gossip_engine.set_sending_full_sync(false);
+            return;
+        }
 
-            let total = entries.len();
-            info!(
-                "[federation] DiffSync 推送: repo_type={}, 差异分片={}, 条目={}, to={}",
-                digest.repo_type, diff_shards.len(), total, from_node_id
-            );
-            total_pushed += total;
+        let entries: Vec<SyncEntry> = raw_entries
+            .into_iter()
+            .map(|(key, payload)| SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: 0,
+                payload,
+            })
+            .collect();
 
-            // 发送 FullSyncStart
-            let start_msg = FullSyncStartMessage {
+        let total = entries.len();
+        info!(
+            "[federation] DiffSync 推送: repo_type={}, 差异分片={}, 条目={}, to={}",
+            digest.repo_type, diff_shards.len(), total, from_node_id
+        );
+        total_pushed = total;
+
+        let start_msg = FullSyncStartMessage {
+            repo_type: digest.repo_type,
+            total_entries: total as u64,
+        };
+        if let Err(e) = conn.send_message(MessageType::FullSyncStart, &start_msg).await {
+            warn!("[federation] FullSyncStart 发送失败: {}", e);
+            self.gossip_engine.set_sending_full_sync(false);
+            return;
+        }
+
+        let mut seq: u64 = 0;
+        for chunk in entries.chunks(batch_size) {
+            let batch_msg = FullSyncBatchMessage {
                 repo_type: digest.repo_type,
-                total_entries: total as u64,
+                entries: chunk.to_vec(),
+                seq,
             };
-            if let Err(e) = conn.send_message(MessageType::FullSyncStart, &start_msg).await {
-                warn!("[federation] FullSyncStart 发送失败: {}", e);
+            if let Err(e) = conn.send_message(MessageType::FullSyncBatch, &batch_msg).await {
+                warn!("[federation] FullSyncBatch seq={} 发送失败: {}", seq, e);
                 break;
             }
-
-            // 分批发送 FullSyncBatch
-            let mut seq: u64 = 0;
-            for chunk in entries.chunks(batch_size) {
-                let batch_msg = FullSyncBatchMessage {
-                    repo_type: digest.repo_type,
-                    entries: chunk.to_vec(),
-                    seq,
-                };
-                if let Err(e) = conn.send_message(MessageType::FullSyncBatch, &batch_msg).await {
-                    warn!("[federation] FullSyncBatch seq={} 发送失败: {}", seq, e);
-                    break;
-                }
-                seq += 1;
-                if seq % (window as u64) == 0 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+            seq += 1;
+            if seq % (window as u64) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-
-            // 发送 FullSyncComplete
-            let complete_msg = FullSyncCompleteMessage {
-                repo_type: digest.repo_type,
-            };
-            let _ = conn.send_message(MessageType::FullSyncComplete, &complete_msg).await;
         }
+
+        let complete_msg = FullSyncCompleteMessage {
+            repo_type: digest.repo_type,
+        };
+        let _ = conn.send_message(MessageType::FullSyncComplete, &complete_msg).await;
 
         self.gossip_engine.set_sending_full_sync(false);
         info!(
@@ -1294,7 +1327,7 @@ impl SyncManager {
                 "[federation] 差异≥20%，触发差异全量同步（repo_type={}, from={}）",
                 digest.repo_type, conn.node_id
             );
-            self.trigger_diff_full_sync(conn.node_id).await;
+            self.trigger_diff_sync(conn.node_id, digest.repo_type).await;
             return;
         }
 

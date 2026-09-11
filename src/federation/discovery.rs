@@ -51,6 +51,8 @@ pub struct DiscoveryService {
     data_dir: PathBuf,
     /// 节点缓存（持久化到磁盘）
     peer_cache: RwLock<PeerCache>,
+    /// NAT 映射后的公网地址（MQTT Rendezvous 上报时优先使用）
+    public_addr: RwLock<Option<SocketAddr>>,
 }
 
 impl DiscoveryService {
@@ -85,6 +87,15 @@ impl DiscoveryService {
             peer_cache: RwLock::new(peer_cache),
             node_repo,
             dht_discoverer,
+            public_addr: RwLock::new(None),
+        }
+    }
+
+    /// 设置 NAT 映射后的公网地址（MQTT Rendezvous 上报时优先使用）
+    pub fn set_public_addr(&self, addr: Option<SocketAddr>) {
+        *self.public_addr.write() = addr;
+        if let Some(a) = addr {
+            info!("[federation] Discovery 公网地址已更新: {}", a);
         }
     }
 
@@ -184,10 +195,18 @@ impl DiscoveryService {
         // 4.1.1 启动 MQTT Rendezvous 发现（公网零配置主通道）
         // 通过 UDP connect 公共地址获取出站 IP
         let mut my_addresses: Vec<SocketAddr> = Vec::new();
+        // 优先上报公网地址（NAT 映射后），外网节点可直连
+        if let Some(public) = *self.public_addr.read() {
+            my_addresses.push(public);
+        }
+        // 其次上报局域网地址，同局域网节点可低延迟直连
         if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
             if let Ok(()) = socket.connect("8.8.8.8:80") {
                 if let Ok(local_addr) = socket.local_addr() {
-                    my_addresses.push(SocketAddr::new(local_addr.ip(), self.config.listen_port));
+                    let lan_addr = SocketAddr::new(local_addr.ip(), self.config.listen_port);
+                    if !my_addresses.contains(&lan_addr) {
+                        my_addresses.push(lan_addr);
+                    }
                 }
             }
         }

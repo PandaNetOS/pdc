@@ -810,6 +810,19 @@ async fn federation_status_handler(State(state): State<AppState>) -> Response {
         .map(|r| r.len_sync() as u64)
         .unwrap_or(0);
     status.peer_repo_total = state.peer_repo.len() as u64;
+    // 计算活跃 peer 数（最近1小时内有活跃）
+    {
+        let all = state.peer_repo.all_peers_sync();
+        let now = std::time::SystemTime::now();
+        status.peer_repo_active = all
+            .iter()
+            .filter(|p| {
+                now.duration_since(p.last_active)
+                    .map(|d| d.as_secs() < 3600)
+                    .unwrap_or(false)
+            })
+            .count() as u64;
+    }
     status.infohash_repo_total = state
         .infohash_repo
         .as_ref()

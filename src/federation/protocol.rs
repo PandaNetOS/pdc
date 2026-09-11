@@ -304,7 +304,7 @@ pub struct SyncBatchMessage {
 }
 
 /// Merkle 摘要
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MerkleDigestMessage {
     /// 仓库类型
     pub repo_type: u8,
@@ -372,12 +372,13 @@ pub struct FullSyncCompleteMessage {
 
 /// 差量同步请求（Merkle 差异≥20%时触发）
 ///
-/// 请求方携带本地各 repo 的 Merkle 摘要，对端对比后找出差异分片，
+/// 请求方携带本地单个 repo 的 Merkle 摘要，对端对比后找出差异分片，
 /// 只推送差异分片的条目（不是全量）。
+/// 每个 repo 独立触发差量同步，独立并发。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiffSyncRequestMessage {
-    /// 发起方本地各 repo 的 Merkle 摘要（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）
-    pub digests: Vec<MerkleDigestMessage>,
+    /// 发起方本地单个 repo 的 Merkle 摘要
+    pub digest: MerkleDigestMessage,
 }
 
 /// 节点信息消息（握手后立即双向发送）
