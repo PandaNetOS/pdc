@@ -22,14 +22,16 @@ use crate::storage::TrackerRepoImpl;
 struct TrackerSyncPayload {
     url: String,
     disabled: bool,
+    last_seen: u64,
 }
 
 /// 构建 Tracker 同步条目的 (key, payload_bytes)。
 /// 格式与 collect_all_entries 一致，供 TrackerRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
-pub(crate) fn build_tracker_sync_entry(url: &str, disabled: bool) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn build_tracker_sync_entry(url: &str, disabled: bool, last_seen: u64) -> Option<(Vec<u8>, Vec<u8>)> {
     let payload = TrackerSyncPayload {
         url: url.to_string(),
         disabled,
+        last_seen,
     };
     let payload_bytes = bincode::serialize(&payload).ok()?;
     let key = url.as_bytes().to_vec();
@@ -106,9 +108,11 @@ impl TrackerSync {
         let mut entries = Vec::with_capacity(trackers.len());
         let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(trackers.len());
         for tracker in &trackers {
+            let ts = tracker.last_used.unwrap_or(now);
             let payload = TrackerSyncPayload {
                 url: tracker.url.clone(),
                 disabled: tracker.disabled,
+                last_seen: ts,
             };
             let payload_bytes = match bincode::serialize(&payload) {
                 Ok(b) => b,
@@ -155,9 +159,11 @@ impl TrackerSync {
         let key = url.as_bytes().to_vec();
         let payload = if operation == operation::UPSERT {
             let tracker = self.tracker_repo.get_tracker_sync(url);
+            let (disabled, last_used) = tracker.map(|t| (t.disabled, t.last_used)).unwrap_or((false, None));
             let p = TrackerSyncPayload {
                 url: url.to_string(),
-                disabled: tracker.map(|t| t.disabled).unwrap_or(false),
+                disabled,
+                last_seen: last_used.unwrap_or(now),
             };
             match bincode::serialize(&p) {
                 Ok(b) => b,
@@ -188,7 +194,7 @@ impl TrackerSync {
     /// 应用收到的 Tracker 同步数据
     pub fn apply_tracker_sync(&self, entries: &[SyncEntry]) {
         // 第一遍：过滤 DELETE / 反序列化失败，收集 url 并批量更新 Merkle
-        let mut urls: Vec<String> = Vec::new();
+        let mut items: Vec<(String, u64)> = Vec::new();
         let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
@@ -202,7 +208,7 @@ impl TrackerSync {
             };
 
             merkle_batch.push((entry.key.clone(), entry.payload.clone()));
-            urls.push(payload.url);
+            items.push((payload.url, payload.last_seen));
             applied += 1;
         }
 
@@ -216,8 +222,8 @@ impl TrackerSync {
         }
 
         // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
-        if !urls.is_empty() {
-            self.tracker_repo.add_trackers_batch_internal(&urls);
+        if !items.is_empty() {
+            self.tracker_repo.add_trackers_batch_internal(&items);
         }
 
         if applied > 0 {
@@ -245,9 +251,11 @@ impl TrackerSync {
 
         let mut entries = Vec::with_capacity(trackers.len());
         for tracker in &trackers {
+            let ts = tracker.last_used.unwrap_or(now);
             let payload = TrackerSyncPayload {
                 url: tracker.url.clone(),
                 disabled: tracker.disabled,
+                last_seen: ts,
             };
             let payload_bytes = match bincode::serialize(&payload) {
                 Ok(b) => b,
@@ -257,7 +265,7 @@ impl TrackerSync {
             entries.push(SyncEntry {
                 key,
                 operation: operation::UPSERT,
-                version: now,
+                version: ts,
                 payload: payload_bytes,
             });
         }
@@ -286,9 +294,11 @@ impl TrackerSync {
 
         let mut entries = Vec::new();
         for tracker in &trackers {
+            let ts = tracker.last_used.unwrap_or(now);
             let payload = TrackerSyncPayload {
                 url: tracker.url.clone(),
                 disabled: tracker.disabled,
+                last_seen: ts,
             };
             if let Ok(payload_bytes) = bincode::serialize(&payload) {
                 entries.push(SyncEntry {
@@ -351,6 +361,7 @@ use crate::federation::node_id::NodeIdentity;
         let payload = TrackerSyncPayload {
             url: "http://tracker.example.com:6969/announce".to_string(),
             disabled: false,
+            last_seen: 1000,
         };
         let bytes = bincode::serialize(&payload).unwrap();
         let decoded: TrackerSyncPayload = bincode::deserialize(&bytes).unwrap();
@@ -380,6 +391,7 @@ use crate::federation::node_id::NodeIdentity;
         let payload = TrackerSyncPayload {
             url: "http://test.tracker:6969/announce".to_string(),
             disabled: false,
+            last_seen: 1000,
         };
         let entries = vec![SyncEntry {
             key: b"http://test.tracker:6969/announce".to_vec(),

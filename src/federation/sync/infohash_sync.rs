@@ -115,8 +115,8 @@ impl InfohashSync {
 
     /// 应用收到的 Infohash 同步数据
     pub fn apply_infohash_sync(&self, entries: &[SyncEntry]) {
-        // 第一遍：过滤 DELETE / 反序列化失败，收集 (infohash, source) 并批量更新 Merkle
-        let mut items: Vec<(Infohash, String)> = Vec::new();
+        // 第一遍：过滤 DELETE / 反序列化失败，收集 (infohash, source, last_seen) 并批量更新 Merkle
+        let mut items: Vec<(Infohash, String, u64)> = Vec::new();
         let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
@@ -129,7 +129,7 @@ impl InfohashSync {
             };
 
             merkle_batch.push((entry.key.clone(), entry.payload.clone()));
-            items.push((payload.infohash, payload.source));
+            items.push((payload.infohash, payload.source, payload.seen_at_secs));
             applied += 1;
         }
 
@@ -165,18 +165,16 @@ impl InfohashSync {
     /// 注意：此方法不更新 Merkle 树，Merkle 树应在数据写入时更新，
     /// 避免在遍历大量数据时持有锁导致死锁。
     pub fn collect_all_entries(&self) -> Vec<SyncEntry> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         let infohashes = self.infohash_repo.all_sync();
         let mut entries = Vec::with_capacity(infohashes.len());
 
-        for infohash in &infohashes {
+        for (infohash, last_seen) in &infohashes {
+            let ts = if *last_seen > 0 { *last_seen } else {
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+            };
             let payload = InfohashSyncPayload {
                 infohash: *infohash,
-                seen_at_secs: now,
+                seen_at_secs: ts,
                 source: "federation_init".to_string(),
             };
             let payload_bytes = match bincode::serialize(&payload) {
@@ -187,7 +185,7 @@ impl InfohashSync {
             entries.push(SyncEntry {
                 key,
                 operation: operation::UPSERT,
-                version: now,
+                version: ts,
                 payload: payload_bytes,
             });
         }

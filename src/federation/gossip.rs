@@ -873,8 +873,8 @@ impl GossipEngine {
             None => return,
         };
 
-        // 发送 Node repo 的 MerkleDigest（阶段2主要同步 Node/Peer/Infohash）
-        for repo_type in &[repo_type::NODE, repo_type::PEER, repo_type::INFOHASH] {
+        // 发送所有 repo 的 MerkleDigest（Node/Peer/Infohash/Tracker）
+        for repo_type in &[repo_type::NODE, repo_type::PEER, repo_type::INFOHASH, repo_type::TRACKER] {
             let digest = merkle_provider.get_digest(*repo_type);
             if let Err(e) = conn.send_message(MessageType::MerkleDigest, &digest).await {
                 debug!("[federation] 反熵 MerkleDigest 发送失败: {}", e);

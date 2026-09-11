@@ -201,6 +201,27 @@ impl MerkleTree {
     pub fn shard_count(&self) -> u16 {
         self.shard_count
     }
+
+    /// 获取指定分片的所有条目（key, payload）
+    pub fn entries_for_shards(&self, shards: &[u16]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let shard_set: std::collections::HashSet<u16> = shards.iter().copied().collect();
+        self.entries
+            .read()
+            .iter()
+            .filter(|(k, _)| shard_set.contains(&self.shard_for_key(k)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// 判断 key 是否存在
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.entries.read().contains_key(key)
+    }
+
+    /// 获取 key 对应的 payload
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.entries.read().get(key).cloned()
+    }
 }
 
 /// Merkle 提供者 trait（用于 GossipEngine 的 anti-entropy 回调）

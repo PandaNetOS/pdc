@@ -90,14 +90,19 @@ impl TrackerRepoImpl {
     /// 内部写入：批量新增 tracker，不触发 Merkle/Gossip。
     /// 返回真正新增的 url 列表。
     /// 联邦同步入站（apply_tracker_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
-    pub(crate) fn add_trackers_batch_internal(&self, urls: &[String]) -> Vec<String> {
-        if urls.is_empty() {
+    pub(crate) fn add_trackers_batch_internal(&self, items: &[(String, u64)]) -> Vec<String> {
+        if items.is_empty() {
             return Vec::new();
         }
         let mut cache = self.cache.write();
         let mut new_urls: Vec<String> = Vec::new();
-        for url in urls {
-            if !cache.entries.contains_key(url) {
+        for (url, last_seen) in items {
+            if let Some(existing) = cache.entries.get_mut(url) {
+                // 已有条目：更新 last_used 取较大值
+                if existing.last_used.map_or(true, |t| *last_seen > t) {
+                    existing.last_used = Some(*last_seen);
+                }
+            } else {
                 cache.entries.insert(
                     url.clone(),
                     TrackerEntry {
@@ -110,7 +115,7 @@ impl TrackerRepoImpl {
                         total_peers_discovered: 0,
                         avg_response_time_ms: 0.0,
                         consecutive_failures: 0,
-                        last_used: None,
+                        last_used: Some(*last_seen),
                     },
                 );
                 new_urls.push(url.clone());
@@ -124,10 +129,14 @@ impl TrackerRepoImpl {
         if new_urls.is_empty() {
             return;
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_urls.len());
         for url in &new_urls {
             if let Some((k, p)) =
-                crate::federation::sync::tracker_sync::build_tracker_sync_entry(url, false)
+                crate::federation::sync::tracker_sync::build_tracker_sync_entry(url, false, now)
             {
                 built.push((k, p));
             }
@@ -137,7 +146,11 @@ impl TrackerRepoImpl {
 
     /// 同步加入单个 tracker（本地路径）：新 tracker 更新 Merkle + 提交 Gossip。
     pub fn add_tracker_sync(&self, url: String) {
-        let new_urls = self.add_trackers_batch_internal(&[url]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let new_urls = self.add_trackers_batch_internal(&[(url, now)]);
         self.propagate_trackers(new_urls);
     }
 
@@ -145,7 +158,12 @@ impl TrackerRepoImpl {
     /// 本地写入路径：新 tracker 更新 Merkle + 提交 Gossip。
     /// 联邦同步入站（apply_tracker_sync）请改用 add_trackers_batch_internal，避免回环。
     pub fn add_trackers_sync_batch(&self, urls: &[String]) -> usize {
-        let new_urls = self.add_trackers_batch_internal(urls);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let items: Vec<(String, u64)> = urls.iter().map(|u| (u.clone(), now)).collect();
+        let new_urls = self.add_trackers_batch_internal(&items);
         let count = new_urls.len();
         self.propagate_trackers(new_urls);
         count

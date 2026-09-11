@@ -145,7 +145,7 @@ impl TrackerPeerFetcher {
                         shuffled.swap(i, j);
                     }
                     shuffled.truncate(infohashes_per_round);
-                    shuffled
+                    shuffled.into_iter().map(|(ih, _)| ih).collect()
                 } else {
                     warn!("[tracker_fetcher] 未绑定 InfohashRepo，跳过本轮");
                     continue;

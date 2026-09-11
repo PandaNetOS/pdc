@@ -356,6 +356,9 @@ impl FederationService {
             .clone()
             .spawn_anti_entropy(self.sync_manager.clone());
 
+        // 7.2 启动 Push-Pull Gossip 任务（每30秒交换最近变更，兜底 Push 丢失的消息）
+        self.sync_manager.clone().spawn_push_pull_gossip();
+
         // 8. 启动中继通道清理
         self.relay_manager.clone().spawn_channel_cleanup();
 

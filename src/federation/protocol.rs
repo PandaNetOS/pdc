@@ -55,12 +55,17 @@ pub enum MessageType {
     /// Gossip 批量合并帧（多个 GossipBatch 合并为一个大帧发送，减少网络往返）。
     /// 假设对端支持此消息类型（当前所有对端同版本），未来需加能力协商。
     GossipBatchBulk = 20,
-    /// 全量同步请求（纯对等拉取：新节点向选中的数据源请求全量数据，
-    /// 数据源收到后才推送，否则不主动发，避免多节点重复推送）。
-    FullSyncRequest = 21,
+    /// 差量同步请求（Merkle 差异≥20%时触发，携带本地 Merkle 摘要，对端只推差异分片）
+    DiffSyncRequest = 21,
     /// 节点信息（握手后立即双向发送，携带本地各 repo 条目数，
     /// 供对端在数据源选择时判断哪个节点数据最完整）。
     PeerInfo = 22,
+    /// Push-Pull Gossip 摘要：携带本端最近变更的 key+version 列表
+    GossipDigest = 23,
+    /// Push-Pull Gossip 拉取请求：请求指定 key 的完整数据
+    GossipPullRequest = 24,
+    /// Push-Pull Gossip 拉取响应：返回完整条目数据
+    GossipPullResponse = 25,
 }
 
 impl MessageType {
@@ -88,8 +93,11 @@ impl MessageType {
             18 => Some(MessageType::FullSyncAck),
             19 => Some(MessageType::FullSyncComplete),
             20 => Some(MessageType::GossipBatchBulk),
-            21 => Some(MessageType::FullSyncRequest),
+            21 => Some(MessageType::DiffSyncRequest),
             22 => Some(MessageType::PeerInfo),
+            23 => Some(MessageType::GossipDigest),
+            24 => Some(MessageType::GossipPullRequest),
+            25 => Some(MessageType::GossipPullResponse),
             _ => None,
         }
     }
@@ -362,17 +370,14 @@ pub struct FullSyncCompleteMessage {
     pub repo_type: u8,
 }
 
-/// 全量同步请求（纯对等拉取）
+/// 差量同步请求（Merkle 差异≥20%时触发）
 ///
-/// 新节点（数据较少者）连接多个对等节点后，按「数据最完整 + 延迟最低」
-/// 选出唯一数据源，仅向其发送本消息；数据源收到后才推送全量数据。
-/// 请求方携带本地各 repo 的条目数，供数据源判断是否需要推送
-/// （避免新节点向老节点无谓推送 / 老节点向新节点空拉）。
+/// 请求方携带本地各 repo 的 Merkle 摘要，对端对比后找出差异分片，
+/// 只推送差异分片的条目（不是全量）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FullSyncRequestMessage {
-    /// 发起方本地各 repo 的总条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致），
-    /// 0 表示未知/为空。
-    pub local_entry_counts: Vec<u32>,
+pub struct DiffSyncRequestMessage {
+    /// 发起方本地各 repo 的 Merkle 摘要（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）
+    pub digests: Vec<MerkleDigestMessage>,
 }
 
 /// 节点信息消息（握手后立即双向发送）
@@ -383,6 +388,27 @@ pub struct FullSyncRequestMessage {
 pub struct PeerInfoMessage {
     /// 发送方本地各 repo 的总条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
     pub local_entry_counts: Vec<u32>,
+}
+
+/// Push-Pull Gossip 摘要：携带本端最近变更的 key+version 列表
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GossipDigestMessage {
+    /// 最近变更的条目：(repo_type, key, version)
+    pub changes: Vec<(u8, Vec<u8>, u64)>,
+}
+
+/// Push-Pull Gossip 拉取请求：请求指定 key 的完整数据
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GossipPullRequestMessage {
+    /// 请求的条目：(repo_type, key)
+    pub keys: Vec<(u8, Vec<u8>)>,
+}
+
+/// Push-Pull Gossip 拉取响应：返回完整条目数据
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GossipPullResponseMessage {
+    /// 完整条目：(repo_type, SyncEntry)
+    pub entries: Vec<(u8, SyncEntry)>,
 }
 
 /// 仓库类型常量

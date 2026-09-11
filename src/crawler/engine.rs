@@ -528,7 +528,7 @@ impl CrawlerEngine {
         // 获取要查询的 infohash（从 InfohashRepo 中取前 5 个）
         let infohashes = if let Some(repo) = &self.infohash_repo {
             let all = repo.all_sync();
-            all.into_iter().take(5).collect::<Vec<_>>()
+            all.into_iter().take(5).map(|(ih, _)| ih).collect::<Vec<_>>()
         } else {
             vec![]
         };
@@ -1044,7 +1044,7 @@ impl CrawlerEngine {
             QueryMethod::SampleInfohashes => {
                 // BEP 51: 返回我们已知的 infohash 样本
                 let all_infohashes = if let Some(repo) = &self.infohash_repo {
-                    repo.all_sync()
+                    repo.all_sync().into_iter().map(|(ih, _)| ih).collect()
                 } else {
                     vec![]
                 };

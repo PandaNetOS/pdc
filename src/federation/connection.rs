@@ -312,14 +312,9 @@ impl ConnectionManager {
         // 入站连接也需要更新 node_table 状态，否则连接维护任务会认为该节点未连接而反复重连
         self.node_table.mark_connected(&node_id, None);
 
-        // 纯对等拉取（P0-2）：入站连接不主动推送全量数据。
-        // 数据同步由出站方（数据较少者）选择数据源后发送 FullSyncRequest 触发；
-        // 本节点作为数据源，在收到 FullSyncRequest 时才推送（handle_full_sync_request）。
-        // 这消除了旧行为「每个入站连接都触发一次全量推送」导致的重复同步（旧 bug：每个节点触发 2 次全量）。
-        info!(
-            "[federation] 入站连接就绪（等待对端 FullSyncRequest，不主动推送）: {}",
-            node_id
-        );
+        // 连接建立后不再自动触发全量同步。
+        // 全量同步由 Merkle 反熵驱动：差异分片≥20%时即时触发差异全量。
+        info!("[federation] 入站连接就绪: {}", node_id);
 
         // 启动消息处理循环
         self.clone().spawn_message_handler(connection.clone()).await;
@@ -467,13 +462,8 @@ impl ConnectionManager {
         // 握手后立即发送 PeerInfo（携带本地条目数），供对端在数据源选择时判断数据完整度
         self.send_peer_info(&connection).await;
 
-        // 出站连接建立成功：作为纯对等拉取入口（P0-2）。
-        // 新节点（数据较少者）主动选择最佳数据源并发送 FullSyncRequest；
-        // SyncManager 内部按 initial_pull_done 去重，只发起一次。
-        // 旧行为出站即 trigger_initial_sync（双向各自推送）导致每个节点触发 2 次全量，已移除。
-        if let Some(sync_mgr) = self.sync_manager.get() {
-            sync_mgr.clone().on_connection_ready(peer_id);
-        }
+        // 连接建立后不再自动触发全量同步。
+        // 全量同步由 Merkle 反熵驱动：差异分片≥20%时即时触发差异全量。
 
         // 连接建立成功，移除 connecting 标记
         self.connecting.write().remove(&addr);
@@ -914,6 +904,8 @@ impl ConnectionManager {
                     if let Some(sync_mgr) = self.sync_manager.get() {
                         // 直接应用到 repo（不经过 Gossip 去重）
                         sync_mgr.handle_full_sync_batch(repo_type, &msg.entries);
+                        // 更新差量同步进度（防止无进度超时）
+                        sync_mgr.update_diff_progress();
                         // 回复 Ack
                         let ack = FullSyncAckMessage { repo_type, seq };
                         let _ = connection.send_message(MessageType::FullSyncAck, &ack).await;
@@ -929,16 +921,15 @@ impl ConnectionManager {
                 // 发送端接收 Ack，简化版不做流控等待
                 false
             }
-            MessageType::FullSyncRequest => {
-                // 纯对等拉取：对端（数据较少者）请求全量数据。本节点作为数据源，
-                // 异步判断本地数据是否更全，更全则推送。
+            MessageType::DiffSyncRequest => {
+                // 差量同步：对端携带 Merkle 摘要，本节点对比后只推送差异分片数据。
                 self.metrics.record_message_recv();
                 if let Some(sync_mgr) = self.sync_manager.get() {
                     let sync_mgr = sync_mgr.clone();
                     let conn = connection.clone();
-                    if let Ok(req) = bincode::deserialize::<FullSyncRequestMessage>(&payload) {
+                    if let Ok(req) = bincode::deserialize::<DiffSyncRequestMessage>(&payload) {
                         tokio::spawn(async move {
-                            sync_mgr.handle_full_sync_request(conn.node_id, req).await;
+                            sync_mgr.handle_diff_sync_request(conn.node_id, req).await;
                         });
                     }
                 }
@@ -951,6 +942,44 @@ impl ConnectionManager {
                 if let Some(sync_mgr) = self.sync_manager.get() {
                     if let Ok(msg) = bincode::deserialize::<PeerInfoMessage>(&payload) {
                         sync_mgr.handle_peer_info(connection.node_id, msg.local_entry_counts);
+                    }
+                }
+                false
+            }
+            MessageType::GossipDigest => {
+                // Push-Pull Gossip：收到对端最近变更摘要，对比本地后请求缺失的 key
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    if let Ok(msg) = bincode::deserialize::<GossipDigestMessage>(&payload) {
+                        tokio::spawn(async move {
+                            sync_mgr.handle_gossip_digest(&conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::GossipPullRequest => {
+                // Push-Pull Gossip：对端请求指定 key 的完整数据
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    if let Ok(msg) = bincode::deserialize::<GossipPullRequestMessage>(&payload) {
+                        tokio::spawn(async move {
+                            sync_mgr.handle_gossip_pull_request(&conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::GossipPullResponse => {
+                // Push-Pull Gossip：收到拉取的完整数据，应用到本地
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<GossipPullResponseMessage>(&payload) {
+                        sync_mgr.handle_gossip_pull_response(msg);
                     }
                 }
                 false

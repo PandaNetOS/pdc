@@ -20,7 +20,7 @@ use crate::types::Infohash;
 
 struct InfohashCacheInner {
     /// infohash -> (引用计数, 首次发现来源, 热门度评分)
-    entries: FxHashMap<Infohash, (u32, String, f64)>,
+    entries: FxHashMap<Infohash, (u32, String, f64, u64)>,
 }
 
 impl InfohashCacheInner {
@@ -95,25 +95,40 @@ impl InfohashRepoImpl {
     }
 
     /// 同步获取所有 infohash
-    pub fn all_sync(&self) -> Vec<Infohash> {
-        self.cache.read().entries.keys().cloned().collect()
+    pub fn all_sync(&self) -> Vec<(Infohash, u64)> {
+        self.cache
+            .read()
+            .entries
+            .iter()
+            .map(|(k, v)| (*k, v.3))
+            .collect()
     }
 
     /// 内部批量注册：更新引用计数 + 新 infohash 入 pending 缓冲区，不触发 Merkle/Gossip。
     /// 返回真正新增的 (infohash, source)（引用计数 0→1）。
     /// 联邦同步入站（apply_infohash_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
-    pub(crate) fn register_batch_internal(&self, items: &[(Infohash, String)]) -> Vec<(Infohash, String)> {
+    pub(crate) fn register_batch_internal(&self, items: &[(Infohash, String, u64)]) -> Vec<(Infohash, String)> {
         if items.is_empty() {
             return Vec::new();
         }
         let mut cache = self.cache.write();
         let mut new_items: Vec<(Infohash, String)> = Vec::new();
-        for (infohash, source) in items {
+        for (infohash, source, last_seen) in items {
+            // LWW: 如果本地已有且对端 last_seen 较旧，则跳过
+            if let Some(existing) = cache.entries.get(infohash) {
+                if *last_seen < existing.3 {
+                    continue;
+                }
+            }
             let entry = cache
                 .entries
                 .entry(*infohash)
-                .or_insert((0, source.clone(), 0.0));
+                .or_insert((0, source.clone(), 0.0, *last_seen));
             entry.0 += 1;
+            // 更新 last_seen（取较大值）
+            if *last_seen > entry.3 {
+                entry.3 = *last_seen;
+            }
             if entry.0 == 1 {
                 new_items.push((*infohash, source.clone()));
             }
@@ -133,7 +148,11 @@ impl InfohashRepoImpl {
     /// 同步注册 infohash（引用计数+1），新 infohash 写入 pending 缓冲区批量持久化。
     /// 本地写入路径：新 infohash 更新 Merkle + 提交 Gossip。
     pub fn register_sync(&self, infohash: Infohash, source: &str) {
-        let items = [(infohash, source.to_string())];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let items = [(infohash, source.to_string(), now)];
         let new_items = self.register_batch_internal(&items);
         self.propagate_infohash(new_items);
     }
@@ -142,7 +161,15 @@ impl InfohashRepoImpl {
     /// 本地写入路径：新 infohash 更新 Merkle + 提交 Gossip。
     /// 联邦同步入站（apply_infohash_sync）请改用 register_batch_internal，避免回环。
     pub fn register_batch_sync(&self, items: &[(Infohash, String)]) -> usize {
-        let new_items = self.register_batch_internal(items);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let items_with_ts: Vec<(Infohash, String, u64)> = items
+            .iter()
+            .map(|(ih, src)| (*ih, src.clone(), now))
+            .collect();
+        let new_items = self.register_batch_internal(&items_with_ts);
         let count = new_items.len();
         self.propagate_infohash(new_items);
         count
@@ -205,7 +232,7 @@ impl InfohashRepoImpl {
             .read()
             .entries
             .iter()
-            .map(|(ih, (count, src, score))| (*ih, *count, src.clone(), *score))
+            .map(|(ih, (count, src, score, _ls))| (*ih, *count, src.clone(), *score))
             .collect();
 
         let storage = self.storage.clone();
@@ -226,7 +253,7 @@ impl InfohashRepoImpl {
         for row in rows {
             cache
                 .entries
-                .insert(row.infohash, (row.ref_count, row.first_source, row.score));
+                .insert(row.infohash, (row.ref_count, row.first_source, row.score, 0));
             count += 1;
         }
         Ok(count)
@@ -241,7 +268,7 @@ impl InfohashRepository for InfohashRepoImpl {
 
     async fn unregister(&self, infohash: &Infohash) {
         let mut cache = self.cache.write();
-        if let Some((count, _, _)) = cache.entries.get_mut(infohash) {
+        if let Some((count, _, _, _)) = cache.entries.get_mut(infohash) {
             *count = count.saturating_sub(1);
         }
     }
@@ -251,7 +278,7 @@ impl InfohashRepository for InfohashRepoImpl {
             .read()
             .entries
             .get(infohash)
-            .map(|(c, _, _)| *c)
+            .map(|(c, _, _, _)| *c)
             .unwrap_or(0)
     }
 
@@ -266,7 +293,7 @@ impl InfohashRepository for InfohashRepoImpl {
     async fn cleanup_zero_ref(&self) -> usize {
         let mut cache = self.cache.write();
         let before = cache.entries.len();
-        cache.entries.retain(|_, (count, _, _)| *count > 0);
+        cache.entries.retain(|_, (count, _, _, _)| *count > 0);
         before - cache.entries.len()
     }
 
@@ -274,7 +301,7 @@ impl InfohashRepository for InfohashRepoImpl {
         // 更新内存缓存
         {
             let mut cache = self.cache.write();
-            if let Some((_, _, s)) = cache.entries.get_mut(infohash) {
+            if let Some((_, _, s, _)) = cache.entries.get_mut(infohash) {
                 *s = score;
             }
         }
@@ -294,7 +321,7 @@ impl InfohashRepository for InfohashRepoImpl {
         {
             let mut cache = self.cache.write();
             for (infohash, score) in scores {
-                if let Some((_, _, s)) = cache.entries.get_mut(infohash) {
+                if let Some((_, _, s, _)) = cache.entries.get_mut(infohash) {
                     *s = *score;
                 }
             }
@@ -312,7 +339,7 @@ impl InfohashRepository for InfohashRepoImpl {
             .read()
             .entries
             .get(infohash)
-            .map(|(_, _, s)| *s)
+            .map(|(_, _, s, _)| *s)
             .unwrap_or(0.0)
     }
 
@@ -322,7 +349,7 @@ impl InfohashRepository for InfohashRepoImpl {
             .read()
             .entries
             .iter()
-            .map(|(ih, (_, _, score))| (*ih, *score))
+            .map(|(ih, (_, _, score, _))| (*ih, *score))
             .collect();
         entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         entries.truncate(n);

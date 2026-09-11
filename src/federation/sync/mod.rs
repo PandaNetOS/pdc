@@ -8,9 +8,8 @@ pub mod merkle_updater;
 pub mod peer_sync;
 pub mod tracker_sync;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,9 +74,13 @@ pub struct SyncManager {
     shutdown: broadcast::Sender<()>,
     /// 已触发初始全量同步的对端节点集合（按对端去重，每个对端只同步一次）
     initial_sync_peers: RwLock<HashSet<NodeId>>,
-    /// 是否已发起过初始拉取（纯对等架构：本节点只主动选择一个数据源拉取一次，
-    /// 后续增量由反熵/Merkle 对账负责）。防止多连接时重复发起 FullSyncRequest。
-    initial_pull_done: AtomicBool,
+    /// 差量同步状态：全局最多1个并发。
+    /// Some((peer_id, start_time, last_progress_time))，None 表示空闲。
+    /// 大差异（Merkle 差异分片≥20%）时触发，只拉差异部分。
+    diff_sync_state: RwLock<Option<(NodeId, Instant, Instant)>>,
+    /// 最近变更缓冲区（Push-Pull Gossip 用）：(repo_type, key, version)
+    /// 固定容量 500，写入时追加，超过容量弹出最旧。
+    recent_changes: RwLock<VecDeque<(u8, Vec<u8>, u64)>>,
     /// 已见过的对端 Merkle 摘要（对端 node_id -> 各 repo 条目数），
     /// 供数据源选择时按「数据最完整（与本地差异最大）」排序。
     peer_digests: RwLock<FxHashMap<NodeId, Vec<u32>>>,
@@ -189,7 +192,8 @@ impl SyncManager {
             metrics,
             shutdown,
             initial_sync_peers: RwLock::new(HashSet::new()),
-            initial_pull_done: AtomicBool::new(false),
+            diff_sync_state: RwLock::new(None),
+            recent_changes: RwLock::new(VecDeque::with_capacity(500)),
             peer_digests: RwLock::new(FxHashMap::default()),
         }
     }
@@ -336,6 +340,16 @@ impl SyncManager {
 
     /// 处理收到的同步批量消息（阶段1 SyncBatch 协议）
     pub fn handle_sync_batch(&self, repo_type: u8, entries: &[SyncEntry]) {
+        // 记录到最近变更缓冲区（Push-Pull Gossip 用）
+        {
+            let mut changes = self.recent_changes.write();
+            for entry in entries {
+                changes.push_back((repo_type, entry.key.clone(), entry.version));
+                if changes.len() > 500 {
+                    changes.pop_front();
+                }
+            }
+        }
         match repo_type {
             repo_type::NODE => self.apply_node_sync(entries),
             repo_type::PEER => {
@@ -650,26 +664,6 @@ impl SyncManager {
         info!("[federation] 初始全量推送完成，Merkle 树已重建");
     }
 
-    /// 出站连接建立就绪（纯对等拉取入口）。
-    ///
-    /// 新节点（数据较少者）主动选择唯一数据源并请求全量数据，而不是被动接收每个入站连接的
-    /// 推送。本节点只主动发起一次初始拉取（initial_pull_done 去重）；后续增量由反熵/对账负责。
-    /// 入站连接不调用本方法（connection.rs 入站路径不再自动触发推送，等待对端 FullSyncRequest）。
-    pub fn on_connection_ready(self: Arc<Self>, _peer_node_id: NodeId) {
-        // 只发起一次初始拉取：用 swap 抢占式标记，避免多个出站连接并发重复选择/请求。
-        if self.initial_pull_done.swap(true, Ordering::SeqCst) {
-            debug!("[federation] 初始拉取已发起过，跳过");
-            return;
-        }
-        let settle_ms = self.config.full_sync_source_select_settle_ms;
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            // 给其他对等节点一点连接建立时间，便于在多个对端中选出最佳数据源。
-            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-            self_clone.select_full_sync_source_and_request().await;
-        });
-    }
-
     /// 处理收到的 PeerInfo（握手后对端立即发送的本地条目数）。
     ///
     /// 将对端各 repo 条目数记录到 peer_digests，供全量同步数据源选择时
@@ -688,121 +682,357 @@ impl SyncManager {
         );
     }
 
-    /// 选择全量数据源并发起拉取（接收方）。
+    /// 触发差异全量同步（接收方）。
     ///
-    /// 遍历所有已连接对等节点，按「数据量降序为主，RTT 升序为平局决胜」排序，
-    /// 只向数据量严格多于本地的一个节点发送 FullSyncRequest。
-    /// 两个空节点（数据量相等）不会互选，从根上避免双向无效推送。
-    async fn select_full_sync_source_and_request(self: Arc<Self>) {
-        let conns = self.connection_manager.all_connections();
-        if conns.is_empty() {
-            debug!("[federation] 选择数据源：无连接，放弃拉取");
-            return;
-        }
-
-        let local_counts = self.local_entry_counts();
-        let local_total: u64 = local_counts.iter().map(|c| *c as u64).sum();
-        let peer_digests = self.peer_digests.read().clone();
-
-        // 收集候选：(node_id, peer_total, rtt_ms)
-        let mut candidates: Vec<(NodeId, u64, u64)> = Vec::with_capacity(conns.len());
-        for conn in &conns {
-            let peer_total = peer_digests
-                .get(&conn.node_id)
-                .map(|counts| counts.iter().map(|c| *c as u64).sum())
-                .unwrap_or(0);
-            let rtt_ms = self.connection_manager.peer_rtt_ms(&conn.node_id) as u64;
-            candidates.push((conn.node_id, peer_total, rtt_ms));
-        }
-
-        // 过滤：只保留数据量严格多于本地的候选（数据源必须有更多数据）
-        let eligible: Vec<(NodeId, u64, u64)> = candidates
-            .iter()
-            .filter(|(_, peer_total, _)| *peer_total > local_total)
-            .copied()
-            .collect();
-
-        // 日志：打印所有候选及过滤结果
-        for (nid, peer_total, rtt) in &candidates {
-            let status = if *peer_total > local_total { "候选" } else { "过滤(数据量<=本地)" };
+    /// 由 Merkle 反熵驱动：当检测到与某对端的差异分片≥20%时调用。
+    /// 全局最多1个差量同步并发，通过 diff_sync_state 标志防止重复触发。
+    /// 发送 DiffSyncRequest（携带本地 Merkle 摘要），对端对比后只推送差异分片数据。
+    async fn trigger_diff_full_sync(self: Arc<Self>, peer: NodeId) {
+        // 尝试获取同步中标志（全局最多1个并发）
+        if !self.try_start_diff_sync(peer) {
             info!(
-                "[federation] 数据源候选: {} 条目={} RTT={}ms [{}]",
-                nid, peer_total, rtt, status
-            );
-        }
-
-        if eligible.is_empty() {
-            info!(
-                "[federation] 选择数据源：无合格候选（本地条目 {}，所有对端数据量均不超过本地），跳过全量拉取",
-                local_total
+                "[federation] 差异全量同步被跳过：已有同步进行中（请求对端={}）",
+                peer
             );
             return;
         }
 
-        // 排序：数据量降序为主，RTT 升序为平局决胜
-        let mut sorted = eligible;
-        sorted.sort_by(|a, b| {
-            b.1.cmp(&a.1) // peer_total 降序
-                .then(a.2.cmp(&b.2)) // RTT 升序
-        });
+        info!("[federation] 触发差异全量同步，对端={}", peer);
 
-        let (source, source_total, source_rtt) = sorted[0];
-        info!(
-            "[federation] 选择全量数据源: {}（条目={}, RTT={}ms；本地条目={}, 候选 {} 个, 合格 {} 个）",
-            source, source_total, source_rtt, local_total, candidates.len(), sorted.len()
-        );
-
-        // 进入接收态：此后收到的 Gossip 只本地写入、不转发（P0-3）。
+        // 进入接收态：此后收到的 Gossip 只本地写入、不转发（防止洪峰放大）
         self.gossip_engine.set_receiving_full_sync(true);
 
-        // 向选中的数据源发送 FullSyncRequest（携带本地条目数供其判断是否需要推送）
-        let req = FullSyncRequestMessage {
-            local_entry_counts: local_counts,
-        };
-        let sent = match self.connection_manager.get_connection(&source) {
-            Some(conn) => conn.send_message(MessageType::FullSyncRequest, &req).await.is_ok(),
+        // 收集本地各 repo 的 Merkle 摘要，供对端计算差集
+        let digests: Vec<MerkleDigestMessage> = [repo_type::NODE, repo_type::PEER, repo_type::INFOHASH, repo_type::TRACKER]
+            .iter()
+            .map(|&rt| self.get_digest(rt))
+            .collect();
+
+        let req = DiffSyncRequestMessage { digests };
+        let sent = match self.connection_manager.get_connection(&peer) {
+            Some(conn) => conn.send_message(MessageType::DiffSyncRequest, &req).await.is_ok(),
             None => false,
         };
         if !sent {
-            warn!("[federation] FullSyncRequest 发送到 {} 失败，放弃本次拉取", source);
-            self.gossip_engine.set_receiving_full_sync(false);
+            warn!("[federation] DiffSyncRequest 发送到 {} 失败，放弃本次差异全量", peer);
+            self.finish_diff_sync();
             return;
         }
         self.metrics.record_message_sent();
 
-        // 接收洪峰到达期间保持接收态；超过接收稳态时长后恢复正常转发。
-        // （Gossip 拉取无显式完成信号，用可配置的接收稳态时长兜底，避免永久禁转发。）
+        // 启动超时监控任务（5分钟无进度 / 1小时硬超时）
+        self.clone().spawn_diff_sync_watcher();
+
+        // 接收稳态时长后认为同步完成（无显式完成信号，用时长兜底）
         let settle_ms = self.config.full_sync_receiving_settle_ms;
-        let gossip = self.gossip_engine.clone();
+        let self_clone = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-            gossip.set_receiving_full_sync(false);
-            info!("[federation] 接收稳态 {}ms 到期，恢复 Gossip 正常转发", settle_ms);
+            info!(
+                "[federation] 差异全量接收稳态 {}ms 到期，执行完成清理",
+                settle_ms
+            );
+            self_clone.finish_diff_sync();
         });
     }
 
-    /// 处理收到的 FullSyncRequest（本节点作为数据源 / 服务端）。
-    ///
-    /// 只有收到对端的请求才推送全量数据，否则不主动发（纯对等拉取）。
-    /// 先比较请求方携带的本地条目数与本节点：仅当本节点数据明显更多时才推送，
-    /// 避免新节点向老节点空拉、或老节点向新节点无谓推送。
-    pub async fn handle_full_sync_request(self: Arc<Self>, from_node_id: NodeId, req: FullSyncRequestMessage) {
-        let local_counts = self.local_entry_counts();
-        let local_total: u64 = local_counts.iter().map(|c| *c as u64).sum();
-        let peer_total: u64 = req.local_entry_counts.iter().map(|c| *c as u64).sum();
-        info!(
-            "[federation] 收到 FullSyncRequest from={}, 本节点条目={}, 请求方条目={}",
-            from_node_id, local_total, peer_total
-        );
+    /// 尝试开始差量同步：全局最多1个并发。
+    /// 返回 true 表示成功获取标志，false 表示已有同步进行中。
+    fn try_start_diff_sync(&self, peer: NodeId) -> bool {
+        let mut state = self.diff_sync_state.write();
+        if state.is_some() {
+            return false;
+        }
+        let now = Instant::now();
+        *state = Some((peer, now, now));
+        true
+    }
 
-        // 仅当本地数据比请求方明显更多时才推送（新节点本地为空 peer_total=0，必然满足）。
-        if local_total <= peer_total {
-            info!("[federation] 本节点数据未多于请求方，跳过全量推送");
+    /// 更新差量同步进度（每收到一批 FullSyncBatch 时调用）。
+    pub fn update_diff_progress(&self) {
+        let mut state = self.diff_sync_state.write();
+        if let Some((peer, start, _)) = state.take() {
+            *state = Some((peer, start, Instant::now()));
+        }
+    }
+
+    /// 完成差量同步：清除标志、flush Merkle、恢复 Gossip 转发。
+    fn finish_diff_sync(&self) {
+        let had_sync = self.diff_sync_state.write().take().is_some();
+        if !had_sync {
+            return;
+        }
+        // 强制 flush Merkle 队列并重建，确保下一次对账准确
+        self.flush_merkle_queue(usize::MAX);
+        self.node_merkle.rebuild_all();
+        if let Some(ps) = &self.peer_sync {
+            ps.merkle().rebuild_all();
+        }
+        if let Some(ihs) = &self.infohash_sync {
+            ihs.merkle().rebuild_all();
+        }
+        if let Some(ts) = &self.tracker_sync {
+            ts.merkle().rebuild_all();
+        }
+        // 延迟 30 秒恢复 Gossip 转发（给最后一批数据消化时间）
+        let gossip = self.gossip_engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            gossip.set_receiving_full_sync(false);
+            info!("[federation] 差异全量完成，延迟30秒后恢复 Gossip 正常转发");
+        });
+        info!("[federation] 差异全量同步完成，Merkle 树已重建");
+    }
+
+    /// 差量同步超时监控任务：5分钟无进度或1小时硬超时则取消。
+    fn spawn_diff_sync_watcher(self: Arc<Self>) {
+        let mut shutdown_rx = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let state = self.diff_sync_state.read().clone();
+                        match state {
+                            None => break, // 同步已完成，监控退出
+                            Some((peer, start, last_progress)) => {
+                                let now = Instant::now();
+                                let no_progress = now.duration_since(last_progress).as_secs() >= 300;
+                                let hard_timeout = now.duration_since(start).as_secs() >= 3600;
+                                if no_progress {
+                                    warn!("[federation] 差异全量同步5分钟无进度，取消（对端={}）", peer);
+                                    self.finish_diff_sync();
+                                    break;
+                                }
+                                if hard_timeout {
+                                    warn!("[federation] 差异全量同步1小时硬超时，取消（对端={}）", peer);
+                                    self.finish_diff_sync();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        });
+    }
+
+    // ========================================================================
+    // Push-Pull Gossip（每30秒交换最近变更，兜底纯 Push 丢失的消息）
+    // ========================================================================
+
+    /// 启动 Push-Pull Gossip 定时任务（连接建立后15秒开始，每30秒一轮）
+    pub fn spawn_push_pull_gossip(self: Arc<Self>) {
+        let mut shutdown_rx = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            // 连接建立后15秒开始第一轮
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.tick().await; // 跳过首次
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        self.clone().push_pull_tick().await;
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("[federation] Push-Pull Gossip 任务收到关闭信号");
+                        break;
+                    }
+                }
+            }
+        });
+        info!("[federation] Push-Pull Gossip 任务已启动（15秒后开始，每30秒一轮）");
+    }
+
+    /// 单次 Push-Pull：随机选1个邻居，发送最近变更摘要
+    async fn push_pull_tick(self: Arc<Self>) {
+        let conns = self.connection_manager.all_connections();
+        if conns.is_empty() {
+            return;
+        }
+        // 随机选1个邻居
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let idx = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as usize) % conns.len();
+        let conn = &conns[idx];
+
+        let changes = self.recent_changes.read().iter().cloned().collect::<Vec<_>>();
+        if changes.is_empty() {
             return;
         }
 
-        info!("[federation] 作为数据源向 {} 推送全量数据", from_node_id);
-        self.trigger_initial_sync(from_node_id);
+        let digest = GossipDigestMessage { changes };
+        if let Err(e) = conn.send_message(MessageType::GossipDigest, &digest).await {
+            debug!("[federation] Push-Pull GossipDigest 发送失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+            debug!("[federation] Push-Pull: 发送 {} 条变更摘要 to={}", digest.changes.len(), conn.node_id);
+        }
+    }
+
+    /// 处理收到的 GossipDigest：对比本地，找出对端有而本地没有的 key，发送 PullRequest
+    pub async fn handle_gossip_digest(&self, conn: &Connection, digest: GossipDigestMessage) {
+        // 收集本地缺失的 key（对端 version > 本地，或本地没有）
+        let mut missing: Vec<(u8, Vec<u8>)> = Vec::new();
+        for (repo_type, key, version) in &digest.changes {
+            // 简化判断：如果本地 Merkle 树中没有这个 key，说明缺失
+            // （实际应该对比 version，但当前 Merkle 只存 payload，不存 version）
+            if let Some(merkle) = self.merkle_for_repo(*repo_type) {
+                if !merkle.contains_key(key) {
+                    missing.push((*repo_type, key.clone()));
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            return;
+        }
+
+        debug!(
+            "[federation] Push-Pull: 发现 {} 个缺失 key，请求拉取 from={}",
+            missing.len(), conn.node_id
+        );
+
+        let req = GossipPullRequestMessage { keys: missing };
+        if let Err(e) = conn.send_message(MessageType::GossipPullRequest, &req).await {
+            debug!("[federation] GossipPullRequest 发送失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// 处理收到的 GossipPullRequest：返回指定 key 的完整数据
+    pub async fn handle_gossip_pull_request(&self, conn: &Connection, req: GossipPullRequestMessage) {
+        let mut entries: Vec<(u8, SyncEntry)> = Vec::new();
+        for (repo_type, key) in &req.keys {
+            if let Some(merkle) = self.merkle_for_repo(*repo_type) {
+                if let Some(payload) = merkle.get(key) {
+                    entries.push((*repo_type, SyncEntry {
+                        key: key.clone(),
+                        operation: operation::UPSERT,
+                        version: 0,
+                        payload,
+                    }));
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let resp = GossipPullResponseMessage { entries };
+        if let Err(e) = conn.send_message(MessageType::GossipPullResponse, &resp).await {
+            debug!("[federation] GossipPullResponse 发送失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// 处理收到的 GossipPullResponse：应用到本地
+    pub fn handle_gossip_pull_response(&self, resp: GossipPullResponseMessage) {
+        let count = resp.entries.len();
+        for (repo_type, entry) in resp.entries {
+            self.handle_sync_batch(repo_type, std::slice::from_ref(&entry));
+        }
+        debug!("[federation] Push-Pull: 应用 {} 条拉取数据", count);
+    }
+
+    /// 处理收到的 DiffSyncRequest（本节点作为数据源 / 服务端）。
+    ///
+    /// 请求方携带本地各 repo 的 Merkle 摘要，本节点对比后找出差异分片，
+    /// 只推送差异分片的条目（不是全量）。
+    pub async fn handle_diff_sync_request(self: Arc<Self>, from_node_id: NodeId, req: DiffSyncRequestMessage) {
+        let conn = match self.connection_manager.get_connection(&from_node_id) {
+            Some(c) => c,
+            None => {
+                warn!("[federation] DiffSync: 目标 {} 无连接，取消", from_node_id);
+                return;
+            }
+        };
+
+        self.gossip_engine.set_sending_full_sync(true);
+        let batch_size = self.config.full_sync_batch_size;
+        let window = self.config.full_sync_window_size;
+        let mut total_pushed = 0usize;
+
+        // 对每个 repo，对比 Merkle 摘要，找出差异分片，只推送差异条目
+        for digest in &req.digests {
+            let merkle = match self.merkle_for_repo(digest.repo_type) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let diff_shards = merkle.diff(digest);
+            if diff_shards.is_empty() {
+                continue;
+            }
+
+            // 从 MerkleTree 获取差异分片的所有条目
+            let raw_entries = merkle.entries_for_shards(&diff_shards);
+            if raw_entries.is_empty() {
+                continue;
+            }
+
+            // 转换为 SyncEntry
+            let entries: Vec<SyncEntry> = raw_entries
+                .into_iter()
+                .map(|(key, payload)| SyncEntry {
+                    key,
+                    operation: operation::UPSERT,
+                    version: 0,
+                    payload,
+                })
+                .collect();
+
+            let total = entries.len();
+            info!(
+                "[federation] DiffSync 推送: repo_type={}, 差异分片={}, 条目={}, to={}",
+                digest.repo_type, diff_shards.len(), total, from_node_id
+            );
+            total_pushed += total;
+
+            // 发送 FullSyncStart
+            let start_msg = FullSyncStartMessage {
+                repo_type: digest.repo_type,
+                total_entries: total as u64,
+            };
+            if let Err(e) = conn.send_message(MessageType::FullSyncStart, &start_msg).await {
+                warn!("[federation] FullSyncStart 发送失败: {}", e);
+                break;
+            }
+
+            // 分批发送 FullSyncBatch
+            let mut seq: u64 = 0;
+            for chunk in entries.chunks(batch_size) {
+                let batch_msg = FullSyncBatchMessage {
+                    repo_type: digest.repo_type,
+                    entries: chunk.to_vec(),
+                    seq,
+                };
+                if let Err(e) = conn.send_message(MessageType::FullSyncBatch, &batch_msg).await {
+                    warn!("[federation] FullSyncBatch seq={} 发送失败: {}", seq, e);
+                    break;
+                }
+                seq += 1;
+                if seq % (window as u64) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+
+            // 发送 FullSyncComplete
+            let complete_msg = FullSyncCompleteMessage {
+                repo_type: digest.repo_type,
+            };
+            let _ = conn.send_message(MessageType::FullSyncComplete, &complete_msg).await;
+        }
+
+        self.gossip_engine.set_sending_full_sync(false);
+        info!(
+            "[federation] DiffSync 完成: to={}, 总推送条目={}",
+            from_node_id, total_pushed
+        );
     }
 
     /// 统计本节点各 repo 的当前条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
@@ -1023,16 +1253,15 @@ impl SyncManager {
 
     /// 处理收到的 MerkleDigest：对比本地 Merkle 树，发现差异后请求修复
     ///
-    /// 收到对端的 MerkleDigest 后，对比本地对应 repo 的 Merkle 树，
-    /// 找出根哈希不同的分片，向对端发送 MerkleRequest 请求差异分片数据。
-    pub async fn handle_merkle_digest(&self, conn: &Connection, digest: MerkleDigestMessage) {
+    /// 小差异（<20%分片）：逐分片发送 MerkleRequest 修复。
+    /// 大差异（≥20%分片）：触发差异全量同步，一次性拉取所有差异分片数据。
+    pub async fn handle_merkle_digest(self: Arc<Self>, conn: &Connection, digest: MerkleDigestMessage) {
         let merkle = match self.merkle_for_repo(digest.repo_type) {
             Some(m) => m,
             None => return,
         };
 
-        // 记录对端该 repo 的条目总数，供后续数据源选择时判断「数据最完整」。
-        // digest.entry_counts 是每分片计数，求和得到该 repo 总数。
+        // 记录对端该 repo 的条目总数
         let idx = (digest.repo_type as usize).wrapping_sub(1);
         if idx < 4 {
             let total: u32 = digest.entry_counts.iter().sum();
@@ -1050,13 +1279,26 @@ impl SyncManager {
             return;
         }
 
-        debug!(
-            "[federation] Merkle 对账发现 {} 个差异分片: repo_type={}, from={}",
+        let diff_ratio = diffs.len() as f64 / 256.0;
+        info!(
+            "[federation] Merkle 对账发现 {} 个差异分片（{:.1}%）: repo_type={}, from={}",
             diffs.len(),
+            diff_ratio * 100.0,
             digest.repo_type,
             conn.node_id
         );
 
+        // 大差异（≥20%分片）：触发差异全量同步
+        if diffs.len() * 5 >= 256 {
+            info!(
+                "[federation] 差异≥20%，触发差异全量同步（repo_type={}, from={}）",
+                digest.repo_type, conn.node_id
+            );
+            self.trigger_diff_full_sync(conn.node_id).await;
+            return;
+        }
+
+        // 小差异：逐分片 MerkleRequest 修复
         let request = MerkleRequestMessage {
             repo_type: digest.repo_type,
             shards: diffs,
