@@ -181,9 +181,6 @@ impl ScoreMaintainer {
             debug!("[score_maintainer] InfohashRepo 增量重算完成: {} 个", count);
         }
 
-        // 定期执行 peer 快照（用于计算增长率）
-        self.maybe_snapshot_peers().await;
-
         total_rescored
     }
 
@@ -305,30 +302,8 @@ impl ScoreMaintainer {
         input
     }
 
-    /// 定期执行 peer 快照（用于计算增长率）
-    async fn maybe_snapshot_peers(&self) {
-        let should_snapshot = {
-            let mut last = self.last_snapshot.lock().unwrap();
-            match *last {
-                None => {
-                    *last = Some(Instant::now());
-                    true
-                }
-                Some(t) => {
-                    if t.elapsed() >= Duration::from_secs(self.snapshot_interval_secs) {
-                        *last = Some(Instant::now());
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-        };
-
-        if !should_snapshot {
-            return;
-        }
-
+    /// 执行 peer 快照（用于计算增长率，由 TaskScheduler 按 120s 周期触发）
+    pub async fn snapshot_peers(&self) {
         if let (Some(peer_repo), Some(peer_history)) = (&self.peer_repo, &self.peer_history) {
             let infohashes = if let Some(ih_repo) = &self.infohash_repo {
                 ih_repo.all_infohashes().await
@@ -347,67 +322,31 @@ impl ScoreMaintainer {
         }
     }
 
-    /// 启动评分维护定时任务
+    /// 清理过期缓存（ScrapeService / PeerHistory / Availability，由 TaskScheduler 调度）
+    pub async fn cleanup_caches(&self) {
+        if let Some(scrape_service) = &self.scrape_service {
+            let removed = scrape_service.cleanup_expired_cache();
+            if removed > 0 {
+                debug!("[score_maintainer] 清理 ScrapeService 过期缓存: {} 条", removed);
+            }
+        }
+        if let Some(peer_history) = &self.peer_history {
+            let removed = peer_history.cleanup_expired();
+            if removed > 0 {
+                debug!("[score_maintainer] 清理 PeerHistory 过期数据: {} 条", removed);
+            }
+        }
+        if let Some(avail_calc) = &self.availability_calculator {
+            let removed = avail_calc.cleanup_expired();
+            if removed > 0 {
+                debug!("[score_maintainer] 清理 Availability 过期缓存: {} 条", removed);
+            }
+        }
+    }
+
+    /// 启动评分维护定时任务（已迁移到 TaskScheduler，此方法为空壳保留兼容）
     pub fn start(self: Arc<Self>) {
-        let incremental_interval = Duration::from_secs(self.incremental_interval_secs);
-        let full_interval = Duration::from_secs(self.full_interval_secs);
-
-        info!(
-            "[score_maintainer] 评分维护任务已启动（增量每 {}s，全量每 {}s，多源聚合已启用）",
-            self.incremental_interval_secs, self.full_interval_secs
-        );
-
-        // 增量重算任务
-        {
-            let maintainer = self.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(incremental_interval).await;
-                    maintainer.rescore_incremental().await;
-                }
-            });
-        }
-
-        // 全量重算任务（兜底）
-        {
-            let maintainer = self.clone();
-            tokio::spawn(async move {
-                // 延迟 120 秒开始第一次全量重算，错峰避免与其他全量任务（HealthCheck/TierManager）同时执行
-                tokio::time::sleep(Duration::from_secs(120)).await;
-                loop {
-                    maintainer.rescore_all().await;
-                    tokio::time::sleep(full_interval).await;
-                }
-            });
-        }
-
-        // 定期清理过期缓存
-        {
-            let maintainer = self.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(600)).await; // 每10分钟清理一次
-                    if let Some(scrape_service) = &maintainer.scrape_service {
-                        let removed = scrape_service.cleanup_expired_cache();
-                        if removed > 0 {
-                            debug!("[score_maintainer] 清理 ScrapeService 过期缓存: {} 条", removed);
-                        }
-                    }
-                    if let Some(peer_history) = &maintainer.peer_history {
-                        let removed = peer_history.cleanup_expired();
-                        if removed > 0 {
-                            debug!("[score_maintainer] 清理 PeerHistory 过期数据: {} 条", removed);
-                        }
-                    }
-                    if let Some(avail_calc) = &maintainer.availability_calculator {
-                        let removed = avail_calc.cleanup_expired();
-                        if removed > 0 {
-                            debug!("[score_maintainer] 清理 Availability 过期缓存: {} 条", removed);
-                        }
-                    }
-                }
-            });
-        }
+        // 所有定时任务已注册到 TaskScheduler，不再自行 spawn
     }
 }
 

@@ -150,20 +150,9 @@ impl TierManageable for PeerTierManager {
                     Ok(Err(e)) => warn!("[tier_manager] PeerRepo 冷数据归档失败: {}", e),
                     Err(e) => warn!("[tier_manager] PeerRepo 冷数据归档任务失败: {}", e),
                 }
-            } else {
-                // 没有 storage 时回退到内存清理
-                self.peer_repo.cleanup_expired(self.config.warm_threshold_secs).await;
-                debug!("[tier_manager] PeerRepo 冷数据内存清理: {} 个", cold_count);
             }
         }
 
-        // 内存上限控制：热数据超过上限时，清理最老的热数据（超过 hot_threshold 的）
-        if hot_count > self.config.max_hot_in_memory {
-            // 清理超过 hot_threshold 的 peer（自然减少热数据数量）
-            self.peer_repo.cleanup_expired(self.config.hot_threshold_secs).await;
-            let demoted = hot_count - self.config.max_hot_in_memory;
-            debug!("[tier_manager] PeerRepo 内存上限降级: 清理 {} 个最老热数据", demoted);
-        }
 
         let stats = TierStats { hot_count, warm_count, cold_count };
         *self.stats.write() = stats.clone();
@@ -271,14 +260,9 @@ impl TierManager {
         }
     }
 
-    /// 启动定期检查任务
+    /// 启动定期检查任务（已迁移到 TaskScheduler，此方法为空壳保留兼容）
     pub async fn run(self: Arc<Self>) {
-        let interval = Duration::from_secs(self.config.check_interval_secs);
-        info!("[tier_manager] 冷热分层管理器已启动，检查间隔 {:?}", interval);
-        loop {
-            tokio::time::sleep(interval).await;
-            self.check_all().await;
-        }
+        // 所有定时检查已注册到 TaskScheduler，不再自行 loop
     }
 }
 

@@ -36,7 +36,10 @@ use tracing::{info, warn};
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::ConnectionManager;
+use pnos_net::transport::{IrohTransportConfig, TransportMode};
+use pnos_net::{NetAgent, NetAgentConfig};
 use crate::federation::discovery::DiscoveryService;
+use crate::federation::dht_discovery::DhtDiscoveryService;
 use crate::federation::gossip::GossipEngine;
 use crate::federation::metrics::{FederationMetrics, FederationMetricsSnapshot};
 use crate::federation::nat_integration::NatIntegration;
@@ -155,6 +158,8 @@ pub struct FederationService {
     pub udp_transport: Arc<UdpTransport>,
     /// 中继管理器
     pub relay_manager: Arc<RelayManager>,
+    /// DHT 魔法 infohash 发现服务（由 TaskScheduler 调度）
+    pub dht_discovery: Option<Arc<DhtDiscoveryService>>,
     /// 配置
     pub config: FederationConfig,
     /// 关闭信号发送端
@@ -226,7 +231,7 @@ impl FederationService {
             shutdown_tx.clone(),
             data_dir,
             Some(node_repo.clone()),
-            dht_discoverer,
+            dht_discoverer.clone(),
         ));
 
         // 8. 创建中继管理器
@@ -241,7 +246,7 @@ impl FederationService {
         // 9. 创建同步管理器（含 PeerSync / InfohashSync / TrackerSync）
         let sync_manager = Arc::new(SyncManager::new(
             connection_manager.clone(),
-            node_repo,
+            node_repo.clone(),
             config.clone(),
             shutdown_tx.clone(),
             gossip_engine.clone(),
@@ -285,6 +290,20 @@ impl FederationService {
         connection_manager.set_signaling_service(signaling_service.clone());
         connection_manager.set_relay_manager(relay_manager.clone());
 
+        // 13. 创建 DHT 魔法 infohash 发现服务（从 DiscoveryService 迁移至此，由 TaskScheduler 统一调度）
+        let dht_discovery = if config.dht_discovery_enabled {
+            Some(Arc::new(DhtDiscoveryService::new(
+                node_table.clone(),
+                config.listen_port,
+                config.dht_discovery_interval_secs,
+                shutdown_tx.clone(),
+                Some(node_repo.clone()),
+                dht_discoverer.clone(),
+            )))
+        } else {
+            None
+        };
+
         info!(
             "[federation] 联邦服务已创建: node_id={}, listen_port={}, ed25519_pubkey={}",
             identity.node_id,
@@ -304,6 +323,7 @@ impl FederationService {
             metrics,
             udp_transport,
             relay_manager,
+            dht_discovery,
             config,
             shutdown: shutdown_tx,
             started_at: Instant::now(),
@@ -320,8 +340,7 @@ impl FederationService {
             .start_listen()
             .await?;
 
-        // 2. 启动心跳任务
-        self.connection_manager.clone().spawn_heartbeat();
+        // 2. 心跳任务已迁移到 TaskScheduler（fed_heartbeat）
 
         // 3. 启动 PEX 交换任务
         self.discovery.clone().spawn_pex_exchange();
@@ -366,8 +385,7 @@ impl FederationService {
             }
         });
 
-        // 6. 启动 Node 同步任务
-        self.sync_manager.clone().spawn_node_sync();
+        // 6. Node 同步任务已迁移到 TaskScheduler（fed_node_sync）
 
         // 6.1 启动 Merkle 异步批量 flush 任务（apply 入队后后台批量更新 Merkle 树）
         self.sync_manager.clone().spawn_merkle_flusher();
@@ -378,10 +396,7 @@ impl FederationService {
         // 7. 启动 Gossip 传播任务
         self.gossip_engine.clone().spawn_gossip_propagation();
 
-        // 7.1 启动 Merkle 反熵任务（定期对账，发现差异自动修复）
-        self.gossip_engine
-            .clone()
-            .spawn_anti_entropy(self.sync_manager.clone());
+        // 7.1 Merkle 反熵任务已迁移到 TaskScheduler（fed_merkle_anti_entropy）
 
         // 7.2 启动 Push-Pull Gossip 任务（每30秒交换最近变更，兜底 Push 丢失的消息）
         self.sync_manager.clone().spawn_push_pull_gossip();
@@ -391,6 +406,14 @@ impl FederationService {
 
         // 9. 引导连接种子节点
         self.discovery.clone().bootstrap().await;
+
+        // 10. DHT 魔法 infohash 发现：异步初始化（不阻塞 start），后续周期由 TaskScheduler 调度
+        if let Some(ref dht) = self.dht_discovery {
+            let dht_clone = dht.clone();
+            tokio::spawn(async move {
+                dht_clone.init_and_first_tick().await;
+            });
+        }
 
         info!(
             "[federation] 联邦服务启动完成: node_id={}, port={}, gossip_interval={}ms",
@@ -543,6 +566,7 @@ mod tests {
             sync_node_interval_secs: 300,
             sync_peer_enabled: false,
             sync_infohash_enabled: false,
+            dht_discovery_enabled: false,
             ..Default::default()
         }
     }
@@ -570,6 +594,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -588,6 +613,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[ignore = "network-dependent, can hang on Windows; run manually with --ignored"]
     #[tokio::test]
     async fn test_federation_service_start_stop() {
         let dir = std::env::temp_dir().join(format!("pdc_fed_start_test_{}", std::process::id()));
@@ -640,6 +666,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let id1 = service1.identity.node_id.to_hex();
@@ -650,6 +677,7 @@ mod tests {
             Arc::new(NatManager::new(nat_config)),
             node_repo,
             &dir,
+            None,
             None,
             None,
             None,

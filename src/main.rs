@@ -430,56 +430,8 @@ async fn main() -> anyhow::Result<()> {
         fetcher.start();
         info!("[main] TrackerPeerFetcher 已启动（主动拉取 peer → 存入 PeerRepo）");
 
-        // 远程 Tracker 列表自动拉取
-        if config.discoverers.enable_remote_tracker {
-            let remote_url = config.discoverers.remote_tracker_url.clone();
-            let refresh_secs = config.discoverers.remote_tracker_refresh_secs;
-            let discoverer_clone = tracker_discoverer.clone();
-            let tracker_repo_clone = tracker_repo.clone();
-
-            tokio::spawn(async move {
-                // 启动时立即拉取一次
-                info!("[main] 开始从远程拉取 Tracker 列表: {}", remote_url);
-                match PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::fetch_remote_trackers(&remote_url).await {
-                    Ok(trackers) => {
-                        discoverer_clone.update_trackers(trackers.clone());
-                        // 同步到 TrackerRepo
-                        for url in &trackers {
-                            tracker_repo_clone.add_tracker(url.clone()).await;
-                        }
-                        info!("[main] 远程 Tracker 列表拉取成功，共 {} 个", trackers.len());
-                    }
-                    Err(e) => {
-                        warn!("[main] 远程 Tracker 列表拉取失败，使用内置默认列表: {}", e);
-                    }
-                }
-
-                // 定时刷新（跳过第一次立即触发）
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
-                let mut first_tick = true;
-                loop {
-                    interval.tick().await;
-                    if first_tick {
-                        first_tick = false;
-                        continue;
-                    }
-                    info!("[main] 定时刷新远程 Tracker 列表: {}", remote_url);
-                    match PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::fetch_remote_trackers(&remote_url).await {
-                        Ok(trackers) => {
-                            discoverer_clone.update_trackers(trackers.clone());
-                            for url in &trackers {
-                                tracker_repo_clone.add_tracker(url.clone()).await;
-                            }
-                            info!("[main] 远程 Tracker 列表刷新成功，共 {} 个", trackers.len());
-                        }
-                        Err(e) => {
-                            warn!("[main] 远程 Tracker 列表刷新失败，保持当前列表: {}", e);
-                        }
-                    }
-                }
-            });
-            info!("[main] 远程 Tracker 列表自动拉取已启用（间隔 {} 秒）", refresh_secs);
-        }
+        // 远程 Tracker 列表自动拉取（已迁移到 TaskScheduler 的 remote_tracker_refresh 任务）
+        let _remote_discoverer_clone = tracker_discoverer.clone();
 
         Some(fetcher)
     };
@@ -624,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
         node_repo: Some(node_repo.clone()),
         infohash_repo: Some(infohash_repo.clone()),
         tracker_repo: Some(tracker_repo.clone()),
-        fetcher: fetcher_ref,
+        fetcher: fetcher_ref.clone(),
         dht_probe: dht_probe_ref,
         rate_limiter,
         hole_punch_signaling: Arc::new(PeerDiscoveryCenter::data_plane::hole_punch_signaling::HolePunchSignaling::new()),
@@ -636,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
         relay_server,
     };
 
-    // 8. 启动健康检查任务
+    // 8. 健康检查任务（注册到 TaskScheduler）
     let hc_config = HealthCheckConfig {
         interval: std::time::Duration::from_secs(config.health_check.interval_secs),
         cache_cleanup_interval: std::time::Duration::from_secs(
@@ -655,22 +607,41 @@ async fn main() -> anyhow::Result<()> {
         hc_config,
         Some(storage.clone()),
     ).with_pause_gate(full_sync_gate.clone()));
-    tokio::spawn(async move {
-        health_check.run().await;
-    });
-    info!("[main] 健康检查任务已启动");
 
-    // 8.5 智能任务调度中心 + 定期持久化任务
+    // 8.5 创建统一 TaskScheduler（所有后台任务纳管）
     let task_scheduler = Arc::new(TaskScheduler::new().with_max_concurrent_full_tasks(2));
 
-    // 8.5.1 定期增量持久化任务（每60秒，P3后台，IO密集）
+    // 8.5.1 资源监控任务（每5秒，Critical，non_deferrable，读取真实系统资源）
     {
-        let node_repo_clone = node_repo.clone();
-        let tracker_repo_clone = tracker_repo.clone();
-        let infohash_repo_clone = infohash_repo.clone();
-        let peer_repo_clone = peer_repo.clone();
-        let storage_clone = storage.clone();
+        let rm = task_scheduler.resource_monitor();
+        task_scheduler.register(
+            TaskMetadata::new("resource_monitor", "系统资源监控", std::time::Duration::from_secs(5))
+                .with_priority(TaskPriority::Critical)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .non_deferrable(),
+            move || {
+                let rm = rm.clone();
+                async move {
+                    rm.refresh();
+                    Ok(())
+                }
+            },
+        );
+    }
 
+    // 8.5.2 定期增量持久化任务（每60秒，Background）
+    {
+        let nr = node_repo.clone();
+        let tr = tracker_repo.clone();
+        let ir = infohash_repo.clone();
+        let pr = peer_repo.clone();
+        let st = storage.clone();
         task_scheduler.register(
             TaskMetadata::new("periodic_persistence", "定期增量持久化", std::time::Duration::from_secs(60))
                 .with_priority(TaskPriority::Background)
@@ -684,42 +655,35 @@ async fn main() -> anyhow::Result<()> {
                 .with_initial_delay(std::time::Duration::from_secs(30))
                 .with_jitter(std::time::Duration::from_secs(10)),
             move || {
-                let node_repo = node_repo_clone.clone();
-                let tracker_repo = tracker_repo_clone.clone();
-                let infohash_repo = infohash_repo_clone.clone();
-                let peer_repo = peer_repo_clone.clone();
-                let storage = storage_clone.clone();
+                let nr = nr.clone();
+                let tr = tr.clone();
+                let ir = ir.clone();
+                let pr = pr.clone();
+                let st = st.clone();
                 async move {
-                    // 增量持久化：NodeRepo/InfohashRepo 只保存脏数据，TrackerRepo 全量（数据量小）
                     let mut saved = 0u64;
-                    // NodeRepo 全量保存（后续优化为增量）
-                    match node_repo.save_all().await {
+                    match nr.save_all().await {
                         Ok(_) => saved += 1,
                         Err(e) => warn!("[persistence] NodeRepo 保存失败: {}", e),
                     }
-                    // TrackerRepo 全量保存（数据量小）
-                    match tracker_repo.save_all().await {
+                    match tr.save_all().await {
                         Ok(_) => saved += 1,
                         Err(e) => warn!("[persistence] TrackerRepo 保存失败: {}", e),
                     }
-                    // InfohashRepo 全量保存（后续优化为增量）
-                    match infohash_repo.save_all().await {
+                    match ir.save_all().await {
                         Ok(_) => saved += 1,
                         Err(e) => warn!("[persistence] InfohashRepo 保存失败: {}", e),
                     }
-                    // PeerRepo 全量保存（当前 peer 状态到 peers 表）
-                    match peer_repo.save_all().await {
+                    match pr.save_all().await {
                         Ok(_) => saved += 1,
                         Err(e) => warn!("[persistence] PeerRepo 保存失败: {}", e),
                     }
-                    // PeerRepo flush history buffer（历史记录到 peer_history 表）
-                    match peer_repo.flush_history().await {
+                    match pr.flush_history().await {
                         Ok(n) if n > 0 => debug!("[persistence] PeerRepo history flushed: {} records", n),
                         Err(e) => warn!("[persistence] PeerRepo history flush 失败: {}", e),
                         _ => {}
                     }
-                    // SQLite WAL checkpoint
-                    if let Err(e) = storage.checkpoint() {
+                    if let Err(e) = st.checkpoint() {
                         warn!("[persistence] WAL checkpoint 失败: {}", e);
                     }
                     debug!("[persistence] 增量持久化完成（{} 项）", saved);
@@ -727,15 +691,36 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         );
-        info!("[main] 定期增量持久化任务已注册（每60秒）");
     }
 
-    // 8.5.2 资源监控更新任务（每5秒，P0关键，低消耗）
+    // 8.5.3 健康检查任务（3个：主检查/统计输出/缓存清理）
     {
-        let resource_monitor = task_scheduler.resource_monitor();
+        let hc = health_check.clone();
         task_scheduler.register(
-            TaskMetadata::new("resource_monitor", "系统资源监控", std::time::Duration::from_secs(5))
-                .with_priority(TaskPriority::Critical)
+            TaskMetadata::new("health_check_main", "健康检查主循环", std::time::Duration::from_secs(300))
+                .with_priority(TaskPriority::Important)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let hc = hc.clone();
+                async move {
+                    hc.check_discoverers_health().await;
+                    Ok(())
+                }
+            },
+        );
+    }
+    {
+        let hc = health_check.clone();
+        task_scheduler.register(
+            TaskMetadata::new("health_check_stats", "健康统计输出", std::time::Duration::from_secs(300))
+                .with_priority(TaskPriority::Normal)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
                     memory: ResourceLevel::Low,
@@ -743,31 +728,46 @@ async fn main() -> anyhow::Result<()> {
                     network: ResourceLevel::Low,
                     is_full_task: false,
                 })
-                .non_deferrable()
-                .with_jitter(std::time::Duration::from_secs(0)),
+                .with_initial_delay(std::time::Duration::from_secs(75))
+                .with_jitter(std::time::Duration::from_secs(10)),
             move || {
-                let monitor = resource_monitor.clone();
+                let hc = hc.clone();
                 async move {
-                    // 简化版资源监控：通过系统信息获取 CPU/内存使用率
-                    // 实际实现可以使用 sysinfo crate
-                    // 这里使用估算值，后续可以接入真实监控
-                    monitor.update(0.3, 0.4); // 示例值，实际应从系统获取
+                    hc.output_stats().await;
                     Ok(())
                 }
             },
         );
-        info!("[main] 资源监控任务已注册（每5秒）");
+    }
+    {
+        let hc = health_check.clone();
+        task_scheduler.register(
+            TaskMetadata::new("health_cache_cleanup", "过期Peer缓存清理", std::time::Duration::from_secs(600))
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(420))
+                .with_jitter(std::time::Duration::from_secs(15))
+                .with_dependencies(vec!["score_full".to_string()]),
+            move || {
+                let hc = hc.clone();
+                async move {
+                    hc.cleanup_expired_peers().await;
+                    Ok(())
+                }
+            },
+        );
     }
 
-    // 启动智能任务调度中心
-    task_scheduler.start();
-    info!("[main] 智能任务调度中心已启动");
-
     // 8.6 ScoreMaintainer: multi-source infohash scoring
-    {
+    let maintainer = {
         use PeerDiscoveryCenter::intelligence::{InfohashScorerImpl, NodeScorerImpl, PeerScorerImpl, ScoreMaintainer, TrackerScorerImpl};
 
-        // Create P1-P3 services
         let dht_activity = Arc::new(DhtActivityTracker::new());
         let peer_history = Arc::new(PeerHistoryManager::new());
         let scrape_service = Arc::new(ScrapeService::new().with_tracker_repo(tracker_repo.clone() as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>));
@@ -776,7 +776,7 @@ async fn main() -> anyhow::Result<()> {
 
         info!("[main] Infohash multi-source scoring services created");
 
-        let maintainer = Arc::new(
+        Arc::new(
             ScoreMaintainer::new(
                 Arc::new(NodeScorerImpl::new()),
                 Arc::new(PeerScorerImpl::new()),
@@ -793,9 +793,270 @@ async fn main() -> anyhow::Result<()> {
             .with_metadata_service(metadata_service.clone())
             .with_availability_calculator(availability_calculator.clone())
             .with_super_tracker(super_tracker.clone()),
+        )
+    };
+
+    // 8.6.1 评分任务注册（3个：增量/全量/快照）
+    {
+        let m = maintainer.clone();
+        task_scheduler.register(
+            TaskMetadata::new("score_incremental", "增量评分重算", std::time::Duration::from_secs(60))
+                .with_priority(TaskPriority::Important)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let m = m.clone();
+                async move {
+                    m.rescore_incremental().await;
+                    Ok(())
+                }
+            },
         );
-        maintainer.start();
     }
+    {
+        let m = maintainer.clone();
+        task_scheduler.register(
+            TaskMetadata::new("score_full", "全量评分重算", std::time::Duration::from_secs(600))
+                .with_priority(TaskPriority::Normal)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::High,
+                    memory: ResourceLevel::Medium,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: true,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(360))
+                .with_jitter(std::time::Duration::from_secs(15))
+                .with_dependencies(vec!["periodic_persistence".to_string()]),
+            move || {
+                let m = m.clone();
+                async move {
+                    m.rescore_all().await;
+                    Ok(())
+                }
+            },
+        );
+    }
+    {
+        let m = maintainer.clone();
+        task_scheduler.register(
+            TaskMetadata::new("score_snapshot", "Peer快照", std::time::Duration::from_secs(120))
+                .with_priority(TaskPriority::Normal)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Medium,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(60))
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let m = m.clone();
+                async move {
+                    m.snapshot_peers().await;
+                    Ok(())
+                }
+            },
+        );
+    }
+    {
+        let m = maintainer.clone();
+        task_scheduler.register(
+            TaskMetadata::new("cache_cleanup", "评分缓存清理", std::time::Duration::from_secs(600))
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(420))
+                .with_jitter(std::time::Duration::from_secs(15))
+                .with_dependencies(vec!["score_full".to_string()]),
+            move || {
+                let m = m.clone();
+                async move {
+                    m.cleanup_caches().await;
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.7 TierManager 冷热分层任务
+    {
+        use PeerDiscoveryCenter::intelligence::TierManager;
+        let tier_mgr = Arc::new(TierManager::new(Default::default()));
+        let tm = tier_mgr.clone();
+        task_scheduler.register(
+            TaskMetadata::new("tier_check", "冷热分层检查", std::time::Duration::from_secs(300))
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(225))
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let tm = tm.clone();
+                async move {
+                    tm.check_all().await;
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.8 联邦任务注册（4个：心跳/节点同步/DHT发现/Merkle反熵）
+    if let Some(ref fed) = federation_service {
+        // fed_heartbeat
+        let cm = fed.connection_manager.clone();
+        task_scheduler.register(
+            TaskMetadata::new("fed_heartbeat", "联邦心跳", std::time::Duration::from_secs(30))
+                .with_priority(TaskPriority::Important)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_jitter(std::time::Duration::from_secs(5)),
+            move || {
+                let cm = cm.clone();
+                async move {
+                    cm.heartbeat_tick().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_node_sync
+        let sm = fed.sync_manager.clone();
+        task_scheduler.register(
+            TaskMetadata::new("fed_node_sync", "联邦节点同步", std::time::Duration::from_secs(300))
+                .with_priority(TaskPriority::Normal)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Medium,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(150))
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let sm = sm.clone();
+                async move {
+                    sm.do_node_sync().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_dht_discovery
+        if let Some(ref dht_disc) = fed.dht_discovery {
+            let dd = dht_disc.clone();
+            task_scheduler.register(
+                TaskMetadata::new("fed_dht_discovery", "联邦DHT发现", std::time::Duration::from_secs(300))
+                    .with_priority(TaskPriority::Normal)
+                    .with_resource(ResourceProfile {
+                        cpu: ResourceLevel::Low,
+                        memory: ResourceLevel::Low,
+                        io: ResourceLevel::Low,
+                        network: ResourceLevel::Medium,
+                        is_full_task: false,
+                    })
+                    .with_jitter(std::time::Duration::from_secs(10)),
+                move || {
+                    let dd = dd.clone();
+                    async move {
+                        dd.discovery_tick().await;
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // fed_merkle_anti_entropy
+        let g = fed.gossip_engine.clone();
+        let s = fed.sync_manager.clone();
+        task_scheduler.register(
+            TaskMetadata::new("fed_merkle_anti_entropy", "联邦Merkle反熵", std::time::Duration::from_secs(60))
+                .with_priority(TaskPriority::Normal)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(45))
+                .with_jitter(std::time::Duration::from_secs(10)),
+            move || {
+                let g = g.clone();
+                let s = s.clone();
+                async move {
+                    g.anti_entropy_tick(s).await;
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.9 远程 Tracker 列表定期刷新任务
+    if config.discoverers.enable_remote_tracker {
+        let remote_url = config.discoverers.remote_tracker_url.clone();
+        let discoverer_ref = fetcher_ref.clone();
+        let tracker_repo_clone = tracker_repo.clone();
+        task_scheduler.register(
+            TaskMetadata::new("remote_tracker_refresh", "远程Tracker列表刷新", std::time::Duration::from_secs(3600))
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_jitter(std::time::Duration::from_secs(30)),
+            move || {
+                let remote_url = remote_url.clone();
+                let tracker_repo = tracker_repo_clone.clone();
+                async move {
+                    info!("[main] 定时刷新远程 Tracker 列表: {}", remote_url);
+                    match PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::fetch_remote_trackers(&remote_url).await {
+                        Ok(trackers) => {
+                            for url in &trackers {
+                                tracker_repo.add_tracker(url.clone()).await;
+                            }
+                            info!("[main] 远程 Tracker 列表刷新成功，共 {} 个", trackers.len());
+                        }
+                        Err(e) => {
+                            warn!("[main] 远程 Tracker 列表刷新失败: {}", e);
+                        }
+                    }
+                    Ok(())
+                }
+            },
+        );
+        info!("[main] 远程 Tracker 列表刷新任务已注册到 TaskScheduler");
+    }
+
+    // 启动统一任务调度中心
+    task_scheduler.start();
+    info!("[main] TaskScheduler 已启动（统一调度所有后台任务，14个任务已注册）");
 
     // 9. 启动 UDP Tracker 服务（BEP 15）
     if config.super_tracker.enabled {

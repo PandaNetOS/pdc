@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -169,6 +169,11 @@ impl TaskMetadata {
         self.max_delay = Duration::from_secs(0);
         self
     }
+
+    pub fn with_dependencies(mut self, deps: Vec<String>) -> Self {
+        self.dependencies = deps;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,12 +274,14 @@ impl ResourceState {
 /// 资源监控器
 pub struct ResourceMonitor {
     state: RwLock<ResourceState>,
+    system: ParkingMutex<sysinfo::System>,
 }
 
 impl ResourceMonitor {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(ResourceState::default()),
+            system: ParkingMutex::new(sysinfo::System::new_all()),
         }
     }
 
@@ -286,6 +293,25 @@ impl ResourceMonitor {
         let mut state = self.state.write();
         state.cpu_usage = cpu.clamp(0.0, 1.0);
         state.memory_usage = memory.clamp(0.0, 1.0);
+        state.timestamp = Instant::now();
+    }
+
+    /// 从系统读取真实 CPU / 内存使用率并更新状态
+    pub fn refresh(&self) {
+        {
+            let mut sys = self.system.lock();
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+        }
+        let sys = self.system.lock();
+        let cpu = sys.global_cpu_usage() as f64 / 100.0;
+        let total_mem = sys.total_memory() as f64;
+        let used_mem = sys.used_memory() as f64;
+        let mem = if total_mem > 0.0 { used_mem / total_mem } else { 0.0 };
+        drop(sys);
+        let mut state = self.state.write();
+        state.cpu_usage = cpu.clamp(0.0, 1.0);
+        state.memory_usage = mem.clamp(0.0, 1.0);
         state.timestamp = Instant::now();
     }
 
@@ -317,11 +343,14 @@ struct ScheduledItem {
 
 impl Ord for ScheduledItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // 优先级高的在前，同优先级按调度时间排序
+        // BinaryHeap 是最大堆：cmp 返回 Greater 的元素排在队首
+        // 时间早的在前：other.scheduled_at.cmp(&self.scheduled_at)
+        //   当 self 时间更早时，other.scheduled_at > self.scheduled_at，返回 Greater，self 排队首
+        // 同时间优先级高的在前；同优先级 seq 小的在前
         other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| self.scheduled_at.cmp(&other.scheduled_at))
+            .scheduled_at
+            .cmp(&self.scheduled_at)
+            .then_with(|| other.priority.cmp(&self.priority))
             .then_with(|| self.seq.cmp(&other.seq))
     }
 }
@@ -484,9 +513,19 @@ impl TaskScheduler {
         }
 
         let mut tick_interval = tokio::time::interval(Duration::from_millis(500));
+        let mut heartbeat = Instant::now();
 
         loop {
             tick_interval.tick().await;
+            if heartbeat.elapsed() >= Duration::from_secs(30) {
+                let queue_len = self.queue.read().len();
+                info!(
+                    "[task_scheduler] 调度器心跳: 队列待执行={}, 运行中全量任务={}",
+                    queue_len,
+                    *self.running_full_tasks.read()
+                );
+                heartbeat = Instant::now();
+            }
             Self::process_queue(self.clone()).await;
         }
     }
@@ -595,6 +634,7 @@ impl TaskScheduler {
             }
 
             // 执行任务
+            debug!("[task_scheduler] 执行任务: {} (优先级={:?})", item.task_id, item.priority);
             Self::execute_task(scheduler.clone(), item).await;
         }
     }
@@ -647,24 +687,28 @@ impl TaskScheduler {
                 }
                 Ok(Err(e)) => {
                     scheduler.stats.write().get_mut(&task_id).unwrap().record_failure();
-                    warn!(
-                        "[task_scheduler] 任务失败: {} - {} (连续失败 {})",
-                        meta.name,
-                        e,
-                        scheduler
-                            .stats
-                            .read()
-                            .get(&task_id)
-                            .map(|s| s.consecutive_failures)
-                            .unwrap_or(0)
-                    );
-                    // 失败重试（指数退避）
                     let consecutive = scheduler
                         .stats
                         .read()
                         .get(&task_id)
                         .map(|s| s.consecutive_failures)
                         .unwrap_or(0);
+                    warn!(
+                        "[task_scheduler] 任务失败: {} - {} (连续失败 {})",
+                        meta.name, e, consecutive
+                    );
+                    // 标记依赖完成 + 释放 full task 计数（重试路径也需要）
+                    scheduler
+                        .completed_dependencies
+                        .write()
+                        .insert(task_id.clone());
+                    if is_full {
+                        let mut running = scheduler.running_full_tasks.write();
+                        if *running > 0 {
+                            *running -= 1;
+                        }
+                    }
+                    // 失败重试（指数退避），重试后 return 避免与下方正常周期重复安排
                     if consecutive < meta.max_retries {
                         let backoff = Duration::from_secs(2u64.pow(consecutive.min(5)));
                         scheduler.schedule_task(
@@ -672,7 +716,9 @@ impl TaskScheduler {
                             Instant::now() + backoff,
                             meta.priority,
                         );
+                        return;
                     }
+                    // 超过最大重试次数：走下方正常周期继续尝试
                 }
                 Err(_) => {
                     scheduler.stats.write().get_mut(&task_id).unwrap().record_failure();

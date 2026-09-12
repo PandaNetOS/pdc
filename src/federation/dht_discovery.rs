@@ -81,52 +81,34 @@ impl DhtDiscoveryService {
         }
     }
 
-    /// 启动后台发现任务（announce + get_peers 交替执行）
-    pub fn spawn(self: Arc<Self>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-        tokio::spawn(async move {
-            // 0. 从主爬虫 NodeRepo 注入种子节点（仅自建 DHT 时）
-            if let Some(repo) = &self.node_repo {
-                let seeds: Vec<(String, u16)> = repo.top_nodes_sync(2000).into_iter()
-                    .map(|e| (e.addr.ip().to_string(), e.addr.port()))
-                    .collect();
-                let injected = self.dht.seed_from_entries(&seeds);
-                info!("[dht] 从 NodeRepo 注入 {} 个种子节点", injected);
-            }
+    /// 初始化并执行首次发现（种子注入 + DHT init + 首次 discovery_tick），不再自跑循环
+    /// 后续周期性调用由 TaskScheduler 触发 discovery_tick()
+    pub async fn init_and_first_tick(self: Arc<Self>) {
+        // 0. 从主爬虫 NodeRepo 注入种子节点（仅自建 DHT 时）
+        if let Some(repo) = &self.node_repo {
+            let seeds: Vec<(String, u16)> = repo.top_nodes_sync(2000).into_iter()
+                .map(|e| (e.addr.ip().to_string(), e.addr.port()))
+                .collect();
+            let injected = self.dht.seed_from_entries(&seeds);
+            info!("[dht] 从 NodeRepo 注入 {} 个种子节点", injected);
+        }
 
-            // 先初始化 DHT（引导到公共 DHT 网络）
-            if let Err(e) = self.dht.init().await {
-                warn!("[federation] DHT 初始化失败: {}", e);
-                return;
-            }
-            info!(
-                "[federation] DHT 魔法 infohash 发现已启动，联邦端口: {}, 间隔: {}s（冷启动前5次=30s）",
-                self.federation_port, self.interval_secs
-            );
+        // 先初始化 DHT（引导到公共 DHT 网络）
+        if let Err(e) = self.dht.init().await {
+            warn!("[federation] DHT 初始化失败: {}", e);
+            return;
+        }
+        info!(
+            "[federation] DHT 魔法 infohash 发现已启动，联邦端口: {}, 间隔: {}s（由 TaskScheduler 调度）",
+            self.federation_port, self.interval_secs
+        );
 
-            // 冷启动：立即执行第一次发现
-            self.clone().discovery_tick().await;
-
-            // 前 5 次短间隔 30s，之后长间隔
-            let mut tick_count = 0u32;
-            loop {
-                let interval = if tick_count < 5 { 30 } else { self.interval_secs };
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(interval)) => {
-                        tick_count += 1;
-                        self.clone().discovery_tick().await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] DHT 发现任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
+        // 立即执行第一次发现
+        self.clone().discovery_tick().await;
     }
 
-    /// 单次发现：先 announce 自己，再 get_peers 发现其他节点
-    async fn discovery_tick(self: Arc<Self>) {
+    /// 单次发现：先 announce 自己，再 get_peers 发现其他节点（由 TaskScheduler 调度）
+    pub async fn discovery_tick(self: Arc<Self>) {
         // 迭代式查找 + 同步 announce（保证 announce 与 discover 查询同一批节点，100% 重叠）
         match self
             .dht

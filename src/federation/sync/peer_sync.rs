@@ -30,7 +30,7 @@ struct PeerSyncPayload {
 }
 
 /// 构建 Peer 同步条目的 (key, payload_bytes)。
-/// 格式与 collect_all_entries 完全一致，供 PeerRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
+/// 主键为 infohash:addr 组合，同步 (infohash, peer) 关联。
 pub(crate) fn build_peer_sync_entry(
     infohash: Infohash,
     addr: std::net::SocketAddr,
@@ -44,9 +44,8 @@ pub(crate) fn build_peer_sync_entry(
         source: source.to_string(),
     };
     let payload_bytes = bincode::serialize(&payload).ok()?;
-    let mut key = Vec::with_capacity(20 + 8);
-    key.extend_from_slice(&infohash);
-    key.extend_from_slice(&addr.to_string().into_bytes());
+    let ih_hex = infohash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let key = format!("{}:{}", ih_hex, addr).into_bytes();
     Some((key, payload_bytes))
 }
 
@@ -126,7 +125,7 @@ impl PeerSync {
 
     /// 应用收到的 Peer 同步数据
     pub fn apply_peer_sync(&self, entries: &[SyncEntry]) {
-        // 第一遍：过滤 DELETE / 反序列化失败，构建 (infohash, peer)，收集 Merkle 批量更新
+        // 第一遍：过滤 DELETE / 反序列化失败，构建 (infohash, PeerInfo) 列表，收集 Merkle 批量更新
         let mut items: Vec<(Infohash, PeerInfo)> = Vec::new();
         let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
@@ -164,10 +163,9 @@ impl PeerSync {
                 metadata: Default::default(),
             };
 
-            // key = infohash(20) + addr 序列化
-            let mut key = Vec::with_capacity(20 + 8);
-            key.extend_from_slice(&payload.infohash);
-            key.extend_from_slice(&payload.addr.to_string().into_bytes());
+            // key = infohash:addr
+            let ih_hex = payload.infohash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+            let key = format!("{}:{}", ih_hex, payload.addr).into_bytes();
             merkle_batch.push((key, entry.payload.clone()));
 
             items.push((payload.infohash, peer));
@@ -176,14 +174,15 @@ impl PeerSync {
 
         // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
         if !merkle_batch.is_empty() {
-            let items: Vec<_> = merkle_batch
+            let items_q: Vec<_> = merkle_batch
                 .into_iter()
                 .map(|(k, v)| (repo_type::PEER, k, v))
                 .collect();
-            self.merkle_queue.push_batch(items);
+            self.merkle_queue.push_batch(items_q);
         }
 
-        // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
+        // 第二遍：一次写锁批量写入（调用 add_peers_sync_internal，维护 global + by_infohash）
+        // 注意：联邦入站不调用 propagate_peers，避免 Gossip 回环；Merkle 已通过 merkle_queue 更新
         if !items.is_empty() {
             self.peer_repo.add_peers_sync_internal(&items);
         }
@@ -200,48 +199,51 @@ impl PeerSync {
         self.merkle.clone()
     }
 
-    /// 收集全量 Peer 同步条目（用于初始全量同步）
+    /// 收集全量 Peer 同步条目（用于差量同步）
     ///
-    /// 遍历所有 infohash 及其关联的 peer，构建 SyncEntry 列表。
-    /// 注意：此方法不更新 Merkle 树，避免在遍历大量数据时持有锁导致死锁。
+    /// 遍历 by_infohash 中的所有 (infohash, addr) 关联，构建 SyncEntry 列表。
+    /// 主键为 infohash:addr 组合。
     pub fn collect_all_entries(&self) -> Vec<SyncEntry> {
-        // 确保 PeerRepo 数据已加载（联邦模块可能拿到独立实例，cache 为空）
-        self.peer_repo.ensure_loaded();
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // 高效方式：一次读锁获取所有 peer 及其关联的 infohashes
-        // 避免遍历 2741 个 infohash 时每次都加锁+排序导致的性能问题
-        let all_peers = self.peer_repo.all_peers_with_infohashes_sync();
+        let all_with_ih = self.peer_repo.all_peers_with_infohashes_sync();
         info!(
-            "[federation] Peer collect_all_entries: all_peers={}",
-            all_peers.len()
+            "[federation] Peer collect_all_entries: peers={}, infohash_refs_total={}",
+            all_with_ih.len(),
+            all_with_ih.iter().map(|(_, ihs)| ihs.len()).sum::<usize>()
         );
 
-        let mut entries = Vec::with_capacity(all_peers.len());
+        let mut entries = Vec::new();
 
-        for (peer, infohashes) in &all_peers {
+        for (peer, infohashes) in &all_with_ih {
+            let first_seen_secs = peer
+                .first_seen
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let source = peer.source.as_str().to_string();
+
+            // 如果 peer 没有关联任何 infohash（理论上不应发生），跳过
+            if infohashes.is_empty() {
+                continue;
+            }
+
             for infohash in infohashes {
                 let payload = PeerSyncPayload {
                     infohash: *infohash,
                     addr: peer.addr,
-                    first_seen_secs: peer
-                        .first_seen
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    source: peer.source.as_str().to_string(),
+                    first_seen_secs,
+                    source: source.clone(),
                 };
                 let payload_bytes = match bincode::serialize(&payload) {
                     Ok(b) => b,
                     Err(_) => continue,
                 };
-                let mut key = Vec::with_capacity(20 + 8);
-                key.extend_from_slice(infohash);
-                key.extend_from_slice(&peer.addr.to_string().into_bytes());
+                let ih_hex = infohash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                let key = format!("{}:{}", ih_hex, peer.addr).into_bytes();
 
                 entries.push(SyncEntry {
                     key,
@@ -322,15 +324,17 @@ mod tests {
             first_seen_secs: 1000,
             source: "tracker".to_string(),
         };
+        let ih_hex = "05".repeat(20);
         let entries = vec![SyncEntry {
-            key: b"testkey".to_vec(),
+            key: format!("{}:10.0.0.1:6881", ih_hex).into_bytes(),
             operation: operation::UPSERT,
             version: 1,
             payload: bincode::serialize(&payload).unwrap(),
         }];
 
         peer_sync.apply_peer_sync(&entries);
-        // 验证 peer 已写入
+        // 验证 peer 已写入 global 和 by_infohash
+        assert_eq!(peer_repo.len(), 1);
         let peers = peer_repo.get_peers_sync(&[5; 20], 10);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].addr, "10.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap());

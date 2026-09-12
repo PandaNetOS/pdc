@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
+use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::federation::metrics::FederationMetrics;
@@ -19,13 +20,13 @@ use crate::federation::protocol::{
 
 /// TCP 读取端（含读取缓冲区）
 struct TcpReader {
-    reader: tokio::net::tcp::OwnedReadHalf,
+    reader: ReadHalf<Box<dyn TransportStream>>,
     read_buf: BytesMut,
 }
 
 /// TCP 写入端
 struct TcpWriter {
-    writer: tokio::net::tcp::OwnedWriteHalf,
+    writer: WriteHalf<Box<dyn TransportStream>>,
 }
 
 /// TCP 传输层（读写分离，独立锁，可并发收发）
@@ -44,11 +45,11 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
-    /// 从已有的 TcpStream 创建传输层
-    pub fn new(stream: TcpStream) -> Self {
-        let peer = stream.peer_addr().ok();
-        let local = stream.local_addr().ok();
-        let (reader, writer) = stream.into_split();
+    /// 从已有的 TransportStream 创建传输层
+    pub fn new(stream: Box<dyn TransportStream>) -> Self {
+        let peer = stream.peer_addr();
+        let local = stream.local_addr();
+        let (reader, writer) = tokio::io::split(stream);
         Self {
             reader: TokioMutex::new(TcpReader {
                 reader,
@@ -78,13 +79,15 @@ impl TcpTransport {
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
         let stream = tokio::time::timeout(
             Duration::from_secs(10),
-            TcpStream::connect(addr),
+            tokio::net::TcpStream::connect(addr),
         )
         .await
         .map_err(|_| anyhow::anyhow!("连接超时: {}", addr))?
         .map_err(|e| anyhow::anyhow!("连接失败 {}: {}", addr, e))?;
         stream.set_nodelay(true).map_err(|e| anyhow::anyhow!("set_nodelay 失败: {}", e))?;
-        Ok(Self::new(stream))
+        let transport_stream: Box<dyn TransportStream> =
+            Box::new(TcpTransportStream::new(stream, TransportKind::Tcp));
+        Ok(Self::new(transport_stream))
     }
 
     /// 绑定监听地址，返回 TcpListener
@@ -290,7 +293,10 @@ mod tests {
         // 服务端接受连接
         let server_handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = TcpTransport::new(stream);
+            let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+                stream,
+                TransportKind::Tcp,
+            )));
             let (msg_type, payload) = transport.recv_message().await.unwrap();
             assert_eq!(msg_type, MessageType::Ping);
             let ping: PingMessage = bincode::deserialize(&payload).unwrap();
@@ -328,7 +334,10 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = TcpTransport::new(stream);
+            let mut transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+                stream,
+                TransportKind::Tcp,
+            )));
             for i in 0..5 {
                 let (msg_type, payload) = transport.recv_message().await.unwrap();
                 assert_eq!(msg_type, MessageType::Ping);
@@ -396,7 +405,10 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let transport = TcpTransport::new(stream);
+            let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+                stream,
+                TransportKind::Tcp,
+            )));
             assert!(transport.peer_addr().is_ok());
         });
 

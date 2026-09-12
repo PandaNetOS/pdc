@@ -204,7 +204,7 @@ mod tests {
         let config = PdcConfig::default();
         let registry = Arc::new(DiscovererRegistry::new());
         let bus = EventBus::default();
-        let cp = ControlPlane::new(config, registry, bus);
+        let mut cp = ControlPlane::new(config, registry, bus);
         cp.init_default_discoverers();
         // 默认启用 tracker + dht + pex = 3 个
         assert_eq!(cp.registry().len(), 3);

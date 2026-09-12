@@ -19,6 +19,9 @@ pub struct FederationConfig {
     /// 联邦监听端口
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    /// 传输模式：tcp_only / iroh_only / auto（默认 auto，Iroh+TCP 并行 race）
+    #[serde(default = "default_transport_mode")]
+    pub transport_mode: String,
     /// API/HTTP 监控端口（LPD 广播时告知对端，端口自动探测后为实际值）
     #[serde(default = "default_api_port")]
     pub api_port: u16,
@@ -181,6 +184,7 @@ pub struct FederationConfig {
 
 fn default_listen_port() -> u16 { 6885 }
 fn default_api_port() -> u16 { 6880 }
+fn default_transport_mode() -> String { "auto".to_string() }
 fn default_lpd_multicast_port() -> u16 { 6772 }
 fn default_max_connections() -> usize { 32 }
 fn default_target_neighbors() -> usize { 8 }
@@ -236,6 +240,7 @@ impl Default for FederationConfig {
             node_id: None,
             seed_nodes: Vec::new(),
             listen_port: default_listen_port(),
+            transport_mode: default_transport_mode(),
             api_port: default_api_port(),
             lpd_multicast_port: default_lpd_multicast_port(),
             max_connections: default_max_connections(),

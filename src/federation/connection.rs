@@ -20,6 +20,7 @@ use crate::federation::protocol::*;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::signaling::SignalingService;
 use crate::federation::transport::TcpTransport;
+use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
 
 /// 单条连接
 pub struct Connection {
@@ -255,9 +256,12 @@ impl ConnectionManager {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     info!("[federation] 收到入站连接: {}", addr);
+                    let _ = stream.set_nodelay(true);
+                    let transport_stream: Box<dyn TransportStream> =
+                        Box::new(TcpTransportStream::new(stream, TransportKind::Tcp));
                     let self_clone = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = self_clone.handle_inbound(stream, addr).await {
+                        if let Err(e) = self_clone.handle_inbound(transport_stream, addr).await {
                             debug!("[federation] 入站连接处理失败 {}: {}", addr, e);
                         }
                     });
@@ -273,10 +277,9 @@ impl ConnectionManager {
     /// 处理入站连接
     async fn handle_inbound(
         self: Arc<Self>,
-        stream: tokio::net::TcpStream,
+        stream: Box<dyn TransportStream>,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        let _ = stream.set_nodelay(true);
         let transport_write_timeout = Duration::from_secs(self.config.transport_write_timeout_secs);
         let transport = TcpTransport::new(stream)
             .with_metrics(self.metrics.clone())
@@ -407,7 +410,7 @@ impl ConnectionManager {
                 .connect_to(net_node_id, &[addr], reachability, nat_type)
                 .await
             {
-                Ok(result) => TcpTransport::new(result.connection.stream)
+                Ok(result) => TcpTransport::new(result.connection)
                     .with_metrics(self.metrics.clone())
                     .with_write_timeout(Duration::from_secs(
                         self.config.transport_write_timeout_secs,
@@ -616,10 +619,9 @@ impl ConnectionManager {
         self.node_table.mark_disconnected(node_id);
     }
 
-    /// 启动心跳后台任务
+    /// 启动心跳后台任务（已迁移到 TaskScheduler，此方法保留兼容但不再被调用）
     pub fn spawn_heartbeat(self: Arc<Self>) {
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs);
-        let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let mut shutdown_rx = self.shutdown.subscribe();
 
         tokio::spawn(async move {
@@ -627,7 +629,7 @@ impl ConnectionManager {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        self.heartbeat_tick(timeout).await;
+                        self.heartbeat_tick().await;
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("[federation] 心跳任务收到关闭信号");
@@ -636,11 +638,12 @@ impl ConnectionManager {
                 }
             }
         });
-        info!("[federation] 心跳任务已启动（间隔 {}s，超时 {}s）", interval.as_secs(), timeout.as_secs());
+        info!("[federation] 心跳任务已启动（间隔 {}s）", interval.as_secs());
     }
 
-    /// 心跳单次执行
-    async fn heartbeat_tick(&self, timeout: Duration) {
+    /// 心跳单次执行（由 TaskScheduler 调度）
+    pub async fn heartbeat_tick(&self) {
+        let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let conns: Vec<Arc<Connection>> = self.all_connections();
         let now = Instant::now();
 
@@ -1353,7 +1356,10 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let transport = TcpTransport::new(stream);
+            let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+                stream,
+                TransportKind::Tcp,
+            )));
             let conn = Connection::new(transport, NodeId([1; 20]), addr);
             let (msg_type, payload) = conn.recv_message().await.unwrap();
             assert_eq!(msg_type, MessageType::Ping);
@@ -1364,7 +1370,10 @@ mod tests {
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let transport = TcpTransport::new(stream);
+        let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+            stream,
+            TransportKind::Tcp,
+        )));
         let conn = Connection::new(transport, NodeId([2; 20]), addr);
 
         let ping = PingMessage { timestamp: 42 };
@@ -1386,12 +1395,18 @@ mod tests {
 
         let _server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _transport = TcpTransport::new(stream);
+            let _transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+                stream,
+                TransportKind::Tcp,
+            )));
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let transport = TcpTransport::new(stream);
+        let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+            stream,
+            TransportKind::Tcp,
+        )));
         let conn = Connection::new(transport, NodeId([1; 20]), addr);
 
         assert!(conn.idle_duration().as_millis() < 100);
@@ -1428,13 +1443,19 @@ mod tests {
         let mgr2_clone = mgr2.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = TcpTransport::new(stream);
+            let mut transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+                stream,
+                TransportKind::Tcp,
+            )));
             let (peer_id, _) = mgr2_clone.handshake_inbound(&mut transport).await.unwrap();
             assert_eq!(peer_id, identity1.node_id);
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut transport = TcpTransport::new(stream);
+        let mut transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+            stream,
+            TransportKind::Tcp,
+        )));
         let peer_id = mgr1.handshake_outbound(&mut transport, identity2.node_id).await.unwrap();
         assert_eq!(peer_id, identity2.node_id);
 

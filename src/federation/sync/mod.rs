@@ -381,7 +381,7 @@ impl SyncManager {
 
     /// 执行一次 Node 同步（已退役）：本地新节点已由 NodeRepoImpl.add_node_sync 统一更新
     /// Merkle + 提交 Gossip，此处不再轮询传播，也不再 take_dirty（避免与 save_all 抢脏标记）。
-    async fn do_node_sync(self: Arc<Self>) {}
+    pub async fn do_node_sync(self: Arc<Self>) {}
 
     /// 处理收到的同步批量消息（阶段1 SyncBatch 协议）
     pub fn handle_sync_batch(&self, repo_type: u8, entries: &[SyncEntry]) {

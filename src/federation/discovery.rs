@@ -19,7 +19,6 @@ use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::{Connection, ConnectionManager};
-use crate::federation::dht_discovery::DhtDiscoveryService;
 use pnos_net::discovery::lpd::LpdDiscoveryService;
 use pnos_net::discovery::mqtt::MqttDiscoveryService;
 use pnos_net::types::DiscoveredNode;
@@ -166,18 +165,7 @@ impl DiscoveryService {
             }
         }
 
-        // 4. 启动 DHT 魔法 infohash 发现
-        if self.config.dht_discovery_enabled {
-            let dht_service = Arc::new(DhtDiscoveryService::new(
-                self.node_table.clone(),
-                self.config.listen_port,
-                self.config.dht_discovery_interval_secs,
-                self.shutdown.clone(),
-                self.node_repo.clone(),
-                self.dht_discoverer.clone(),
-            ));
-            dht_service.spawn();
-        }
+        // 4. DHT 魔法 infohash 发现已迁移到 FederationService 统一管理（由 TaskScheduler 调度）
 
         // 4.1 启动 LPD 局域网多播发现（零配置核心：同网段节点自动发现）
         // pnos-net 的 LPD 通过事件输出发现结果，此处订阅后加入 NodeTable

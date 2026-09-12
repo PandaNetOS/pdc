@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::discoverers::DiscovererRegistry;
@@ -147,40 +146,18 @@ impl HealthCheckTask {
         self
     }
 
-    /// 启动健康检查任务
-    pub async fn run(self: Arc<Self>) {
-        let mut main_ticker = interval(self.config.interval);
-        let mut cache_ticker = interval(self.config.cache_cleanup_interval);
-        let mut stats_ticker = interval(self.config.stats_output_interval);
-
-        info!(
-            "[health_check] 健康检查任务已启动，主间隔 {:?}, 缓存清理间隔 {:?}, 统计输出间隔 {:?}",
-            self.config.interval,
-            self.config.cache_cleanup_interval,
-            self.config.stats_output_interval
-        );
-
-        loop {
-            // 全量同步期间暂停健康检查等周期性工作，把带宽/CPU 让给联邦同步
-            let paused = self.pause_gate.as_ref()
-                .map(|g| g.load(Ordering::Relaxed))
-                .unwrap_or(false);
-            tokio::select! {
-                _ = main_ticker.tick() => {
-                    if !paused { self.check_discoverers_health().await; }
-                }
-                _ = cache_ticker.tick() => {
-                    if !paused { self.cleanup_expired_peers().await; }
-                }
-                _ = stats_ticker.tick() => {
-                    if !paused { self.output_stats().await; }
-                }
-            }
-        }
+    /// 检查暂停门是否为 true（全量同步期间跳过周期性工作）
+    fn is_paused(&self) -> bool {
+        self.pause_gate.as_ref()
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
-    /// 检查所有发现器健康状态
-    async fn check_discoverers_health(&self) {
+    /// 检查所有发现器健康状态（由 TaskScheduler 调度）
+    pub async fn check_discoverers_health(&self) {
+        if self.is_paused() {
+            return;
+        }
         let discoverers = self.registry.all();
         debug!(
             "[health_check] 开始健康检查，共 {} 个发现器",
@@ -200,25 +177,12 @@ impl HealthCheckTask {
         }
     }
 
-    /// 清理过期的 peer 缓存
-    async fn cleanup_expired_peers(&self) {
-        let before = self.cache.len();
-        self.cache.cleanup_expired_sync();
-        let after = self.cache.len();
-
-        if before != after {
-            info!(
-                "[health_check] 已清理过期 peer: {} -> {} (清理 {} 个)",
-                before,
-                after,
-                before - after
-            );
-        } else {
-            debug!(
-                "[health_check] 缓存清理完成，无过期 peer，当前 {} 个",
-                after
-            );
+    /// 清理过期的 peer 缓存（由 TaskScheduler 调度）
+    pub async fn cleanup_expired_peers(&self) {
+        if self.is_paused() {
+            return;
         }
+        // 永久资产模式：不删除 peer
     }
 
     /// 计算系统综合健康度（使用 HealthScorer 统一入口，唯一计算路径）
@@ -260,8 +224,11 @@ impl HealthCheckTask {
         }
     }
 
-    /// 输出统计信息
-    async fn output_stats(&self) {
+    /// 输出统计信息（由 TaskScheduler 调度）
+    pub async fn output_stats(&self) {
+        if self.is_paused() {
+            return;
+        }
         let raw_stats = self.registry.aggregate_stats();
         let mut total_requests = 0u64;
         let mut success_requests = 0u64;

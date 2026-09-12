@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use rustc_hash::FxHashSet;
 use tracing::{info, warn};
 
 use crate::federation::gossip::GossipEngine;
@@ -147,16 +148,19 @@ impl PeerRepoImpl {
     }
 
     /// 内部写入：批量更新内存缓存 + history 缓冲区，不触发 Merkle/Gossip。
-    /// 返回真正新增的 (merkle key, payload bytes) 对（仅 (infohash, addr) 新关联）。
-    /// 联邦同步入站路径（apply_peer_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
-    pub(crate) fn add_peers_sync_internal(&self, items: &[(Infohash, PeerInfo)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// 内部写入：批量新增 peer + 关联，不触发 Merkle/Gossip。
+    /// 返回真正新增的 peer (addr, first_seen_secs, source)（按 addr 去重）。
+    /// 联邦同步入站（apply_peer_sync）请改用 add_peers_only_internal，避免回环。
+    pub(crate) fn add_peers_sync_internal(&self, items: &[(Infohash, PeerInfo)]) -> Vec<(Infohash, SocketAddr, u64, String)> {
         if items.is_empty() {
             return Vec::new();
         }
         let mut cache = self.cache.write();
-        let mut new_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut new_entries: Vec<(Infohash, SocketAddr, u64, String)> = Vec::new();
+        let mut seen_keys: FxHashSet<(Infohash, SocketAddr)> = FxHashSet::default();
         for (infohash, peer) in items {
             let addr = peer.addr;
+            let is_new_peer = !cache.global.contains_key(&addr);
             if let Some(existing) = cache.global.get_mut(&addr) {
                 existing.last_active = peer.last_active;
                 existing.source = peer.source;
@@ -166,22 +170,16 @@ impl PeerRepoImpl {
             } else {
                 cache.global.insert(addr, peer.clone());
             }
-            // 检测 (infohash, addr) 是否为新关联（merkle key 粒度）
-            let is_new_assoc = match cache.by_infohash.get(infohash) {
-                Some(set) => !set.contains(&addr),
-                None => true,
-            };
-            cache.by_infohash.entry(*infohash).or_default().insert(addr);
+            // 维护 (infohash, addr) 关联
+            let is_new_assoc = cache
+                .by_infohash
+                .entry(*infohash)
+                .or_default()
+                .insert(addr);
             cache.infohash_refs.entry(addr).or_default().insert(*infohash);
-            if is_new_assoc {
-                if let Some((k, p)) = crate::federation::sync::peer_sync::build_peer_sync_entry(
-                    *infohash,
-                    peer.addr,
-                    peer.first_seen.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                    peer.source.as_str(),
-                ) {
-                    new_entries.push((k, p));
-                }
+            if is_new_assoc && seen_keys.insert((*infohash, addr)) {
+                let first_seen_secs = peer.first_seen.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                new_entries.push((*infohash, addr, first_seen_secs, peer.source.as_str().to_string()));
             }
         }
         drop(cache);
@@ -211,23 +209,63 @@ impl PeerRepoImpl {
         new_entries
     }
 
+    /// 内部写入：仅批量新增 peer（不维护 infohash 关联），不触发 Merkle/Gossip。
+    /// 联邦同步入站（apply_peer_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    pub(crate) fn add_peers_only_internal(&self, peers: &[PeerInfo]) {
+        if peers.is_empty() {
+            return;
+        }
+        let mut cache = self.cache.write();
+        for peer in peers {
+            let addr = peer.addr;
+            if let Some(existing) = cache.global.get_mut(&addr) {
+                existing.last_active = peer.last_active;
+                existing.source = peer.source;
+                if peer.peer_id.is_some() {
+                    existing.peer_id = peer.peer_id.clone();
+                }
+            } else {
+                cache.global.insert(addr, peer.clone());
+            }
+        }
+    }
+
+    /// 把新 peer 列表构建成 merkle/gossip 条目并传播（与 Node/Infohash/Tracker 一致）。
+    fn propagate_peers(&self, new_entries: Vec<(Infohash, SocketAddr, u64, String)>) {
+        if new_entries.is_empty() {
+            return;
+        }
+        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_entries.len());
+        for (infohash, addr, first_seen_secs, source) in &new_entries {
+            if let Some((k, p)) = crate::federation::sync::peer_sync::build_peer_sync_entry(
+                *infohash,
+                *addr,
+                *first_seen_secs,
+                source,
+            ) {
+                built.push((k, p));
+            }
+        }
+        self.propagate(repo_type::PEER, built);
+    }
+
     /// 同步批量加入 peer（本地发现路径）：写入后统一更新 Merkle + 提交 Gossip。
     pub fn add_peers_sync(&self, infohash: &Infohash, new_peers: &[PeerInfo]) {
         let items: Vec<(Infohash, PeerInfo)> =
             new_peers.iter().map(|p| (*infohash, p.clone())).collect();
-        let new_entries = self.add_peers_sync_internal(&items);
-        self.propagate(repo_type::PEER, new_entries);
+        let new_peers = self.add_peers_sync_internal(&items);
+        self.propagate_peers(new_peers);
     }
 
     /// 批量写入 peer（一次 cache 写锁 + 一次 history_buffer 写锁），返回处理条数。
-    /// 本地写入路径：新关联条目更新 Merkle + 提交 Gossip。
-    /// 联邦同步入站（apply_peer_sync）请改用 add_peers_sync_internal，避免回环。
+    /// 本地写入路径：新 peer 更新 Merkle + 提交 Gossip。
+    /// 联邦同步入站（apply_peer_sync）请改用 add_peers_only_internal，避免回环。
     pub fn add_peers_sync_batch(&self, items: &[(Infohash, PeerInfo)]) -> usize {
         if items.is_empty() {
             return 0;
         }
-        let new_entries = self.add_peers_sync_internal(items);
-        self.propagate(repo_type::PEER, new_entries);
+        let new_peers = self.add_peers_sync_internal(items);
+        self.propagate_peers(new_peers);
         items.len()
     }
 
@@ -273,25 +311,7 @@ impl PeerRepoImpl {
     }
 
     pub fn cleanup_expired_sync(&self) {
-        let ttl = Duration::from_secs(3600); // 榛樿1灏忔椂
-        let now = SystemTime::now();
-        let mut cache = self.cache.write();
-        let expired: Vec<SocketAddr> = cache
-            .global.iter()
-            .filter(|(_, p)| now.duration_since(p.last_active).unwrap_or_default() > ttl)
-            .map(|(a, _)| *a)
-            .collect();
-        for addr in &expired {
-            if let Some(refs) = cache.infohash_refs.remove(addr) {
-                for ih in refs {
-                    if let Some(set) = cache.by_infohash.get_mut(&ih) {
-                        set.remove(addr);
-                        if set.is_empty() { cache.by_infohash.remove(&ih); }
-                    }
-                }
-            }
-            cache.global.remove(addr);
-        }
+        // 永久资产模式：不删除任何 peer
     }
 
     pub fn len(&self) -> usize {
@@ -484,26 +504,8 @@ impl PeerRepository for PeerRepoImpl {
         self.cache.read().infohash_refs.get(addr).map(|s| s.len() as u32).unwrap_or(0)
     }
 
-    async fn cleanup_expired(&self, ttl_secs: u64) {
-        let ttl = Duration::from_secs(ttl_secs);
-        let now = SystemTime::now();
-        let mut cache = self.cache.write();
-        let expired: Vec<SocketAddr> = cache
-            .global.iter()
-            .filter(|(_, p)| now.duration_since(p.last_active).unwrap_or_default() > ttl)
-            .map(|(a, _)| *a)
-            .collect();
-        for addr in &expired {
-            if let Some(refs) = cache.infohash_refs.remove(addr) {
-                for ih in refs {
-                    if let Some(set) = cache.by_infohash.get_mut(&ih) {
-                        set.remove(addr);
-                        if set.is_empty() { cache.by_infohash.remove(&ih); }
-                    }
-                }
-            }
-            cache.global.remove(addr);
-        }
+    async fn cleanup_expired(&self, _ttl_secs: u64) {
+        // 永久资产模式：不删除任何 peer
     }
 
     async fn save_all(&self) -> anyhow::Result<()> {

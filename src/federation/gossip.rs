@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use rand::SeedableRng;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::broadcast;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::{Connection, ConnectionManager};
@@ -859,10 +859,11 @@ impl GossipEngine {
         debug!("[federation] 反熵任务已启动（间隔 60s）");
     }
 
-    /// 单次反熵：随机选1个邻居，发送所有 repo_type 的 MerkleDigest
-    async fn anti_entropy_tick<M: MerkleProvider>(self: Arc<Self>, merkle_provider: Arc<M>) {
+    /// 单次反熵：随机选1个邻居，发送所有 repo_type 的 MerkleDigest（由 TaskScheduler 调度）
+    pub async fn anti_entropy_tick<M: MerkleProvider>(self: Arc<Self>, merkle_provider: Arc<M>) {
         let conns = self.connection_manager.all_connections();
         if conns.is_empty() {
+            debug!("[federation] 反熵跳过：无连接");
             return;
         }
 
@@ -873,17 +874,22 @@ impl GossipEngine {
             None => return,
         };
 
+        let mut sent = 0u8;
         // 发送所有 repo 的 MerkleDigest（Node/Peer/Infohash/Tracker）
         for repo_type in &[repo_type::NODE, repo_type::PEER, repo_type::INFOHASH, repo_type::TRACKER] {
             let digest = merkle_provider.get_digest(*repo_type);
             if let Err(e) = conn.send_message(MessageType::MerkleDigest, &digest).await {
-                debug!("[federation] 反熵 MerkleDigest 发送失败: {}", e);
+                warn!("[federation] 反熵 MerkleDigest 发送失败 (repo={}): {}", repo_type, e);
             } else {
                 self.metrics.record_message_sent();
+                sent += 1;
             }
         }
 
-        debug!("[federation] 反熵对账发送到 {}", conn.node_id);
+        info!(
+            "[federation] 反熵对账发送到 {} ({} 个 repo, 连接数={})",
+            conn.node_id, sent, conns.len()
+        );
     }
 
     /// outbox 大小

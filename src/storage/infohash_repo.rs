@@ -291,10 +291,8 @@ impl InfohashRepository for InfohashRepoImpl {
     }
 
     async fn cleanup_zero_ref(&self) -> usize {
-        let mut cache = self.cache.write();
-        let before = cache.entries.len();
-        cache.entries.retain(|_, (count, _, _, _)| *count > 0);
-        before - cache.entries.len()
+        // 永久资产模式：infohash 永久保留，不删除零引用条目
+        0
     }
 
     async fn update_score(&self, infohash: &Infohash, score: f64) {
