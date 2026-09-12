@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::storage::PeerRepoImpl;
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::http_tracker::SuperTrackerState;
-use crate::types::AnnounceEvent;
+use crate::types::{AnnounceEvent, ScrapeEntry};
 use crate::data_plane::rate_limiter::{RateLimiter, RequestType};
 
 // BEP 15 协议常量
@@ -194,8 +194,7 @@ impl UdpTrackerServer {
                 .await
             }
             ACTION_SCRAPE => {
-                // 暂未实现 scrape，返回错误
-                Some(Self::build_error(transaction_id, "scrape not implemented"))
+                Self::handle_scrape(data, transaction_id, super_tracker, infohash_repo)
             }
             _ => Some(Self::build_error(transaction_id, "invalid action")),
         }
@@ -345,6 +344,70 @@ impl UdpTrackerServer {
         );
 
         Some(resp)
+    }
+
+    /// 处理 UDP scrape 请求（BEP 15）
+    ///
+    /// 请求：connection_id(8) + action(4)=2 + transaction_id(4) + infohash 列表（每个 20 字节）
+    /// 响应：action(4)=2 + transaction_id(4) + 每个 infohash 的 seeders(4)+completed(4)+leechers(4)
+    fn handle_scrape(
+        data: &[u8],
+        transaction_id: u32,
+        super_tracker: &SuperTrackerState,
+        infohash_repo: Option<&Arc<crate::storage::InfohashRepoImpl>>,
+    ) -> Option<Vec<u8>> {
+        // 验证最小长度：16 字节头 + 至少 1 个 infohash（20 字节）
+        if data.len() < 36 {
+            return Some(Self::build_error(transaction_id, "invalid scrape request"));
+        }
+
+        // 解析 infohash 列表（从第 16 字节开始）
+        let infohash_count = (data.len() - 16) / 20;
+        let mut info_hashes: Vec<[u8; 20]> = Vec::with_capacity(infohash_count);
+        for i in 0..infohash_count {
+            let start = 16 + i * 20;
+            let ih_bytes: [u8; 20] = data[start..start + 20].try_into().ok()?;
+            info_hashes.push(ih_bytes);
+        }
+
+        // 统一数据归口：将 infohash 注册到 InfohashRepo
+        if let Some(repo) = infohash_repo {
+            for ih in &info_hashes {
+                repo.register_sync(*ih, "udp_scrape");
+            }
+        }
+
+        // 从 SuperTrackerState 查询统计
+        let scrape_resp = super_tracker.handle_scrape(&info_hashes);
+
+        // 构建响应：action(4) + transaction_id(4) + 每个 infohash 12 字节
+        let mut response = Vec::with_capacity(8 + infohash_count * 12);
+        response.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
+        response.extend_from_slice(&transaction_id.to_be_bytes());
+
+        for ih in &info_hashes {
+            let entry = scrape_resp.files.get(ih).cloned().unwrap_or(ScrapeEntry {
+                complete: 0,
+                downloaded: 0,
+                incomplete: 0,
+                name: None,
+            });
+            // BEP 15 顺序：seeders(4) + completed(4) + leechers(4)
+            // seeders = complete（做种者）
+            // completed = downloaded（总下载完成数，PDC 暂不统计，填 0）
+            // leechers = incomplete（下载者）
+            response.extend_from_slice(&(entry.complete as u32).to_be_bytes());
+            response.extend_from_slice(&(entry.downloaded as u32).to_be_bytes());
+            response.extend_from_slice(&(entry.incomplete as u32).to_be_bytes());
+        }
+
+        debug!(
+            "[udp_tracker] scrape: {} 个 infohash, 响应 {} 字节",
+            infohash_count,
+            response.len()
+        );
+
+        Some(response)
     }
 
     /// 构建错误响应

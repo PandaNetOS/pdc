@@ -66,6 +66,10 @@ pub enum MessageType {
     GossipPullRequest = 24,
     /// Push-Pull Gossip 拉取响应：返回完整条目数据
     GossipPullResponse = 25,
+    /// 实时 peer 查询请求（announce 时本地 peer 不足，向联邦节点查询）
+    PeerQueryRequest = 26,
+    /// 实时 peer 查询响应
+    PeerQueryResponse = 27,
 }
 
 impl MessageType {
@@ -98,6 +102,8 @@ impl MessageType {
             23 => Some(MessageType::GossipDigest),
             24 => Some(MessageType::GossipPullRequest),
             25 => Some(MessageType::GossipPullResponse),
+            26 => Some(MessageType::PeerQueryRequest),
+            27 => Some(MessageType::PeerQueryResponse),
             _ => None,
         }
     }
@@ -410,6 +416,37 @@ pub struct GossipPullRequestMessage {
 pub struct GossipPullResponseMessage {
     /// 完整条目：(repo_type, SyncEntry)
     pub entries: Vec<(u8, SyncEntry)>,
+}
+
+/// 实时 peer 查询请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerQueryRequestMessage {
+    /// 要查询的 infohash
+    pub infohash: [u8; 20],
+    /// 期望返回的 peer 数量上限
+    pub limit: u32,
+}
+
+/// 实时 peer 查询响应中的单个 peer 条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerQueryEntry {
+    /// peer IP 地址（字符串形式，兼容 IPv4/IPv6）
+    pub ip: String,
+    /// peer 端口
+    pub port: u16,
+    /// peer 来源（tracker/dht/pex/super_tracker/lpd/webseed/manual）
+    pub source: String,
+    /// 优先级评分
+    pub score: f64,
+}
+
+/// 实时 peer 查询响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerQueryResponseMessage {
+    /// 查询的 infohash
+    pub infohash: [u8; 20],
+    /// 查到的 peer 列表
+    pub peers: Vec<PeerQueryEntry>,
 }
 
 /// 仓库类型常量

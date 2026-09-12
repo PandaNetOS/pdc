@@ -234,12 +234,6 @@ async fn main() -> anyhow::Result<()> {
     control_plane.init_default_discoverers();
     info!("[main] 已注册 {} 个发现器", control_plane.registry().len());
 
-    // 5. 创建超级 Tracker 状态（注入 peer_repo，announce peer 双写）
-    let super_tracker = Arc::new(
-        SuperTrackerState::new(config.super_tracker.clone())
-            .with_peer_repo(peer_repo.clone()),
-    );
-
     // 6.5 创建 NAT 管理器，UPnP 端口映射异步后台初始化（不阻塞 HTTP 服务启动）
     let nat_config = PeerDiscoveryCenter::nat::NatConfig {
         enabled: config.nat.enabled,
@@ -308,6 +302,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // 5. 创建超级 Tracker 状态（注入 peer_repo + 联邦服务）
+    // 注意：创建时机推迟到 federation_service 之后，以便注入联邦引用
+    let mut super_tracker_builder = SuperTrackerState::new(config.super_tracker.clone())
+        .with_peer_repo(peer_repo.clone());
+    if let Some(ref fed) = federation_service {
+        super_tracker_builder = super_tracker_builder.with_federation(fed.clone());
+    }
+    let super_tracker = Arc::new(super_tracker_builder);
 
     // 6.8.5 自动防火墙规则配置（零配置协同：确保局域网发现和联邦连接不被拦截）
     // 失败时只记录 warning，不影响主流程启动。

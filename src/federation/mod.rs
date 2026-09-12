@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
@@ -534,6 +534,65 @@ impl FederationService {
             infohash_repo_total: 0,
             tracker_repo_total: 0,
         }
+    }
+
+    /// 向所有已连接的联邦节点并行发送 PeerQueryRequest，等待 `timeout` 后收集响应中的 peer 地址，去重返回。
+    ///
+    /// 用于 SuperTracker announce 时本地 peer 不足，实时向联邦节点拉取同 infohash 的 peer。
+    /// 响应会同时异步写入本地 PeerRepo（由 ConnectionManager dispatch 的 PeerQueryResponse 分支完成）。
+    pub async fn query_peers(
+        &self,
+        infohash: &[u8; 20],
+        limit: usize,
+        timeout: Duration,
+    ) -> Vec<SocketAddr> {
+        use std::collections::HashSet;
+        use crate::federation::protocol::{MessageType, PeerQueryRequestMessage};
+
+        let conns = self.connection_manager.all_connections();
+        if conns.is_empty() {
+            return Vec::new();
+        }
+
+        // 清空该 infohash 的旧响应，避免上一次查询残留
+        self.connection_manager.clear_peer_query_responses(infohash);
+
+        let req = PeerQueryRequestMessage {
+            infohash: *infohash,
+            limit: limit as u32,
+        };
+
+        // 并行向所有已连接节点发送查询请求（fire-and-forget，响应异步到达）
+        for conn in &conns {
+            if let Err(e) = conn.send_message(MessageType::PeerQueryRequest, &req).await {
+                debug!(
+                    "[federation] PeerQueryRequest 发送到 {} 失败: {}",
+                    conn.node_id, e
+                );
+            }
+        }
+
+        // 等待响应到达（统一超时，不阻塞调用方超过 timeout）
+        tokio::time::sleep(timeout).await;
+
+        // 收集所有节点返回的 peer，按 SocketAddr 去重
+        let entries = self.connection_manager.take_peer_query_responses(infohash);
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for e in entries {
+            if let Ok(ip) = e.ip.parse::<std::net::IpAddr>() {
+                let addr = SocketAddr::new(ip, e.port);
+                if seen.insert(addr) {
+                    result.push(addr);
+                }
+            }
+        }
+        debug!(
+            "[federation] query_peers: infohash={:?}, peers_returned={}",
+            &hex::encode(infohash),
+            result.len()
+        );
+        result
     }
 }
 

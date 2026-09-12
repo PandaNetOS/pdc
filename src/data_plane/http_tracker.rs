@@ -7,7 +7,7 @@
 //!
 //! qBittorrent 只需配置一个 tracker 地址：`http://pdc-host:port/announce`
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +20,23 @@ use axum::Router;
 use dashmap::DashMap;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// 超级 Tracker peer 补充策略阈值（冷数据 / 联邦）
+// TODO: 后续纳入 SuperTrackerConfig（带 #[serde(default)]），当前先以常量固定
+// ---------------------------------------------------------------------------
+/// 内存 peer 不足此数量时，从 peer_history 冷数据补充
+const PEER_HISTORY_SUPPLY_THRESHOLD: usize = 10;
+/// 单次从 peer_history 补充的最大 peer 数
+const PEER_HISTORY_SUPPLY_LIMIT: usize = 50;
+/// 补充历史后仍不足此数量时，触发联邦查询
+const FEDERATION_SUPPLY_THRESHOLD: usize = 20;
+/// 单次联邦查询请求的 peer 上限
+const FEDERATION_QUERY_LIMIT: usize = 50;
+/// 联邦查询超时（毫秒），避免拖慢 announce 响应
+const FEDERATION_QUERY_TIMEOUT_MS: u64 = 500;
+/// scrape 统计时从 PeerRepo 拉取的 peer 上限
+const SCRAPE_REPO_PEER_LIMIT: usize = 1000;
 
 use crate::storage::PeerRepoImpl;
 use crate::storage::repo_traits::PeerRepository;
@@ -59,6 +76,8 @@ pub struct SuperTrackerState {
     config: Arc<tokio::sync::RwLock<SuperTrackerConfig>>,
     /// 统一 PeerRepo（双写）
     peer_repo: Option<Arc<PeerRepoImpl>>,
+    /// 联邦服务（可选，peer 不足时跨节点查询补充）
+    federation: Option<Arc<crate::federation::FederationService>>,
 }
 
 impl SuperTrackerState {
@@ -68,6 +87,7 @@ impl SuperTrackerState {
             peers: Arc::new(DashMap::new()),
             config: Arc::new(tokio::sync::RwLock::new(config)),
             peer_repo: None,
+            federation: None,
         };
         state.spawn_cleanup_task();
         state
@@ -76,6 +96,12 @@ impl SuperTrackerState {
     /// 注入 PeerRepo（announce peer 双写到统一归口）
     pub fn with_peer_repo(mut self, repo: Arc<PeerRepoImpl>) -> Self {
         self.peer_repo = Some(repo);
+        self
+    }
+
+    /// 注入联邦服务（peer 不足时跨节点查询补充）
+    pub fn with_federation(mut self, fed: Arc<crate::federation::FederationService>) -> Self {
+        self.federation = Some(fed);
         self
     }
 
@@ -104,6 +130,33 @@ impl SuperTrackerState {
         for peer in cached {
             if !peers.contains(&peer.addr) && peer.addr != req.remote_addr {
                 peers.push(peer.addr);
+            }
+        }
+
+        // 2.5 peer_history 冷数据补充（内存 peer 不足时）
+        if peers.len() < PEER_HISTORY_SUPPLY_THRESHOLD {
+            for addr in cache.get_peers_from_history(&req.info_hash, PEER_HISTORY_SUPPLY_LIMIT) {
+                if !peers.contains(&addr) && addr != req.remote_addr {
+                    peers.push(addr);
+                }
+            }
+        }
+
+        // 2.6 联邦查询补充（仍不足时，带超时）
+        if peers.len() < FEDERATION_SUPPLY_THRESHOLD {
+            if let Some(fed) = &self.federation {
+                let remote = fed
+                    .query_peers(
+                        &req.info_hash,
+                        FEDERATION_QUERY_LIMIT,
+                        Duration::from_millis(FEDERATION_QUERY_TIMEOUT_MS),
+                    )
+                    .await;
+                for addr in remote {
+                    if !peers.contains(&addr) && addr != req.remote_addr {
+                        peers.push(addr);
+                    }
+                }
             }
         }
 
@@ -140,7 +193,18 @@ impl SuperTrackerState {
     pub fn handle_scrape(&self, info_hashes: &[Infohash]) -> TrackerScrapeResponse {
         let mut files = FxHashMap::default();
         for ih in info_hashes {
-            let (complete, incomplete) = self.count_seeders_leechers(ih);
+            let (complete, mut incomplete) = self.count_seeders_leechers(ih);
+            // 冷数据合并：PeerRepo 中不在 self.peers 的 peer 统一计入 incomplete
+            if let Some(repo) = &self.peer_repo {
+                let live: FxHashSet<SocketAddr> = self
+                    .peers
+                    .get(ih)
+                    .map(|e| e.keys().copied().collect())
+                    .unwrap_or_default();
+                let repo_peers = repo.get_peers_sync(ih, SCRAPE_REPO_PEER_LIMIT);
+                let extra = repo_peers.iter().filter(|p| !live.contains(&p.addr)).count();
+                incomplete += extra as i64;
+            }
             files.insert(
                 *ih,
                 ScrapeEntry {
@@ -343,6 +407,33 @@ impl SuperTrackerState {
         for peer in cached {
             if !peers.contains(&peer.addr) && peer.addr != peer_addr {
                 peers.push(peer.addr);
+            }
+        }
+
+        // peer_history 冷数据补充（内存 peer 不足时）
+        if peers.len() < PEER_HISTORY_SUPPLY_THRESHOLD {
+            for addr in cache.get_peers_from_history(&infohash, PEER_HISTORY_SUPPLY_LIMIT) {
+                if !peers.contains(&addr) && addr != peer_addr {
+                    peers.push(addr);
+                }
+            }
+        }
+
+        // 联邦查询补充（仍不足时，带超时）
+        if peers.len() < FEDERATION_SUPPLY_THRESHOLD {
+            if let Some(fed) = &self.federation {
+                let remote = fed
+                    .query_peers(
+                        &infohash,
+                        FEDERATION_QUERY_LIMIT,
+                        Duration::from_millis(FEDERATION_QUERY_TIMEOUT_MS),
+                    )
+                    .await;
+                for addr in remote {
+                    if !peers.contains(&addr) && addr != peer_addr {
+                        peers.push(addr);
+                    }
+                }
             }
         }
 

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
+use dashmap::DashMap;
 use tokio::sync::{broadcast, Mutex as TokioMutex, Notify, OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -136,6 +137,10 @@ pub struct ConnectionManager {
     seed_node_ids: RwLock<FxHashMap<SocketAddr, NodeId>>,
     /// 上次触发自动重连的 unix 秒（冷却限流，由 GossipEngine 在无连接时调用）
     last_reconnect_attempt: AtomicU64,
+    /// 联邦实时 peer 查询响应收集器：key=infohash，value=各联邦节点返回的 peer 条目。
+    /// query_peers 发起时清空对应 key，dispatch 收到 PeerQueryResponse 时 push，
+    /// 超时后由 query_peers 取走结果并删除 key。
+    peer_query_responses: Arc<DashMap<[u8; 20], Vec<PeerQueryEntry>>>,
 }
 
 impl ConnectionManager {
@@ -167,6 +172,7 @@ impl ConnectionManager {
             )),
             seed_node_ids: RwLock::new(FxHashMap::default()),
             last_reconnect_attempt: AtomicU64::new(0),
+            peer_query_responses: Arc::new(DashMap::new()),
         }
     }
 
@@ -1032,6 +1038,47 @@ impl ConnectionManager {
                 self.remove_connection(&connection.node_id);
                 false
             }
+            MessageType::PeerQueryRequest => {
+                // 实时 peer 查询请求：从本地 PeerRepo 查询该 infohash 的 peer 并回复
+                self.metrics.record_message_recv();
+                if let Ok(req) = bincode::deserialize::<PeerQueryRequestMessage>(&payload) {
+                    let peers: Vec<PeerQueryEntry> = if let Some(sync_mgr) = self.sync_manager.get() {
+                        sync_mgr.query_peers_for_infohash(&req.infohash, req.limit as usize)
+                    } else {
+                        Vec::new()
+                    };
+                    let resp = PeerQueryResponseMessage {
+                        infohash: req.infohash,
+                        peers,
+                    };
+                    if let Err(e) = connection
+                        .send_message(MessageType::PeerQueryResponse, &resp)
+                        .await
+                    {
+                        debug!(
+                            "[federation] PeerQueryResponse 发送到 {} 失败: {}",
+                            connection.node_id, e
+                        );
+                    }
+                }
+                false
+            }
+            MessageType::PeerQueryResponse => {
+                // 实时 peer 查询响应：写入本地 PeerRepo，并推入响应收集器供 query_peers 取走
+                self.metrics.record_message_recv();
+                if let Ok(resp) = bincode::deserialize::<PeerQueryResponseMessage>(&payload) {
+                    if let Some(sync_mgr) = self.sync_manager.get() {
+                        sync_mgr.add_remote_peers(&resp.infohash, &resp.peers);
+                    }
+                    if !resp.peers.is_empty() {
+                        self.peer_query_responses
+                            .entry(resp.infohash)
+                            .or_default()
+                            .extend(resp.peers);
+                    }
+                }
+                false
+            }
             _ => {
                 debug!("[federation] 收到未处理消息类型 {:?} from {}", msg_type, connection.node_id);
                 false
@@ -1229,6 +1276,19 @@ impl ConnectionManager {
     /// 当前连接数
     pub fn connection_count(&self) -> usize {
         self.connections.read().len()
+    }
+
+    /// 联邦实时查询：清空指定 infohash 的旧响应（发起查询前调用）
+    pub fn clear_peer_query_responses(&self, infohash: &[u8; 20]) {
+        self.peer_query_responses.remove(infohash);
+    }
+
+    /// 联邦实时查询：取走并删除指定 infohash 的所有响应条目（超时后调用）
+    pub fn take_peer_query_responses(&self, infohash: &[u8; 20]) -> Vec<PeerQueryEntry> {
+        self.peer_query_responses
+            .remove(infohash)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
     }
 
     /// 无连接时自动重连：遍历种子节点与节点表中 Disconnected/Failed 且有地址的节点，逐个尝试 dial。

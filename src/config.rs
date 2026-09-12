@@ -313,13 +313,13 @@ fn default_scrape_path() -> String {
     "/scrape".to_string()
 }
 fn default_interval() -> i64 {
-    1800
+    30
 }
 fn default_min_interval() -> i64 {
-    900
+    30
 }
 fn default_numwant() -> usize {
-    100
+    200
 }
 fn default_peer_ttl() -> u64 {
     3600
@@ -361,10 +361,10 @@ pub struct DiscoverersConfig {
     #[serde(default = "default_true")]
     pub enable_pex: bool,
     /// 是否启用 LPD 发现器（局域网多播）
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enable_lpd: bool,
     /// 是否启用 WebSeed 发现器
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enable_webseed: bool,
     /// 单次发现超时（秒）
     #[serde(default = "default_discovery_timeout")]
@@ -420,8 +420,8 @@ impl Default for DiscoverersConfig {
             enable_tracker: default_true(),
             enable_dht: default_true(),
             enable_pex: default_true(),
-            enable_lpd: false,
-            enable_webseed: false,
+            enable_lpd: true,
+            enable_webseed: true,
             discovery_timeout_secs: default_discovery_timeout(),
             max_concurrent: default_max_concurrent(),
             custom_trackers: vec![],
@@ -701,9 +701,9 @@ mod tests {
         let config = PdcConfig::default();
         assert_eq!(config.server.port, 6880);
         assert!(config.super_tracker.enabled);
-        assert_eq!(config.super_tracker.interval, 1800);
+        assert_eq!(config.super_tracker.interval, 30);
         assert!(config.discoverers.enable_tracker);
-        assert!(!config.discoverers.enable_lpd);
+        assert!(config.discoverers.enable_lpd);
         assert!(config.crawler.enabled);
     }
 

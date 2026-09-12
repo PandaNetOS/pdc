@@ -1402,6 +1402,63 @@ impl SyncManager {
         );
         self.handle_sync_batch(repair.repo_type, &repair.entries);
     }
+
+    /// 联邦实时查询：从本地 PeerRepo 获取指定 infohash 的 peer
+    pub fn query_peers_for_infohash(
+        &self,
+        infohash: &[u8; 20],
+        limit: usize,
+    ) -> Vec<crate::federation::protocol::PeerQueryEntry> {
+        self.peer_repo
+            .as_ref()
+            .map(|repo| {
+                let ih: crate::types::Infohash = *infohash;
+                repo.get_peers_sync(&ih, limit)
+                    .into_iter()
+                    .map(|p| crate::federation::protocol::PeerQueryEntry {
+                        ip: p.addr.ip().to_string(),
+                        port: p.addr.port(),
+                        source: p.source.as_str().to_string(),
+                        score: p.priority_score,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 联邦实时查询：将远程节点返回的 peer 写入本地 PeerRepo
+    pub fn add_remote_peers(
+        &self,
+        infohash: &[u8; 20],
+        peers: &[crate::federation::protocol::PeerQueryEntry],
+    ) {
+        let repo = match &self.peer_repo {
+            Some(r) => r,
+            None => return,
+        };
+        let ih: crate::types::Infohash = *infohash;
+        let peer_infos: Vec<crate::types::PeerInfo> = peers
+            .iter()
+            .filter_map(|p| {
+                let ip: std::net::IpAddr = p.ip.parse().ok()?;
+                let addr = std::net::SocketAddr::new(ip, p.port);
+                let source = match p.source.as_str() {
+                    "tracker" => crate::types::PeerSource::Tracker,
+                    "dht" => crate::types::PeerSource::Dht,
+                    "pex" => crate::types::PeerSource::Pex,
+                    "super_tracker" => crate::types::PeerSource::SuperTracker,
+                    "lpd" => crate::types::PeerSource::Lpd,
+                    "webseed" => crate::types::PeerSource::WebSeed,
+                    "utp" => crate::types::PeerSource::Utp,
+                    _ => crate::types::PeerSource::Manual,
+                };
+                let mut peer = crate::types::PeerInfo::new(addr, source);
+                peer.priority_score = p.score;
+                Some(peer)
+            })
+            .collect();
+        repo.add_peers_sync(&ih, &peer_infos);
+    }
 }
 
 /// MerkleProvider 实现：为 GossipEngine 反熵任务提供各 repo 的 Merkle 摘要和分片数据

@@ -292,6 +292,20 @@ impl PeerRepoImpl {
         result
     }
 
+    /// 从 peer_history 表同步查询历史 peer（冷数据补充）。
+    ///
+    /// 用于超级 Tracker 在内存 peer 不足时补充落盘的冷数据。
+    /// 返回解析出的 SocketAddr 列表（按 discovered_at 倒序，由 SQL 决定）。
+    pub fn get_peers_from_history(&self, infohash: &Infohash, limit: usize) -> Vec<SocketAddr> {
+        match self.storage.query_peer_history(infohash, limit) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| row.ip.parse().ok().map(|ip| SocketAddr::new(ip, row.port)))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn mark_connection_success_sync(&self, infohash: &Infohash, addr: &SocketAddr) {
         let mut cache = self.cache.write();
         if let Some(peer) = cache.global.get_mut(addr) {
