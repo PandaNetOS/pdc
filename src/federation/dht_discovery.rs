@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::discoverers::dht::{DhtConfig, DhtDiscoverer};
+use crate::federation::ConnectionManager;
 use crate::federation::node_id::{NodeAddress, NodeId, Reachability};
 use crate::federation::node_table::NodeTable;
 use crate::storage::node_repo::NodeRepoImpl;
@@ -51,6 +52,8 @@ pub struct DhtDiscoveryService {
     shutdown: broadcast::Sender<()>,
     /// pnos-net 发现事件发送端
     discovered_tx: Option<broadcast::Sender<DiscoveredNode>>,
+    /// 连接管理器（发现节点后触发自动连接）
+    connection_manager: Option<Arc<ConnectionManager>>,
 }
 
 impl DhtDiscoveryService {
@@ -68,6 +71,7 @@ impl DhtDiscoveryService {
         shutdown: broadcast::Sender<()>,
         node_repo: Option<Arc<NodeRepoImpl>>,
         external_dht: Option<Arc<DhtDiscoverer>>,
+        connection_manager: Option<Arc<ConnectionManager>>,
     ) -> Self {
         let dht = external_dht.unwrap_or_else(|| Arc::new(DhtDiscoverer::new(DhtConfig::default())));
         Self {
@@ -78,7 +82,14 @@ impl DhtDiscoveryService {
             interval_secs,
             shutdown,
             discovered_tx: None,
+            connection_manager,
         }
+    }
+
+    /// 设置连接管理器（发现节点后触发自动连接）
+    pub fn with_connection_manager(mut self, cm: Arc<ConnectionManager>) -> Self {
+        self.connection_manager = Some(cm);
+        self
     }
 
     /// 初始化并执行首次发现（种子注入 + DHT init + 首次 discovery_tick），不再自跑循环
@@ -141,9 +152,22 @@ impl DhtDiscoveryService {
                         self.node_table.len()
                     );
                 }
+                // 触发自动连接：对新发现的节点尝试建立连接
+                if let Some(cm) = &self.connection_manager {
+                    for peer in &peers {
+                        let addr = peer.addr;
+                        let temp_id = NodeId::random();
+                        let cm_clone = cm.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = cm_clone.connect_to(temp_id, addr).await {
+                                debug!("[federation] DHT 发现节点自动连接 {} 失败: {}", addr, e);
+                            }
+                        });
+                    }
+                }
             }
             Err(e) => {
-                debug!("[federation] DHT discover+announce 失败: {}", e);
+                warn!("[federation] DHT discover+announce 失败: {}", e);
             }
         }
     }

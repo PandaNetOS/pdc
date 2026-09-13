@@ -209,29 +209,29 @@ impl DiscoveryService {
         mqtt_service.spawn();
         info!("[federation] MQTT Rendezvous 发现已启动，本地地址: {:?}", my_addresses);
 
-        // 4.2 订阅 LPD/MQTT 发现事件，加入节点表由 ConnectionManager 自动连接
+        // 4.2 订阅 LPD/MQTT 发现事件，加入节点表并立即触发连接
         let self_clone = self.clone();
         tokio::spawn(async move {
             loop {
                 match discovered_rx.recv().await {
                     Ok(node) => {
                         info!("[federation] 收到发现事件: source={}, node_id={}, addrs={:?}", node.source, hex::encode(node.node_id.0), node.addresses);
-                        for addr in &node.addresses {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let new_nodes: Vec<crate::federation::node_id::NodeAddress> = node.addresses.iter().map(|addr| {
                             let temp_id = crate::federation::node_id::NodeId::random();
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let node_addr = crate::federation::node_id::NodeAddress {
+                            crate::federation::node_id::NodeAddress {
                                 node_id: temp_id.0,
                                 ipv4_addr: if addr.is_ipv4() { Some(*addr) } else { None },
                                 ipv6_addr: if addr.is_ipv6() { Some(*addr) } else { None },
                                 reachability: crate::federation::node_id::Reachability::Unknown,
                                 last_seen: now,
                                 nat_type: None,
-                            };
-                            self_clone.node_table.add_or_update(node_addr);
-                        }
+                            }
+                        }).collect();
+                        self_clone.process_new_nodes(new_nodes);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -243,6 +243,9 @@ impl DiscoveryService {
         if self.config.peer_cache_enabled {
             self.clone().spawn_peer_cache_saver();
         }
+
+        // 5.1 启动定期连接维护任务（主动连接 node_table 中未连接的节点）
+        self.clone().spawn_connection_maintainer();
 
         if self.config.seed_nodes.is_empty() {
             info!("[federation] 零配置模式：依赖 LPD 局域网多播 + DHT 魔法 infohash 自动发现（seed_nodes 为空）");
@@ -596,8 +599,8 @@ impl DiscoveryService {
 
         debug!("[federation] PEX 交换完成，向 {} 个连接发送了节点信息", conn_count);
     }
-}
 
+}
 #[cfg(test)]
 mod tests {
     use super::*;

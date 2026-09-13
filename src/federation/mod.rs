@@ -162,6 +162,8 @@ pub struct FederationService {
     pub dht_discovery: Option<Arc<DhtDiscoveryService>>,
     /// 配置
     pub config: FederationConfig,
+    /// 数据目录（用于 NetAgent/Iroh 持久化）
+    data_dir: std::path::PathBuf,
     /// 关闭信号发送端
     shutdown: broadcast::Sender<()>,
     /// 启动时间
@@ -299,6 +301,7 @@ impl FederationService {
                 shutdown_tx.clone(),
                 Some(node_repo.clone()),
                 dht_discoverer.clone(),
+                Some(connection_manager.clone()),
             )))
         } else {
             None
@@ -325,14 +328,75 @@ impl FederationService {
             relay_manager,
             dht_discovery,
             config,
+            data_dir: data_dir.to_path_buf(),
             shutdown: shutdown_tx,
             started_at: Instant::now(),
         })
     }
 
+    /// 初始化 NetAgent（Iroh+TCP 传输层）并注入 ConnectionManager
+    ///
+    /// 根据 config.transport_mode 创建 TransportRouter：
+    /// - tcp_only: 仅 TCP
+    /// - iroh_only: 仅 Iroh（QUIC）
+    /// - auto: Iroh + TCP 并行 race，先连成功的用
+    async fn init_net_agent(self: &Arc<Self>) -> anyhow::Result<()> {
+        use pnos_net::transport::{IrohTransportConfig, TransportMode};
+
+        let mode = match self.config.transport_mode.as_str() {
+            "iroh_only" => TransportMode::IrohOnly,
+            "auto" => TransportMode::Auto,
+            _ => TransportMode::TcpOnly,
+        };
+
+        info!(
+            "[federation] 初始化 NetAgent: transport_mode={:?}, listen_port={}",
+            mode, self.config.listen_port
+        );
+
+        // Iroh 配置（非 TcpOnly 时启用）
+        let iroh_config = if mode != TransportMode::TcpOnly {
+            Some(IrohTransportConfig {
+                node_id: self.identity.node_id.0,
+                listen_port: self.config.listen_port,  // 与 TCP 复用端口（QUIC 基于 UDP）
+                data_dir: self.data_dir.join("iroh"),
+                derp_enabled: true,
+                derp_urls: Vec::new(),
+                connect_timeout: std::time::Duration::from_secs(10),
+                alpn: b"pdc-federation/1.0".to_vec(),
+            })
+        } else {
+            None
+        };
+
+        let net_config = pnos_net::NetAgentConfig {
+            node_id: self.identity.node_id.0,
+            listen_port: self.config.listen_port,
+            api_port: self.config.api_port,
+            data_dir: self.data_dir.clone(),
+            lpd_multicast_port: 6771,
+            lpd_enabled: false,       // PDC 已有独立 LPD
+            peer_cache_enabled: false, // PDC 已有独立 peer_cache
+            nat_enabled: false,       // PDC 已有独立 NAT
+            hole_punch_enabled: false, // PDC 已有独立打洞
+            connect_config: Default::default(),
+            transport_mode: mode,
+            iroh_config,
+        };
+
+        let net_agent = pnos_net::NetAgent::new(net_config).await?;
+        net_agent.start_transport_only().await?;
+        self.connection_manager.set_net_agent(net_agent);
+        info!("[federation] NetAgent 已注入 ConnectionManager");
+        Ok(())
+    }
+
     /// 启动所有后台任务
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         info!("[federation] 启动联邦服务（阶段2）...");
+
+        // 0. 创建并注入 NetAgent（Iroh+TCP 传输层）
+        self.init_net_agent().await?;
 
         // 1. 启动 TCP 监听
         self.connection_manager
