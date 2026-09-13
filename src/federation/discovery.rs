@@ -366,15 +366,21 @@ impl DiscoveryService {
         let connected = self.node_table.connected_count();
         if connected < self.config.target_neighbors {
             let need = self.config.target_neighbors - connected;
-            let candidates = self.node_table
+            // 按活跃度降序排序，优先连接活跃节点；尝试 need*3 个候选，避免只选到死节点
+            let mut candidates = self.node_table
                 .all_nodes()
                 .into_iter()
                 .filter(|e| {
                     e.status != crate::federation::node_table::NodeStatus::Connected
                         && e.info.preferred_addr().is_some()
                 })
-                .take(need)
                 .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| {
+                b.activity_score()
+                    .partial_cmp(&a.activity_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let candidates = candidates.into_iter().take(need * 3).collect::<Vec<_>>();
 
             for entry in candidates {
                 if let Some(addr) = entry.info.preferred_addr() {
@@ -535,7 +541,8 @@ impl DiscoveryService {
             .map(|c| c.node_id)
             .collect();
 
-        let candidates = self.node_table
+        // 按活跃度降序排序，优先连接活跃节点；尝试 need*3 个候选，避免只选到死节点
+        let mut candidates = self.node_table
             .all_nodes()
             .into_iter()
             .filter(|e| {
@@ -543,8 +550,13 @@ impl DiscoveryService {
                     && e.info.preferred_addr().is_some()
                     && !connected_ids.contains(&NodeId(e.info.node_id))
             })
-            .take(need)
             .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            b.activity_score()
+                .partial_cmp(&a.activity_score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let candidates = candidates.into_iter().take(need * 3).collect::<Vec<_>>();
 
         for entry in candidates {
             if let Some(addr) = entry.info.preferred_addr() {
