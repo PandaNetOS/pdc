@@ -8,17 +8,5 @@ on:
 
 jobs:
   compliance:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout pandanetos-meta
-        uses: actions/checkout@v4
-        with:
-          repository: PandaNetOS/pandanetos-meta
-          path: pandanetos-meta
-          token: ${{ secrets.PANDANETOS_META_PAT }}
-
-      - name: Run compliance check
-        shell: pwsh
-        run: .\pandanetos-meta\check-compliance.ps1
+    uses: PandaNetOS/.github/.github/workflows/compliance.yml@main
+    secrets: inherit
