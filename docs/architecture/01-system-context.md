@@ -1,4 +1,4 @@
-# 01 — 系统上下文 (C4 Level 1)
+﻿# 01 — 系统上下文 (C4 Level 1)
 
 > PeerDiscoveryCenter 在 PandaNetOS 生态中的位置与外部交互
 
@@ -11,7 +11,6 @@ graph TB
         PK[pk 主控台<br/>Agent管理/任务调度/监控]
         SPDE[spde 下载执行Agent<br/>BT/磁力/HTTP下载]
         PDC[PeerDiscoveryCenter<br/>节点发现Agent]
-        PCDN[pcdn-keeper<br/>PCDN带宽调度]
     end
 
     subgraph "外部系统"
@@ -30,7 +29,6 @@ graph TB
     PK -->|任务下发| SPDE
     SPDE -->|请求Peer列表| PDC
     PDC -->|返回高质量Peer| SPDE
-    PCDN -->|带宽调度| SPDE
 
     %% 外部网络交互
     PDC -->|find_node/get_peers| DHT
@@ -73,9 +71,6 @@ graph LR
         A2[PDC<br/>节点发现]
     end
 
-    subgraph "应用场景"
-        B1[pcdn-keeper<br/>带宽变现]
-    end
 
     subgraph "控制平面"
         C1[pk 主控台<br/>统一管理]
@@ -83,7 +78,6 @@ graph LR
 
     C1 --> A1 & A2
     A2 -->|提供Peer| A1
-    A1 -->|消耗带宽| B1
 ```
 
 **PDC 的定位**：
