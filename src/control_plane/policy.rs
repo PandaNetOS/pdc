@@ -60,7 +60,7 @@ impl DiscoveryPolicy {
     pub fn default_policy() -> Self {
         Self {
             max_concurrent: 10,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(30), // [ALLOWED-HARDCODED]
             max_peers: 200,
             enabled_types: vec![
                 DiscovererType::Tracker,

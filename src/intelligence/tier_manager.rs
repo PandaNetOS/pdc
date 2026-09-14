@@ -15,11 +15,10 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::{NodeRepository, PeerRepository};
-use crate::types::Infohash;
 
 /// 数据温度层级
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,10 +57,10 @@ pub struct TierConfig {
 impl Default for TierConfig {
     fn default() -> Self {
         Self {
-            hot_threshold_secs: 1800,    // 30 分钟内有活跃视为热
-            warm_threshold_secs: 7200,   // 2 小时内有活跃视为温
-            max_hot_in_memory: 5000,      // 内存最多保留 5000 热数据
-            check_interval_secs: 300,      // 每 5 分钟检查一次
+            hot_threshold_secs: 1800,  // 30 分钟内有活跃视为热
+            warm_threshold_secs: 7200, // 2 小时内有活跃视为温
+            max_hot_in_memory: 5000,   // 内存最多保留 5000 热数据
+            check_interval_secs: 300,  // 每 5 分钟检查一次
         }
     }
 }
@@ -107,8 +106,11 @@ impl PeerTierManager {
     }
 
     /// 判断 peer 的温度层级
+    #[allow(dead_code)]
     fn classify_peer(last_active: SystemTime, config: &TierConfig) -> DataTier {
-        let elapsed = last_active.elapsed().unwrap_or(Duration::from_secs(u64::MAX));
+        let elapsed = last_active
+            .elapsed()
+            .unwrap_or(Duration::from_secs(u64::MAX));
         if elapsed.as_secs() < config.hot_threshold_secs {
             DataTier::Hot
         } else if elapsed.as_secs() < config.warm_threshold_secs {
@@ -130,7 +132,9 @@ impl TierManageable for PeerTierManager {
         let mut cold_count = 0;
 
         for peer in &peers {
-            let elapsed = now.duration_since(peer.last_active).unwrap_or(Duration::from_secs(u64::MAX));
+            let elapsed = now
+                .duration_since(peer.last_active)
+                .unwrap_or(Duration::from_secs(u64::MAX));
             if elapsed.as_secs() < self.config.hot_threshold_secs {
                 hot_count += 1;
             } else if elapsed.as_secs() < self.config.warm_threshold_secs {
@@ -145,7 +149,9 @@ impl TierManageable for PeerTierManager {
             if let Some(ref storage) = self.storage {
                 let storage = storage.clone();
                 let threshold = self.config.warm_threshold_secs as i64;
-                match tokio::task::spawn_blocking(move || storage.archive_cold_peers(threshold)).await {
+                match tokio::task::spawn_blocking(move || storage.archive_cold_peers(threshold))
+                    .await
+                {
                     Ok(Ok(count)) => debug!("[tier_manager] PeerRepo 冷数据归档: {} 个", count),
                     Ok(Err(e)) => warn!("[tier_manager] PeerRepo 冷数据归档失败: {}", e),
                     Err(e) => warn!("[tier_manager] PeerRepo 冷数据归档任务失败: {}", e),
@@ -153,8 +159,11 @@ impl TierManageable for PeerTierManager {
             }
         }
 
-
-        let stats = TierStats { hot_count, warm_count, cold_count };
+        let stats = TierStats {
+            hot_count,
+            warm_count,
+            cold_count,
+        };
         *self.stats.write() = stats.clone();
         stats
     }
@@ -201,7 +210,11 @@ impl TierManageable for NodeTierManager {
             }
         }
 
-        let stats = TierStats { hot_count, warm_count, cold_count };
+        let stats = TierStats {
+            hot_count,
+            warm_count,
+            cold_count,
+        };
         *self.stats.write() = stats.clone();
         stats
     }
@@ -244,7 +257,10 @@ impl TierManager {
     }
 
     pub fn with_node_repo(mut self, node_repo: Arc<dyn NodeRepository>) -> Self {
-        self.node_manager = Some(Arc::new(NodeTierManager::new(node_repo, self.config.clone())));
+        self.node_manager = Some(Arc::new(NodeTierManager::new(
+            node_repo,
+            self.config.clone(),
+        )));
         self
     }
 
@@ -252,11 +268,17 @@ impl TierManager {
     pub async fn check_all(&self) {
         if let Some(ref mgr) = self.peer_manager {
             let stats = mgr.check_and_migrate().await;
-            debug!("[tier_manager] PeerRepo 分层: hot={}, warm={}, cold={}", stats.hot_count, stats.warm_count, stats.cold_count);
+            debug!(
+                "[tier_manager] PeerRepo 分层: hot={}, warm={}, cold={}",
+                stats.hot_count, stats.warm_count, stats.cold_count
+            );
         }
         if let Some(ref mgr) = self.node_manager {
             let stats = mgr.check_and_migrate().await;
-            debug!("[tier_manager] NodeRepo 分层: hot={}, warm={}, cold={}", stats.hot_count, stats.warm_count, stats.cold_count);
+            debug!(
+                "[tier_manager] NodeRepo 分层: hot={}, warm={}, cold={}",
+                stats.hot_count, stats.warm_count, stats.cold_count
+            );
         }
     }
 

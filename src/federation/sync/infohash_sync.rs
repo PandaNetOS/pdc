@@ -13,7 +13,6 @@ use crate::event_bus::EventBus;
 use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
-use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
 use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::InfohashRepoImpl;
@@ -47,7 +46,7 @@ pub(crate) fn build_infohash_sync_entry(
 /// InfohashRepo 同步服务
 pub struct InfohashSync {
     infohash_repo: Arc<InfohashRepoImpl>,
-    gossip_engine: Arc<GossipEngine>,
+    _gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
     merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
@@ -58,7 +57,7 @@ pub struct InfohashSync {
 impl InfohashSync {
     pub fn new(
         infohash_repo: Arc<InfohashRepoImpl>,
-        gossip_engine: Arc<GossipEngine>,
+        _gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
         merkle_queue: Arc<MerkleUpdateQueue>,
         metrics: Arc<FederationMetrics>,
@@ -66,7 +65,7 @@ impl InfohashSync {
     ) -> Self {
         Self {
             infohash_repo,
-            gossip_engine,
+            _gossip_engine,
             merkle,
             merkle_queue,
             metrics,
@@ -169,8 +168,13 @@ impl InfohashSync {
         let mut entries = Vec::with_capacity(infohashes.len());
 
         for (infohash, last_seen) in &infohashes {
-            let ts = if *last_seen > 0 { *last_seen } else {
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+            let ts = if *last_seen > 0 {
+                *last_seen
+            } else {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
             };
             let payload = InfohashSyncPayload {
                 infohash: *infohash,
@@ -197,6 +201,7 @@ impl InfohashSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::node_id::NodeId;
     use crate::storage::Storage;
 
     fn make_infohash_repo() -> Arc<InfohashRepoImpl> {
@@ -241,14 +246,7 @@ mod tests {
         ));
         let merkle = Arc::new(MerkleTree::new(16));
         let queue = Arc::new(MerkleUpdateQueue::new());
-        let ih_sync = InfohashSync::new(
-            repo.clone(),
-            gossip,
-            merkle,
-            queue,
-            metrics,
-            shutdown_tx,
-        );
+        let ih_sync = InfohashSync::new(repo.clone(), gossip, merkle, queue, metrics, shutdown_tx);
 
         assert_eq!(repo.count_sync(), 0);
 

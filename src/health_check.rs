@@ -7,17 +7,19 @@
 //!
 //! 终极形态改造：从 DiscovererRegistry 获取发现器，不再依赖 aggregator。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::discoverers::DiscovererRegistry;
-use crate::intelligence::{HealthScorerImpl, HealthScorer};
+use crate::intelligence::{HealthScorer, HealthScorerImpl};
+use crate::storage::repo_traits::{
+    InfohashRepository, NodeRepository, PeerRepository, TrackerRepository,
+};
 use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoImpl};
-use crate::storage::repo_traits::{InfohashRepository, NodeRepository, PeerRepository, TrackerRepository};
 
 /// 系统健康状态
 #[derive(Debug, Clone, Serialize)]
@@ -84,9 +86,9 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(300),
-            cache_cleanup_interval: Duration::from_secs(600),
-            stats_output_interval: Duration::from_secs(300),
+            interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            cache_cleanup_interval: Duration::from_secs(600), // [ALLOWED-HARDCODED]
+            stats_output_interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
         }
     }
 }
@@ -98,7 +100,7 @@ pub struct HealthCheckTask {
     node_repo: Option<Arc<NodeRepoImpl>>,
     tracker_repo: Option<Arc<TrackerRepoImpl>>,
     infohash_repo: Option<Arc<InfohashRepoImpl>>,
-    config: HealthCheckConfig,
+    _config: HealthCheckConfig,
     storage: Option<Arc<crate::storage::Storage>>,
     health_scorer: HealthScorerImpl,
     /// 全量同步暂停门：为 true 时跳过健康检查/缓存清理/统计输出
@@ -122,7 +124,7 @@ impl HealthCheckTask {
             node_repo,
             tracker_repo,
             infohash_repo,
-            config,
+            _config: config,
             storage,
             health_scorer: HealthScorerImpl::new(),
             pause_gate: None,
@@ -137,7 +139,15 @@ impl HealthCheckTask {
         tracker_repo: Option<Arc<TrackerRepoImpl>>,
         infohash_repo: Option<Arc<InfohashRepoImpl>>,
     ) -> Self {
-        Self::new(registry, cache, node_repo, tracker_repo, infohash_repo, HealthCheckConfig::default(), None)
+        Self::new(
+            registry,
+            cache,
+            node_repo,
+            tracker_repo,
+            infohash_repo,
+            HealthCheckConfig::default(),
+            None,
+        )
     }
 
     /// 设置全量同步暂停门（为 true 时暂停健康检查工作）
@@ -148,7 +158,8 @@ impl HealthCheckTask {
 
     /// 检查暂停门是否为 true（全量同步期间跳过周期性工作）
     fn is_paused(&self) -> bool {
-        self.pause_gate.as_ref()
+        self.pause_gate
+            .as_ref()
             .map(|g| g.load(Ordering::Relaxed))
             .unwrap_or(false)
     }
@@ -179,9 +190,7 @@ impl HealthCheckTask {
 
     /// 清理过期的 peer 缓存（由 TaskScheduler 调度）
     pub async fn cleanup_expired_peers(&self) {
-        if self.is_paused() {
-            return;
-        }
+        if self.is_paused() {}
         // 永久资产模式：不删除 peer
     }
 
@@ -191,12 +200,15 @@ impl HealthCheckTask {
         if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) =
             (&self.node_repo, &self.tracker_repo, &self.infohash_repo)
         {
-            let report = self.health_scorer.calculate(
-                tracker_repo.as_ref() as &dyn TrackerRepository,
-                node_repo.as_ref() as &dyn NodeRepository,
-                self.cache.as_ref() as &dyn PeerRepository,
-                infohash_repo.as_ref() as &dyn InfohashRepository,
-            ).await;
+            let report = self
+                .health_scorer
+                .calculate(
+                    tracker_repo.as_ref() as &dyn TrackerRepository,
+                    node_repo.as_ref() as &dyn NodeRepository,
+                    self.cache.as_ref() as &dyn PeerRepository,
+                    infohash_repo.as_ref() as &dyn InfohashRepository,
+                )
+                .await;
 
             let status = SystemHealth::from_score(report.overall);
             return SystemHealth {
@@ -308,6 +320,6 @@ mod tests {
         let storage = Arc::new(crate::storage::Storage::memory().unwrap());
         let cache = Arc::new(PeerRepoImpl::new(storage));
         let task = HealthCheckTask::with_default_config(registry, cache, None, None, None);
-        assert_eq!(task.config.interval, Duration::from_secs(300));
+        assert_eq!(task._config.interval, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
     }
 }

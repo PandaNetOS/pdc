@@ -66,6 +66,7 @@ impl WriteQueue {
         stats: Arc<Mutex<WriteStats>>,
     ) {
         let mut batch: Vec<WriteRequest> = Vec::with_capacity(batch_size);
+        // [ALLOWED-INTERVAL] 写入队列消费者事件循环，定时 flush 是 select! 的一个分支，非独立定时任务
         let mut interval = tokio::time::interval(flush_interval);
 
         loop {

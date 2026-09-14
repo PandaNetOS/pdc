@@ -55,7 +55,10 @@ impl NodeRepoImpl {
     }
 
     /// 兼容旧接口：从 crawler 路由表创建（现在忽略路由表，独立存储）
-    pub fn from_crawler(_routing_table: Arc<parking_lot::RwLock<crate::dht::routing_table::RoutingTable>>, storage: Arc<Storage>) -> Self {
+    pub fn from_crawler(
+        _routing_table: Arc<parking_lot::RwLock<crate::dht::routing_table::RoutingTable>>,
+        storage: Arc<Storage>,
+    ) -> Self {
         Self::new(storage)
     }
 
@@ -73,8 +76,12 @@ impl NodeRepoImpl {
         if built.is_empty() {
             return;
         }
-        let Some(merkle) = self.merkle.get() else { return; };
-        let Some(gossip) = self.gossip.get() else { return; };
+        let Some(merkle) = self.merkle.get() else {
+            return;
+        };
+        let Some(gossip) = self.gossip.get() else {
+            return;
+        };
         let refs: Vec<(&[u8], &[u8])> = built
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
@@ -101,7 +108,10 @@ impl NodeRepoImpl {
     /// 内部写入：批量新增节点 + 标记 dirty，不触发 Merkle/Gossip。
     /// 返回真正新增的 (node_id, addr) 对。
     /// 联邦同步入站（apply_node_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
-    pub(crate) fn add_nodes_batch_internal(&self, items: &[(NodeId, SocketAddr)]) -> Vec<(NodeId, SocketAddr)> {
+    pub(crate) fn add_nodes_batch_internal(
+        &self,
+        items: &[(NodeId, SocketAddr)],
+    ) -> Vec<(NodeId, SocketAddr)> {
         if items.is_empty() {
             return Vec::new();
         }
@@ -195,12 +205,23 @@ impl NodeRepoImpl {
         if total > 0 {
             avg_score /= total as f64;
         }
-        NodeStats { total, good, questionable, bad, active, avg_score }
+        NodeStats {
+            total,
+            good,
+            questionable,
+            bad,
+            active,
+            avg_score,
+        }
     }
 
     pub fn top_nodes_sync(&self, n: usize) -> Vec<KBucketEntry> {
         let mut all: Vec<KBucketEntry> = self.nodes.read().values().cloned().collect();
-        all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all.truncate(n);
         all
     }
@@ -233,7 +254,12 @@ impl NodeRepoImpl {
     }
 
     /// 记录查询成功及返回的节点数（用于节点产出维度评分）
-    pub fn record_query_with_nodes_sync(&self, addr: SocketAddr, latency_ms: u64, nodes_returned: u64) {
+    pub fn record_query_with_nodes_sync(
+        &self,
+        addr: SocketAddr,
+        latency_ms: u64,
+        nodes_returned: u64,
+    ) {
         let mut nodes = self.nodes.write();
         if let Some(entry) = nodes.get_mut(&addr) {
             entry.query_count += 1;
@@ -456,6 +482,56 @@ impl NodeRepository for NodeRepoImpl {
         Ok(())
     }
 
+    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
+    #[allow(dead_code)]
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        // 【增量持久化】只保存 dirty 节点，避免全量保存千万级数据
+        let dirty_addrs = self.take_dirty_sync();
+        if dirty_addrs.is_empty() {
+            return Ok(());
+        }
+
+        // 用独立作用域构建 batch，确保 read guard 在作用域结束时释放
+        let batch: Vec<crate::storage::db::DhtNodeRow> = {
+            let nodes = self.nodes.read();
+            dirty_addrs
+                .iter()
+                .filter_map(|addr| nodes.get(addr))
+                .map(|node| {
+                    let state_str = match node.state {
+                        NodeState::Good => "Good",
+                        NodeState::Questionable => "Questionable",
+                        NodeState::Bad => "Bad",
+                    };
+                    crate::storage::db::DhtNodeRow {
+                        id: node.id,
+                        ip: node.addr.ip().to_string(),
+                        port: node.addr.port(),
+                        score: node.score,
+                        state: state_str.to_string(),
+                        query_count: node.query_count,
+                        success_count: node.success_count,
+                        total_latency_ms: node.total_latency_ms,
+                        consecutive_failures: node.consecutive_failures,
+                        nodes_returned: node.nodes_returned,
+                        last_query_time: node.last_query_time.map(|t| t.elapsed().as_secs() as i64),
+                    }
+                })
+                .collect()
+        };
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let storage = self.storage.clone();
+        let count = batch.len();
+        tracing::debug!("[node_repo] 增量保存 {} 个 dirty 节点", count);
+        // 用 spawn_blocking 包装数据库操作，避免阻塞 tokio 工作线程
+        tokio::task::spawn_blocking(move || storage.save_dht_nodes_batch(&batch)).await??;
+        Ok(())
+    }
+
     async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_dht_nodes()?;
         let mut nodes = self.nodes.write();
@@ -469,7 +545,9 @@ impl NodeRepository for NodeRepoImpl {
             entry.total_latency_ms = row.total_latency_ms;
             entry.consecutive_failures = row.consecutive_failures;
             entry.nodes_returned = row.nodes_returned;
-            entry.last_query_time = row.last_query_time.map(|secs| Instant::now() - Duration::from_secs(secs.max(0) as u64));
+            entry.last_query_time = row
+                .last_query_time
+                .map(|secs| Instant::now() - Duration::from_secs(secs.max(0) as u64));
             entry.state = match row.state.as_str() {
                 "Good" => NodeState::Good,
                 "Questionable" => NodeState::Questionable,

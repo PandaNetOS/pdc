@@ -76,12 +76,29 @@ impl Storage {
         let mut stats = self.write_stats.lock().unwrap();
         stats.total_writes += 1;
         match table {
-            "dht_nodes" => { stats.dht_nodes_writes += 1; stats.dht_nodes_rows += rows; }
-            "peers" => { stats.peers_writes += 1; stats.peers_rows += rows; }
-            "peer_history" => { stats.peer_history_writes += 1; stats.peer_history_rows += rows; }
-            "trackers" => { stats.trackers_writes += 1; stats.trackers_rows += rows; }
-            "infohashes" => { stats.infohashes_writes += 1; stats.infohashes_rows += rows; }
-            "stats" => { stats.stats_writes += 1; }
+            "dht_nodes" => {
+                stats.dht_nodes_writes += 1;
+                stats.dht_nodes_rows += rows;
+            }
+            "peers" => {
+                stats.peers_writes += 1;
+                stats.peers_rows += rows;
+            }
+            "peer_history" => {
+                stats.peer_history_writes += 1;
+                stats.peer_history_rows += rows;
+            }
+            "trackers" => {
+                stats.trackers_writes += 1;
+                stats.trackers_rows += rows;
+            }
+            "infohashes" => {
+                stats.infohashes_writes += 1;
+                stats.infohashes_rows += rows;
+            }
+            "stats" => {
+                stats.stats_writes += 1;
+            }
             _ => {}
         }
     }
@@ -205,8 +222,14 @@ impl Storage {
         )?;
 
         // 向后兼容迁移：为已存在的 dht_nodes 表添加新列
-        let _ = conn.execute("ALTER TABLE dht_nodes ADD COLUMN nodes_returned INTEGER DEFAULT 0", []);
-        let _ = conn.execute("ALTER TABLE dht_nodes ADD COLUMN last_query_time INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE dht_nodes ADD COLUMN nodes_returned INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE dht_nodes ADD COLUMN last_query_time INTEGER",
+            [],
+        );
         // 向后兼容迁移：为已存在的 infohashes 表添加 score 列
         let _ = conn.execute("ALTER TABLE infohashes ADD COLUMN score REAL DEFAULT 0", []);
 
@@ -217,6 +240,7 @@ impl Storage {
     // ---- DHT 节点 ----
 
     /// 保存 DHT 节点（upsert）
+    #[allow(clippy::too_many_arguments)]
     pub fn save_dht_node(
         &self,
         id: &[u8; 20],
@@ -247,9 +271,18 @@ impl Storage {
                 last_query_time=excluded.last_query_time,
                 last_active=excluded.last_active"#,
             params![
-                id.as_slice(), ip, port as i64, score, state,
-                query_count as i64, success_count as i64, total_latency_ms as i64,
-                consecutive_failures as i64, nodes_returned as i64, last_query_time, now
+                id.as_slice(),
+                ip,
+                port as i64,
+                score,
+                state,
+                query_count as i64,
+                success_count as i64,
+                total_latency_ms as i64,
+                consecutive_failures as i64,
+                nodes_returned as i64,
+                last_query_time,
+                now
             ],
         )?;
         Ok(())
@@ -315,10 +348,18 @@ impl Storage {
             )?;
             for node in nodes {
                 stmt.execute(params![
-                    node.id.as_slice(), node.ip.as_str(), node.port as i64, node.score,
-                    node.state.as_str(), node.query_count as i64, node.success_count as i64,
-                    node.total_latency_ms as i64, node.consecutive_failures as i64,
-                    node.nodes_returned as i64, node.last_query_time, now
+                    node.id.as_slice(),
+                    node.ip.as_str(),
+                    node.port as i64,
+                    node.score,
+                    node.state.as_str(),
+                    node.query_count as i64,
+                    node.success_count as i64,
+                    node.total_latency_ms as i64,
+                    node.consecutive_failures as i64,
+                    node.nodes_returned as i64,
+                    node.last_query_time,
+                    now
                 ])?;
             }
         }
@@ -413,7 +454,8 @@ impl Storage {
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes")?;
+        let mut stmt =
+            conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
             let mut arr = [0u8; 20];
@@ -467,6 +509,7 @@ impl Storage {
     // ---- Peers（运行时活跃 peer 全量持久化）----
 
     /// 保存 peer（upsert）
+    #[allow(clippy::too_many_arguments)]
     pub fn save_peer(
         &self,
         infohash: &[u8; 20],
@@ -547,9 +590,13 @@ impl Storage {
             )?;
             for peer in peers {
                 stmt.execute(params![
-                    peer.infohash.as_slice(), peer.ip.as_str(), peer.port as i64,
-                    peer.source.as_str(), peer.score,
-                    peer.connection_attempts as i64, peer.connection_successes as i64,
+                    peer.infohash.as_slice(),
+                    peer.ip.as_str(),
+                    peer.port as i64,
+                    peer.source.as_str(),
+                    peer.score,
+                    peer.connection_attempts as i64,
+                    peer.connection_successes as i64,
                     peer.last_active
                 ])?;
             }
@@ -585,7 +632,10 @@ impl Storage {
             params![now, threshold],
         )?;
         // 从主表删除
-        tx.execute("DELETE FROM peers WHERE last_active < ?1", params![threshold])?;
+        tx.execute(
+            "DELETE FROM peers WHERE last_active < ?1",
+            params![threshold],
+        )?;
         tx.commit()?;
 
         Ok(count as usize)
@@ -639,7 +689,11 @@ impl Storage {
     }
 
     /// 查询某 infohash 的 peer 历史
-    pub fn query_peer_history(&self, infohash: &[u8; 20], limit: usize) -> anyhow::Result<Vec<PeerHistoryRow>> {
+    pub fn query_peer_history(
+        &self,
+        infohash: &[u8; 20],
+        limit: usize,
+    ) -> anyhow::Result<Vec<PeerHistoryRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT ip, port, source, score, discovered_at FROM peer_history WHERE infohash = ?1 ORDER BY discovered_at DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![infohash.as_slice(), limit as i64], |row| {
@@ -658,7 +712,10 @@ impl Storage {
     pub fn cleanup_peer_history(&self, days: u64) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();
         let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86400);
-        let deleted = conn.execute("DELETE FROM peer_history WHERE discovered_at < ?1", params![cutoff])?;
+        let deleted = conn.execute(
+            "DELETE FROM peer_history WHERE discovered_at < ?1",
+            params![cutoff],
+        )?;
         if deleted > 0 {
             debug!("[storage] 清理了 {} 条过期 peer 历史", deleted);
         }
@@ -796,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_init_tables() {
-        let storage = Storage::memory().unwrap();
+        let _storage = Storage::memory().unwrap();
         // 表创建成功
     }
 
@@ -804,7 +861,21 @@ mod tests {
     fn test_dht_node_save_load() {
         let storage = Storage::memory().unwrap();
         let id = [1u8; 20];
-        storage.save_dht_node(&id, "127.0.0.1", 6881, 85.5, "Good", 10, 8, 5000, 1, 64, None).unwrap();
+        storage
+            .save_dht_node(
+                &id,
+                "127.0.0.1",
+                6881,
+                85.5,
+                "Good",
+                10,
+                8,
+                5000,
+                1,
+                64,
+                None,
+            )
+            .unwrap();
         let nodes = storage.load_dht_nodes().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].ip, "127.0.0.1");
@@ -815,7 +886,19 @@ mod tests {
     #[test]
     fn test_tracker_save_load() {
         let storage = Storage::memory().unwrap();
-        storage.save_tracker("http://example.com/announce", 70.0, 100, 80, 20, 500, 15000.0, 1, false).unwrap();
+        storage
+            .save_tracker(
+                "http://example.com/announce",
+                70.0,
+                100,
+                80,
+                20,
+                500,
+                15000.0,
+                1,
+                false,
+            )
+            .unwrap();
         let trackers = storage.load_trackers().unwrap();
         assert_eq!(trackers.len(), 1);
         assert_eq!(trackers[0].url, "http://example.com/announce");
@@ -826,8 +909,12 @@ mod tests {
     fn test_peer_history() {
         let storage = Storage::memory().unwrap();
         let ih = [2u8; 20];
-        storage.record_peer_history(&ih, "10.0.0.1", 5000, "tracker", 50.0).unwrap();
-        storage.record_peer_history(&ih, "10.0.0.2", 5001, "dht", 60.0).unwrap();
+        storage
+            .record_peer_history(&ih, "10.0.0.1", 5000, "tracker", 50.0)
+            .unwrap();
+        storage
+            .record_peer_history(&ih, "10.0.0.2", 5001, "dht", 60.0)
+            .unwrap();
         let history = storage.query_peer_history(&ih, 10).unwrap();
         assert_eq!(history.len(), 2);
     }

@@ -50,8 +50,8 @@ impl InfohashHistory {
             peer_count,
         });
         // 清理超过30分钟的旧快照
-        let cutoff = now - Duration::from_secs(1800);
-        while snapshots.front().map_or(false, |s| s.timestamp < cutoff) {
+        let cutoff = now - Duration::from_secs(1800); // [ALLOWED-HARDCODED]
+        while snapshots.front().is_some_and(|s| s.timestamp < cutoff) {
             snapshots.pop_front();
         }
         *self.last_snapshot.write() = now;
@@ -163,7 +163,7 @@ impl PeerHistoryManager {
         }
 
         let rate = (current - past) / past;
-        rate.max(-1.0).min(1.0)
+        rate.clamp(-1.0, 1.0)
     }
 
     /// 获取当前 peer 数
@@ -266,6 +266,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::manual_range_contains)]
     fn test_growth_from_zero() {
         let manager = PeerHistoryManager::new();
         let infohash = [5u8; 20];

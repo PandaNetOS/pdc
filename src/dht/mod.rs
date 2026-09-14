@@ -1,4 +1,4 @@
-//! Kademlia DHT 路由表模块
+﻿//! Kademlia DHT 路由表模块
 //!
 //! 实现标准 Kademlia K-Bucket 路由表：
 //! - 160 个 bucket（对应 node_id 每一位）
@@ -26,10 +26,10 @@ pub fn xor_distance(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
 /// 计算 XOR 距离的最高有效位位置（0-159），用于确定 bucket 索引
 /// 返回 0 表示距离为 0（相同 ID）
 pub fn bucket_index_for_distance(distance: &[u8; 20]) -> usize {
-    for i in 0..20 {
-        if distance[i] != 0 {
+    for (i, &byte) in distance.iter().enumerate() {
+        if byte != 0 {
             // 找到第一个非零字节，计算其最高位
-            let leading_zeros = distance[i].leading_zeros() as usize;
+            let leading_zeros = byte.leading_zeros() as usize;
             return i * 8 + leading_zeros;
         }
     }

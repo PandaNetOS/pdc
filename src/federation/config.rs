@@ -182,15 +182,33 @@ pub struct FederationConfig {
     pub full_sync_receiving_settle_ms: u64,
 }
 
-fn default_listen_port() -> u16 { 6885 }
-fn default_api_port() -> u16 { 6880 }
-fn default_transport_mode() -> String { "auto".to_string() }
-fn default_lpd_multicast_port() -> u16 { 6772 }
-fn default_max_connections() -> usize { 32 }
-fn default_target_neighbors() -> usize { 8 }
-fn default_heartbeat_interval() -> u64 { 30 }
-fn default_heartbeat_timeout() -> u64 { 90 }
-fn default_true() -> bool { true }
+fn default_listen_port() -> u16 {
+    6885
+}
+fn default_api_port() -> u16 {
+    6880
+}
+fn default_transport_mode() -> String {
+    "auto".to_string()
+}
+fn default_lpd_multicast_port() -> u16 {
+    6772
+}
+fn default_max_connections() -> usize {
+    32
+}
+fn default_target_neighbors() -> usize {
+    8
+}
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_heartbeat_timeout() -> u64 {
+    90
+}
+fn default_true() -> bool {
+    true
+}
 fn default_stun_servers() -> Vec<String> {
     // 国内可达的 STUN 服务器优先（小米/B站/腾讯），其次 Cloudflare，
     // 最后 Google（国内默认被墙，仅在有代理环境时作为兜底）。
@@ -202,36 +220,96 @@ fn default_stun_servers() -> Vec<String> {
         "stun.l.google.com:19302".to_string(),
     ]
 }
-fn default_relay_bandwidth() -> u32 { 10 }
-fn default_relay_max_connections() -> usize { 5 }
-fn default_relay_auto_setup_on_connect() -> bool { true }
-fn default_gossip_interval() -> u64 { 1000 }
-fn default_gossip_fanout() -> usize { 3 }
-fn default_gossip_seen_shards() -> usize { 16 }
-fn default_sync_node_interval() -> u64 { 300 }
-fn default_dht_interval() -> u64 { 300 }
-fn default_peer_cache_max() -> usize { 100 }
-fn default_transport_write_timeout() -> u64 { 5 }
-fn default_gossip_max_consecutive_failures() -> u32 { 3 }
-fn default_reconnect_cooldown_secs() -> u64 { 30 }
-fn default_heavy_task_max_concurrency() -> usize { 8 }
-fn default_gossip_max_bytes_per_second() -> u64 { 5 * 1024 * 1024 }
-fn default_gossip_max_messages_per_second() -> u32 { 100 }
-fn default_receive_pending_threshold() -> u32 { 1000 }
-fn default_initial_sync_batch_size() -> usize { 5000 }
-fn default_gossip_flush_interval_ms() -> u64 { 50 }
-fn default_gossip_flush_max_batches() -> usize { 10 }
-fn default_full_sync_batch_size() -> usize { 5000 }
-fn default_full_sync_window_size() -> usize { 3 }
-fn default_full_sync_gossip_max_messages_per_second() -> u32 { 5000 }
-fn default_full_sync_gossip_max_bytes_per_second() -> u64 { 50 * 1024 * 1024 }
-fn default_merkle_async_update_interval_ms() -> u64 { 1000 }
-fn default_merkle_async_update_batch_size() -> usize { 10000 }
-fn default_gossip_bulk_max_batches() -> usize { 50 }
-fn default_gossip_bulk_max_bytes() -> usize { 2 * 1024 * 1024 } // 2MB
-fn default_parallel_propagation() -> bool { true }
-fn default_full_sync_source_select_settle_ms() -> u64 { 60_000 }
-fn default_full_sync_receiving_settle_ms() -> u64 { 60_000 }
+fn default_relay_bandwidth() -> u32 {
+    10
+}
+fn default_relay_max_connections() -> usize {
+    5
+}
+fn default_relay_auto_setup_on_connect() -> bool {
+    true
+}
+fn default_gossip_interval() -> u64 {
+    1000
+}
+fn default_gossip_fanout() -> usize {
+    3
+}
+fn default_gossip_seen_shards() -> usize {
+    16
+}
+fn default_sync_node_interval() -> u64 {
+    300
+}
+fn default_dht_interval() -> u64 {
+    300
+}
+fn default_peer_cache_max() -> usize {
+    100
+}
+fn default_transport_write_timeout() -> u64 {
+    5
+}
+fn default_gossip_max_consecutive_failures() -> u32 {
+    3
+}
+fn default_reconnect_cooldown_secs() -> u64 {
+    30
+}
+fn default_heavy_task_max_concurrency() -> usize {
+    8
+}
+fn default_gossip_max_bytes_per_second() -> u64 {
+    5 * 1024 * 1024
+}
+fn default_gossip_max_messages_per_second() -> u32 {
+    100
+}
+fn default_receive_pending_threshold() -> u32 {
+    1000
+}
+fn default_initial_sync_batch_size() -> usize {
+    5000
+}
+fn default_gossip_flush_interval_ms() -> u64 {
+    50
+}
+fn default_gossip_flush_max_batches() -> usize {
+    10
+}
+fn default_full_sync_batch_size() -> usize {
+    5000
+}
+fn default_full_sync_window_size() -> usize {
+    3
+}
+fn default_full_sync_gossip_max_messages_per_second() -> u32 {
+    5000
+}
+fn default_full_sync_gossip_max_bytes_per_second() -> u64 {
+    50 * 1024 * 1024
+}
+fn default_merkle_async_update_interval_ms() -> u64 {
+    1000
+}
+fn default_merkle_async_update_batch_size() -> usize {
+    10000
+}
+fn default_gossip_bulk_max_batches() -> usize {
+    50
+}
+fn default_gossip_bulk_max_bytes() -> usize {
+    2 * 1024 * 1024
+} // 2MB
+fn default_parallel_propagation() -> bool {
+    true
+}
+fn default_full_sync_source_select_settle_ms() -> u64 {
+    60_000
+}
+fn default_full_sync_receiving_settle_ms() -> u64 {
+    60_000
+}
 
 impl Default for FederationConfig {
     fn default() -> Self {
@@ -277,7 +355,8 @@ impl Default for FederationConfig {
             gossip_flush_max_batches: default_gossip_flush_max_batches(),
             full_sync_batch_size: default_full_sync_batch_size(),
             full_sync_window_size: default_full_sync_window_size(),
-            full_sync_gossip_max_messages_per_second: default_full_sync_gossip_max_messages_per_second(),
+            full_sync_gossip_max_messages_per_second:
+                default_full_sync_gossip_max_messages_per_second(),
             full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
             merkle_async_update_interval_ms: default_merkle_async_update_interval_ms(),
             merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
@@ -323,8 +402,8 @@ mod tests {
 enabled: true
 listen_port: 7000
 seed_nodes:
-  - "1.2.3.4:6885"
-  - "5.6.7.8:6885"
+  - "1.2.3.4:6885" # [ALLOWED-HARDCODED]
+  - "5.6.7.8:6885" # [ALLOWED-HARDCODED]
 max_connections: 64
 "#;
         let cfg: FederationConfig = serde_yaml::from_str(yaml).unwrap();
@@ -341,7 +420,7 @@ max_connections: 64
     fn test_config_serialize() {
         let cfg = FederationConfig::default();
         let yaml = serde_yaml::to_string(&cfg).unwrap();
-        assert!(yaml.contains("listen_port: 6885"));
+        assert!(yaml.contains("listen_port: 6885")); // [ALLOWED-HARDCODED]
         assert!(yaml.contains("enabled: true"));
     }
 }

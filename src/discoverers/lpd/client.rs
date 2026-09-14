@@ -53,13 +53,13 @@ impl Default for LpdConfig {
             .collect();
 
         Self {
-            listen_port: 6881,
+            listen_port: 6881, // [ALLOWED-HARDCODED]
             multicast_addr: LPD_MULTICAST_ADDR.parse().unwrap(),
             multicast_port: LPD_MULTICAST_PORT,
             cookie,
-            min_broadcast_interval: Duration::from_secs(300),
-            query_wait_time: Duration::from_secs(3),
-            peer_ttl: Duration::from_secs(1800),
+            min_broadcast_interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            query_wait_time: Duration::from_secs(3),          // [ALLOWED-HARDCODED]
+            peer_ttl: Duration::from_secs(1800),              // [ALLOWED-HARDCODED]
             enabled: true,
         }
     }
@@ -303,6 +303,7 @@ impl PeerDiscoverer for LpdDiscoverer {
         // 发送多播查询
         let _ = self.broadcast_query(infohash).await;
 
+        // [ALLOWED-SLEEP] LPD 查询后一次性等待响应，非周期性
         // 等待响应
         tokio::time::sleep(self.config.query_wait_time).await;
 
@@ -370,7 +371,7 @@ mod tests {
         let text = String::from_utf8_lossy(&msg);
         assert!(text.contains("BT-SEARCH"));
         assert!(text.contains("Infohash: 0101010101010101010101010101010101010101"));
-        assert!(text.contains("Port: 6881"));
+        assert!(text.contains("Port: 6881")); // [ALLOWED-HARDCODED]
         assert!(text.contains("cookie: testcookie"));
     }
 

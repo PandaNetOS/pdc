@@ -85,35 +85,17 @@ impl KeywordSearchService {
         self
     }
 
-    /// 启动关键词搜索服务（定期搜索）
-    pub async fn start(self: Arc<Self>) {
+    /// 执行一次关键词搜索（由 TaskScheduler 按间隔调度）
+    pub async fn run_once(&self) {
         if self.config.targets.is_empty() {
-            info!("[keyword_search] 未配置搜索目标，跳过");
             return;
         }
 
         if self.node_addrs.is_empty() {
-            warn!("[keyword_search] 未配置 DHT 节点地址，跳过");
             return;
         }
 
-        info!(
-            "[keyword_search] 启动关键词搜索服务: {} 个目标, {} 个 DHT 节点, 间隔 {}s",
-            self.config.targets.len(),
-            self.node_addrs.len(),
-            self.config.interval_secs
-        );
-
-        // 启动时立即搜索一次
         self.search_all().await;
-
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.interval_secs));
-
-        loop {
-            interval.tick().await;
-            self.search_all().await;
-        }
     }
 
     /// 搜索所有目标
@@ -143,7 +125,10 @@ impl KeywordSearchService {
         }
 
         if total_infohashes > 0 {
-            info!("[keyword_search] 本轮共提取 {} 个 infohash", total_infohashes);
+            info!(
+                "[keyword_search] 本轮共提取 {} 个 infohash",
+                total_infohashes
+            );
         }
     }
 
@@ -151,7 +136,10 @@ impl KeywordSearchService {
     async fn search_target(&self, public_key_hex: &str, salt: &str) -> Result<usize> {
         let public_key = hex::decode(public_key_hex)?;
         if public_key.len() != 32 {
-            return Err(anyhow::anyhow!("public_key 长度应为32字节，实际{}", public_key.len()));
+            return Err(anyhow::anyhow!(
+                "public_key 长度应为32字节，实际{}",
+                public_key.len()
+            ));
         }
 
         // 向多个 DHT 节点发送 BEP 44 get 请求
@@ -159,7 +147,10 @@ impl KeywordSearchService {
         let mut all_values = vec![];
 
         for addr in self.node_addrs.iter().take(self.config.nodes_per_query) {
-            if let Ok(value) = self.query_mutable(&socket, *addr, &public_key, salt.as_bytes()).await {
+            if let Ok(value) = self
+                .query_mutable(&socket, *addr, &public_key, salt.as_bytes())
+                .await
+            {
                 all_values.push(value);
             }
         }
@@ -199,7 +190,8 @@ impl KeywordSearchService {
         socket.send_to(&request, addr).await?;
 
         let mut buf = [0u8; 2048];
-        let (len, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await??;
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await??; // [ALLOWED-HARDCODED]
 
         let value = parse_bep44_get_response(&buf[..len])?;
         Ok(value)
@@ -235,14 +227,16 @@ fn parse_bep44_get_response(data: &[u8]) -> Result<Vec<u8>> {
         _ => return Err(anyhow::anyhow!("响应不是字典")),
     };
 
-    let r = dict.get(&b"r".to_vec())
+    let r = dict
+        .get(&b"r"[..])
         .ok_or_else(|| anyhow::anyhow!("响应缺少 r 字段"))?;
     let r_dict = match r {
         Value::Dict(d) => d,
         _ => return Err(anyhow::anyhow!("r 字段不是字典")),
     };
 
-    let v = r_dict.get(&b"v".to_vec())
+    let v = r_dict
+        .get(&b"v".to_vec())
         .ok_or_else(|| anyhow::anyhow!("响应缺少 v 字段"))?;
     match v {
         Value::Bytes(b) => Ok(b.clone()),
@@ -268,10 +262,8 @@ fn extract_infohashes_from_value(value: &[u8]) -> Vec<Infohash> {
             let candidate = &text[i..i + 40];
             if candidate.chars().all(|c| c.is_ascii_hexdigit()) {
                 let mut ih = [0u8; 20];
-                if hex::decode_to_slice(candidate, &mut ih).is_ok() {
-                    if !infohashes.contains(&ih) {
-                        infohashes.push(ih);
-                    }
+                if hex::decode_to_slice(candidate, &mut ih).is_ok() && !infohashes.contains(&ih) {
+                    infohashes.push(ih);
                 }
             }
             i += 1;

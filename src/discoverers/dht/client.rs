@@ -62,11 +62,11 @@ impl Default for DhtConfig {
                 .iter()
                 .map(|(host, port)| (host.to_string(), *port))
                 .collect(),
-            listen_port: 6881,
+            listen_port: 6881, // [ALLOWED-HARDCODED]
             node_id,
-            refresh_interval: Duration::from_secs(300),
-            node_ttl: Duration::from_secs(3600),
-            request_timeout: Duration::from_secs(8),
+            refresh_interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            node_ttl: Duration::from_secs(3600),        // [ALLOWED-HARDCODED]
+            request_timeout: Duration::from_secs(8),    // [ALLOWED-HARDCODED]
             max_concurrent_requests: 3,
             max_query_rounds: 5,
             enabled: true,
@@ -165,7 +165,11 @@ impl DhtDiscoverer {
     }
 
     /// 获取距离目标最近的 N 个节点
-    fn nearest_nodes(&self, target: &[u8; 20], count: usize) -> Vec<crate::dht::kbucket::KBucketEntry> {
+    fn nearest_nodes(
+        &self,
+        target: &[u8; 20],
+        count: usize,
+    ) -> Vec<crate::dht::kbucket::KBucketEntry> {
         let healthy: HashSet<SocketAddr> = self.healthy_nodes().iter().map(|n| n.addr).collect();
         let mut closest = self.routing_table.read().find_closest(target, count * 3);
         closest.retain(|n| healthy.contains(&n.addr));
@@ -259,7 +263,7 @@ impl DhtDiscoverer {
         let mut rounds_without_improvement = 0;
         let mut announced_count = 0usize;
 
-        for round in 0..self.config.max_query_rounds {
+        for _round in 0..self.config.max_query_rounds {
             let candidates = self.nearest_nodes(infohash, 20);
             let to_query: Vec<_> = candidates
                 .into_iter()
@@ -324,7 +328,11 @@ impl DhtDiscoverer {
                                     announced_count += 1;
                                 }
                             }
-                            self.mark_node_success(&node_addr, qr.responder_id, start.elapsed().as_millis() as u64);
+                            self.mark_node_success(
+                                &node_addr,
+                                qr.responder_id,
+                                start.elapsed().as_millis() as u64,
+                            );
                         }
                         Err(_) => {
                             self.mark_node_failure(&node_addr);
@@ -342,9 +350,11 @@ impl DhtDiscoverer {
             start.elapsed()
         );
 
-        Ok(all_peers.into_iter().map(|addr| PeerInfo::new(addr, PeerSource::Dht)).collect())
+        Ok(all_peers
+            .into_iter()
+            .map(|addr| PeerInfo::new(addr, PeerSource::Dht))
+            .collect())
     }
-
 
     /// 从 NodeRepo 条目批量注入种子节点到路由表
     pub fn seed_from_entries(&self, entries: &[(String, u16)]) -> usize {
@@ -362,7 +372,6 @@ impl DhtDiscoverer {
         }
         injected
     }
-
 }
 #[async_trait]
 impl PeerDiscoverer for DhtDiscoverer {
@@ -474,7 +483,11 @@ impl PeerDiscoverer for DhtDiscoverer {
                                     new_nodes_count += 1;
                                 }
                             }
-                            self.mark_node_success(&node_addr, qr.responder_id, start.elapsed().as_millis() as u64);
+                            self.mark_node_success(
+                                &node_addr,
+                                qr.responder_id,
+                                start.elapsed().as_millis() as u64,
+                            );
                         }
                         Err(e) => {
                             debug!("[dht] 节点 {} 查询失败: {}", node_addr, e);
@@ -640,7 +653,7 @@ mod tests {
         let result = discoverer.init().await;
         assert!(result.is_ok());
         assert!(*discoverer.initialized.read());
-        assert!(discoverer.routing_table.read().len() > 0);
+        assert!(!discoverer.routing_table.read().is_empty());
     }
 
     #[test]

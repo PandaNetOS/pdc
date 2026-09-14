@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 
 use axum::response::Response;
 use prometheus::{
-    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// 全局 Metrics 注册表
@@ -72,11 +72,8 @@ pub fn init_metrics() {
         "Total DHT messages received",
     )
     .unwrap();
-    let dht_requests = IntCounter::new(
-        "pdc_dht_requests_sent_total",
-        "Total DHT requests sent",
-    )
-    .unwrap();
+    let dht_requests =
+        IntCounter::new("pdc_dht_requests_sent_total", "Total DHT requests sent").unwrap();
 
     // 缓存指标
     let cache_ih = Gauge::new("pdc_cache_infohashes", "Cached infohash count").unwrap();
@@ -93,15 +90,21 @@ pub fn init_metrics() {
     let health = Gauge::new("pdc_health_score", "System health score (0-100)").unwrap();
 
     // 注册
-    registry.register(Box::new(tracker_requests.clone())).unwrap();
-    registry.register(Box::new(tracker_response.clone())).unwrap();
+    registry
+        .register(Box::new(tracker_requests.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(tracker_response.clone()))
+        .unwrap();
     registry.register(Box::new(tracker_score.clone())).unwrap();
     registry.register(Box::new(dht_nodes.clone())).unwrap();
     registry.register(Box::new(dht_messages.clone())).unwrap();
     registry.register(Box::new(dht_requests.clone())).unwrap();
     registry.register(Box::new(cache_ih.clone())).unwrap();
     registry.register(Box::new(cache_peers.clone())).unwrap();
-    registry.register(Box::new(peer_discovered.clone())).unwrap();
+    registry
+        .register(Box::new(peer_discovered.clone()))
+        .unwrap();
     registry.register(Box::new(health.clone())).unwrap();
 
     // 设置全局引用

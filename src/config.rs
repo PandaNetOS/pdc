@@ -115,15 +115,33 @@ pub struct PersistenceConfig {
     pub max_hot_in_memory: usize,
 }
 
-fn default_save_interval() -> u64 { 60 }
-fn default_checkpoint_interval() -> u64 { 600 }
-fn default_wal_autocheckpoint() -> u32 { 2000 }
-fn default_batch_size() -> usize { 500 }
-fn default_false() -> bool { false }
-fn default_tier_check_interval() -> u64 { 300 }
-fn default_hot_threshold() -> u64 { 1800 }
-fn default_warm_threshold() -> u64 { 7200 }
-fn default_max_hot_in_memory() -> usize { 5000 }
+fn default_save_interval() -> u64 {
+    60
+}
+fn default_checkpoint_interval() -> u64 {
+    600
+}
+fn default_wal_autocheckpoint() -> u32 {
+    2000
+}
+fn default_batch_size() -> usize {
+    500
+}
+fn default_false() -> bool {
+    false
+}
+fn default_tier_check_interval() -> u64 {
+    300
+}
+fn default_hot_threshold() -> u64 {
+    1800
+}
+fn default_warm_threshold() -> u64 {
+    7200
+}
+fn default_max_hot_in_memory() -> usize {
+    5000
+}
 
 impl Default for PersistenceConfig {
     fn default() -> Self {
@@ -411,7 +429,7 @@ fn default_remote_tracker_url() -> String {
     "https://cdn.jsdelivr.net/gh/adysec/tracker@main/trackers_best.txt".to_string()
 }
 fn default_remote_tracker_refresh() -> u64 {
-    3600  // 每小时刷新一次
+    3600 // 每小时刷新一次
 }
 
 impl Default for DiscoverersConfig {
@@ -711,7 +729,7 @@ mod tests {
     fn test_parse_yaml() {
         let yaml = r#"
 server:
-  port: 9090
+  port: 9090 # [ALLOWED-HARDCODED]
 super_tracker:
   interval: 3600
 discoverers:

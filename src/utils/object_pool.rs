@@ -40,7 +40,7 @@ impl<T> ObjectPool<T> {
 
     /// 从池中获取对象
     /// 如果池为空，创建新对象
-    pub fn acquire(&self) -> PooledObject<T> {
+    pub fn acquire(&self) -> PooledObject<'_, T> {
         let obj = self.pool.pop().unwrap_or_else(|| (self.factory)());
         PooledObject {
             obj: Some(obj),

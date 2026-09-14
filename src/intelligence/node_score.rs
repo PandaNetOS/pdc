@@ -143,7 +143,7 @@ pub fn calculate_node_score_with_config(entry: &KBucketEntry, config: &NodeScore
         }
     }
 
-    total.max(0.0).min(100.0)
+    total.clamp(0.0, 100.0)
 }
 
 #[cfg(test)]

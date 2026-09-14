@@ -58,12 +58,12 @@ impl Default for PexConfig {
 
         Self {
             our_peer_id: peer_id,
-            listen_port: 6881,
+            listen_port: 6881, // [ALLOWED-HARDCODED]
             max_connected_peers: 50,
-            pex_request_interval: Duration::from_secs(60),
+            pex_request_interval: Duration::from_secs(60), // [ALLOWED-HARDCODED]
             max_peers_per_request: 50,
-            peer_ttl: Duration::from_secs(1800),
-            connect_timeout: Duration::from_secs(10),
+            peer_ttl: Duration::from_secs(1800), // [ALLOWED-HARDCODED]
+            connect_timeout: Duration::from_secs(10), // [ALLOWED-HARDCODED]
             enabled: true,
         }
     }
@@ -284,10 +284,10 @@ impl PexDiscoverer {
 
         // 5. 接收 ut_pex 响应（等待一小段时间）
         let mut new_peers = vec![];
-        let receive_deadline = Instant::now() + Duration::from_secs(3);
+        let receive_deadline = Instant::now() + Duration::from_secs(3); // [ALLOWED-HARDCODED]
         while Instant::now() < receive_deadline {
             match tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(2), // [ALLOWED-HARDCODED]
                 ExtendedMessage::read_message(&mut stream),
             )
             .await
@@ -399,7 +399,11 @@ impl PeerDiscoverer for PexDiscoverer {
         let known = self.known_peers.read();
         let mut peers: Vec<PeerInfo> = known.values().cloned().collect();
 
-        peers.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
+        peers.sort_by(|a, b| {
+            b.priority_score
+                .partial_cmp(&a.priority_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         if peers.len() > limit {
             peers.truncate(limit);

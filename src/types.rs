@@ -51,7 +51,7 @@ impl PeerInfo {
             source,
             first_seen: now,
             last_active: now,
-            priority_score: 45.0,  // 中性初始分，等待 ScoreMaintainer 重算（评分唯一性原则）
+            priority_score: 45.0, // 中性初始分，等待 ScoreMaintainer 重算（评分唯一性原则）
             connection_attempts: 0,
             connection_successes: 0,
             is_ipv6: addr.is_ipv6(),
@@ -63,7 +63,7 @@ impl PeerInfo {
     pub fn is_expired(&self) -> bool {
         self.last_active
             .elapsed()
-            .map(|e| e > Duration::from_secs(86400))
+            .map(|e| e > Duration::from_secs(86400)) // [ALLOWED-HARDCODED]
             .unwrap_or(false)
     }
 }

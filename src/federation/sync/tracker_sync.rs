@@ -3,11 +3,11 @@
 //! 通过 Gossip 协议传播 Tracker 列表变更，支持 Merkle 全量对账。
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::MerkleTree;
@@ -27,7 +27,11 @@ struct TrackerSyncPayload {
 
 /// 构建 Tracker 同步条目的 (key, payload_bytes)。
 /// 格式与 collect_all_entries 一致，供 TrackerRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
-pub(crate) fn build_tracker_sync_entry(url: &str, disabled: bool, last_seen: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn build_tracker_sync_entry(
+    url: &str,
+    disabled: bool,
+    last_seen: u64,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let payload = TrackerSyncPayload {
         url: url.to_string(),
         disabled,
@@ -46,8 +50,8 @@ pub struct TrackerSync {
     merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
     last_full_sync: parking_lot::RwLock<Instant>,
-    enabled: bool,
-    shutdown: broadcast::Sender<()>,
+    _enabled: bool,
+    _shutdown: broadcast::Sender<()>,
 }
 
 impl TrackerSync {
@@ -66,39 +70,24 @@ impl TrackerSync {
             merkle_queue,
             metrics,
             last_full_sync: parking_lot::RwLock::new(Instant::now()),
-            enabled: true,
-            shutdown,
+            _enabled: true,
+            _shutdown: shutdown,
         }
     }
 
     /// 启动全量对账后台任务（每小时）
+    ///
+    /// 已迁移：周期性 tick 由 TaskScheduler 统一调度，调用 [`TrackerSync::do_full_sync`]。
+    /// 保留空壳以兼容 mod.rs 中的旧调用，待 start() 统一清理后移除。
     pub fn spawn_full_sync(self: Arc<Self>) {
-        if !self.enabled {
-            return;
-        }
-        let mut shutdown_rx = self.shutdown.subscribe();
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.do_full_sync();
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] Tracker 全量同步任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] Tracker 全量同步任务已启动（间隔 3600s）");
+        // [MIGRATED] 内部 spawn+interval 循环已迁移到 TaskScheduler，由 main.rs 统一注册。
+        // 周期 tick 入口: pub(crate) fn do_full_sync(&self)
     }
 
     /// 执行全量对账
-    fn do_full_sync(&self) {
+    ///
+    /// 周期性 tick 入口，已迁移到 TaskScheduler 统一调度。
+    pub fn do_full_sync(&self) {
         let trackers = self.tracker_repo.all_trackers_sync();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -159,7 +148,9 @@ impl TrackerSync {
         let key = url.as_bytes().to_vec();
         let payload = if operation == operation::UPSERT {
             let tracker = self.tracker_repo.get_tracker_sync(url);
-            let (disabled, last_used) = tracker.map(|t| (t.disabled, t.last_used)).unwrap_or((false, None));
+            let (disabled, last_used) = tracker
+                .map(|t| (t.disabled, t.last_used))
+                .unwrap_or((false, None));
             let p = TrackerSyncPayload {
                 url: url.to_string(),
                 disabled,
@@ -188,7 +179,10 @@ impl TrackerSync {
 
         self.gossip_engine
             .submit_gossip(repo_type::TRACKER, vec![entry]);
-        debug!("[federation] Tracker 变更传播: url={}, op={}", url, operation);
+        debug!(
+            "[federation] Tracker 变更传播: url={}, op={}",
+            url, operation
+        );
     }
 
     /// 应用收到的 Tracker 同步数据
@@ -324,9 +318,9 @@ impl TrackerSync {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::federation::config::FederationConfig;
-use crate::federation::connection::ConnectionManager;
-use crate::federation::node_id::NodeIdentity;
+    use crate::federation::config::FederationConfig;
+    use crate::federation::connection::ConnectionManager;
+    use crate::federation::node_id::NodeIdentity;
     use crate::federation::node_table::NodeTable;
     use crate::storage::Storage;
 
@@ -377,14 +371,8 @@ use crate::federation::node_id::NodeIdentity;
         let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
         let queue = Arc::new(MerkleUpdateQueue::new());
-        let tracker_sync = TrackerSync::new(
-            repo.clone(),
-            gossip,
-            merkle,
-            queue,
-            metrics,
-            shutdown_tx,
-        );
+        let tracker_sync =
+            TrackerSync::new(repo.clone(), gossip, merkle, queue, metrics, shutdown_tx);
 
         assert_eq!(repo.count_sync(), 0);
 
@@ -414,14 +402,8 @@ use crate::federation::node_id::NodeIdentity;
         let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
         let queue = Arc::new(MerkleUpdateQueue::new());
-        let tracker_sync = TrackerSync::new(
-            repo,
-            gossip.clone(),
-            merkle,
-            queue,
-            metrics,
-            shutdown_tx,
-        );
+        let tracker_sync =
+            TrackerSync::new(repo, gossip.clone(), merkle, queue, metrics, shutdown_tx);
 
         // 提交变更，应加入 gossip outbox
         tracker_sync.submit_tracker_change("http://change.tracker:6969", operation::UPSERT);
@@ -438,14 +420,8 @@ use crate::federation::node_id::NodeIdentity;
         let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
         let queue = Arc::new(MerkleUpdateQueue::new());
-        let tracker_sync = TrackerSync::new(
-            repo,
-            gossip,
-            merkle.clone(),
-            queue,
-            metrics,
-            shutdown_tx,
-        );
+        let tracker_sync =
+            TrackerSync::new(repo, gossip, merkle.clone(), queue, metrics, shutdown_tx);
 
         // 先做一次全量同步更新 merkle
         tracker_sync.do_full_sync();

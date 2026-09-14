@@ -7,13 +7,13 @@
 //! 数据面不做策略决策，所有策略由控制面提供。
 //! 数据面可以水平扩展（多实例无状态），状态存储在共享缓存中。
 
+pub mod hole_punch_signaling;
 pub mod http_tracker;
 pub mod metrics;
-pub mod rest_api;
-pub mod udp_tracker;
 pub mod rate_limiter;
 pub mod relay;
-pub mod hole_punch_signaling;
+pub mod rest_api;
+pub mod udp_tracker;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -80,6 +80,8 @@ pub struct AppState {
     pub federation: Option<Arc<crate::federation::FederationService>>,
     /// 中继服务器（UDP+TCP 流量转发，打洞失败时使用）
     pub relay_server: Option<Arc<crate::data_plane::relay::RelayServer>>,
+    /// UDP Tracker 服务端（供 TaskScheduler 调用 cleanup_expired_connections）
+    pub udp_tracker: Option<Arc<UdpTrackerServer>>,
 }
 
 /// 数据面
@@ -97,7 +99,6 @@ impl DataPlane {
     pub fn build_api_router(state: AppState) -> Router {
         use axum::http::{Request, StatusCode};
         use axum::middleware::{from_fn, Next};
-        use axum::response::Response;
 
         let token = state.config.read().server.token.clone();
 
@@ -107,27 +108,34 @@ impl DataPlane {
         if let Some(expected_token) = token {
             if !expected_token.is_empty() {
                 let expected = expected_token.clone();
-                return app.layer(from_fn(move |req: Request<axum::body::Body>, next: Next| {
-                    let expected = expected.clone();
-                    async move {
-                        let auth_valid = req.headers()
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|v| v.trim_start_matches("Bearer ").trim() == expected)
-                            .unwrap_or(false)
-                            || req.headers()
-                                .get("x-api-key")
+                return app.layer(from_fn(
+                    move |req: Request<axum::body::Body>, next: Next| {
+                        let expected = expected.clone();
+                        async move {
+                            let auth_valid = req
+                                .headers()
+                                .get("authorization")
                                 .and_then(|v| v.to_str().ok())
-                                .map(|v| v == expected)
-                                .unwrap_or(false);
+                                .map(|v| v.trim_start_matches("Bearer ").trim() == expected)
+                                .unwrap_or(false)
+                                || req
+                                    .headers()
+                                    .get("x-api-key")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|v| v == expected)
+                                    .unwrap_or(false);
 
-                        if auth_valid {
-                            Ok(next.run(req).await)
-                        } else {
-                            Err((StatusCode::UNAUTHORIZED, "Unauthorized: invalid or missing token"))
+                            if auth_valid {
+                                Ok(next.run(req).await)
+                            } else {
+                                Err((
+                                    StatusCode::UNAUTHORIZED,
+                                    "Unauthorized: invalid or missing token",
+                                ))
+                            }
                         }
-                    }
-                }));
+                    },
+                ));
             }
         }
         app
@@ -150,8 +158,21 @@ impl DataPlane {
         let config = state.config.read().clone();
         let addr = format!("{}:{}", config.server.listen, config.server.api_port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        let has_token = config.server.token.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
-        info!("[data_plane] API/监控 HTTP 启动，监听 {}（{}）", addr, if has_token { "token鉴权已启用" } else { "未配置token，无鉴权" });
+        let has_token = config
+            .server
+            .token
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        info!(
+            "[data_plane] API/监控 HTTP 启动，监听 {}（{}）",
+            addr,
+            if has_token {
+                "token鉴权已启用"
+            } else {
+                "未配置token，无鉴权"
+            }
+        );
 
         let app = Self::build_api_router(state);
         axum::serve(listener, app).await?;
@@ -187,20 +208,29 @@ impl DataPlane {
     /// 与 HTTP 服务共用同一个端口（UDP/TCP 可以同端口），
     /// 或使用配置中指定的 UDP 端口。
     pub async fn serve_udp(state: AppState) -> anyhow::Result<()> {
-        let config = state.config.read().clone();
-        let udp_port = config.super_tracker.udp_port.unwrap_or(config.server.port);
-        let listen_addr = format!("{}:{}", config.server.listen, udp_port).parse()?;
+        // 优先使用 AppState 注入的实例（与 TaskScheduler 持有同一 Arc，以便做过期清理）。
+        // 未注入（None）时回退到本地创建，保持现有启动行为不变。
+        let server: Arc<UdpTrackerServer> = match state.udp_tracker.clone() {
+            Some(server) => server,
+            None => {
+                let config = state.config.read().clone();
+                let udp_port = config.super_tracker.udp_port.unwrap_or(config.server.port);
+                let listen_addr: SocketAddr =
+                    format!("{}:{}", config.server.listen, udp_port).parse()?;
 
-        let mut server = UdpTrackerServer::new(
-            listen_addr,
-            state.super_tracker.clone(),
-            state.peer_repo.clone(),
-            config.super_tracker,
-            state.rate_limiter.clone(),
-        );
-        if let Some(ref repo) = state.infohash_repo {
-            server = server.with_infohash_repo(repo.clone());
-        }
+                let mut server = UdpTrackerServer::new(
+                    listen_addr,
+                    state.super_tracker.clone(),
+                    state.peer_repo.clone(),
+                    config.super_tracker,
+                    state.rate_limiter.clone(),
+                );
+                if let Some(ref repo) = state.infohash_repo {
+                    server = server.with_infohash_repo(repo.clone());
+                }
+                Arc::new(server)
+            }
+        };
 
         server.start().await
     }

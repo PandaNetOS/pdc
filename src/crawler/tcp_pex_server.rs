@@ -3,7 +3,6 @@
 //! 通过标准 TCP BT 连接被动接收 PEX 消息，提取 peer 加入 PeerRepo。
 //! 与 uTP 服务端互补，支持不支持 uTP 的传统 BT 客户端。
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,7 +118,10 @@ impl TcpPexServer {
                     {
                         let active = *self.active_count.read();
                         if active >= self.max_connections {
-                            debug!("[TCP-PEX] 连接数已满（{}），拒绝连接 from {}", self.max_connections, addr);
+                            debug!(
+                                "[TCP-PEX] 连接数已满（{}），拒绝连接 from {}",
+                                self.max_connections, addr
+                            );
                             continue;
                         }
                     }
@@ -139,14 +141,8 @@ impl TcpPexServer {
                     let active_count = self.active_count.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(
-                            stream,
-                            addr,
-                            node_id,
-                            peer_repo,
-                            pex_receiver,
-                        )
-                        .await
+                        if let Err(e) =
+                            handle_connection(stream, addr, node_id, peer_repo, pex_receiver).await
                         {
                             debug!("[TCP-PEX] 连接处理错误 from {}: {}", addr, e);
                         }
@@ -190,7 +186,11 @@ async fn handle_connection(
     let infohash: Infohash = handshake_buf[28..48].try_into()?;
     let peer_id: [u8; 20] = handshake_buf[48..68].try_into()?;
 
-    debug!("[TCP-PEX] 收到 BT 握手 from {} (infohash={})", addr, hex::encode(infohash));
+    debug!(
+        "[TCP-PEX] 收到 BT 握手 from {} (infohash={})",
+        addr,
+        hex::encode(infohash)
+    );
 
     // 2. 发送我们的 BT 握手响应
     let mut our_handshake = Vec::with_capacity(68);
@@ -221,7 +221,7 @@ async fn handle_connection(
 
     // 5. 循环读取消息，等待 PEX 消息
     let mut ut_pex_id: Option<u8> = None;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60); // [ALLOWED-HARDCODED]
 
     while Instant::now() < deadline {
         // 读取消息长度
@@ -271,13 +271,12 @@ async fn handle_connection(
                     }
                 }
             }
-            9 => {
+            9
                 // port 消息
-                if msg_buf.len() >= 3 {
+                if msg_buf.len() >= 3 => {
                     let port = u16::from_be_bytes([msg_buf[1], msg_buf[2]]);
                     debug!("[TCP-PEX] 对端监听端口: {}", port);
                 }
-            }
             _ => {
                 // 其他消息忽略
             }

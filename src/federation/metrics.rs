@@ -1,56 +1,55 @@
-//! 联邦网络监控指标
+//! 鑱旈偊缃戠粶鐩戞帶鎸囨爣
 //!
-//! 使用 AtomicU64 记录各类计数器，提供快照用于序列化和展示。
+//! 浣跨敤 AtomicU64 璁板綍鍚勭被璁℃暟鍣紝鎻愪緵蹇収鐢ㄤ簬搴忓垪鍖栧拰灞曠ず銆?
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use serde::Serialize;
 
-/// 联邦网络指标（原子计数器）
+/// 鑱旈偊缃戠粶鎸囨爣锛堝師瀛愯鏁板櫒锛?
 #[derive(Debug, Default)]
 pub struct FederationMetrics {
-    /// 发送消息总数
+    /// 鍙戦€佹秷鎭€绘暟
     pub total_messages_sent: AtomicU64,
-    /// 接收消息总数
+    /// 鎺ユ敹娑堟伅鎬绘暟
     pub total_messages_recv: AtomicU64,
-    /// 发送字节总数（序列化后的完整帧字节数，含帧头）
+    /// 鍙戦€佸瓧鑺傛€绘暟锛堝簭鍒楀寲鍚庣殑瀹屾暣甯у瓧鑺傛暟锛屽惈甯уご锛?
     pub bytes_sent: AtomicU64,
-    /// 接收字节总数（序列化后的完整帧字节数，含帧头）
+    /// 鎺ユ敹瀛楄妭鎬绘暟锛堝簭鍒楀寲鍚庣殑瀹屾暣甯у瓧鑺傛暟锛屽惈甯уご锛?
     pub bytes_recv: AtomicU64,
-    /// Gossip 传播次数
+    /// Gossip 浼犳挱娆℃暟
     pub gossip_propagations: AtomicU64,
-    /// Gossip 接收次数
+    /// Gossip 鎺ユ敹娆℃暟
     pub gossip_received: AtomicU64,
-    /// 同步条目应用数
+    /// 鍚屾鏉＄洰搴旂敤鏁?
     pub sync_entries_applied: AtomicU64,
-    /// Node 同步计数
+    /// Node 鍚屾璁℃暟
     pub node_sync_count: AtomicU64,
-    /// Peer 同步计数
+    /// Peer 鍚屾璁℃暟
     pub peer_sync_count: AtomicU64,
-    /// Infohash 同步计数
+    /// Infohash 鍚屾璁℃暟
     pub infohash_sync_count: AtomicU64,
-    /// Tracker 同步计数
+    /// Tracker 鍚屾璁℃暟
     pub tracker_sync_count: AtomicU64,
-    /// 打洞尝试次数
+    /// 鎵撴礊灏濊瘯娆℃暟
     pub hole_punch_attempts: AtomicU64,
-    /// 打洞成功次数
+    /// 鎵撴礊鎴愬姛娆℃暟
     pub hole_punch_successes: AtomicU64,
-    /// 中继转发字节数
+    /// 涓户杞彂瀛楄妭鏁?
     pub relay_bytes_forwarded: AtomicU64,
-    /// 中继通道被接受次数
+    /// 涓户閫氶亾琚帴鍙楁鏁?
     pub relay_channels_accepted: AtomicU64,
-    /// 中继通道被拒绝次数（过载）
+    /// 涓户閫氶亾琚嫆缁濇鏁帮紙杩囪浇锛?
     pub relay_channels_rejected: AtomicU64,
-    /// 中继通道关闭次数
+    /// 涓户閫氶亾鍏抽棴娆℃暟
     pub relay_channels_closed: AtomicU64,
-    /// Merkle 修复次数
+    /// Merkle 淇娆℃暟
     pub merkle_repairs: AtomicU64,
-    /// 签名验证失败次数
+    /// 绛惧悕楠岃瘉澶辫触娆℃暟
     pub signature_verification_failures: AtomicU64,
-    /// 连接建立成功次数
+    /// 杩炴帴寤虹珛鎴愬姛娆℃暟
     pub connections_established: AtomicU64,
-    /// 连接断开次数
+    /// 杩炴帴鏂紑娆℃暟
     pub connections_closed: AtomicU64,
 }
 
@@ -67,12 +66,12 @@ impl FederationMetrics {
         self.total_messages_recv.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 累加发送字节数（序列化后的完整帧字节长度）
+    /// 绱姞鍙戦€佸瓧鑺傛暟锛堝簭鍒楀寲鍚庣殑瀹屾暣甯у瓧鑺傞暱搴︼級
     pub fn record_bytes_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// 累加接收字节数（序列化后的完整帧字节长度）
+    /// 绱姞鎺ユ敹瀛楄妭鏁帮紙搴忓垪鍖栧悗鐨勫畬鏁村抚瀛楄妭闀垮害锛?
     pub fn record_bytes_recv(&self, bytes: u64) {
         self.bytes_recv.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -86,25 +85,26 @@ impl FederationMetrics {
     }
 
     pub fn record_sync_entries(&self, count: u64) {
-        self.sync_entries_applied.fetch_add(count, Ordering::Relaxed);
+        self.sync_entries_applied
+            .fetch_add(count, Ordering::Relaxed);
     }
 
-    /// 记录 Node 同步应用条数
+    /// 璁板綍 Node 鍚屾搴旂敤鏉℃暟
     pub fn record_node_sync(&self, count: u64) {
         self.node_sync_count.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// 记录 Peer 同步应用条数
+    /// 璁板綍 Peer 鍚屾搴旂敤鏉℃暟
     pub fn record_peer_sync(&self, count: u64) {
         self.peer_sync_count.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// 记录 Infohash 同步应用条数
+    /// 璁板綍 Infohash 鍚屾搴旂敤鏉℃暟
     pub fn record_infohash_sync(&self, count: u64) {
         self.infohash_sync_count.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// 记录 Tracker 同步应用条数
+    /// 璁板綍 Tracker 鍚屾搴旂敤鏉℃暟
     pub fn record_tracker_sync(&self, count: u64) {
         self.tracker_sync_count.fetch_add(count, Ordering::Relaxed);
     }
@@ -118,7 +118,8 @@ impl FederationMetrics {
     }
 
     pub fn record_relay_bytes(&self, bytes: u64) {
-        self.relay_bytes_forwarded.fetch_add(bytes, Ordering::Relaxed);
+        self.relay_bytes_forwarded
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn record_relay_channel_accepted(&self) {
@@ -138,7 +139,8 @@ impl FederationMetrics {
     }
 
     pub fn record_signature_failure(&self) {
-        self.signature_verification_failures.fetch_add(1, Ordering::Relaxed);
+        self.signature_verification_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_connection_established(&self) {
@@ -149,7 +151,7 @@ impl FederationMetrics {
         self.connections_closed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 生成快照（将 AtomicU64 转为普通字段）
+    /// 鐢熸垚蹇収锛堝皢 AtomicU64 杞负鏅€氬瓧娈碉級
     pub fn snapshot(&self) -> FederationMetricsSnapshot {
         FederationMetricsSnapshot {
             total_messages_sent: self.total_messages_sent.load(Ordering::Relaxed),
@@ -170,15 +172,17 @@ impl FederationMetrics {
             relay_channels_rejected: self.relay_channels_rejected.load(Ordering::Relaxed),
             relay_channels_closed: self.relay_channels_closed.load(Ordering::Relaxed),
             merkle_repairs: self.merkle_repairs.load(Ordering::Relaxed),
-            signature_verification_failures: self.signature_verification_failures.load(Ordering::Relaxed),
+            signature_verification_failures: self
+                .signature_verification_failures
+                .load(Ordering::Relaxed),
             connections_established: self.connections_established.load(Ordering::Relaxed),
             connections_closed: self.connections_closed.load(Ordering::Relaxed),
         }
     }
 }
 
-/// 指标快照（可序列化）
-#[derive(Debug, Clone, Serialize)]
+/// 鎸囨爣蹇収锛堝彲搴忓垪鍖栵級
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct FederationMetricsSnapshot {
     pub total_messages_sent: u64,
     pub total_messages_recv: u64,
@@ -203,37 +207,10 @@ pub struct FederationMetricsSnapshot {
     pub connections_closed: u64,
 }
 
-impl Default for FederationMetricsSnapshot {
-    fn default() -> Self {
-        Self {
-            total_messages_sent: 0,
-            total_messages_recv: 0,
-            bytes_sent: 0,
-            bytes_recv: 0,
-            gossip_propagations: 0,
-            gossip_received: 0,
-            sync_entries_applied: 0,
-            node_sync_count: 0,
-            peer_sync_count: 0,
-            infohash_sync_count: 0,
-            tracker_sync_count: 0,
-            hole_punch_attempts: 0,
-            hole_punch_successes: 0,
-            relay_bytes_forwarded: 0,
-            relay_channels_accepted: 0,
-            relay_channels_rejected: 0,
-            relay_channels_closed: 0,
-            merkle_repairs: 0,
-            signature_verification_failures: 0,
-            connections_established: 0,
-            connections_closed: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_metrics_counters() {

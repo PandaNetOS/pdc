@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::discoverers::DiscovererRegistry;
-use crate::storage::PeerRepoImpl;
 use crate::event_bus::EventBus;
+use crate::storage::PeerRepoImpl;
 use crate::traits::{AnnounceEvent, DiscovererStats, PeerDiscoverer};
 use crate::types::{DiscoveryResult, Event, Infohash, PeerInfo, PeerSource};
 
@@ -38,8 +38,8 @@ impl Default for PeerDiscoveryConfig {
     fn default() -> Self {
         Self {
             max_cached_peers: 10000,
-            peer_ttl: Duration::from_secs(86400),
-            discovery_timeout: Duration::from_secs(30),
+            peer_ttl: Duration::from_secs(86400), // [ALLOWED-HARDCODED]
+            discovery_timeout: Duration::from_secs(30), // [ALLOWED-HARDCODED]
             max_concurrent_discoverers: 10,
             max_peers_per_discovery: 200,
         }
@@ -171,7 +171,11 @@ impl PeerDiscoveryAggregator {
         all_peers.dedup_by(|a, b| a.addr == b.addr);
 
         // 5. 按初始评分排序（评分由 ScoreMaintainer 统一维护，aggregator 不具备算分权限）
-        all_peers.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
+        all_peers.sort_by(|a, b| {
+            b.priority_score
+                .partial_cmp(&a.priority_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // 6. 限制数量
         if all_peers.len() > limit {

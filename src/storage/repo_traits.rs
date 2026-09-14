@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 
 use crate::dht::kbucket::{KBucketEntry, NodeState};
-use crate::types::{Infohash, PeerInfo, PeerSource};
+use crate::types::{Infohash, PeerInfo};
 
 /// DHT 节点 ID
 pub type NodeId = [u8; 20];
@@ -63,6 +63,10 @@ pub trait NodeRepository: Send + Sync {
 
     // 持久化
     async fn save_all(&self) -> anyhow::Result<()>;
+    /// 增量持久化：只保存脏数据（默认实现为全量保存，后续可优化为增量）
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        self.save_all().await
+    }
     async fn load_all(&self) -> anyhow::Result<usize>;
 }
 
@@ -96,6 +100,10 @@ pub trait PeerRepository: Send + Sync {
 
     // 全量持久化
     async fn save_all(&self) -> anyhow::Result<()>;
+    /// 增量持久化：只保存脏数据（默认实现为全量保存，后续可优化为增量）
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        self.save_all().await
+    }
     async fn load_all(&self) -> anyhow::Result<usize>;
 
     // 历史持久化
@@ -162,5 +170,9 @@ pub trait TrackerRepository: Send + Sync {
 
     // 持久化
     async fn save_all(&self) -> anyhow::Result<()>;
+    /// 增量持久化：只保存脏数据（默认实现为全量保存，后续可优化为增量）
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        self.save_all().await
+    }
     async fn load_all(&self) -> anyhow::Result<usize>;
 }

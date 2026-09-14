@@ -1,4 +1,4 @@
-﻿//! PEX 被动接收器（BEP 11）
+//! PEX 被动接收器（BEP 11）
 //!
 //! 目的：从其他 BT 客户端的 PEX（Peer Exchange）消息中被动获取 peer 列表，
 //! 加入 PeerRepo。PEX 消息通过 BT 扩展协议（BEP 10）发送。
@@ -284,7 +284,7 @@ impl PexReceiver {
             peer_repo: None,
             stats: parking_lot::RwLock::new(PexReceiverStats::default()),
             dedup_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            dedup_ttl: std::time::Duration::from_secs(60),
+            dedup_ttl: std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
         }
     }
 
@@ -342,17 +342,9 @@ impl PexReceiver {
         match PexMessage::parse(data) {
             Some(msg) => {
                 let total_added = msg.added.len() + msg.added6.len();
-                let utp_count = msg
-                    .added
-                    .iter()
-                    .filter(|(_, f)| f.utp)
-                    .count()
+                let utp_count = msg.added.iter().filter(|(_, f)| f.utp).count()
                     + msg.added6.iter().filter(|(_, f)| f.utp).count();
-                let holepunch_count = msg
-                    .added
-                    .iter()
-                    .filter(|(_, f)| f.holepunch)
-                    .count()
+                let holepunch_count = msg.added.iter().filter(|(_, f)| f.holepunch).count()
                     + msg.added6.iter().filter(|(_, f)| f.holepunch).count();
 
                 {
@@ -385,7 +377,8 @@ impl PexReceiver {
                         peer.last_active = now;
                         // 记录 uTP 和 holepunch 支持到 metadata
                         if flags.utp {
-                            peer.metadata.insert("supports_utp".to_string(), "true".to_string());
+                            peer.metadata
+                                .insert("supports_utp".to_string(), "true".to_string());
                         }
                         if flags.holepunch {
                             peer.metadata
@@ -396,7 +389,8 @@ impl PexReceiver {
                                 .insert("encryption_preferred".to_string(), "true".to_string());
                         }
                         if flags.seed {
-                            peer.metadata.insert("is_seed".to_string(), "true".to_string());
+                            peer.metadata
+                                .insert("is_seed".to_string(), "true".to_string());
                         }
                         peers_to_add.push(peer);
                     }
@@ -406,7 +400,8 @@ impl PexReceiver {
                         peer.first_seen = now;
                         peer.last_active = now;
                         if flags.utp {
-                            peer.metadata.insert("supports_utp".to_string(), "true".to_string());
+                            peer.metadata
+                                .insert("supports_utp".to_string(), "true".to_string());
                         }
                         if flags.holepunch {
                             peer.metadata
@@ -424,12 +419,14 @@ impl PexReceiver {
                         cache.retain(|_, t| now.duration_since(*t) < self.dedup_ttl);
                         // 过滤掉已在缓存中的 peer
                         peers_to_add.retain(|p| {
-                            if cache.contains_key(&p.addr) {
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                cache.entry(p.addr)
+                            {
+                                e.insert(now);
+                                true
+                            } else {
                                 dedup_skipped += 1;
                                 false
-                            } else {
-                                cache.insert(p.addr, now);
-                                true
                             }
                         });
                     }
@@ -479,8 +476,8 @@ mod tests {
         ];
         let peers = parse_compact_peers(&data);
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].to_string(), "192.168.1.1:6881");
-        assert_eq!(peers[1].to_string(), "10.0.0.1:8080");
+        assert_eq!(peers[0].to_string(), "192.168.1.1:6881"); // [ALLOWED-HARDCODED]
+        assert_eq!(peers[1].to_string(), "10.0.0.1:8080"); // [ALLOWED-HARDCODED]
     }
 
     #[test]

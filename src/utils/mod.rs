@@ -4,4 +4,4 @@
 
 pub mod object_pool;
 
-pub use object_pool::{ObjectPool, PooledObject, create_buffer_pool};
+pub use object_pool::{create_buffer_pool, ObjectPool, PooledObject};

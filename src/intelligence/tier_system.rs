@@ -16,11 +16,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::intelligence::tier_manager::{DataTier, TierConfig, TierStats};
 use crate::storage::repo_traits::NodeRepository;
@@ -44,12 +44,7 @@ impl TierSystem {
     }
 
     /// 判断单个节点的冷热层级（多维度综合判定）
-    pub fn classify_node(
-        &self,
-        last_active: Instant,
-        score: f64,
-        query_count: u64,
-    ) -> DataTier {
+    pub fn classify_node(&self, last_active: Instant, score: f64, query_count: u64) -> DataTier {
         let elapsed = last_active.elapsed();
 
         // 1. 基础分层：根据最后活跃时间
@@ -102,7 +97,12 @@ impl TierSystem {
     }
 
     /// 判断节点是否在内存中保留（热数据保留，温数据部分保留，冷数据可清理）
-    pub fn should_keep_in_memory(&self, last_active: Instant, score: f64, query_count: u64) -> bool {
+    pub fn should_keep_in_memory(
+        &self,
+        last_active: Instant,
+        score: f64,
+        query_count: u64,
+    ) -> bool {
         match self.classify_node(last_active, score, query_count) {
             DataTier::Hot => true,
             DataTier::Warm => score > 50.0, // 温数据中评分 > 50 的保留
@@ -125,10 +125,17 @@ impl TierSystem {
             }
         }
 
-        let stats = TierStats { hot_count, warm_count, cold_count };
+        let stats = TierStats {
+            hot_count,
+            warm_count,
+            cold_count,
+        };
         *self.stats.write() = stats.clone();
         *self.last_full_check.write() = Some(Instant::now());
-        debug!("[tier_system] NodeRepo 分层: hot={}, warm={}, cold={}", hot_count, warm_count, cold_count);
+        debug!(
+            "[tier_system] NodeRepo 分层: hot={}, warm={}, cold={}",
+            hot_count, warm_count, cold_count
+        );
         stats
     }
 
@@ -142,9 +149,7 @@ impl TierSystem {
         let nodes = repo.all_nodes().await;
         nodes
             .into_iter()
-            .filter(|n| {
-                self.classify_node(n.last_active, n.score, n.query_count) == DataTier::Hot
-            })
+            .filter(|n| self.classify_node(n.last_active, n.score, n.query_count) == DataTier::Hot)
             .map(|n| n.addr)
             .collect()
     }
@@ -193,6 +198,7 @@ impl TierManageable for NodeTierManagerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn test_config() -> TierConfig {
         TierConfig {
@@ -206,7 +212,7 @@ mod tests {
     #[test]
     fn test_classify_hot() {
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(100);
+        let last_active = Instant::now() - Duration::from_secs(100); // [ALLOWED-HARDCODED]
         let tier = system.classify_node(last_active, 50.0, 10);
         assert_eq!(tier, DataTier::Hot);
     }
@@ -214,7 +220,7 @@ mod tests {
     #[test]
     fn test_classify_warm() {
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(3600);
+        let last_active = Instant::now() - Duration::from_secs(3600); // [ALLOWED-HARDCODED]
         let tier = system.classify_node(last_active, 50.0, 10);
         assert_eq!(tier, DataTier::Warm);
     }
@@ -222,7 +228,7 @@ mod tests {
     #[test]
     fn test_classify_cold() {
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(10000);
+        let last_active = Instant::now() - Duration::from_secs(10000); // [ALLOWED-HARDCODED]
         let tier = system.classify_node(last_active, 50.0, 10);
         assert_eq!(tier, DataTier::Cold);
     }
@@ -231,7 +237,7 @@ mod tests {
     fn test_high_score_floor() {
         // 高评分节点即使冷也至少温
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(10000);
+        let last_active = Instant::now() - Duration::from_secs(10000); // [ALLOWED-HARDCODED]
         let tier = system.classify_node(last_active, 85.0, 10);
         assert_eq!(tier, DataTier::Warm);
     }
@@ -240,7 +246,7 @@ mod tests {
     fn test_low_score_accelerated_demotion() {
         // 低评分节点热阈值缩短
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(800); // 正常是热(1800)，低评分缩短为600
+        let last_active = Instant::now() - Duration::from_secs(800); // 正常是热(1800)，低评分缩短为600 // [ALLOWED-HARDCODED]
         let tier = system.classify_node(last_active, 20.0, 10);
         assert_eq!(tier, DataTier::Warm);
     }
@@ -251,8 +257,11 @@ mod tests {
         // 热数据需要持久化
         assert!(system.should_persist(Instant::now(), 50.0, 10));
         // 冷数据不需要持久化
-        assert!(!system.should_persist(Instant::now() - Duration::from_secs(10000), 50.0, 10));
-        // 高评分冷数据（温）需要持久化
+        assert!(!system.should_persist(Instant::now() - Duration::from_secs(10000), 50.0, 10)); // [ALLOWED-HARDCODED]
+                                                                                                // 高评分冷数据（温）需要持久化
         assert!(system.should_persist(Instant::now() - Duration::from_secs(10000), 85.0, 10));
+        // [ALLOWED-HARDCODED]
+        // [ALLOWED-HARDCODED]
+        // [ALLOWED-HARDCODED]
     }
 }

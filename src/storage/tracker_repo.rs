@@ -62,8 +62,12 @@ impl TrackerRepoImpl {
         if built.is_empty() {
             return;
         }
-        let Some(merkle) = self.merkle.get() else { return; };
-        let Some(gossip) = self.gossip.get() else { return; };
+        let Some(merkle) = self.merkle.get() else {
+            return;
+        };
+        let Some(gossip) = self.gossip.get() else {
+            return;
+        };
         let refs: Vec<(&[u8], &[u8])> = built
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
@@ -99,7 +103,7 @@ impl TrackerRepoImpl {
         for (url, last_seen) in items {
             if let Some(existing) = cache.entries.get_mut(url) {
                 // 已有条目：更新 last_used 取较大值
-                if existing.last_used.map_or(true, |t| *last_seen > t) {
+                if existing.last_used.is_none_or(|t| *last_seen > t) {
                     existing.last_used = Some(*last_seen);
                 }
             } else {
@@ -189,7 +193,11 @@ impl TrackerRepoImpl {
 
     pub fn top_trackers_sync(&self, n: usize) -> Vec<TrackerEntry> {
         let mut trackers: Vec<TrackerEntry> = self.active_trackers_sync();
-        trackers.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        trackers.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         trackers.truncate(n);
         trackers
     }
@@ -288,6 +296,31 @@ impl TrackerRepository for TrackerRepoImpl {
     }
 
     async fn save_all(&self) -> anyhow::Result<()> {
+        let trackers = self.all_trackers_sync();
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            for t in &trackers {
+                storage.save_tracker(
+                    &t.url,
+                    t.score,
+                    t.total_requests,
+                    t.success_requests,
+                    t.failed_requests,
+                    t.total_peers_discovered,
+                    t.avg_response_time_ms,
+                    t.consecutive_failures,
+                    t.disabled,
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
+    #[allow(dead_code)]
+    async fn save_dirty(&self) -> anyhow::Result<()> {
         let trackers = self.all_trackers_sync();
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {

@@ -3,8 +3,8 @@
 //! 基于流行病协议的消息传播。节点将同步数据提交到 outbox，
 //! 后台任务定期随机选择 fanout 个邻居传播。已处理消息通过 LRU 去重。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
@@ -43,7 +43,7 @@ pub struct GossipEngine {
     /// 指标
     metrics: Arc<FederationMetrics>,
     /// 关闭信号
-    shutdown: broadcast::Sender<()>,
+    _shutdown: broadcast::Sender<()>,
     /// 每个 batch 的重试次数计数（按 msg_id），超过 MAX_RETRIES 则丢弃
     retry_counts: RwLock<FxHashMap<u64, u32>>,
     /// 每个节点的 Gossip 连续发送失败计数，达到阈值则断开连接
@@ -107,7 +107,7 @@ impl GossipEngine {
         shutdown: broadcast::Sender<()>,
     ) -> Self {
         let shards = config.gossip_seen_shards.max(1);
-        let cap_per_shard = (SEEN_MSGS_TOTAL_CAPACITY + shards - 1) / shards;
+        let cap_per_shard = SEEN_MSGS_TOTAL_CAPACITY.div_ceil(shards);
         Self {
             outbox: RwLock::new(Vec::new()),
             outbox_msg_ids: RwLock::new(FxHashSet::default()),
@@ -117,7 +117,7 @@ impl GossipEngine {
             next_msg_id: AtomicU64::new(1),
             local_node_id,
             metrics,
-            shutdown,
+            _shutdown: shutdown,
             retry_counts: RwLock::new(FxHashMap::default()),
             consecutive_failures: RwLock::new(FxHashMap::default()),
             rate_window_secs: AtomicU64::new(0),
@@ -199,7 +199,10 @@ impl GossipEngine {
         // 标记自己发出的消息为已处理（避免回环）
         self.seen_msgs.put((self.local_node_id, msg_id), ());
         self.push_outbox_unique(batch);
-        debug!("[federation] Gossip 提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, entry_count);
+        debug!(
+            "[federation] Gossip 提交: msg_id={}, repo_type={}, entries={}",
+            msg_id, repo_type, entry_count
+        );
     }
 
     /// 批量提交同步数据到 outbox（将大量 entries 按 batch_size 拆分成多批提交）
@@ -231,46 +234,45 @@ impl GossipEngine {
             };
             batch.serialized_size = bincode::serialized_size(&batch).unwrap_or(0);
             batches.push(batch);
-            debug!("[federation] Gossip 批量提交: msg_id={}, repo_type={}, entries={}", msg_id, repo_type, chunk.len());
+            debug!(
+                "[federation] Gossip 批量提交: msg_id={}, repo_type={}, entries={}",
+                msg_id,
+                repo_type,
+                chunk.len()
+            );
         }
 
         let accepted = self.extend_outbox_unique(batches);
         debug!("[federation] Gossip 批量提交完成: 接受 {} 条", accepted);
     }
 
-    /// 启动 Gossip 传播后台任务
+    /// 启动 Gossip 传播后台任务（已迁移到 TaskScheduler）
+    ///
+    /// 周期性传播由 TaskScheduler 调用 `gossip_propagation_tick()` 驱动。
+    /// 此方法保留为空以兼容现有调用点，不再内部 spawn。
     pub fn spawn_gossip_propagation(self: Arc<Self>) {
-        let interval = Duration::from_millis(self.config.gossip_interval_ms);
+        // 已迁移：周期性 Gossip 传播由 TaskScheduler 调度 gossip_propagation_tick()
+    }
+
+    /// 单次 Gossip 传播 tick（由 TaskScheduler 定期调用）。
+    ///
+    /// 全量同步期间连续处理多批（原动态间隔 10ms 的等效行为），
+    /// 非全量期处理一批。方法内部根据 `is_sending_full_sync()` 自适应处理量。
+    pub async fn gossip_propagation_tick(self: Arc<Self>) {
         let fanout = self.config.gossip_fanout;
-        let mut shutdown_rx = self.shutdown.subscribe();
-
-        // P2: 全量同步期间发送端零节流加速。
-        // 全量同步进行中（outbox 洪峰）时使用 10ms 极短间隔连续发送；
-        // 10ms 同时作为限流跳过（rate_skipped）时的最小退避，避免 rate_try_consume
-        // 持续拒绝导致 CPU 忙等。非全量期保持原 gossip_interval_ms（默认 1000ms）。
-        const FULL_SYNC_TICK_INTERVAL: Duration = Duration::from_millis(10);
-
-        tokio::spawn(async move {
-            loop {
-                // 每轮循环开头根据发送端全量同步标记动态计算下一次 tick 间隔
-                let tick_interval = if self.is_sending_full_sync() {
-                    FULL_SYNC_TICK_INTERVAL
-                } else {
-                    interval
-                };
-
-                tokio::select! {
-                    _ = tokio::time::sleep(tick_interval) => {
-                        self.clone().propagation_tick(fanout).await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] Gossip 传播任务收到关闭信号");
-                        break;
-                    }
+        if self.is_sending_full_sync() {
+            // 全量同步期间：连续排空 outbox，等效原 10ms 极短间隔连续 tick。
+            // 上限 20 批防止单次 tick 过长；TaskScheduler 下一轮会继续处理。
+            const MAX_BATCHES_PER_TICK: usize = 20;
+            for _ in 0..MAX_BATCHES_PER_TICK {
+                if self.outbox_size() == 0 {
+                    break;
                 }
+                self.clone().propagation_tick(fanout).await;
             }
-        });
-        debug!("[federation] Gossip 传播任务已启动（常规间隔 {}ms, 全量期间隔 {}ms, fanout={}）", interval.as_millis(), FULL_SYNC_TICK_INTERVAL.as_millis(), fanout);
+        } else {
+            self.clone().propagation_tick(fanout).await;
+        }
     }
 
     /// 发送端全局速率限制：尝试在当前秒级窗口内计入 `bytes` 字节 / `msgs` 条消息。
@@ -381,7 +383,8 @@ impl GossipEngine {
         // 标记 in-flight：这些 batch 已从 outbox 取出但发送尚未完成（含阻塞中的 write_all）。
         // 此处之后无 early return，函数末尾统一 fetch_sub，保证配对。
         let in_flight_added = batches.len();
-        self.in_flight_count.fetch_add(in_flight_added, Ordering::Relaxed);
+        self.in_flight_count
+            .fetch_add(in_flight_added, Ordering::Relaxed);
         warn!(
             "[federation][DIAG] propagation_tick: took={} batches, outbox_remaining={}, in_flight_after_add={}",
             batches.len(),
@@ -416,7 +419,11 @@ impl GossipEngine {
                         .collect()
                 };
                 for conn in selected {
-                    by_conn.entry(conn.node_id).or_insert_with(|| (conn, Vec::new())).1.push(batch_idx);
+                    by_conn
+                        .entry(conn.node_id)
+                        .or_insert_with(|| (conn, Vec::new()))
+                        .1
+                        .push(batch_idx);
                 }
             }
         }
@@ -429,14 +436,15 @@ impl GossipEngine {
         let mut rate_skipped_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         // 至少在一个连接上发送成功的 batch msg_id（合并自所有连接结果）。
         // 有成功发送的 batch 视为已传播到网络中，不再回退 outbox。
-        let mut successful_msg_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut successful_msg_ids: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
         // 按节点跟踪本次 tick 的发送结果
         let mut failed_nodes: FxHashSet<NodeId> = FxHashSet::default();
         let mut successful_nodes: FxHashSet<NodeId> = FxHashSet::default();
 
         // 记录所有被分配到连接发送的 batch msg_id（用于识别未分配到任何连接的孤儿 batch）
         let mut assigned_msg_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for (_node_id, (_, batch_indices)) in &by_conn {
+        for (_, batch_indices) in by_conn.values() {
             for &idx in batch_indices {
                 assigned_msg_ids.insert(batches[idx].msg_id);
             }
@@ -484,7 +492,13 @@ impl GossipEngine {
             // 串行发送（单连接 localhost 场景并行无收益，并行反而放大 write timeout）。
             for (_node_id, (conn, batch_indices)) in by_conn {
                 let res = self
-                    .send_to_conn(conn, batch_indices, batches.clone(), bulk_max_batches, bulk_max_bytes)
+                    .send_to_conn(
+                        conn,
+                        batch_indices,
+                        batches.clone(),
+                        bulk_max_batches,
+                        bulk_max_bytes,
+                    )
                     .await;
                 failed_msg_ids.extend(res.failed_msg_ids);
                 rate_skipped_ids.extend(res.rate_skipped_ids);
@@ -532,10 +546,14 @@ impl GossipEngine {
         //   - 零成功 + 全部因限流跳过（无连接错误）→ 系统过载，DROP（不回退，避免死循环）
         //   - 未分配到任何连接的孤儿 batch → 回退（从未尝试发送）
 
-        let all_batch_ids: std::collections::HashSet<u64> = batches.iter().map(|b| b.msg_id).collect();
+        let all_batch_ids: std::collections::HashSet<u64> =
+            batches.iter().map(|b| b.msg_id).collect();
 
         // 零成功发送的 batch（所有连接都没成功）
-        let no_success_ids: Vec<u64> = all_batch_ids.difference(&successful_msg_ids).copied().collect();
+        let no_success_ids: Vec<u64> = all_batch_ids
+            .difference(&successful_msg_ids)
+            .copied()
+            .collect();
 
         // 需要重试的：零成功 + 至少一个连接实际失败（非限流跳过）
         let retry_ids: std::collections::HashSet<u64> = no_success_ids
@@ -545,7 +563,10 @@ impl GossipEngine {
             .collect();
 
         // 因限流全部跳过且零成功的 batch（DROP，不回退）
-        let rate_drop_count = no_success_ids.iter().filter(|id| !failed_msg_ids.contains(id)).count();
+        let rate_drop_count = no_success_ids
+            .iter()
+            .filter(|id| !failed_msg_ids.contains(id))
+            .count();
 
         // 将需要重试的 batch 放回 outbox，带重试次数限制
         if !retry_ids.is_empty() {
@@ -595,17 +616,28 @@ impl GossipEngine {
         }
 
         // 未被分配到任何连接的孤儿 batch（fanout 选不到邻居时产生），回退 outbox 避免丢失
-        let orphan_count = batches.iter().filter(|b| !assigned_msg_ids.contains(&b.msg_id)).count();
+        let orphan_count = batches
+            .iter()
+            .filter(|b| !assigned_msg_ids.contains(&b.msg_id))
+            .count();
         if orphan_count > 0 {
-            warn!("[federation][DIAG] propagation_tick: {} 条 batch 未分配到连接，回退 outbox", orphan_count);
-            let orphans: Vec<GossipBatchMessage> = batches.iter()
+            warn!(
+                "[federation][DIAG] propagation_tick: {} 条 batch 未分配到连接，回退 outbox",
+                orphan_count
+            );
+            let orphans: Vec<GossipBatchMessage> = batches
+                .iter()
                 .filter(|b| !assigned_msg_ids.contains(&b.msg_id))
                 .cloned()
                 .collect();
             self.extend_outbox_unique(orphans);
         }
 
-        debug!("[federation] Gossip 传播: {} 条消息发送到 {} 个邻居", batches.len(), fanout);
+        debug!(
+            "[federation] Gossip 传播: {} 条消息发送到 {} 个邻居",
+            batches.len(),
+            fanout
+        );
         warn!(
             "[federation][DIAG] propagation_tick: sent={} batches, success={}, failed={}, rate_skipped={}, rate_dropped={}, retry={}, in_flight_before_sub={}",
             batches.len(),
@@ -616,7 +648,8 @@ impl GossipEngine {
             retry_ids.len(),
             self.in_flight_count.load(Ordering::Relaxed)
         );
-        self.in_flight_count.fetch_sub(in_flight_added, Ordering::Relaxed);
+        self.in_flight_count
+            .fetch_sub(in_flight_added, Ordering::Relaxed);
     }
 
     /// 向单个连接串行发送该连接的所有 batch（内部按 bulk 分组，保证单连接顺序）。
@@ -643,15 +676,21 @@ impl GossipEngine {
             };
 
             let would_exceed_batches = pending.len() >= bulk_max_batches;
-            let would_exceed_bytes = !pending.is_empty()
-                && pending_bytes + batch_size > bulk_max_bytes as u64;
+            let would_exceed_bytes =
+                !pending.is_empty() && pending_bytes + batch_size > bulk_max_bytes as u64;
 
             if would_exceed_batches || would_exceed_bytes {
                 Self::send_bulk_or_single(
-                    self, &conn, batches.as_slice(), &pending, pending_bytes,
-                    &mut result.failed_msg_ids, &mut result.rate_skipped_ids,
+                    self,
+                    &conn,
+                    batches.as_slice(),
+                    &pending,
+                    pending_bytes,
+                    &mut result.failed_msg_ids,
+                    &mut result.rate_skipped_ids,
                     &mut result.successful_msg_ids,
-                    &mut result.failed_nodes, &mut result.successful_nodes,
+                    &mut result.failed_nodes,
+                    &mut result.successful_nodes,
                 )
                 .await;
                 pending.clear();
@@ -663,10 +702,16 @@ impl GossipEngine {
 
         if !pending.is_empty() {
             Self::send_bulk_or_single(
-                self, &conn, batches.as_slice(), &pending, pending_bytes,
-                &mut result.failed_msg_ids, &mut result.rate_skipped_ids,
+                self,
+                &conn,
+                batches.as_slice(),
+                &pending,
+                pending_bytes,
+                &mut result.failed_msg_ids,
+                &mut result.rate_skipped_ids,
                 &mut result.successful_msg_ids,
-                &mut result.failed_nodes, &mut result.successful_nodes,
+                &mut result.failed_nodes,
+                &mut result.successful_nodes,
             )
             .await;
         }
@@ -676,6 +721,7 @@ impl GossipEngine {
     /// 发送一组（可能仅1个）batch 到指定连接。
     /// 单个 batch 直接发 GossipBatch；多个 batch 合并为 GossipBatchBulk 发送。
     /// 限流按 batch 数量扣减 msgs，按总字节数扣减 bytes。
+    #[allow(clippy::too_many_arguments)]
     async fn send_bulk_or_single(
         self: &Arc<Self>,
         conn: &Connection,
@@ -713,7 +759,11 @@ impl GossipEngine {
                 failed_msg_ids.insert(batch.msg_id);
                 failed_nodes.insert(node_id);
                 let err_str = e.to_string();
-                if err_str.contains("10058") || err_str.contains("Connection reset") || err_str.contains("Broken pipe") || err_str.contains("closed") {
+                if err_str.contains("10058")
+                    || err_str.contains("Connection reset")
+                    || err_str.contains("Broken pipe")
+                    || err_str.contains("closed")
+                {
                     warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
                     self.connection_manager.remove_connection(&node_id);
                 }
@@ -725,16 +775,24 @@ impl GossipEngine {
             }
         } else {
             // 多个 batch：合并为 GossipBatchBulk 发送
-            let bulk_refs: Vec<&GossipBatchMessage> = indices.iter().map(|&i| &batches[i]).collect();
+            let bulk_refs: Vec<&GossipBatchMessage> =
+                indices.iter().map(|&i| &batches[i]).collect();
             let bulk = BulkRef { batches: bulk_refs };
             if let Err(e) = conn.send_message(MessageType::GossipBatchBulk, &bulk).await {
-                warn!("[federation] GossipBulk 发送 {} 条到 {} 失败: {}", batch_count, node_id, e);
+                warn!(
+                    "[federation] GossipBulk 发送 {} 条到 {} 失败: {}",
+                    batch_count, node_id, e
+                );
                 for &idx in indices {
                     failed_msg_ids.insert(batches[idx].msg_id);
                 }
                 failed_nodes.insert(node_id);
                 let err_str = e.to_string();
-                if err_str.contains("10058") || err_str.contains("Connection reset") || err_str.contains("Broken pipe") || err_str.contains("closed") {
+                if err_str.contains("10058")
+                    || err_str.contains("Connection reset")
+                    || err_str.contains("Broken pipe")
+                    || err_str.contains("closed")
+                {
                     warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
                     self.connection_manager.remove_connection(&node_id);
                 }
@@ -765,7 +823,10 @@ impl GossipEngine {
         let seen_start = Instant::now();
         let dedup_key = (NodeId(batch.origin), batch.msg_id);
         if !self.seen_msgs.check_and_put(dedup_key, ()) {
-            debug!("[federation] Gossip 消息已处理，跳过: msg_id={}", batch.msg_id);
+            debug!(
+                "[federation] Gossip 消息已处理，跳过: msg_id={}",
+                batch.msg_id
+            );
             return Vec::new();
         }
         let seen_elapsed = seen_start.elapsed();
@@ -811,7 +872,13 @@ impl GossipEngine {
         } else {
             // 单连接/无传播场景：直接 move entries，零 clone。
             // 2 节点同步场景下这是常见路径，节省 5000 条 entries 的深拷贝。
-            let GossipBatchMessage { entries, msg_id, origin, repo_type, .. } = batch;
+            let GossipBatchMessage {
+                entries,
+                msg_id,
+                origin,
+                repo_type,
+                ..
+            } = batch;
             debug!(
                 "[federation] Gossip 收到新消息(不传播): msg_id={}, origin={}, repo_type={}, entries={}",
                 msg_id, NodeId(origin), repo_type, entries.len()
@@ -834,29 +901,16 @@ impl GossipEngine {
         result
     }
 
-    /// 启动反熵（anti-entropy）后台任务
+    /// 启动反熵（anti-entropy）后台任务（已迁移到 TaskScheduler）
     ///
-    /// 每60秒随机选1个邻居，发送 MerkleDigest 进行对账。
-    pub fn spawn_anti_entropy<M: MerkleProvider + 'static>(self: Arc<Self>, merkle_provider: Arc<M>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.tick().await; // 跳过第一次
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.clone().anti_entropy_tick(merkle_provider.clone()).await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] 反熵任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        debug!("[federation] 反熵任务已启动（间隔 60s）");
+    /// 周期性反熵由 TaskScheduler 调用 `anti_entropy_tick()` 驱动。
+    /// 此方法保留为空以兼容现有调用点，不再内部 spawn。
+    pub fn spawn_anti_entropy<M: MerkleProvider + 'static>(
+        self: Arc<Self>,
+        merkle_provider: Arc<M>,
+    ) {
+        // 已迁移：周期性反熵对账由 TaskScheduler 调度 anti_entropy_tick()
+        let _ = merkle_provider;
     }
 
     /// 单次反熵：随机选1个邻居，发送所有 repo_type 的 MerkleDigest（由 TaskScheduler 调度）
@@ -876,10 +930,18 @@ impl GossipEngine {
 
         let mut sent = 0u8;
         // 发送所有 repo 的 MerkleDigest（Node/Peer/Infohash/Tracker）
-        for repo_type in &[repo_type::NODE, repo_type::PEER, repo_type::INFOHASH, repo_type::TRACKER] {
+        for repo_type in &[
+            repo_type::NODE,
+            repo_type::PEER,
+            repo_type::INFOHASH,
+            repo_type::TRACKER,
+        ] {
             let digest = merkle_provider.get_digest(*repo_type);
             if let Err(e) = conn.send_message(MessageType::MerkleDigest, &digest).await {
-                warn!("[federation] 反熵 MerkleDigest 发送失败 (repo={}): {}", repo_type, e);
+                warn!(
+                    "[federation] 反熵 MerkleDigest 发送失败 (repo={}): {}",
+                    repo_type, e
+                );
             } else {
                 self.metrics.record_message_sent();
                 sent += 1;
@@ -888,7 +950,9 @@ impl GossipEngine {
 
         info!(
             "[federation] 反熵对账发送到 {} ({} 个 repo, 连接数={})",
-            conn.node_id, sent, conns.len()
+            conn.node_id,
+            sent,
+            conns.len()
         );
     }
 
@@ -904,7 +968,11 @@ impl GossipEngine {
         let key = (NodeId(batch.origin), batch.msg_id);
         let mut ids = self.outbox_msg_ids.write();
         if ids.contains(&key) {
-            debug!("[federation] outbox 去重跳过: origin={}, msg_id={}", NodeId(batch.origin), batch.msg_id);
+            debug!(
+                "[federation] outbox 去重跳过: origin={}, msg_id={}",
+                NodeId(batch.origin),
+                batch.msg_id
+            );
             return;
         }
         ids.insert(key);
@@ -965,7 +1033,8 @@ impl GossipEngine {
             } else {
                 empty_streak = 0;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // [ALLOWED-SLEEP] wait_outbox_empty 带超时的轮询等待，非周期性
+            tokio::time::sleep(Duration::from_millis(100)).await; // [ALLOWED-HARDCODED]
         }
         false
     }
@@ -1002,17 +1071,14 @@ mod tests {
             Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
-        let engine = GossipEngine::new(
-            cm,
-            make_config(),
-            NodeId([1; 20]),
-            metrics,
-            shutdown_tx,
-        );
+        let engine = GossipEngine::new(cm, make_config(), NodeId([1; 20]), metrics, shutdown_tx);
 
-        let entries = vec![
-            SyncEntry { key: b"k1".to_vec(), operation: 0, version: 1, payload: vec![1] },
-        ];
+        let entries = vec![SyncEntry {
+            key: b"k1".to_vec(),
+            operation: 0,
+            version: 1,
+            payload: vec![1],
+        }];
         engine.submit_gossip(repo_type::NODE, entries.clone());
         assert_eq!(engine.outbox_size(), 1);
 
@@ -1056,13 +1122,7 @@ mod tests {
             Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
-        let engine = GossipEngine::new(
-            cm,
-            make_config(),
-            NodeId([1; 20]),
-            metrics,
-            shutdown_tx,
-        );
+        let engine = GossipEngine::new(cm, make_config(), NodeId([1; 20]), metrics, shutdown_tx);
 
         engine.submit_gossip(repo_type::NODE, vec![]);
         assert_eq!(engine.outbox_size(), 0);
@@ -1082,15 +1142,14 @@ mod tests {
             Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
-        let engine = GossipEngine::new(
-            cm,
-            make_config(),
-            NodeId([1; 20]),
-            metrics,
-            shutdown_tx,
-        );
+        let engine = GossipEngine::new(cm, make_config(), NodeId([1; 20]), metrics, shutdown_tx);
 
-        let entries = vec![SyncEntry { key: b"k".to_vec(), operation: 0, version: 1, payload: vec![] }];
+        let entries = vec![SyncEntry {
+            key: b"k".to_vec(),
+            operation: 0,
+            version: 1,
+            payload: vec![],
+        }];
         engine.submit_gossip(1, entries.clone());
         engine.submit_gossip(1, entries.clone());
         engine.submit_gossip(1, entries);

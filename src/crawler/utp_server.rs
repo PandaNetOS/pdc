@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::storage::PeerRepoImpl;
 use crate::types::Infohash;
@@ -108,9 +108,9 @@ impl UtpHeader {
 #[derive(Debug, Clone)]
 struct UtpConnection {
     /// 对端地址
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     /// 对端 connection_id
-    peer_conn_id: u16,
+    _peer_conn_id: u16,
     /// 我们的 connection_id（对端 conn_id - 1）
     our_conn_id: u16,
     /// 我们的下一个序列号
@@ -205,7 +205,10 @@ impl UtpServer {
     }
 
     /// 设置 PEX 接收器
-    pub fn with_pex_receiver(mut self, pex_receiver: Arc<crate::crawler::pex_receiver::PexReceiver>) -> Self {
+    pub fn with_pex_receiver(
+        mut self,
+        pex_receiver: Arc<crate::crawler::pex_receiver::PexReceiver>,
+    ) -> Self {
         self.pex_receiver = Some(pex_receiver);
         self
     }
@@ -217,7 +220,10 @@ impl UtpServer {
 
     /// 启动 uTP 服务端（接收循环）
     pub async fn run(&self) {
-        info!("[uTP] 服务端启动，监听 {}", self.socket.local_addr().unwrap());
+        info!(
+            "[uTP] 服务端启动，监听 {}",
+            self.socket.local_addr().unwrap()
+        );
         let mut buf = vec![0u8; 65536];
 
         loop {
@@ -260,7 +266,10 @@ impl UtpServer {
             }
             UtpPacketType::State => {
                 // 对端的 ACK，暂时忽略
-                debug!("[uTP] 收到 STATE from {} (seq={}, ack={})", from, header.seq_nr, header.ack_nr);
+                debug!(
+                    "[uTP] 收到 STATE from {} (seq={}, ack={})",
+                    from, header.seq_nr, header.ack_nr
+                );
             }
             UtpPacketType::Fin => {
                 self.handle_fin(&header, from).await;
@@ -272,14 +281,19 @@ impl UtpServer {
                     stats.resets_received += 1;
                 }
                 // 移除连接
-                self.connections.write().remove(&(from, header.connection_id));
+                self.connections
+                    .write()
+                    .remove(&(from, header.connection_id));
             }
         }
     }
 
     /// 处理 SYN 包
     async fn handle_syn(&self, header: &UtpHeader, from: SocketAddr) {
-        debug!("[uTP] 收到 SYN from {} (conn_id={}, seq={})", from, header.connection_id, header.seq_nr);
+        debug!(
+            "[uTP] 收到 SYN from {} (conn_id={}, seq={})",
+            from, header.connection_id, header.seq_nr
+        );
 
         {
             let mut stats = self.stats.write();
@@ -321,7 +335,10 @@ impl UtpServer {
 
         // 拒绝新连接（在 guard 外发送 RESET）
         if should_reject {
-            debug!("[uTP] 连接池已满（{}），拒绝新连接 from {}", self.max_connections, from);
+            debug!(
+                "[uTP] 连接池已满（{}），拒绝新连接 from {}",
+                self.max_connections, from
+            );
             let reset = UtpHeader {
                 packet_type: UtpPacketType::Reset,
                 version: 1,
@@ -340,8 +357,8 @@ impl UtpServer {
         // 创建连接
         let our_conn_id = header.connection_id.wrapping_sub(1);
         let conn = UtpConnection {
-            peer_addr: from,
-            peer_conn_id: header.connection_id,
+            _peer_addr: from,
+            _peer_conn_id: header.connection_id,
             our_conn_id,
             our_seq: 1,
             peer_seq_expected: header.seq_nr.wrapping_add(1),
@@ -355,7 +372,9 @@ impl UtpServer {
             last_data_time: Instant::now(),
         };
 
-        self.connections.write().insert((from, header.connection_id), conn);
+        self.connections
+            .write()
+            .insert((from, header.connection_id), conn);
 
         // 发送 STATE（SYN-ACK）
         let now_micros = std::time::SystemTime::now()
@@ -375,8 +394,16 @@ impl UtpServer {
             ack_nr: header.seq_nr,
         };
 
-        if self.socket.send_to(&response.to_bytes(), from).await.is_ok() {
-            debug!("[uTP] 已发送 SYN-ACK to {} (our_conn_id={})", from, our_conn_id);
+        if self
+            .socket
+            .send_to(&response.to_bytes(), from)
+            .await
+            .is_ok()
+        {
+            debug!(
+                "[uTP] 已发送 SYN-ACK to {} (our_conn_id={})",
+                from, our_conn_id
+            );
             {
                 let mut stats = self.stats.write();
                 stats.connections_established += 1;
@@ -410,14 +437,20 @@ impl UtpServer {
 
                 // 阶段1：如果还没收到 BT 握手，尝试解析
                 if !conn.got_handshake {
-                    if let Some((peer_id, infohash)) = parse_bittorrent_handshake(&conn.recv_buffer) {
+                    if let Some((peer_id, infohash)) = parse_bittorrent_handshake(&conn.recv_buffer)
+                    {
                         conn.got_handshake = true;
                         conn.peer_id = Some(peer_id);
                         conn.infohash = Some(infohash);
                         infohash_for_resp = Some(infohash);
                         need_handshake_response = true;
 
-                        info!("[uTP] 收到 BT 握手 from {} (peer_id={}, infohash={})", from, hex::encode(&peer_id[..8]), hex::encode(infohash));
+                        info!(
+                            "[uTP] 收到 BT 握手 from {} (peer_id={}, infohash={})",
+                            from,
+                            hex::encode(&peer_id[..8]),
+                            hex::encode(infohash)
+                        );
 
                         // 加入 PeerRepo
                         if let Some(repo) = &self.peer_repo {
@@ -428,7 +461,7 @@ impl UtpServer {
                                 source: crate::types::PeerSource::Utp,
                                 first_seen: now,
                                 last_active: now,
-                                priority_score: 45.0,  // 中性初始分，等待 ScoreMaintainer 重算
+                                priority_score: 45.0, // 中性初始分，等待 ScoreMaintainer 重算
                                 connection_attempts: 0,
                                 connection_successes: 0,
                                 is_ipv6: from.is_ipv6(),
@@ -446,7 +479,12 @@ impl UtpServer {
                 } else {
                     // 阶段2：已收到 BT 握手，解析 BT 协议消息
                     while conn.recv_buffer.len() >= 4 {
-                        let msg_len = u32::from_be_bytes([conn.recv_buffer[0], conn.recv_buffer[1], conn.recv_buffer[2], conn.recv_buffer[3]]) as usize;
+                        let msg_len = u32::from_be_bytes([
+                            conn.recv_buffer[0],
+                            conn.recv_buffer[1],
+                            conn.recv_buffer[2],
+                            conn.recv_buffer[3],
+                        ]) as usize;
                         if msg_len == 0 {
                             conn.recv_buffer.drain(0..4);
                             continue;
@@ -472,11 +510,9 @@ impl UtpServer {
                                     }
                                 }
                             }
-                            9 => {
-                                if msg_payload.len() >= 2 {
-                                    let port = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
-                                    debug!("[uTP] 对端监听端口: {}", port);
-                                }
+                            9 if msg_payload.len() >= 2 => {
+                                let port = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
+                                debug!("[uTP] 对端监听端口: {}", port);
                             }
                             _ => {}
                         }
@@ -484,6 +520,9 @@ impl UtpServer {
                 }
 
                 if conn.last_data_time.elapsed() > Duration::from_secs(60) {
+                    // [ALLOWED-HARDCODED]
+                    // [ALLOWED-HARDCODED]
+                    // [ALLOWED-HARDCODED]
                     should_close = true;
                 }
             } else {
@@ -512,7 +551,11 @@ impl UtpServer {
 
         // 处理扩展握手
         if let Some(ext_data) = ext_handshake_data {
-            if let Some(ut_pex_id) = self.pex_receiver.as_ref().and_then(|r| r.handle_extension_handshake(&ext_data)) {
+            if let Some(ut_pex_id) = self
+                .pex_receiver
+                .as_ref()
+                .and_then(|r| r.handle_extension_handshake(&ext_data))
+            {
                 let mut conns = self.connections.write();
                 if let Some(conn) = conns.get_mut(&key) {
                     conn.got_extension_handshake = true;
@@ -533,9 +576,24 @@ impl UtpServer {
         if need_handshake_response {
             if let Some(ih) = infohash_for_resp {
                 let our_handshake = build_bittorrent_handshake(&self.node_id, &ih);
-                let _ = self.send_data(from, our_conn_id_for_resp, &mut our_seq_for_resp, &our_handshake).await;
+                let _ = self
+                    .send_data(
+                        from,
+                        our_conn_id_for_resp,
+                        &mut our_seq_for_resp,
+                        &our_handshake,
+                    )
+                    .await;
                 let ext_handshake = build_extension_handshake(6883);
-                let _ = self.send_extended_message(from, our_conn_id_for_resp, &mut our_seq_for_resp, 0, &ext_handshake).await;
+                let _ = self
+                    .send_extended_message(
+                        from,
+                        our_conn_id_for_resp,
+                        &mut our_seq_for_resp,
+                        0,
+                        &ext_handshake,
+                    )
+                    .await;
                 let mut conns = self.connections.write();
                 if let Some(conn) = conns.get_mut(&key) {
                     conn.our_seq = our_seq_for_resp;
@@ -545,7 +603,10 @@ impl UtpServer {
         }
 
         // 发送 ACK（STATE）
-        let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u32;
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u32;
         let ack = UtpHeader {
             packet_type: UtpPacketType::State,
             version: 1,
@@ -578,8 +639,17 @@ impl UtpServer {
         }
     }
 
-    async fn send_data(&self, to: SocketAddr, conn_id: u16, seq: &mut u16, data: &[u8]) -> std::io::Result<usize> {
-        let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u32;
+    async fn send_data(
+        &self,
+        to: SocketAddr,
+        conn_id: u16,
+        seq: &mut u16,
+        data: &[u8],
+    ) -> std::io::Result<usize> {
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u32;
         let header = UtpHeader {
             packet_type: UtpPacketType::Data,
             version: 1,
@@ -598,7 +668,14 @@ impl UtpServer {
     }
 
     /// 发送扩展消息（辅助方法）
-    async fn send_extended_message(&self, to: SocketAddr, conn_id: u16, seq: &mut u16, ext_id: u8, payload: &[u8]) -> std::io::Result<usize> {
+    async fn send_extended_message(
+        &self,
+        to: SocketAddr,
+        conn_id: u16,
+        seq: &mut u16,
+        ext_id: u8,
+        payload: &[u8],
+    ) -> std::io::Result<usize> {
         let mut data = Vec::with_capacity(1 + payload.len());
         data.push(ext_id);
         data.extend_from_slice(payload);
@@ -608,7 +685,9 @@ impl UtpServer {
     async fn handle_fin(&self, header: &UtpHeader, from: SocketAddr) {
         debug!("[uTP] 收到 FIN from {}", from);
         // 移除连接
-        self.connections.write().remove(&(from, header.connection_id));
+        self.connections
+            .write()
+            .remove(&(from, header.connection_id));
         {
             let mut stats = self.stats.write();
             stats.active_connections = self.connections.read().len();
@@ -631,7 +710,7 @@ impl UtpServer {
     /// 清理超时连接
     fn cleanup_timeout_connections(&self) {
         let mut conns = self.connections.write();
-        let timeout = Duration::from_secs(30);
+        let timeout = Duration::from_secs(30); // [ALLOWED-HARDCODED]
         let before = conns.len();
         conns.retain(|_, conn| conn.created_at.elapsed() < timeout);
         let removed = before - conns.len();

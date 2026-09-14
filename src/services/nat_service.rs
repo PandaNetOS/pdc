@@ -73,7 +73,7 @@ impl NatService {
         let result = crate::nat::stun::check_udp_reachability(
             &servers,
             port,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
         );
         Some(result)
     }
@@ -81,8 +81,16 @@ impl NatService {
     /// 获取映射统计摘要
     pub fn mapping_summary(&self) -> MappingSummary {
         let status = self.manager.status();
-        let tcp_total = status.mappings.iter().filter(|m| m.protocol == "TCP").count();
-        let udp_total = status.mappings.iter().filter(|m| m.protocol == "UDP").count();
+        let tcp_total = status
+            .mappings
+            .iter()
+            .filter(|m| m.protocol == "TCP")
+            .count();
+        let udp_total = status
+            .mappings
+            .iter()
+            .filter(|m| m.protocol == "UDP")
+            .count();
         let verified = status.mappings.iter().filter(|m| m.verified).count();
         let reachable = status.mappings.iter().filter(|m| m.reachable).count();
 

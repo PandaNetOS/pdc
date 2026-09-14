@@ -144,9 +144,7 @@ impl TrackerStats {
 
         // 响应速度得分（0-20）：越快越高，基准 5000ms 为 0 分，100ms 为满分
         let avg_latency = self.avg_response_time_ms();
-        let latency_score = if avg_latency <= 0.0 {
-            0.0
-        } else if avg_latency >= 5000.0 {
+        let latency_score = if avg_latency <= 0.0 || avg_latency >= 5000.0 {
             0.0
         } else {
             20.0 * (1.0 - avg_latency / 5000.0)
@@ -154,11 +152,7 @@ impl TrackerStats {
 
         // peer 产出得分（0-25）：每次请求平均 peer 数，基准 10 个为满分
         let ppr = self.peers_per_request();
-        let peers_per_request_score = if ppr >= 10.0 {
-            25.0
-        } else {
-            ppr / 10.0 * 25.0
-        };
+        let peers_per_request_score = if ppr >= 10.0 { 25.0 } else { ppr / 10.0 * 25.0 };
 
         // 在线率得分（0-15）：基于连续失败次数，0 次失败为满分
         let uptime_score = if self.consecutive_failures == 0 {

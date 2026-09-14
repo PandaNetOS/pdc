@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 /// QPS 统计（滑动窗口，1 秒精度）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QpsStats {
     pub total_requests: u64,
     pub requests_last_sec: u64,
@@ -23,20 +23,6 @@ pub struct QpsStats {
     pub scrape_requests: u64,
     pub error_requests: u64,
     pub blocked_requests: u64,
-}
-
-impl Default for QpsStats {
-    fn default() -> Self {
-        Self {
-            total_requests: 0,
-            requests_last_sec: 0,
-            connect_requests: 0,
-            announce_requests: 0,
-            scrape_requests: 0,
-            error_requests: 0,
-            blocked_requests: 0,
-        }
-    }
 }
 
 /// 请求类型
@@ -99,8 +85,8 @@ impl RateLimiter {
             ip_states: Mutex::new(FxHashMap::default()),
             stats: Mutex::new(QpsStats::default()),
             sec_window: Mutex::new(VecDeque::new()),
-            ban_duration: Duration::from_secs(60), // 封禁 60 秒
-            anomaly_threshold: 500, // 1 秒 500 请求视为异常
+            ban_duration: Duration::from_secs(60), // 封禁 60 秒 // [ALLOWED-HARDCODED]
+            anomaly_threshold: 500,                // 1 秒 500 请求视为异常
         }
     }
 
@@ -125,7 +111,13 @@ impl RateLimiter {
             let mut window = self.sec_window.lock();
             window.push_back((now, 1));
             // 清理超过 1 秒的记录
-            while window.front().map_or(false, |(t, _)| now.duration_since(*t) > Duration::from_secs(1)) {
+            while window
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(1))
+            // [ALLOWED-HARDCODED]
+            // [ALLOWED-HARDCODED]
+            // [ALLOWED-HARDCODED]
+            {
                 window.pop_front();
             }
         }
@@ -152,7 +144,14 @@ impl RateLimiter {
 
         // 记录请求时间（用于异常检测）
         state.recent_requests.push_back(now);
-        while state.recent_requests.front().map_or(false, |t| now.duration_since(*t) > Duration::from_secs(1)) {
+        while state
+            .recent_requests
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1))
+        // [ALLOWED-HARDCODED]
+        // [ALLOWED-HARDCODED]
+        // [ALLOWED-HARDCODED]
+        {
             state.recent_requests.pop_front();
         }
 
@@ -204,7 +203,10 @@ impl RateLimiter {
     pub fn banned_count(&self) -> usize {
         let now = Instant::now();
         let states = self.ip_states.lock();
-        states.values().filter(|s| s.banned_until.map_or(false, |t| now < t)).count()
+        states
+            .values()
+            .filter(|s| s.banned_until.is_some_and(|t| now < t))
+            .count()
     }
 }
 

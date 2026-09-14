@@ -5,7 +5,7 @@
 //!
 //! 千万级数据下，64 分片可将锁竞争减少 90%+。
 
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -25,7 +25,10 @@ where
 {
     /// 创建新的分片 HashMap
     pub fn new(shard_count: usize) -> Self {
-        assert!(shard_count > 0 && shard_count.is_power_of_two(), "shard_count 必须是 2 的幂");
+        assert!(
+            shard_count > 0 && shard_count.is_power_of_two(),
+            "shard_count 必须是 2 的幂"
+        );
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             shards.push(RwLock::new(FxHashMap::default()));
@@ -33,16 +36,14 @@ where
         Self {
             shards,
             shard_count,
-            hasher: rustc_hash::FxBuildHasher::default(),
+            hasher: rustc_hash::FxBuildHasher,
         }
     }
 
     /// 计算分片索引
     #[inline]
     fn shard_index(&self, key: &K) -> usize {
-        let mut h = self.hasher.build_hasher();
-        key.hash(&mut h);
-        (h.finish() as usize) & (self.shard_count - 1)
+        (self.hasher.hash_one(key) as usize) & (self.shard_count - 1)
     }
 
     /// 获取值（克隆）
@@ -154,6 +155,10 @@ where
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     pub fn for_each<F>(&self, f: F)

@@ -1,11 +1,14 @@
 //! TrackerService — 超级 Tracker 业务层
 
-use std::sync::Arc;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
-use crate::storage::repo_traits::{InfohashRepository, PeerRepository, TrackerRepository};
+use crate::storage::repo_traits::{InfohashRepository, PeerRepository};
 use crate::storage::{InfohashRepoImpl, PeerRepoImpl, TrackerRepoImpl};
-use crate::types::{Infohash, PeerInfo, TrackerAnnounceRequest, TrackerAnnounceResponse, TrackerScrapeRequest, TrackerScrapeResponse};
+use crate::types::{
+    PeerInfo, TrackerAnnounceRequest, TrackerAnnounceResponse, TrackerScrapeRequest,
+    TrackerScrapeResponse,
+};
 
 pub struct TrackerService {
     peer_repo: Arc<PeerRepoImpl>,
@@ -28,7 +31,9 @@ impl TrackerService {
 
     pub async fn announce(&self, req: TrackerAnnounceRequest) -> TrackerAnnounceResponse {
         // 注册 infohash
-        self.infohash_repo.register(req.info_hash, "super_tracker").await;
+        self.infohash_repo
+            .register(req.info_hash, "super_tracker")
+            .await;
 
         // 把请求方加入 peer 池
         let peer = PeerInfo::new(req.remote_addr, crate::types::PeerSource::SuperTracker);

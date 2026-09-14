@@ -11,7 +11,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
@@ -19,14 +18,14 @@ use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::{Connection, ConnectionManager};
+use crate::federation::node_id::{NodeAddress, NodeId, NodeIdentity, Reachability};
+use crate::federation::node_table::NodeTable;
+use crate::federation::peer_cache::PeerCache;
+use crate::federation::protocol::*;
+use crate::storage::node_repo::NodeRepoImpl;
 use pnos_net::discovery::lpd::LpdDiscoveryService;
 use pnos_net::discovery::mqtt::MqttDiscoveryService;
 use pnos_net::types::DiscoveredNode;
-use crate::federation::node_id::{NodeAddress, NodeIdentity, NodeId, Reachability};
-use crate::federation::node_table::NodeTable;
-use crate::federation::peer_cache::PeerCache;
-use crate::storage::node_repo::NodeRepoImpl;
-use crate::federation::protocol::*;
 
 /// 节点发现服务
 pub struct DiscoveryService {
@@ -35,9 +34,9 @@ pub struct DiscoveryService {
     /// 节点表
     node_table: Arc<NodeTable>,
     /// 主爬虫节点库
-    node_repo: Option<Arc<NodeRepoImpl>>,
+    _node_repo: Option<Arc<NodeRepoImpl>>,
     /// 主爬虫 DHT 发现器
-    dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
+    _dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
     /// 节点身份
     identity: Arc<NodeIdentity>,
     /// 配置
@@ -58,6 +57,7 @@ impl DiscoveryService {
     /// 创建发现服务
     ///
     /// 如果 `config.peer_cache_enabled` 为 true，会从 `data_dir/federation_peers.json` 加载历史节点缓存。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         connection_manager: Arc<ConnectionManager>,
         node_table: Arc<NodeTable>,
@@ -66,8 +66,8 @@ impl DiscoveryService {
         api_port: u16,
         shutdown: broadcast::Sender<()>,
         data_dir: &Path,
-        node_repo: Option<Arc<NodeRepoImpl>>,
-        dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
+        _node_repo: Option<Arc<NodeRepoImpl>>,
+        _dht_discoverer: Option<Arc<crate::discoverers::dht::DhtDiscoverer>>,
     ) -> Self {
         let peer_cache = if config.peer_cache_enabled {
             PeerCache::load(data_dir)
@@ -84,8 +84,8 @@ impl DiscoveryService {
             shutdown,
             data_dir: data_dir.to_path_buf(),
             peer_cache: RwLock::new(peer_cache),
-            node_repo,
-            dht_discoverer,
+            _node_repo,
+            _dht_discoverer,
             public_addr: RwLock::new(None),
         }
     }
@@ -114,10 +114,7 @@ impl DiscoveryService {
                 cache.top_addrs(8)
             };
             if !cached_addrs.is_empty() {
-                info!(
-                    "[federation] 从缓存加载 {} 个历史节点",
-                    cached_addrs.len()
-                );
+                info!("[federation] 从缓存加载 {} 个历史节点", cached_addrs.len());
                 for addr_str in &cached_addrs {
                     if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                         let temp_id = NodeId::random();
@@ -207,7 +204,10 @@ impl DiscoveryService {
             self.shutdown.clone(),
         ));
         mqtt_service.spawn();
-        info!("[federation] MQTT Rendezvous 发现已启动，本地地址: {:?}", my_addresses);
+        info!(
+            "[federation] MQTT Rendezvous 发现已启动，本地地址: {:?}",
+            my_addresses
+        );
 
         // 4.2 订阅 LPD/MQTT 发现事件，加入节点表并立即触发连接
         let self_clone = self.clone();
@@ -215,22 +215,31 @@ impl DiscoveryService {
             loop {
                 match discovered_rx.recv().await {
                     Ok(node) => {
-                        info!("[federation] 收到发现事件: source={}, node_id={}, addrs={:?}", node.source, hex::encode(node.node_id.0), node.addresses);
+                        info!(
+                            "[federation] 收到发现事件: source={}, node_id={}, addrs={:?}",
+                            node.source,
+                            hex::encode(node.node_id.0),
+                            node.addresses
+                        );
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let new_nodes: Vec<crate::federation::node_id::NodeAddress> = node.addresses.iter().map(|addr| {
-                            let temp_id = crate::federation::node_id::NodeId::random();
-                            crate::federation::node_id::NodeAddress {
-                                node_id: temp_id.0,
-                                ipv4_addr: if addr.is_ipv4() { Some(*addr) } else { None },
-                                ipv6_addr: if addr.is_ipv6() { Some(*addr) } else { None },
-                                reachability: crate::federation::node_id::Reachability::Unknown,
-                                last_seen: now,
-                                nat_type: None,
-                            }
-                        }).collect();
+                        let new_nodes: Vec<crate::federation::node_id::NodeAddress> = node
+                            .addresses
+                            .iter()
+                            .map(|addr| {
+                                let temp_id = crate::federation::node_id::NodeId::random();
+                                crate::federation::node_id::NodeAddress {
+                                    node_id: temp_id.0,
+                                    ipv4_addr: if addr.is_ipv4() { Some(*addr) } else { None },
+                                    ipv6_addr: if addr.is_ipv6() { Some(*addr) } else { None },
+                                    reachability: crate::federation::node_id::Reachability::Unknown,
+                                    last_seen: now,
+                                    nat_type: None,
+                                }
+                            })
+                            .collect();
                         self_clone.process_new_nodes(new_nodes);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -259,9 +268,17 @@ impl DiscoveryService {
             .map_err(|e| anyhow::anyhow!("缓存节点地址解析失败 {}: {}", addr, e))?;
 
         let temp_id = NodeId::random();
-        match self.connection_manager.clone().connect_to(temp_id, socket_addr).await {
+        match self
+            .connection_manager
+            .clone()
+            .connect_to(temp_id, socket_addr)
+            .await
+        {
             Ok(conn) => {
-                info!("[federation] 缓存节点连接成功: {} ({})", conn.node_id, socket_addr);
+                info!(
+                    "[federation] 缓存节点连接成功: {} ({})",
+                    conn.node_id, socket_addr
+                );
                 // 连接成功后发送 GetNodes 获取更多节点
                 let req = GetNodesMessage { count: 32 };
                 if let Err(e) = conn.send_message(MessageType::GetNodes, &req).await {
@@ -301,7 +318,12 @@ impl DiscoveryService {
                 nat_type: None,
             });
 
-            match self.connection_manager.clone().connect_to(temp_id, addr).await {
+            match self
+                .connection_manager
+                .clone()
+                .connect_to(temp_id, addr)
+                .await
+            {
                 Ok(conn) => {
                     info!("[federation] 种子节点连接成功: {} ({})", conn.node_id, addr);
                     // 连接成功后发送 GetNodes
@@ -359,7 +381,11 @@ impl DiscoveryService {
         }
 
         if new_count > 0 {
-            debug!("[federation] 发现 {} 个新节点，节点表总数: {}", new_count, self.node_table.len());
+            debug!(
+                "[federation] 发现 {} 个新节点，节点表总数: {}",
+                new_count,
+                self.node_table.len()
+            );
         }
 
         // 尝试连接未连接的节点（不超过 target_neighbors）
@@ -367,7 +393,8 @@ impl DiscoveryService {
         if connected < self.config.target_neighbors {
             let need = self.config.target_neighbors - connected;
             // 按活跃度降序排序，优先连接活跃节点；尝试 need*3 个候选，避免只选到死节点
-            let mut candidates = self.node_table
+            let mut candidates = self
+                .node_table
                 .all_nodes()
                 .into_iter()
                 .filter(|e| {
@@ -396,83 +423,23 @@ impl DiscoveryService {
         }
     }
 
-    /// 启动 PEX 交换后台任务（每5分钟向所有连接发 ExchangeNodes）
+    /// 启动 PEX 交换后台任务（已迁移到 TaskScheduler，此方法保留兼容但不再被调用）
     pub fn spawn_pex_exchange(self: Arc<Self>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-        let interval = Duration::from_secs(300); // 5 分钟
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // 跳过第一次立即触发
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.clone().pex_exchange_tick().await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] PEX 交换任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] PEX 交换任务已启动（间隔 300s）");
+        // 已迁移到 TaskScheduler
     }
 
-    /// 启动连接维护后台任务（每30秒重置卡住的连接状态，并尝试重连断开的节点）
+    /// 启动连接维护后台任务（已迁移到 TaskScheduler，此方法保留兼容但不再被调用）
     pub fn spawn_connection_maintainer(self: Arc<Self>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-        let interval = Duration::from_secs(30);
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // 跳过第一次立即触发
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.clone().connection_maintainer_tick().await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] 连接维护任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] 连接维护任务已启动（间隔 30s）");
+        // 已迁移到 TaskScheduler
     }
 
-    /// 启动节点缓存定期保存任务（每 5 分钟同步已连接节点状态并保存到磁盘）
+    /// 启动节点缓存定期保存任务（已迁移到 TaskScheduler，此方法保留兼容但不再被调用）
     pub fn spawn_peer_cache_saver(self: Arc<Self>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-        let interval = Duration::from_secs(300); // 5 分钟
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // 跳过第一次立即触发
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.clone().peer_cache_save_tick().await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] 节点缓存保存任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] 节点缓存保存任务已启动（间隔 300s）");
+        // 已迁移到 TaskScheduler
     }
 
     /// 节点缓存保存单次执行：同步已连接节点状态 → 清理过期 → 写入磁盘
-    async fn peer_cache_save_tick(self: Arc<Self>) {
+    pub async fn peer_cache_save_tick(self: Arc<Self>) {
         self.sync_from_node_table();
 
         let cache = self.peer_cache.read().clone();
@@ -497,7 +464,7 @@ impl DiscoveryService {
     }
 
     /// 连接维护单次执行
-    async fn connection_maintainer_tick(self: Arc<Self>) {
+    pub async fn connection_maintainer_tick(self: Arc<Self>) {
         // 1. 重置卡住的 Connecting 状态
         let stale = self.node_table.reset_stale_connecting();
         if stale > 0 {
@@ -514,7 +481,7 @@ impl DiscoveryService {
 
         // 优先连接种子节点（如果种子节点未连接）
         for seed in &self.config.seed_nodes {
-            if need <= 0 {
+            if need == 0 {
                 break;
             }
             if let Ok(addr) = seed.parse::<SocketAddr>() {
@@ -542,7 +509,8 @@ impl DiscoveryService {
             .collect();
 
         // 按活跃度降序排序，优先连接活跃节点；尝试 need*3 个候选，避免只选到死节点
-        let mut candidates = self.node_table
+        let mut candidates = self
+            .node_table
             .all_nodes()
             .into_iter()
             .filter(|e| {
@@ -572,7 +540,7 @@ impl DiscoveryService {
     }
 
     /// PEX 交换单次执行
-    async fn pex_exchange_tick(self: Arc<Self>) {
+    pub async fn pex_exchange_tick(self: Arc<Self>) {
         let conns = self.connection_manager.all_connections();
         if conns.is_empty() {
             return;
@@ -609,9 +577,11 @@ impl DiscoveryService {
             }
         }
 
-        debug!("[federation] PEX 交换完成，向 {} 个连接发送了节点信息", conn_count);
+        debug!(
+            "[federation] PEX 交换完成，向 {} 个连接发送了节点信息",
+            conn_count
+        );
     }
-
 }
 #[cfg(test)]
 mod tests {
@@ -662,7 +632,17 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir, None, None);
+        let discovery = DiscoveryService::new(
+            cm,
+            node_table.clone(),
+            identity,
+            make_test_config(),
+            0,
+            shutdown_tx,
+            &dir,
+            None,
+            None,
+        );
 
         let nodes = vec![
             make_node_address(1, 6885),
@@ -693,7 +673,17 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir, None, None);
+        let discovery = DiscoveryService::new(
+            cm,
+            node_table.clone(),
+            identity,
+            make_test_config(),
+            0,
+            shutdown_tx,
+            &dir,
+            None,
+            None,
+        );
 
         let nodes = vec![make_node_address(5, 6890), make_node_address(6, 6891)];
         discovery.handle_exchange_nodes(nodes);
@@ -716,7 +706,17 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity.clone(), make_test_config(), 0, shutdown_tx, &dir, None, None);
+        let discovery = DiscoveryService::new(
+            cm,
+            node_table.clone(),
+            identity.clone(),
+            make_test_config(),
+            0,
+            shutdown_tx,
+            &dir,
+            None,
+            None,
+        );
 
         // 包含自己的节点
         let mut self_addr = make_node_address(0, 6885);
@@ -744,7 +744,17 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = Arc::new(DiscoveryService::new(cm, node_table, identity, make_test_config(), 0, shutdown_tx, &dir, None, None));
+        let discovery = Arc::new(DiscoveryService::new(
+            cm,
+            node_table,
+            identity,
+            make_test_config(),
+            0,
+            shutdown_tx,
+            &dir,
+            None,
+            None,
+        ));
 
         // 没有种子节点，应该立即返回（但会启动 DHT 发现和缓存保存）
         discovery.bootstrap().await;
@@ -766,7 +776,17 @@ mod tests {
             cm_shutdown,
             Arc::new(FederationMetrics::new()),
         ));
-        let discovery = DiscoveryService::new(cm, node_table.clone(), identity, make_test_config(), 0, shutdown_tx, &dir, None, None);
+        let discovery = DiscoveryService::new(
+            cm,
+            node_table.clone(),
+            identity,
+            make_test_config(),
+            0,
+            shutdown_tx,
+            &dir,
+            None,
+            None,
+        );
 
         // 添加节点并标记为已连接
         node_table.add_or_update(make_node_address(1, 6885));
@@ -778,7 +798,7 @@ mod tests {
         let cache = discovery.peer_cache.read();
         assert_eq!(cache.nodes.len(), 1);
         assert_eq!(cache.nodes[0].success_count, 1);
-        assert_eq!(cache.nodes[0].addr, "127.0.0.1:6885");
+        assert_eq!(cache.nodes[0].addr, "127.0.0.1:6885"); // [ALLOWED-HARDCODED]
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -113,14 +113,11 @@ impl NodeTable {
             // 新节点
             if nodes.len() >= self.max_nodes {
                 // 已满，移除活跃度最低的节点
-                if let Some((&worst_id, _)) = nodes
-                    .iter()
-                    .min_by(|a, b| {
-                        a.1.activity_score()
-                            .partial_cmp(&b.1.activity_score())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                {
+                if let Some((&worst_id, _)) = nodes.iter().min_by(|a, b| {
+                    a.1.activity_score()
+                        .partial_cmp(&b.1.activity_score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
                     nodes.remove(&worst_id);
                 }
             }
@@ -177,7 +174,10 @@ impl NodeTable {
                 if result.len() >= n {
                     break;
                 }
-                if !result.iter().any(|r| NodeId(r.info.node_id) == NodeId(entry.info.node_id)) {
+                if !result
+                    .iter()
+                    .any(|r| NodeId(r.info.node_id) == NodeId(entry.info.node_id))
+                {
                     result.push(entry.clone());
                 }
             }
@@ -294,7 +294,7 @@ mod tests {
     fn make_node(id: u8, last_seen: u64) -> NodeAddress {
         NodeAddress {
             node_id: [id; 20],
-            ipv4_addr: Some(format!("127.0.0.{}:6885", id).parse().unwrap()),
+            ipv4_addr: Some(format!("127.0.0.{}:6885", id).parse().unwrap()), // [ALLOWED-HARDCODED]
             ipv6_addr: None,
             reachability: Reachability::Mapped,
             last_seen,
@@ -310,7 +310,10 @@ mod tests {
         assert!(!table.add_or_update(info)); // 更新
 
         let entry = table.get(&NodeId([1; 20])).unwrap();
-        assert_eq!(entry.info.ipv4_addr, Some("127.0.0.1:6885".parse().unwrap()));
+        assert_eq!(
+            entry.info.ipv4_addr,
+            Some("127.0.0.1:6885".parse().unwrap()) // [ALLOWED-HARDCODED]
+        );
         assert_eq!(table.len(), 1);
     }
 
@@ -329,7 +332,10 @@ mod tests {
         table.add_or_update(make_node(1, 100));
 
         table.mark_connecting(&NodeId([1; 20]));
-        assert_eq!(table.get(&NodeId([1; 20])).unwrap().status, NodeStatus::Connecting);
+        assert_eq!(
+            table.get(&NodeId([1; 20])).unwrap().status,
+            NodeStatus::Connecting
+        );
 
         table.mark_connected(&NodeId([1; 20]), Some(50));
         let entry = table.get(&NodeId([1; 20])).unwrap();
@@ -369,7 +375,9 @@ mod tests {
         let neighbors = table.random_neighbors(5);
         assert_eq!(neighbors.len(), 5);
         // 应该包含已连接节点
-        assert!(neighbors.iter().any(|n| NodeId(n.info.node_id) == NodeId([1; 20])));
+        assert!(neighbors
+            .iter()
+            .any(|n| NodeId(n.info.node_id) == NodeId([1; 20])));
     }
 
     #[test]
@@ -413,7 +421,7 @@ mod tests {
         table.mark_connected(&NodeId([1; 20]), None);
 
         // timeout=0 表示所有未连接节点都视为过期
-        let removed = table.cleanup_expired(Duration::from_secs(0));
+        let removed = table.cleanup_expired(Duration::from_secs(0)); // [ALLOWED-HARDCODED]
         assert_eq!(removed, 1); // 节点2被清理
         assert!(table.get(&NodeId([1; 20])).is_some());
         assert!(table.get(&NodeId([2; 20])).is_none());

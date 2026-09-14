@@ -9,10 +9,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio::time::interval;
 use tracing::{info, warn};
 
 use crate::discoverers::tracker::TrackerDiscoverer;
@@ -53,7 +50,7 @@ pub struct TrackerPeerFetcher {
     peer_repo: Option<Arc<crate::storage::PeerRepoImpl>>,
     /// Infohash 仓库（唯一数据源，必需）
     infohash_repo: Option<Arc<crate::storage::InfohashRepoImpl>>,
-    interval_secs: u64,
+    _interval_secs: u64,
     trackers_per_round: usize,
     infohashes_per_round: usize,
     peers_per_infohash: usize,
@@ -69,7 +66,7 @@ impl TrackerPeerFetcher {
             discoverer,
             peer_repo: None,
             infohash_repo: None,
-            interval_secs: 60,
+            _interval_secs: 60,
             trackers_per_round: 10,
             infohashes_per_round: 5,
             peers_per_infohash: 50,
@@ -99,103 +96,119 @@ impl TrackerPeerFetcher {
                 }
             }
         }
-        info!("[tracker_fetcher] 已注册 {} 个内置热门 infohash 到 InfohashRepo", registered);
+        info!(
+            "[tracker_fetcher] 已注册 {} 个内置热门 infohash 到 InfohashRepo",
+            registered
+        );
         self.infohash_repo = Some(repo);
         self
     }
 
     /// 获取当前 InfohashRepo 中的 infohash 数量
     pub fn infohash_count(&self) -> usize {
-        self.infohash_repo.as_ref().map(|r| r.count_sync()).unwrap_or(0)
+        self.infohash_repo
+            .as_ref()
+            .map(|r| r.count_sync())
+            .unwrap_or(0)
     }
 
-    /// 启动后台拉取任务
-    pub fn start(&self) {
-        let discoverer = self.discoverer.clone();
-        let peer_repo = self.peer_repo.clone();
-        let infohash_repo = self.infohash_repo.clone();
-        let trackers_per_round = self.trackers_per_round;
-        let infohashes_per_round = self.infohashes_per_round;
-        let peers_per_infohash = self.peers_per_infohash;
-        let interval_secs = self.interval_secs;
-        let total_rounds = self.total_rounds.clone();
-        let total_peers_fetched = self.total_peers_fetched.clone();
-        let last_round_peers = self.last_round_peers.clone();
-
-        tokio::spawn(async move {
-            info!("[tracker_fetcher] 后台拉取任务启动，间隔 {}s", interval_secs);
-            let mut ticker = interval(Duration::from_secs(interval_secs));
-            // 启动后立即执行一次
-            ticker.tick().await;
-
-            loop {
-                ticker.tick().await;
-
-                // 从 InfohashRepo 调取所有 infohash，随机选 N 个
-                let ihs: Vec<Infohash> = if let Some(repo) = &infohash_repo {
-                    let all = repo.all_sync();
-                    if all.is_empty() {
-                        warn!("[tracker_fetcher] InfohashRepo 为空，跳过本轮");
-                        continue;
-                    }
-                    // Fisher-Yates 洗牌
-                    let mut shuffled = all;
-                    for i in (1..shuffled.len()).rev() {
-                        let j = rand::random::<usize>() % (i + 1);
-                        shuffled.swap(i, j);
-                    }
-                    shuffled.truncate(infohashes_per_round);
-                    shuffled.into_iter().map(|(ih, _)| ih).collect()
-                } else {
-                    warn!("[tracker_fetcher] 未绑定 InfohashRepo，跳过本轮");
-                    continue;
-                };
-
-                info!("[tracker_fetcher] 开始本轮拉取: {} infohash (Repo总计 {}), 最多 {} tracker/infohash",
-                    ihs.len(), infohash_repo.as_ref().map(|r| r.count_sync()).unwrap_or(0), trackers_per_round);
-
-                // 批量 scrape，收集 infohash 统计（complete/incomplete/downloaded）
-                let scrape_results = discoverer.scrape(&ihs).await;
-                if !scrape_results.is_empty() {
-                    info!("[tracker_fetcher] scrape 完成: {} 个 infohash 有统计", scrape_results.len());
-                    for (ih, complete, incomplete, downloaded) in &scrape_results {
-                        info!("[tracker_fetcher] ih={} complete={} incomplete={} downloaded={}",
-                            &hex::encode(&ih[..4]), complete, incomplete, downloaded);
-                    }
-                }
-
-                let mut total_peers = 0;
-                let mut total_added = 0;
-
-                for ih in &ihs {
-                    match discoverer.discover_peers(ih, peers_per_infohash).await {
-                        Ok(peers) => {
-                            total_peers += peers.len();
-                            // 存入 PeerRepo（统一数据归口，DhtProbe 会定期从 PeerRepo 拉取探测）
-                            if let Some(repo) = &peer_repo {
-                                if !peers.is_empty() {
-                                    repo.add_peers_sync(ih, &peers);
-                                    total_added += peers.len();
-                                }
-                            }
-                            info!("[tracker_fetcher] ih={} 获取 {} peer, 存入 PeerRepo",
-                                &hex::encode(&ih[..4]), peers.len());
-                        }
-                        Err(e) => {
-                            warn!("[tracker_fetcher] ih={} 拉取失败: {}",
-                                &hex::encode(&ih[..4]), e);
-                        }
-                    }
-                }
-
-                // 更新统计
-                total_rounds.fetch_add(1, Ordering::Relaxed);
-                total_peers_fetched.fetch_add(total_peers as u64, Ordering::Relaxed);
-                last_round_peers.store(total_peers as u64, Ordering::Relaxed);
-
-                info!("[tracker_fetcher] 本轮完成: 获取 {} peer, 加入探测队列 {}, InfohashRepo={}",
-                    total_peers, total_added, infohash_repo.as_ref().map(|r| r.count_sync()).unwrap_or(0));
+    /// 执行一次 tracker 拉取（由 TaskScheduler 按间隔调度）
+    pub async fn run_once(&self) {
+        // 从 InfohashRepo 调取所有 infohash，随机选 N 个
+        let ihs: Vec<Infohash> = if let Some(repo) = &self.infohash_repo {
+            let all = repo.all_sync();
+            if all.is_empty() {
+                return;
             }
-        });
+            // Fisher-Yates 洗牌
+            let mut shuffled = all;
+            for i in (1..shuffled.len()).rev() {
+                let j = rand::random::<usize>() % (i + 1);
+                shuffled.swap(i, j);
+            }
+            shuffled.truncate(self.infohashes_per_round);
+            shuffled.into_iter().map(|(ih, _)| ih).collect()
+        } else {
+            return;
+        };
+
+        info!(
+            "[tracker_fetcher] 开始本轮拉取: {} infohash (Repo总计 {}), 最多 {} tracker/infohash",
+            ihs.len(),
+            self.infohash_repo
+                .as_ref()
+                .map(|r| r.count_sync())
+                .unwrap_or(0),
+            self.trackers_per_round
+        );
+
+        // 批量 scrape，收集 infohash 统计（complete/incomplete/downloaded）
+        let scrape_results = self.discoverer.scrape(&ihs).await;
+        if !scrape_results.is_empty() {
+            info!(
+                "[tracker_fetcher] scrape 完成: {} 个 infohash 有统计",
+                scrape_results.len()
+            );
+            for (ih, complete, incomplete, downloaded) in &scrape_results {
+                info!(
+                    "[tracker_fetcher] ih={} complete={} incomplete={} downloaded={}",
+                    &hex::encode(&ih[..4]),
+                    complete,
+                    incomplete,
+                    downloaded
+                );
+            }
+        }
+
+        let mut total_peers = 0;
+        let mut total_added = 0;
+
+        for ih in &ihs {
+            match self
+                .discoverer
+                .discover_peers(ih, self.peers_per_infohash)
+                .await
+            {
+                Ok(peers) => {
+                    total_peers += peers.len();
+                    // 存入 PeerRepo（统一数据归口，DhtProbe 会定期从 PeerRepo 拉取探测）
+                    if let Some(repo) = &self.peer_repo {
+                        if !peers.is_empty() {
+                            repo.add_peers_sync(ih, &peers);
+                            total_added += peers.len();
+                        }
+                    }
+                    info!(
+                        "[tracker_fetcher] ih={} 获取 {} peer, 存入 PeerRepo",
+                        &hex::encode(&ih[..4]),
+                        peers.len()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[tracker_fetcher] ih={} 拉取失败: {}",
+                        &hex::encode(&ih[..4]),
+                        e
+                    );
+                }
+            }
+        }
+
+        // 更新统计
+        self.total_rounds.fetch_add(1, Ordering::Relaxed);
+        self.total_peers_fetched
+            .fetch_add(total_peers as u64, Ordering::Relaxed);
+        self.last_round_peers
+            .store(total_peers as u64, Ordering::Relaxed);
+
+        info!(
+            "[tracker_fetcher] 本轮完成: 获取 {} peer, 加入探测队列 {}, InfohashRepo={}",
+            total_peers,
+            total_added,
+            self.infohash_repo
+                .as_ref()
+                .map(|r| r.count_sync())
+                .unwrap_or(0)
+        );
     }
 }

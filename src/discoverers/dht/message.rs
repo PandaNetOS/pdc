@@ -24,7 +24,7 @@ pub enum QueryMethod {
     GetPeers,
     AnnouncePeer,
     SampleInfohashes, // BEP 51: DHT Infohash Indexing
-    Scrape,            // BEP 33: DHT Scrapes
+    Scrape,           // BEP 33: DHT Scrapes
 }
 
 impl QueryMethod {
@@ -202,10 +202,7 @@ impl DhtMessage {
     ///
     /// 向远程节点请求它已知的 infohash 列表（随机采样子集）
     /// 请求格式: d1:ad2:id20:<node_id>e1:q19:sample_infohashes1:t2:<tid>1:y1:qe
-    pub fn build_sample_infohashes(
-        transaction_id: &[u8; 2],
-        node_id: &[u8; 20],
-    ) -> Vec<u8> {
+    pub fn build_sample_infohashes(transaction_id: &[u8; 2], node_id: &[u8; 20]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"d1:ad2:id20:");
         buf.extend_from_slice(node_id);
@@ -593,7 +590,9 @@ impl DhtMessage {
     /// 解析 sample_infohashes 响应（BEP 51: DHT Infohash Indexing）
     ///
     /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t2:<tid>1:y1:re
-    pub fn parse_sample_infohashes_response(data: &[u8]) -> Option<([u8; 2], SampleInfohashesResponse)> {
+    pub fn parse_sample_infohashes_response(
+        data: &[u8],
+    ) -> Option<([u8; 2], SampleInfohashesResponse)> {
         let value: BencodeValue = from_bytes(data).ok()?;
         let dict = value.as_dict()?;
 
@@ -619,7 +618,10 @@ impl DhtMessage {
         }
 
         // num（节点跟踪的 infohash 总数）
-        let num = r.get(b"num".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
+        let num = r
+            .get(b"num".as_slice())
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
 
         // samples（多个 20 字节 infohash 拼接）
         let mut samples = vec![];
@@ -635,12 +637,15 @@ impl DhtMessage {
         // interval（重新计算采样的间隔，可选）
         let interval = r.get(b"interval".as_slice()).and_then(|v| v.as_int());
 
-        Some((tid, SampleInfohashesResponse {
-            node_id,
-            num,
-            samples,
-            interval,
-        }))
+        Some((
+            tid,
+            SampleInfohashesResponse {
+                node_id,
+                num,
+                samples,
+                interval,
+            },
+        ))
     }
 
     /// 解析 scrape 响应（BEP 33: DHT Scrapes）
@@ -686,9 +691,18 @@ impl DhtMessage {
                     _ => continue,
                 };
 
-                let complete = file_dict.get(b"complete".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
-                let incomplete = file_dict.get(b"incomplete".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
-                let downloaded = file_dict.get(b"downloaded".as_slice()).and_then(|v| v.as_int()).unwrap_or(0);
+                let complete = file_dict
+                    .get(b"complete".as_slice())
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                let incomplete = file_dict
+                    .get(b"incomplete".as_slice())
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                let downloaded = file_dict
+                    .get(b"downloaded".as_slice())
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
 
                 files.push(ScrapeFileStats {
                     infohash: ih,
@@ -794,8 +808,8 @@ mod tests {
         let data = [127, 0, 0, 1, 0x1A, 0xE1, 192, 168, 1, 1, 0x1A, 0xE2];
         let peers = parse_compact_peers(&data);
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].to_string(), "127.0.0.1:6881");
-        assert_eq!(peers[1].to_string(), "192.168.1.1:6882");
+        assert_eq!(peers[0].to_string(), "127.0.0.1:6881"); // [ALLOWED-HARDCODED]
+        assert_eq!(peers[1].to_string(), "192.168.1.1:6882"); // [ALLOWED-HARDCODED]
     }
 
     #[test]
@@ -811,7 +825,7 @@ mod tests {
 
         let node = DhtNode::from_compact(&data).unwrap();
         assert_eq!(node.id[0], 1);
-        assert_eq!(node.addr.to_string(), "127.0.0.1:6881");
+        assert_eq!(node.addr.to_string(), "127.0.0.1:6881"); // [ALLOWED-HARDCODED]
     }
 
     #[test]

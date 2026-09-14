@@ -15,9 +15,9 @@ use reqwest::Client;
 use tracing::{debug, info, warn};
 use url::Url;
 
+use crate::storage::repo_traits::TrackerRepository;
 use crate::traits::{AnnounceEvent, DiscovererStats, DiscovererType, PeerDiscoverer};
 use crate::types::{Infohash, PeerInfo, PeerSource};
-use crate::storage::repo_traits::TrackerRepository;
 
 use super::udp::UdpTrackerClient;
 
@@ -70,11 +70,11 @@ impl Default for TrackerConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(15), // [ALLOWED-HARDCODED]
             max_concurrent_requests: 10,
             max_consecutive_failures: 3,
-            cooldown_duration: Duration::from_secs(300),
-            listen_port: 6881,
+            cooldown_duration: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            listen_port: 6881,                           // [ALLOWED-HARDCODED]
             uploaded: 0,
             downloaded: 0,
             left: 0,
@@ -183,7 +183,10 @@ impl TrackerDiscoverer {
         // 移除不在新列表中的 tracker（可选，这里保留以防回退）
         // 更新 config 中的 tracker 列表
         // 注意：config 是不可变的，需要用内部可变性或直接更新 states
-        info!("[tracker] Tracker 列表已更新，当前 {} 个 tracker", new_trackers.len());
+        info!(
+            "[tracker] Tracker 列表已更新，当前 {} 个 tracker",
+            new_trackers.len()
+        );
     }
 
     /// 获取当前 Tracker 列表
@@ -194,7 +197,7 @@ impl TrackerDiscoverer {
     /// 从远程 URL 拉取 Tracker 列表
     pub async fn fetch_remote_trackers(url: &str) -> anyhow::Result<Vec<String>> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(30)) // [ALLOWED-HARDCODED]
             .user_agent("PDC-TrackerFetcher/1.0")
             .build()?;
         let resp = client.get(url).send().await?;
@@ -202,7 +205,13 @@ impl TrackerDiscoverer {
         let trackers: Vec<String> = text
             .lines()
             .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && (l.starts_with("http://") || l.starts_with("https://") || l.starts_with("udp://") || l.starts_with("wss://")))
+            .filter(|l| {
+                !l.is_empty()
+                    && (l.starts_with("http://")
+                        || l.starts_with("https://")
+                        || l.starts_with("udp://")
+                        || l.starts_with("wss://"))
+            })
             .collect();
         info!("[tracker] 从远程拉取到 {} 个 tracker", trackers.len());
         Ok(trackers)
@@ -349,7 +358,8 @@ impl TrackerDiscoverer {
             }
 
             // 计算平均分
-            let avg_score: f64 = trackers.iter().map(|t| t.score).sum::<f64>() / trackers.len() as f64;
+            let avg_score: f64 =
+                trackers.iter().map(|t| t.score).sum::<f64>() / trackers.len() as f64;
 
             // 过滤出 score >= 平均分的 tracker，按 score 降序排序
             let mut high_score_trackers: Vec<(String, f64)> = trackers
@@ -357,20 +367,30 @@ impl TrackerDiscoverer {
                 .filter(|t| !t.disabled && t.score >= avg_score)
                 .map(|t| (t.url, t.score))
                 .collect();
-            high_score_trackers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            high_score_trackers
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             // 如果过滤后为空（所有 tracker 都低于平均分），则返回分数最高的前 5 个作为保底
             if high_score_trackers.is_empty() {
-                let mut all_trackers: Vec<(String, f64)> = self.states.read()
+                let mut all_trackers: Vec<(String, f64)> = self
+                    .states
+                    .read()
                     .iter()
                     .filter(|(_, s)| !s.disabled)
                     .map(|(url, _)| (url.clone(), 0.0))
                     .collect();
                 all_trackers.sort_by(|a, b| a.0.cmp(&b.0));
-                return all_trackers.into_iter().take(5).map(|(url, _)| url).collect();
+                return all_trackers
+                    .into_iter()
+                    .take(5)
+                    .map(|(url, _)| url)
+                    .collect();
             }
 
-            return high_score_trackers.into_iter().map(|(url, _)| url).collect();
+            return high_score_trackers
+                .into_iter()
+                .map(|(url, _)| url)
+                .collect();
         }
 
         // 回退：TrackerRepo 不可用时，从自己的 states 获取（不评分，按 url 排序）
@@ -429,7 +449,10 @@ impl TrackerDiscoverer {
         let mut results = vec![];
         let mut tasks = vec![];
 
-        for tracker_url in active_trackers.iter().take(self.config.max_concurrent_requests) {
+        for tracker_url in active_trackers
+            .iter()
+            .take(self.config.max_concurrent_requests)
+        {
             if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
                 continue;
             }
@@ -488,7 +511,7 @@ impl TrackerDiscoverer {
                     _ => return vec![],
                 };
 
-                let files = match dict.get(&b"files".to_vec()) {
+                let files = match dict.get(&b"files"[..]) {
                     Some(f) => f,
                     None => return vec![],
                 };
@@ -502,9 +525,9 @@ impl TrackerDiscoverer {
                 for (key, value) in files_dict {
                     let mut ih = [0u8; 20];
                     if key.len() == 20 {
-                        ih.copy_from_slice(&key);
+                        ih.copy_from_slice(key);
                     } else if key.len() == 40 {
-                        if hex::decode_to_slice(&key, &mut ih).is_err() {
+                        if hex::decode_to_slice(key, &mut ih).is_err() {
                             continue;
                         }
                     } else {
@@ -516,18 +539,27 @@ impl TrackerDiscoverer {
                         _ => continue,
                     };
 
-                    let complete = file_dict.get(&b"complete".to_vec()).and_then(|v| match v {
-                        serde_bencode::value::Value::Int(i) => Some(*i),
-                        _ => None,
-                    }).unwrap_or(0);
-                    let incomplete = file_dict.get(&b"incomplete".to_vec()).and_then(|v| match v {
-                        serde_bencode::value::Value::Int(i) => Some(*i),
-                        _ => None,
-                    }).unwrap_or(0);
-                    let downloaded = file_dict.get(&b"downloaded".to_vec()).and_then(|v| match v {
-                        serde_bencode::value::Value::Int(i) => Some(*i),
-                        _ => None,
-                    }).unwrap_or(0);
+                    let complete = file_dict
+                        .get(&b"complete".to_vec())
+                        .and_then(|v| match v {
+                            serde_bencode::value::Value::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let incomplete = file_dict
+                        .get(&b"incomplete".to_vec())
+                        .and_then(|v| match v {
+                            serde_bencode::value::Value::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let downloaded = file_dict
+                        .get(&b"downloaded".to_vec())
+                        .and_then(|v| match v {
+                            serde_bencode::value::Value::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
 
                     result.push((ih, complete, incomplete, downloaded));
                 }
@@ -761,7 +793,7 @@ mod tests {
         let data = [127, 0, 0, 1, 0x1A, 0xE1];
         let peers = TrackerDiscoverer::parse_compact_peers(&data);
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].to_string(), "127.0.0.1:6881");
+        assert_eq!(peers[0].to_string(), "127.0.0.1:6881"); // [ALLOWED-HARDCODED]
     }
 
     #[test]

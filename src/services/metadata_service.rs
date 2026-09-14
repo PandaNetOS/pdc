@@ -14,16 +14,14 @@
 //! 【参考】BEP 9: https://www.bittorrent.org/beps/bep_0009.html
 //! 【参考】BEP 10: https://www.bittorrent.org/beps/bep_0010.html
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serde_bencode::value::Value as BencodeValue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::types::Infohash;
 
@@ -77,7 +75,7 @@ pub struct MetadataService {
     /// metadata 分片大小（16KB，BEP 9 标准）
     piece_size: usize,
     /// 最大重试次数
-    max_retries: u32,
+    _max_retries: u32,
     /// 缓存有效期（默认 24 小时）
     cache_ttl: Duration,
 }
@@ -105,11 +103,11 @@ impl MetadataService {
             cache: DashMap::new(),
             downloading: DashMap::new(),
             peer_id,
-            connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(15),
-            piece_size: 16 * 1024, // 16KB
-            max_retries: 2,
-            cache_ttl: Duration::from_secs(86400), // 24小时
+            connect_timeout: Duration::from_secs(10), // [ALLOWED-HARDCODED]
+            read_timeout: Duration::from_secs(15),    // [ALLOWED-HARDCODED]
+            piece_size: 16 * 1024,                    // 16KB
+            _max_retries: 2,
+            cache_ttl: Duration::from_secs(86400), // 24小时 // [ALLOWED-HARDCODED]
         }
     }
 
@@ -135,7 +133,11 @@ impl MetadataService {
     ///
     /// # Returns
     /// 下载成功返回 TorrentMetadata，失败返回错误信息
-    pub async fn fetch_from_peer(&self, infohash: Infohash, peer_addr: SocketAddr) -> MetadataResult {
+    pub async fn fetch_from_peer(
+        &self,
+        infohash: Infohash,
+        peer_addr: SocketAddr,
+    ) -> MetadataResult {
         // 检查缓存
         if let Some(cached) = self.get_metadata(&infohash) {
             debug!("[metadata] 缓存命中: {}", hex::encode(&infohash[..8]));
@@ -162,7 +164,11 @@ impl MetadataService {
                 meta.total_size
             );
         } else if let Err(ref e) = result {
-            debug!("[metadata] 下载失败: {} error={}", hex::encode(&infohash[..8]), e);
+            debug!(
+                "[metadata] 下载失败: {} error={}",
+                hex::encode(&infohash[..8]),
+                e
+            );
         }
 
         result
@@ -200,13 +206,10 @@ impl MetadataService {
         peer_addr: SocketAddr,
     ) -> MetadataResult {
         // 1. TCP 连接
-        let stream = tokio::time::timeout(
-            self.connect_timeout,
-            TcpStream::connect(peer_addr),
-        )
-        .await
-        .map_err(|_| "Connection timeout".to_string())?
-        .map_err(|e| format!("Connection failed: {}", e))?;
+        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(peer_addr))
+            .await
+            .map_err(|_| "Connection timeout".to_string())?
+            .map_err(|e| format!("Connection failed: {}", e))?;
 
         let (mut reader, mut writer) = stream.into_split();
 
@@ -218,10 +221,14 @@ impl MetadataService {
             return Err("Peer does not support extension protocol".to_string());
         }
 
-        debug!("[metadata] 握手成功, peer_id={}", hex::encode(&remote_peer_id[..8]));
+        debug!(
+            "[metadata] 握手成功, peer_id={}",
+            hex::encode(&remote_peer_id[..8])
+        );
 
         // 3. 扩展握手
-        let (ut_metadata_id, metadata_size) = self.extension_handshake(&mut reader, &mut writer).await?;
+        let (ut_metadata_id, metadata_size) =
+            self.extension_handshake(&mut reader, &mut writer).await?;
 
         if metadata_size == 0 {
             return Err("Peer reported metadata_size=0".to_string());
@@ -233,27 +240,25 @@ impl MetadataService {
         );
 
         // 4. 分块下载 metadata
-        let total_pieces = (metadata_size as usize + self.piece_size - 1) / self.piece_size;
+        let total_pieces = (metadata_size as usize).div_ceil(self.piece_size);
         let mut metadata_pieces: Vec<Option<Vec<u8>>> = vec![None; total_pieces];
 
-        for piece_idx in 0..total_pieces {
-            let data = self.request_metadata_piece(
-                &mut reader,
-                &mut writer,
-                ut_metadata_id,
-                piece_idx as u32,
-            )
-            .await?;
-            metadata_pieces[piece_idx] = Some(data);
-            debug!("[metadata] 分片 {}/{} 下载完成", piece_idx + 1, total_pieces);
+        for (piece_idx, slot) in metadata_pieces.iter_mut().enumerate().take(total_pieces) {
+            let data = self
+                .request_metadata_piece(&mut reader, &mut writer, ut_metadata_id, piece_idx as u32)
+                .await?;
+            *slot = Some(data);
+            debug!(
+                "[metadata] 分片 {}/{} 下载完成",
+                piece_idx + 1,
+                total_pieces
+            );
         }
 
         // 5. 组装 metadata
         let mut metadata_bytes = Vec::with_capacity(metadata_size as usize);
-        for piece in metadata_pieces.iter() {
-            if let Some(data) = piece {
-                metadata_bytes.extend_from_slice(data);
-            }
+        for data in metadata_pieces.iter().flatten() {
+            metadata_bytes.extend_from_slice(data);
         }
         metadata_bytes.truncate(metadata_size as usize);
 
@@ -304,7 +309,10 @@ impl MetadataService {
             .write_all(&handshake)
             .await
             .map_err(|e| format!("Failed to send handshake: {}", e))?;
-        writer.flush().await.map_err(|e| format!("Flush failed: {}", e))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("Flush failed: {}", e))?;
 
         Ok(())
     }
@@ -371,13 +379,17 @@ impl MetadataService {
         // 构造扩展握手消息
         // d1:ei0e1:md11:ut_metadatai1eee
         let handshake_dict = b"d1:ei0e1:md11:ut_metadatai1eee";
-        self.send_extension_message(writer, 0, handshake_dict).await?;
+        self.send_extension_message(writer, 0, handshake_dict)
+            .await?;
 
         // 读取扩展握手响应
         let (ext_id, payload) = self.read_extension_message(reader).await?;
 
         if ext_id != 0 {
-            return Err(format!("Expected extension handshake (id=0), got id={}", ext_id));
+            return Err(format!(
+                "Expected extension handshake (id=0), got id={}",
+                ext_id
+            ));
         }
 
         // 解析响应字典
@@ -417,13 +429,17 @@ impl MetadataService {
     ) -> Result<Vec<u8>, String> {
         // 构造请求消息：d8:msg_typei0e5:pieceiN ee
         let request_dict = format!("d8:msg_typei0e5:piecei{}e", piece);
-        self.send_extension_message(writer, ut_metadata_id, request_dict.as_bytes()).await?;
+        self.send_extension_message(writer, ut_metadata_id, request_dict.as_bytes())
+            .await?;
 
         // 读取响应
         let (ext_id, payload) = self.read_extension_message(reader).await?;
 
         if ext_id != ut_metadata_id {
-            return Err(format!("Expected ut_metadata message (id={}), got id={}", ut_metadata_id, ext_id));
+            return Err(format!(
+                "Expected ut_metadata message (id={}), got id={}",
+                ut_metadata_id, ext_id
+            ));
         }
 
         // 解析响应
@@ -452,7 +468,10 @@ impl MetadataService {
         }
 
         if msg_type != 1 {
-            return Err(format!("Expected data message (type=1), got type={}", msg_type));
+            return Err(format!(
+                "Expected data message (type=1), got type={}",
+                msg_type
+            ));
         }
 
         Ok(piece_data.to_vec())
@@ -482,7 +501,10 @@ impl MetadataService {
             .write_all(&msg)
             .await
             .map_err(|e| format!("Failed to send extension message: {}", e))?;
-        writer.flush().await.map_err(|e| format!("Flush failed: {}", e))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("Flush failed: {}", e))?;
 
         Ok(())
     }
@@ -563,7 +585,9 @@ impl MetadataService {
                         i += 1;
                     }
                     i += 1; // 跳过 ':'
-                    let len: usize = len_str.parse().map_err(|_| "Invalid string length".to_string())?;
+                    let len: usize = len_str
+                        .parse()
+                        .map_err(|_| "Invalid string length".to_string())?;
                     i += len;
                 }
                 _ => {
@@ -615,53 +639,56 @@ impl MetadataService {
         };
 
         // 文件列表
-        let (files, total_size) = if let Some(BencodeValue::List(file_list)) = dict.get(b"files".as_ref()) {
-            // 多文件模式
-            let mut files = Vec::new();
-            let mut total_size = 0u64;
+        let (files, total_size) =
+            if let Some(BencodeValue::List(file_list)) = dict.get(b"files".as_ref()) {
+                // 多文件模式
+                let mut files = Vec::new();
+                let mut total_size = 0u64;
 
-            for file_value in file_list {
-                if let BencodeValue::Dict(file_dict) = file_value {
-                    let size = match file_dict.get(b"length".as_ref()) {
-                        Some(BencodeValue::Int(n)) => *n as u64,
-                        _ => 0,
-                    };
+                for file_value in file_list {
+                    if let BencodeValue::Dict(file_dict) = file_value {
+                        let size = match file_dict.get(b"length".as_ref()) {
+                            Some(BencodeValue::Int(n)) => *n as u64,
+                            _ => 0,
+                        };
 
-                    let path = match file_dict.get(b"path".as_ref()) {
-                        Some(BencodeValue::List(path_list)) => {
-                            let parts: Vec<String> = path_list
-                                .iter()
-                                .filter_map(|p| match p {
-                                    BencodeValue::Bytes(b) => Some(String::from_utf8_lossy(b).to_string()),
-                                    _ => None,
-                                })
-                                .collect();
-                            parts.join("/")
-                        }
-                        _ => "unknown".to_string(),
-                    };
+                        let path = match file_dict.get(b"path".as_ref()) {
+                            Some(BencodeValue::List(path_list)) => {
+                                let parts: Vec<String> = path_list
+                                    .iter()
+                                    .filter_map(|p| match p {
+                                        BencodeValue::Bytes(b) => {
+                                            Some(String::from_utf8_lossy(b).to_string())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                parts.join("/")
+                            }
+                            _ => "unknown".to_string(),
+                        };
 
-                    total_size += size;
-                    files.push(TorrentFile { path, size });
+                        total_size += size;
+                        files.push(TorrentFile { path, size });
+                    }
                 }
-            }
 
-            (files, total_size)
-        } else {
-            // 单文件模式
-            let size = match dict.get(b"length".as_ref()) {
-                Some(BencodeValue::Int(n)) => *n as u64,
-                _ => 0,
-            };
+                (files, total_size)
+            } else {
+                // 单文件模式
+                let size = match dict.get(b"length".as_ref()) {
+                    Some(BencodeValue::Int(n)) => *n as u64,
+                    _ => 0,
+                };
 
-            (
-                vec![TorrentFile {
-                    path: name.clone(),
+                (
+                    vec![TorrentFile {
+                        path: name.clone(),
+                        size,
+                    }],
                     size,
-                }],
-                size,
-            )
-        };
+                )
+            };
 
         Ok(TorrentMetadata {
             infohash,
@@ -736,7 +763,7 @@ mod tests {
         info_dict.extend_from_slice(b"6:lengthi1048576ee");
 
         let infohash = [1u8; 20];
-        let peer = "127.0.0.1:6881".parse().unwrap();
+        let peer = "127.0.0.1:6881".parse().unwrap(); // [ALLOWED-HARDCODED]
 
         let meta = service.parse_info_dict(&info_dict, infohash, peer).unwrap();
         assert_eq!(meta.name, "test.bin");
@@ -761,7 +788,7 @@ mod tests {
         );
 
         let infohash = [2u8; 20];
-        let peer = "127.0.0.1:6881".parse().unwrap();
+        let peer = "127.0.0.1:6881".parse().unwrap(); // [ALLOWED-HARDCODED]
 
         // 多文件解析可能因 serde_bencode 嵌套处理问题而失败
         // 这里只测试解析不崩溃，具体值在单文件测试中验证

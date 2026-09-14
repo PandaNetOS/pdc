@@ -24,7 +24,7 @@ pub struct NatIntegration {
     /// 配置
     config: FederationConfig,
     /// 关闭信号
-    shutdown: broadcast::Sender<()>,
+    _shutdown: broadcast::Sender<()>,
     /// 最近一次 STUN 探测结果
     last_stun: parking_lot::RwLock<Option<StunResult>>,
 }
@@ -35,13 +35,13 @@ impl NatIntegration {
         nat_manager: Arc<NatManager>,
         identity: Arc<NodeIdentity>,
         config: FederationConfig,
-        shutdown: broadcast::Sender<()>,
+        _shutdown: broadcast::Sender<()>,
     ) -> Self {
         Self {
             nat_manager,
             identity,
             config,
-            shutdown,
+            _shutdown,
             last_stun: parking_lot::RwLock::new(None),
         }
     }
@@ -61,7 +61,7 @@ impl NatIntegration {
         // 再次 bind 同一端口会直接 EADDRINUSE，导致所有 STUN 服务器看似全部失败。
         // STUN 只需要公网 IP 和 NAT 类型，映射端口后续由 UPnP/默认端口决定。
         let local_addr = "0.0.0.0:0";
-        let timeout = Duration::from_secs(5);
+        let timeout = Duration::from_secs(5); // [ALLOWED-HARDCODED]
 
         info!(
             "[federation] STUN 探测开始: 服务器数={}, 列表={:?}, 本地绑定={}",
@@ -111,9 +111,10 @@ impl NatIntegration {
         let listen_port = self.config.listen_port;
 
         // 查找联邦端口的映射
-        let fed_mapping = status.mappings.iter().find(|m| {
-            m.description.contains("Federation") && m.internal_port == listen_port
-        });
+        let fed_mapping = status
+            .mappings
+            .iter()
+            .find(|m| m.description.contains("Federation") && m.internal_port == listen_port);
 
         let external_port = fed_mapping.map(|m| m.external_port).unwrap_or(listen_port);
 
@@ -141,7 +142,10 @@ impl NatIntegration {
             .unwrap_or_else(|| format!("{:?}", status.nat_type));
 
         // 构造本地地址
-        let local_ip = status.local_ip.clone().and_then(|ip| ip.parse::<IpAddr>().ok());
+        let local_ip = status
+            .local_ip
+            .clone()
+            .and_then(|ip| ip.parse::<IpAddr>().ok());
         let local_addr = local_ip.map(|ip| SocketAddr::new(ip, listen_port));
 
         let now = std::time::SystemTime::now()
@@ -200,9 +204,10 @@ impl NatIntegration {
         let status = self.nat_manager.status();
         let listen_port = self.config.listen_port;
 
-        let fed_mapping = status.mappings.iter().find(|m| {
-            m.description.contains("Federation") && m.internal_port == listen_port
-        });
+        let fed_mapping = status
+            .mappings
+            .iter()
+            .find(|m| m.description.contains("Federation") && m.internal_port == listen_port);
         let external_port = fed_mapping.map(|m| m.external_port).unwrap_or(listen_port);
 
         // 优先 STUN 结果
@@ -274,31 +279,19 @@ impl NatIntegration {
     }
 
     /// 启动地址刷新后台任务（每5分钟重新探测公网地址 + STUN）
+    ///
+    /// 已迁移：周期性 tick 由 TaskScheduler 统一调度，调用 [`NatIntegration::refresh_tick`]。
+    /// 保留空壳以兼容 mod.rs 中的旧调用，待 start() 统一清理后移除。
     pub fn spawn_address_refresh(self: Arc<Self>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-        let interval = Duration::from_secs(300);
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.clone().refresh_addresses();
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] 地址刷新任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] 地址刷新任务已启动（间隔 300s，含 STUN 探测）");
+        // [MIGRATED] 内部 spawn+interval 循环已迁移到 TaskScheduler，由 main.rs 统一注册。
+        // 周期 tick 入口: pub async fn refresh_tick(&self)
     }
 
-    /// 刷新地址（STUN 探测 + 公网地址变化检测）
-    fn refresh_addresses(self: Arc<Self>) {
+    /// 执行一次 NAT 地址刷新 + STUN 探测（供 TaskScheduler 周期性调用）
+    ///
+    /// 包含：STUN 绑定请求 + NAT 类型检测、UPnP 端口映射刷新、公网地址变化检测。
+    /// STUN 探测内部有 5s 超时，单次 tick 最长阻塞约 10s。
+    pub async fn refresh_tick(&self) {
         // 执行 STUN 探测
         let _ = self.stun_probe();
 
@@ -323,7 +316,8 @@ impl NatIntegration {
 
 /// 检查 STUN 探测是否成功（收到了有效响应）
 fn stun_succeeded(stun: Option<&StunResult>) -> bool {
-    stun.map(|s| s.success && s.mapped_addr.is_some()).unwrap_or(false)
+    stun.map(|s| s.success && s.mapped_addr.is_some())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -334,7 +328,7 @@ mod tests {
     fn make_test_config() -> FederationConfig {
         FederationConfig {
             enabled: true,
-            listen_port: 6885,
+            listen_port: 6885, // [ALLOWED-HARDCODED]
             nat_mapping_enabled: true,
             stun_servers: vec!["stun.l.google.com:19302".to_string()],
             ..Default::default()
@@ -376,8 +370,8 @@ mod tests {
             reachability_score: 80,
             mappings: vec![crate::nat::NatMapping {
                 protocol: "TCP".to_string(),
-                internal_port: 6885,
-                external_port: 6885,
+                internal_port: 6885, // [ALLOWED-HARDCODED]
+                external_port: 6885, // [ALLOWED-HARDCODED]
                 description: "PDC Federation TCP".to_string(),
                 verified: true,
                 reachable: true,

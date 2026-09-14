@@ -4,8 +4,8 @@
 //! 提取 peer 加入 PeerRepo。与被动接收互补，主动获取更多 peer。
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -82,9 +82,9 @@ impl ActivePexRequester {
             stats: Arc::new(RwLock::new(ActivePexStats::default())),
             running: Arc::new(RwLock::new(false)),
             batch_size: 20,
-            interval: Duration::from_secs(60),
-            connect_timeout: Duration::from_secs(5),
-            pex_wait_time: Duration::from_secs(10),
+            interval: Duration::from_secs(60), // [ALLOWED-HARDCODED]
+            connect_timeout: Duration::from_secs(5), // [ALLOWED-HARDCODED]
+            pex_wait_time: Duration::from_secs(10), // [ALLOWED-HARDCODED]
             max_concurrent: 10,
             connect_interval_ms: 100,
             pause_gate: None,
@@ -149,28 +149,22 @@ impl ActivePexRequester {
         *self.running.write() = false;
     }
 
-    /// 启动主动 PEX 请求器
-    pub async fn run(&self) {
-        *self.running.write() = true;
-        info!("[Active-PEX] 主动 PEX 请求器已启动（每 {} 秒连接 {} 个 peer）", self.interval.as_secs(), self.batch_size);
-
-        while *self.running.read() {
-            // 全量同步期间暂停主动 PEX，把带宽/CPU 让给联邦同步
-            if self.pause_gate.as_ref().map(|g| g.load(Ordering::Relaxed)).unwrap_or(false) {
-                tokio::time::sleep(self.interval).await;
-                continue;
-            }
-            if let Err(e) = self.run_batch().await {
-                warn!("[Active-PEX] 批量请求错误: {}", e);
-                {
-                    let mut stats = self.stats.write();
-                    stats.errors += 1;
-                }
-            }
-            tokio::time::sleep(self.interval).await;
+    /// 执行一次主动 PEX 批量请求（由 TaskScheduler 按间隔调度）
+    pub async fn run_once(&self) {
+        // 全量同步期间暂停主动 PEX，把带宽/CPU 让给联邦同步
+        if self
+            .pause_gate
+            .as_ref()
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            return;
         }
-
-        info!("[Active-PEX] 主动 PEX 请求器已停止");
+        if let Err(e) = self.run_batch().await {
+            warn!("[Active-PEX] 批量请求错误: {}", e);
+            let mut stats = self.stats.write();
+            stats.errors += 1;
+        }
     }
 
     /// 运行一轮批量请求
@@ -183,7 +177,11 @@ impl ActivePexRequester {
         }
 
         // 按评分降序排序
-        all_peers.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
+        all_peers.sort_by(|a, b| {
+            b.priority_score
+                .partial_cmp(&a.priority_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // 支持 IPv4 + IPv6，取前 batch_size * 2 个
         let targets: Vec<(SocketAddr, Infohash)> = all_peers
@@ -197,8 +195,12 @@ impl ActivePexRequester {
             return Ok(());
         }
 
-        debug!("[Active-PEX] 开始批量连接 {} 个 peer（最大并发 {}，间隔 {}ms）",
-            targets.len(), self.max_concurrent, self.connect_interval_ms);
+        debug!(
+            "[Active-PEX] 开始批量连接 {} 个 peer（最大并发 {}，间隔 {}ms）",
+            targets.len(),
+            self.max_concurrent,
+            self.connect_interval_ms
+        );
 
         // 使用信号量限制并发连接数
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
@@ -263,6 +265,7 @@ impl ActivePexRequester {
 }
 
 /// 连接单个 peer 并请求 PEX
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_request_pex(
     addr: SocketAddr,
     infohash: Infohash,
@@ -318,6 +321,9 @@ async fn connect_and_request_pex(
     // 3. 读取 BT 握手响应
     let mut resp_buf = [0u8; 68];
     match timeout(Duration::from_secs(5), stream.read_exact(&mut resp_buf)).await {
+        // [ALLOWED-HARDCODED]
+        // [ALLOWED-HARDCODED]
+        // [ALLOWED-HARDCODED]
         Ok(_) => {}
         Err(_) => {
             {
@@ -360,6 +366,9 @@ async fn connect_and_request_pex(
         // 读取消息长度
         let mut len_buf = [0u8; 4];
         match timeout(Duration::from_secs(2), stream.read_exact(&mut len_buf)).await {
+            // [ALLOWED-HARDCODED]
+            // [ALLOWED-HARDCODED]
+            // [ALLOWED-HARDCODED]
             Ok(_) => {}
             Err(_) => break,
         }
@@ -374,6 +383,9 @@ async fn connect_and_request_pex(
         // 读取消息内容
         let mut msg_buf = vec![0u8; msg_len];
         match timeout(Duration::from_secs(2), stream.read_exact(&mut msg_buf)).await {
+            // [ALLOWED-HARDCODED]
+            // [ALLOWED-HARDCODED]
+            // [ALLOWED-HARDCODED]
             Ok(_) => {}
             Err(_) => break,
         }

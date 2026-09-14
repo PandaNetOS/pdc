@@ -19,10 +19,9 @@ use parking_lot::RwLock;
 use reqwest::Client;
 use serde_bencode::from_bytes;
 use serde_bencode::value::Value as BencodeValue;
-use tracing::{debug, info, warn};
-use url::Url;
+use tracing::{debug, warn};
 
-use crate::storage::repo_traits::{TrackerRepository, TrackerEntry};
+use crate::storage::repo_traits::TrackerRepository;
 use crate::types::{Infohash, ScrapeEntry};
 
 /// 单个 infohash 的 scrape 结果（融合多个 Tracker 的结果）
@@ -65,7 +64,7 @@ struct TrackerRateLimit {
 impl TrackerRateLimit {
     fn new() -> Self {
         Self {
-            last_request: RwLock::new(Instant::now() - Duration::from_secs(3600)),
+            last_request: RwLock::new(Instant::now() - Duration::from_secs(3600)), // [ALLOWED-HARDCODED]
             consecutive_failures: RwLock::new(0),
             disabled_until: RwLock::new(None),
         }
@@ -129,7 +128,7 @@ impl ScrapeService {
     /// 创建新的 Scrape 服务
     pub fn new() -> Self {
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10)) // [ALLOWED-HARDCODED]
             .user_agent("PeerDiscoveryCenter/1.0")
             .build()
             .unwrap_or_default();
@@ -140,11 +139,11 @@ impl ScrapeService {
             rate_limits: DashMap::new(),
             tracker_repo: None,
             cache_ttl_secs: 300,
-            min_request_interval: Duration::from_secs(1),
+            min_request_interval: Duration::from_secs(1), // [ALLOWED-HARDCODED]
             max_consecutive_failures: 3,
-            cooldown_duration: Duration::from_secs(300),
+            cooldown_duration: Duration::from_secs(300), // [ALLOWED-HARDCODED]
             max_trackers_per_scrape: 5,
-            request_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(10), // [ALLOWED-HARDCODED]
         }
     }
 
@@ -191,13 +190,13 @@ impl ScrapeService {
                 continue;
             }
 
-            let infohash = infohash;
             let tracker_url = tracker_url.clone();
             let http_client = self.http_client.clone();
             let timeout = self.request_timeout;
 
             tasks.push(tokio::spawn(async move {
-                let result = scrape_single_tracker(&http_client, &tracker_url, &infohash, timeout).await;
+                let result =
+                    scrape_single_tracker(&http_client, &tracker_url, &infohash, timeout).await;
                 (tracker_url, result)
             }));
         }
@@ -219,7 +218,8 @@ impl ScrapeService {
                         );
                     }
                     Err(e) => {
-                        rate_limit.record_failure(self.max_consecutive_failures, self.cooldown_duration);
+                        rate_limit
+                            .record_failure(self.max_consecutive_failures, self.cooldown_duration);
                         debug!("[scrape_service] {} scrape失败: {}", tracker_url, e);
                     }
                 }
@@ -237,7 +237,10 @@ impl ScrapeService {
     }
 
     /// 批量 scrape 多个 infohash
-    pub async fn scrape_infohashes(&self, infohashes: &[Infohash]) -> HashMap<Infohash, ScrapeResult> {
+    pub async fn scrape_infohashes(
+        &self,
+        infohashes: &[Infohash],
+    ) -> HashMap<Infohash, ScrapeResult> {
         let mut results = HashMap::new();
         for &infohash in infohashes {
             let result = self.scrape_infohash(infohash).await;
@@ -361,7 +364,12 @@ fn urlencode_infohash(infohash: &Infohash) -> String {
     let mut encoded = String::with_capacity(60);
     for &byte in infohash.iter() {
         // 未保留字符直接输出，其他用 %XX 编码
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.' || byte == b'~' {
+        if byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+        {
             encoded.push(byte as char);
         } else {
             encoded.push_str(&format!("%{:02X}", byte));
@@ -372,7 +380,8 @@ fn urlencode_infohash(infohash: &Infohash) -> String {
 
 /// 解析 scrape 响应（bencode 格式）
 fn parse_scrape_response(bytes: &[u8], infohash: &Infohash) -> Result<ScrapeEntry, String> {
-    let value: BencodeValue = from_bytes(bytes).map_err(|e| format!("Bencode parse error: {}", e))?;
+    let value: BencodeValue =
+        from_bytes(bytes).map_err(|e| format!("Bencode parse error: {}", e))?;
 
     // 响应格式：d5:filesd20:<infohash>d8:completeiN e10:incompleteiN e10:downloadediN eee
     let dict = match value {
@@ -382,7 +391,10 @@ fn parse_scrape_response(bytes: &[u8], infohash: &Infohash) -> Result<ScrapeEntr
 
     // 检查 failure reason
     if let Some(BencodeValue::Bytes(reason)) = dict.get(b"failure reason".as_ref()) {
-        return Err(format!("Tracker failure: {}", String::from_utf8_lossy(reason)));
+        return Err(format!(
+            "Tracker failure: {}",
+            String::from_utf8_lossy(reason)
+        ));
     }
 
     // 获取 files 字典
@@ -432,7 +444,10 @@ mod tests {
         let infohash = [0u8; 20];
         let encoded = urlencode_infohash(&infohash);
         // 全0应该全部编码为 %00
-        assert_eq!(encoded, "%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00");
+        assert_eq!(
+            encoded,
+            "%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00%00"
+        );
 
         // 测试可打印字符
         let mut infohash2 = [0u8; 20];
@@ -476,17 +491,17 @@ mod tests {
         let rl = TrackerRateLimit::new();
 
         // 初始状态应该可以请求
-        assert!(rl.can_request(Duration::from_secs(1)));
+        assert!(rl.can_request(Duration::from_secs(1))); // [ALLOWED-HARDCODED]
 
         // 记录成功后，应该被限流
         rl.record_success();
-        assert!(!rl.can_request(Duration::from_secs(10)));
+        assert!(!rl.can_request(Duration::from_secs(10))); // [ALLOWED-HARDCODED]
 
         // 记录失败
-        rl.record_failure(3, Duration::from_secs(300));
-        rl.record_failure(3, Duration::from_secs(300));
-        rl.record_failure(3, Duration::from_secs(300));
-        // 第3次失败后应该被禁用
-        assert!(!rl.can_request(Duration::from_secs(0)));
+        rl.record_failure(3, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
+        rl.record_failure(3, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
+        rl.record_failure(3, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
+                                                        // 第3次失败后应该被禁用
+        assert!(!rl.can_request(Duration::from_secs(0))); // [ALLOWED-HARDCODED]
     }
 }

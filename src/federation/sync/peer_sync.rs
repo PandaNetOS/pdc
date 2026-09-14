@@ -44,7 +44,10 @@ pub(crate) fn build_peer_sync_entry(
         source: source.to_string(),
     };
     let payload_bytes = bincode::serialize(&payload).ok()?;
-    let ih_hex = infohash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let ih_hex = infohash
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
     let key = format!("{}:{}", ih_hex, addr).into_bytes();
     Some((key, payload_bytes))
 }
@@ -52,10 +55,10 @@ pub(crate) fn build_peer_sync_entry(
 /// PeerRepo 同步服务
 pub struct PeerSync {
     peer_repo: Arc<PeerRepoImpl>,
-    gossip_engine: Arc<GossipEngine>,
+    _gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
     merkle_queue: Arc<MerkleUpdateQueue>,
-    local_node_id: NodeId,
+    _local_node_id: NodeId,
     metrics: Arc<FederationMetrics>,
     enabled: bool,
     shutdown: broadcast::Sender<()>,
@@ -64,19 +67,19 @@ pub struct PeerSync {
 impl PeerSync {
     pub fn new(
         peer_repo: Arc<PeerRepoImpl>,
-        gossip_engine: Arc<GossipEngine>,
+        _gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
         merkle_queue: Arc<MerkleUpdateQueue>,
-        local_node_id: NodeId,
+        _local_node_id: NodeId,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
         Self {
             peer_repo,
-            gossip_engine,
+            _gossip_engine,
             merkle,
             merkle_queue,
-            local_node_id,
+            _local_node_id,
             metrics,
             enabled: true,
             shutdown,
@@ -164,7 +167,11 @@ impl PeerSync {
             };
 
             // key = infohash:addr
-            let ih_hex = payload.infohash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+            let ih_hex = payload
+                .infohash
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
             let key = format!("{}:{}", ih_hex, payload.addr).into_bytes();
             merkle_batch.push((key, entry.payload.clone()));
 
@@ -242,7 +249,10 @@ impl PeerSync {
                     Ok(b) => b,
                     Err(_) => continue,
                 };
-                let ih_hex = infohash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                let ih_hex = infohash
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
                 let key = format!("{}:{}", ih_hex, peer.addr).into_bytes();
 
                 entries.push(SyncEntry {
@@ -254,7 +264,10 @@ impl PeerSync {
             }
         }
 
-        info!("[federation] Peer collect_all_entries 完成: {} 条 entries", entries.len());
+        info!(
+            "[federation] Peer collect_all_entries 完成: {} 条 entries",
+            entries.len()
+        );
         entries
     }
 }
@@ -273,14 +286,17 @@ mod tests {
     fn test_peer_sync_payload_serde() {
         let payload = PeerSyncPayload {
             infohash: [1; 20],
-            addr: "127.0.0.1:6881".parse().unwrap(),
+            addr: "127.0.0.1:6881".parse().unwrap(), // [ALLOWED-HARDCODED]
             first_seen_secs: 1000,
             source: "dht".to_string(),
         };
         let bytes = bincode::serialize(&payload).unwrap();
         let decoded: PeerSyncPayload = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.infohash, [1; 20]);
-        assert_eq!(decoded.addr, "127.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap());
+        assert_eq!(
+            decoded.addr,
+            "127.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap() // [ALLOWED-HARDCODED]
+        );
         assert_eq!(decoded.source, "dht");
     }
 
@@ -320,13 +336,13 @@ mod tests {
 
         let payload = PeerSyncPayload {
             infohash: [5; 20],
-            addr: "10.0.0.1:6881".parse().unwrap(),
+            addr: "10.0.0.1:6881".parse().unwrap(), // [ALLOWED-HARDCODED]
             first_seen_secs: 1000,
             source: "tracker".to_string(),
         };
         let ih_hex = "05".repeat(20);
         let entries = vec![SyncEntry {
-            key: format!("{}:10.0.0.1:6881", ih_hex).into_bytes(),
+            key: format!("{}:10.0.0.1:6881", ih_hex).into_bytes(), // [ALLOWED-HARDCODED]
             operation: operation::UPSERT,
             version: 1,
             payload: bincode::serialize(&payload).unwrap(),
@@ -337,6 +353,9 @@ mod tests {
         assert_eq!(peer_repo.len(), 1);
         let peers = peer_repo.get_peers_sync(&[5; 20], 10);
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].addr, "10.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap());
+        assert_eq!(
+            peers[0].addr,
+            "10.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap() // [ALLOWED-HARDCODED]
+        );
     }
 }

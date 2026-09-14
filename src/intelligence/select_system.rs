@@ -7,8 +7,6 @@
 //! 避免全量克隆 60000+ 节点造成的内存分配和 CPU 开销。
 
 use rustc_hash::FxHashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
 
 use crate::dht::kbucket::{KBucketEntry, NodeState};
 use crate::storage::repo_traits::NodeRepository;
@@ -146,25 +144,47 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeRepository for MockRepo {
-        async fn add_node(&self, _id: [u8; 20], _addr: SocketAddr) -> bool { false }
-        async fn remove_node(&self, _addr: &SocketAddr) -> bool { false }
-        async fn get_node(&self, _addr: &SocketAddr) -> Option<KBucketEntry> { None }
-        async fn all_nodes(&self) -> Vec<KBucketEntry> { self.nodes.read().clone() }
-        async fn node_count(&self) -> usize { self.nodes.read().len() }
-        async fn is_empty(&self) -> bool { self.nodes.read().is_empty() }
+        async fn add_node(&self, _id: [u8; 20], _addr: SocketAddr) -> bool {
+            false
+        }
+        async fn remove_node(&self, _addr: &SocketAddr) -> bool {
+            false
+        }
+        async fn get_node(&self, _addr: &SocketAddr) -> Option<KBucketEntry> {
+            None
+        }
+        async fn all_nodes(&self) -> Vec<KBucketEntry> {
+            self.nodes.read().clone()
+        }
+        async fn node_count(&self) -> usize {
+            self.nodes.read().len()
+        }
+        async fn is_empty(&self) -> bool {
+            self.nodes.read().is_empty()
+        }
         async fn top_nodes(&self, n: usize) -> Vec<KBucketEntry> {
             let mut all = self.nodes.read().clone();
-            all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            all.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             all.truncate(n);
             all
         }
         fn top_nodes_sync(&self, n: usize) -> Vec<KBucketEntry> {
             let mut all = self.nodes.read().clone();
-            all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            all.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             all.truncate(n);
             all
         }
-        fn len_sync(&self) -> usize { self.nodes.read().len() }
+        fn len_sync(&self) -> usize {
+            self.nodes.read().len()
+        }
         async fn stats(&self) -> crate::storage::node_repo::NodeStats {
             let nodes = self.nodes.read();
             crate::storage::node_repo::NodeStats {
@@ -173,29 +193,52 @@ mod tests {
                 questionable: 0,
                 bad: 0,
                 active: nodes.iter().filter(|n| n.query_count > 0).count(),
-                avg_score: if nodes.is_empty() { 0.0 } else { nodes.iter().map(|n| n.score).sum::<f64>() / nodes.len() as f64 },
+                avg_score: if nodes.is_empty() {
+                    0.0
+                } else {
+                    nodes.iter().map(|n| n.score).sum::<f64>() / nodes.len() as f64
+                },
             }
         }
-        async fn closest_nodes(&self, _target: &[u8; 20], _n: usize) -> Vec<KBucketEntry> { Vec::new() }
+        async fn closest_nodes(&self, _target: &[u8; 20], _n: usize) -> Vec<KBucketEntry> {
+            Vec::new()
+        }
         async fn update_score(&self, _addr: &SocketAddr, _score: f64) {}
         async fn update_scores_batch(&self, _scores: &[(SocketAddr, f64)]) {}
         async fn record_query(&self, _addr: &SocketAddr, _success: bool, _latency_ms: u64) {}
         async fn set_node_state(&self, _addr: &SocketAddr, _state: NodeState) {}
         async fn refresh_all_states(&self) {}
-        async fn bucket_count(&self) -> usize { 0 }
-        async fn non_empty_bucket_targets(&self) -> Vec<[u8; 20]> { Vec::new() }
+        async fn bucket_count(&self) -> usize {
+            0
+        }
+        async fn non_empty_bucket_targets(&self) -> Vec<[u8; 20]> {
+            Vec::new()
+        }
         async fn rescore_all(&self) {}
-        async fn save_all(&self) -> anyhow::Result<()> { Ok(()) }
-        async fn load_all(&self) -> anyhow::Result<usize> { Ok(0) }
+        async fn save_all(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
+        async fn save_dirty(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn load_all(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
         async fn mark_dirty(&self, _addr: &SocketAddr) {}
-        async fn dirty_nodes(&self) -> Vec<SocketAddr> { Vec::new() }
+        async fn dirty_nodes(&self) -> Vec<SocketAddr> {
+            Vec::new()
+        }
         async fn clear_dirty(&self, _addr: &SocketAddr) {}
         async fn clear_all_dirty(&self) {}
     }
 
     #[test]
     fn test_select_diverse_nodes_empty() {
-        let repo = MockRepo { nodes: parking_lot::RwLock::new(Vec::new()) };
+        let repo = MockRepo {
+            nodes: parking_lot::RwLock::new(Vec::new()),
+        };
         let result = SelectSystem::select_diverse_nodes(&repo, 10, 2);
         assert!(result.is_empty());
     }
@@ -204,11 +247,16 @@ mod tests {
     fn test_select_top_nodes() {
         let mut nodes = Vec::new();
         for i in 0..5 {
-            let mut entry = KBucketEntry::new([i as u8; 20], SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, i as u8)), 6881));
+            let mut entry = KBucketEntry::new(
+                [i as u8; 20],
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, i as u8)), 6881),
+            );
             entry.score = i as f64 * 10.0;
             nodes.push(entry);
         }
-        let repo = MockRepo { nodes: parking_lot::RwLock::new(nodes) };
+        let repo = MockRepo {
+            nodes: parking_lot::RwLock::new(nodes),
+        };
         let result = SelectSystem::select_top_nodes(&repo, 3);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].score, 40.0); // 最高分

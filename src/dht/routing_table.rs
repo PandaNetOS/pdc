@@ -133,9 +133,17 @@ impl RoutingTable {
 
     /// Bucket 分布统计：非空bucket数 / 最满bucket节点数 / 满bucket数
     pub fn buckets_summary(&self) -> String {
-        let non_empty = self.buckets.iter().filter(|b| !b.entries().is_empty()).count();
+        let non_empty = self
+            .buckets
+            .iter()
+            .filter(|b| !b.entries().is_empty())
+            .count();
         let max_fill = self.buckets.iter().map(|b| b.len()).max().unwrap_or(0);
-        let full = self.buckets.iter().filter(|b| b.len() >= super::kbucket::K).count();
+        let full = self
+            .buckets
+            .iter()
+            .filter(|b| b.len() >= super::kbucket::K)
+            .count();
         format!("非空{}/160 最满{}/K 满{}", non_empty, max_fill, full)
     }
 
@@ -196,7 +204,11 @@ impl RoutingTable {
     /// 按评分降序返回 top n 节点
     pub fn top_nodes_by_score(&self, n: usize) -> Vec<KBucketEntry> {
         let mut all = self.all_nodes();
-        all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all.truncate(n);
         all
     }
@@ -220,8 +232,8 @@ impl RoutingTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::kbucket::K;
+    use super::*;
 
     #[test]
     fn test_bucket_index() {
@@ -286,7 +298,9 @@ mod tests {
         let json = table.to_json().unwrap();
         let loaded = RoutingTable::from_json(node_id, &json).unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(loaded.find_by_addr(SocketAddr::from(([127, 0, 0, 1], 1234))).is_some());
+        assert!(loaded
+            .find_by_addr(SocketAddr::from(([127, 0, 0, 1], 1234)))
+            .is_some());
     }
 
     #[test]

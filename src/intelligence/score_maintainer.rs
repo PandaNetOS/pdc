@@ -22,18 +22,22 @@
 //! - 错峰调度：全量重算初始延迟 120s，避免与 HealthCheck/TierManager 同时爆发
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::data_plane::http_tracker::SuperTrackerState;
 use crate::intelligence::availability::AvailabilityCalculator;
 use crate::intelligence::dht_activity::DhtActivityTracker;
 use crate::intelligence::peer_history::PeerHistoryManager;
-use crate::intelligence::scorer_traits::{InfohashScoreInput, InfohashScorer, NodeScorer, PeerScorer, TrackerScorer};
+use crate::intelligence::scorer_traits::{
+    InfohashScoreInput, InfohashScorer, NodeScorer, PeerScorer, TrackerScorer,
+};
 use crate::services::metadata_service::MetadataService;
 use crate::services::scrape_service::ScrapeService;
-use crate::storage::repo_traits::{InfohashRepository, NodeRepository, PeerRepository, TrackerRepository};
+use crate::storage::repo_traits::{
+    InfohashRepository, NodeRepository, PeerRepository, TrackerRepository,
+};
 use crate::types::Infohash;
 
 /// 统一评分维护器
@@ -65,7 +69,7 @@ pub struct ScoreMaintainer {
     /// Peer 快照间隔（秒，用于计算增长率）
     pub snapshot_interval_secs: u64,
     /// 最后一次 peer 快照时间
-    last_snapshot: std::sync::Mutex<Option<Instant>>,
+    _last_snapshot: std::sync::Mutex<Option<Instant>>,
 }
 
 impl ScoreMaintainer {
@@ -93,7 +97,7 @@ impl ScoreMaintainer {
             incremental_interval_secs: 60,
             full_interval_secs: 600,
             snapshot_interval_secs: 120,
-            last_snapshot: std::sync::Mutex::new(None),
+            _last_snapshot: std::sync::Mutex::new(None),
         }
     }
 
@@ -212,7 +216,10 @@ impl ScoreMaintainer {
             return 0;
         }
 
-        debug!("[score_maintainer] 开始聚合 {} 个 infohash 的评分", infohashes.len());
+        debug!(
+            "[score_maintainer] 开始聚合 {} 个 infohash 的评分",
+            infohashes.len()
+        );
 
         let mut scores: Vec<(Infohash, f64)> = Vec::with_capacity(infohashes.len());
 
@@ -318,7 +325,10 @@ impl ScoreMaintainer {
             }
 
             peer_history.record_snapshots(&snapshots);
-            debug!("[score_maintainer] Peer 快照完成: {} 个 infohash", snapshots.len());
+            debug!(
+                "[score_maintainer] Peer 快照完成: {} 个 infohash",
+                snapshots.len()
+            );
         }
     }
 
@@ -327,19 +337,28 @@ impl ScoreMaintainer {
         if let Some(scrape_service) = &self.scrape_service {
             let removed = scrape_service.cleanup_expired_cache();
             if removed > 0 {
-                debug!("[score_maintainer] 清理 ScrapeService 过期缓存: {} 条", removed);
+                debug!(
+                    "[score_maintainer] 清理 ScrapeService 过期缓存: {} 条",
+                    removed
+                );
             }
         }
         if let Some(peer_history) = &self.peer_history {
             let removed = peer_history.cleanup_expired();
             if removed > 0 {
-                debug!("[score_maintainer] 清理 PeerHistory 过期数据: {} 条", removed);
+                debug!(
+                    "[score_maintainer] 清理 PeerHistory 过期数据: {} 条",
+                    removed
+                );
             }
         }
         if let Some(avail_calc) = &self.availability_calculator {
             let removed = avail_calc.cleanup_expired();
             if removed > 0 {
-                debug!("[score_maintainer] 清理 Availability 过期缓存: {} 条", removed);
+                debug!(
+                    "[score_maintainer] 清理 Availability 过期缓存: {} 条",
+                    removed
+                );
             }
         }
     }
@@ -352,12 +371,11 @@ impl ScoreMaintainer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
 
     #[test]
     fn test_score_maintainer_creation() {
         // 这里只测试基本创建，不测试完整流程（需要 mock）
         // 完整测试在集成测试中进行
-        assert!(true);
     }
 }

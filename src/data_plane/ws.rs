@@ -55,7 +55,11 @@ fn build_message(event_type: &str, data: serde_json::Value) -> String {
 /// 将 Event 转换为 JSON Value（手动构建，避免序列化问题）
 fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
     match event {
-        Event::PeerDiscovered { infohash, peers, source } => {
+        Event::PeerDiscovered {
+            infohash,
+            peers,
+            source,
+        } => {
             let ih_hex = hex::encode(infohash);
             let peers_json: Vec<serde_json::Value> = peers
                 .iter()
@@ -75,7 +79,11 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
                 }),
             ))
         }
-        Event::InfohashSeen { infohash, source, seen_at } => {
+        Event::InfohashSeen {
+            infohash,
+            source,
+            seen_at,
+        } => {
             let ih_hex = hex::encode(infohash);
             let ts = seen_at
                 .duration_since(std::time::UNIX_EPOCH)
@@ -90,7 +98,11 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
                 }),
             ))
         }
-        Event::NodeHealthUpdate { discoverer, healthy, message } => Some((
+        Event::NodeHealthUpdate {
+            discoverer,
+            healthy,
+            message,
+        } => Some((
             "node_health_update".to_string(),
             serde_json::json!({
                 "discoverer": discoverer,
@@ -98,7 +110,15 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
                 "message": message,
             }),
         )),
-        Event::AnnounceRequest { infohash, peer_addr, peer_id, event, uploaded, downloaded, left } => {
+        Event::AnnounceRequest {
+            infohash,
+            peer_addr,
+            peer_id,
+            event,
+            uploaded,
+            downloaded,
+            left,
+        } => {
             let ih_hex = hex::encode(infohash);
             Some((
                 "announce_request".to_string(),
@@ -113,7 +133,11 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
                 }),
             ))
         }
-        Event::PeerQualityScore { addr, score, reason } => Some((
+        Event::PeerQualityScore {
+            addr,
+            score,
+            reason,
+        } => Some((
             "peer_quality_score".to_string(),
             serde_json::json!({
                 "addr": addr.to_string(),
@@ -121,7 +145,12 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
                 "reason": reason,
             }),
         )),
-        Event::CrawlProgress { nodes_crawled, infohashes_collected, peers_collected, message } => Some((
+        Event::CrawlProgress {
+            nodes_crawled,
+            infohashes_collected,
+            peers_collected,
+            message,
+        } => Some((
             "crawl_progress".to_string(),
             serde_json::json!({
                 "nodes_crawled": nodes_crawled,
@@ -130,29 +159,28 @@ fn event_to_json(event: &Event) -> Option<(String, serde_json::Value)> {
                 "message": message,
             }),
         )),
-        Event::ConfigChanged => Some((
-            "config_changed".to_string(),
-            serde_json::json!({}),
-        )),
+        Event::ConfigChanged => Some(("config_changed".to_string(), serde_json::json!({}))),
     }
 }
 
 /// 收集状态快照
 async fn collect_status(state: &AppState) -> serde_json::Value {
-    let registry = state.control_plane.registry();
+    let _registry = state.control_plane.registry();
     let cache_stats = state.peer_repo.stats();
     // 计算活跃 peer 数（最近1小时内有活跃的 peer）
     let active_peers = {
         let all = state.peer_repo.all_peers_sync();
         let now = std::time::SystemTime::now();
-        all.iter().filter(|p| {
-            now.duration_since(p.last_active)
-                .map(|d| d.as_secs() < 3600)
-                .unwrap_or(false)
-        }).count()
+        all.iter()
+            .filter(|p| {
+                now.duration_since(p.last_active)
+                    .map(|d| d.as_secs() < 3600)
+                    .unwrap_or(false)
+            })
+            .count()
     };
     // 从 crawler_state 获取入站连通性评分
-    let inbound_score = state.crawler_state.as_ref().map(|cs| {
+    let _inbound_score = state.crawler_state.as_ref().map(|cs| {
         let s = cs.read();
         let uptime = s.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let inbound_per_min = if uptime > 0 {
@@ -160,25 +188,36 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
         } else {
             0.0
         };
-        if inbound_per_min >= 10.0 { 100.0 }
-        else if inbound_per_min >= 5.0 { 80.0 }
-        else if inbound_per_min >= 1.0 { 60.0 }
-        else if inbound_per_min >= 0.1 { 40.0 }
-        else if inbound_per_min > 0.0 { 20.0 }
-        else { 0.0 }
+        if inbound_per_min >= 10.0 {
+            100.0
+        } else if inbound_per_min >= 5.0 {
+            80.0
+        } else if inbound_per_min >= 1.0 {
+            60.0
+        } else if inbound_per_min >= 0.1 {
+            40.0
+        } else if inbound_per_min > 0.0 {
+            20.0
+        } else {
+            0.0
+        }
     });
 
     // 使用 HealthScorerImpl 统一计算健康度（唯一计算路径，评分统一收口）
     let health_scorer = crate::intelligence::health_scorer::HealthScorerImpl::new();
-    let health = if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) =
-        (state.node_repo.as_ref(), state.tracker_repo.as_ref(), state.infohash_repo.as_ref())
-    {
-        let report = health_scorer.calculate(
-            tracker_repo.as_ref() as &dyn crate::storage::repo_traits::TrackerRepository,
-            node_repo.as_ref() as &dyn crate::storage::repo_traits::NodeRepository,
-            state.peer_repo.as_ref() as &dyn crate::storage::repo_traits::PeerRepository,
-            infohash_repo.as_ref() as &dyn crate::storage::repo_traits::InfohashRepository,
-        ).await;
+    let health = if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) = (
+        state.node_repo.as_ref(),
+        state.tracker_repo.as_ref(),
+        state.infohash_repo.as_ref(),
+    ) {
+        let report = health_scorer
+            .calculate(
+                tracker_repo.as_ref() as &dyn crate::storage::repo_traits::TrackerRepository,
+                node_repo.as_ref() as &dyn crate::storage::repo_traits::NodeRepository,
+                state.peer_repo.as_ref() as &dyn crate::storage::repo_traits::PeerRepository,
+                infohash_repo.as_ref() as &dyn crate::storage::repo_traits::InfohashRepository,
+            )
+            .await;
         let status = crate::health_check::SystemHealth::from_score(report.overall);
         crate::health_check::SystemHealth {
             overall_score: report.overall,
@@ -203,43 +242,71 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
         }
     };
 
-    let crawler = state.crawler_state.as_ref().map(|cs| {
-        let s = cs.read();
-        serde_json::json!({
-            "enabled": true,
-            "running": s.running,
-            "known_nodes": s.known_nodes,
-            "messages_received": s.messages_received,
-            "requests_sent": s.requests_sent,
-            "errors": s.errors,
-            "infohashes_collected": s.infohashes_collected,
-            "peers_collected": s.peers_collected,
-            "nodes_crawled": s.nodes_crawled,
+    let crawler = state
+        .crawler_state
+        .as_ref()
+        .map(|cs| {
+            let s = cs.read();
+            serde_json::json!({
+                "enabled": true,
+                "running": s.running,
+                "known_nodes": s.known_nodes,
+                "messages_received": s.messages_received,
+                "requests_sent": s.requests_sent,
+                "errors": s.errors,
+                "infohashes_collected": s.infohashes_collected,
+                "peers_collected": s.peers_collected,
+                "nodes_crawled": s.nodes_crawled,
+            })
         })
-    }).unwrap_or_else(|| serde_json::json!({"enabled": false}));
+        .unwrap_or_else(|| serde_json::json!({"enabled": false}));
 
     // 从 TrackerRepo（数据层）获取 tracker 分数，而不是 registry（控制面）
     // 评分系统统一维护 TrackerRepo 的分数，其他地方均从数据 repo 调取
-    let tracker_scores: Vec<serde_json::Value> = state.tracker_repo.as_ref()
+    let tracker_scores: Vec<serde_json::Value> = state
+        .tracker_repo
+        .as_ref()
         .map(|repo| {
             repo.all_trackers_sync()
                 .into_iter()
-                .map(|t| serde_json::json!({
-                    "url": t.url,
-                    "score": t.score,
-                    "disabled": t.disabled,
-                }))
+                .map(|t| {
+                    serde_json::json!({
+                        "url": t.url,
+                        "score": t.score,
+                        "disabled": t.disabled,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
 
     // NAT 状态
     let nat_status = state.nat.status();
-    let tcp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "TCP").count();
-    let udp_mapped = nat_status.mappings.iter().filter(|m| m.protocol == "UDP").count();
-    let tcp_verified = nat_status.mappings.iter().filter(|m| m.protocol == "TCP" && m.verified).count();
-    let udp_verified = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.verified).count();
-    let udp_reachable = nat_status.mappings.iter().filter(|m| m.protocol == "UDP" && m.reachable).count();
+    let tcp_mapped = nat_status
+        .mappings
+        .iter()
+        .filter(|m| m.protocol == "TCP")
+        .count();
+    let udp_mapped = nat_status
+        .mappings
+        .iter()
+        .filter(|m| m.protocol == "UDP")
+        .count();
+    let tcp_verified = nat_status
+        .mappings
+        .iter()
+        .filter(|m| m.protocol == "TCP" && m.verified)
+        .count();
+    let udp_verified = nat_status
+        .mappings
+        .iter()
+        .filter(|m| m.protocol == "UDP" && m.verified)
+        .count();
+    let udp_reachable = nat_status
+        .mappings
+        .iter()
+        .filter(|m| m.protocol == "UDP" && m.reachable)
+        .count();
 
     serde_json::json!({
         "health": {
@@ -326,7 +393,7 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             let stats = s.stats();
             serde_json::json!({
                 "enabled": true,
-                "port": 6883,
+                "port": 6883, // [ALLOWED-HARDCODED]
                 "syn_received": stats.syn_received,
                 "connections_established": stats.connections_established,
                 "handshakes_received": stats.handshakes_received,
@@ -359,7 +426,7 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             let stats = s.stats();
             serde_json::json!({
                 "enabled": true,
-                "port": 6884,
+                "port": 6884, // [ALLOWED-HARDCODED]
                 "connections_accepted": stats.connections_accepted,
                 "handshakes_completed": stats.handshakes_completed,
                 "pex_messages": stats.pex_messages,
@@ -409,7 +476,10 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
     subscriptions.insert("all".to_string());
 
     let mut rx = event_bus.subscribe();
-    info!("[ws] 新客户端连接，订阅者总数: {}", event_bus.subscriber_count());
+    info!(
+        "[ws] 新客户端连接，订阅者总数: {}",
+        event_bus.subscriber_count()
+    );
 
     // 发送欢迎消息
     let welcome = build_message(
@@ -428,10 +498,12 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
     let status_json = build_message("status", collect_status(&state).await);
     let _ = sender.send(Message::Text(status_json)).await;
 
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    // [ALLOWED-INTERVAL] 连接级心跳，随 WebSocket 连接生命周期
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30)); // [ALLOWED-HARDCODED]
     heartbeat.tick().await;
+    // [ALLOWED-INTERVAL] 连接级状态推送，随 WebSocket 连接生命周期
     // 状态推送间隔 5 秒（避免每秒克隆 60000+ 节点造成大量内存分配和磁盘 IO）
-    let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
+    let mut status_ticker = tokio::time::interval(Duration::from_secs(5)); // [ALLOWED-HARDCODED]
     status_ticker.tick().await;
 
     loop {

@@ -4,11 +4,11 @@
 
 use async_trait::async_trait;
 
+use crate::dht::kbucket::KBucketEntry;
 use crate::storage::repo_traits::{
     InfohashRepository, NodeRepository, PeerRepository, TrackerRepository,
 };
 use crate::types::PeerInfo;
-use crate::dht::kbucket::KBucketEntry;
 
 // ---------------------------------------------------------------------------
 // NodeScorer — DHT 节点评分（4维度加权）
@@ -104,16 +104,36 @@ impl InfohashScoreInput {
         let mut valid = 0u32;
         let total = 10u32;
 
-        if self.unique_peers > 0 { valid += 1; }
-        if self.dht_query_rate > 0 { valid += 1; }
-        if self.announce_rate_5m.is_some() { valid += 1; }
-        if self.source_count > 0 { valid += 1; }
-        if self.peer_growth_rate != 0.0 { valid += 1; }
-        if self.seeders.is_some() { valid += 1; }
-        if self.leechers.is_some() { valid += 1; }
-        if self.external_seeders.is_some() { valid += 1; }
-        if self.longevity_secs > 0 { valid += 1; }
-        if self.has_metadata { valid += 1; }
+        if self.unique_peers > 0 {
+            valid += 1;
+        }
+        if self.dht_query_rate > 0 {
+            valid += 1;
+        }
+        if self.announce_rate_5m.is_some() {
+            valid += 1;
+        }
+        if self.source_count > 0 {
+            valid += 1;
+        }
+        if self.peer_growth_rate != 0.0 {
+            valid += 1;
+        }
+        if self.seeders.is_some() {
+            valid += 1;
+        }
+        if self.leechers.is_some() {
+            valid += 1;
+        }
+        if self.external_seeders.is_some() {
+            valid += 1;
+        }
+        if self.longevity_secs > 0 {
+            valid += 1;
+        }
+        if self.has_metadata {
+            valid += 1;
+        }
 
         valid as f64 / total as f64
     }
@@ -121,16 +141,24 @@ impl InfohashScoreInput {
     /// 获取融合后的做种者数（超级Tracker + 外部Scrape取最大）
     pub fn fused_seeders(&self) -> u32 {
         let mut max = 0u32;
-        if let Some(s) = self.seeders { max = max.max(s); }
-        if let Some(s) = self.external_seeders { max = max.max(s); }
+        if let Some(s) = self.seeders {
+            max = max.max(s);
+        }
+        if let Some(s) = self.external_seeders {
+            max = max.max(s);
+        }
         max
     }
 
     /// 获取融合后的下载者数
     pub fn fused_leechers(&self) -> u32 {
         let mut max = 0u32;
-        if let Some(l) = self.leechers { max = max.max(l); }
-        if let Some(l) = self.external_leechers { max = max.max(l); }
+        if let Some(l) = self.leechers {
+            max = max.max(l);
+        }
+        if let Some(l) = self.external_leechers {
+            max = max.max(l);
+        }
         max
     }
 

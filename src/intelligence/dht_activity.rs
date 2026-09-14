@@ -58,8 +58,8 @@ impl InfohashActivity {
             event_type,
         });
         // 清理超过1小时的旧事件
-        let cutoff = now - Duration::from_secs(3600);
-        while events.front().map_or(false, |e| e.timestamp < cutoff) {
+        let cutoff = now - Duration::from_secs(3600); // [ALLOWED-HARDCODED]
+        while events.front().is_some_and(|e| e.timestamp < cutoff) {
             events.pop_front();
         }
         *self.last_active.write() = now;
@@ -68,12 +68,12 @@ impl InfohashActivity {
     /// 获取最近1小时内的事件数
     fn count_recent(&self, event_type: Option<ActivityEventType>) -> u32 {
         let now = Instant::now();
-        let cutoff = now - Duration::from_secs(3600);
+        let cutoff = now - Duration::from_secs(3600); // [ALLOWED-HARDCODED]
         let events = self.events.read();
         events
             .iter()
             .filter(|e| e.timestamp >= cutoff)
-            .filter(|e| event_type.map_or(true, |t| e.event_type == t))
+            .filter(|e| event_type.is_none_or(|t| e.event_type == t))
             .count() as u32
     }
 
@@ -184,7 +184,7 @@ impl DhtActivityTracker {
 
     /// 清理长时间无活动的 infohash（超过24小时无活动则移除）
     pub fn cleanup_expired(&self) -> usize {
-        let cutoff = Instant::now() - Duration::from_secs(86400); // 24小时
+        let cutoff = Instant::now() - Duration::from_secs(86400); // 24小时 // [ALLOWED-HARDCODED]
         let mut removed = 0;
         self.activities.retain(|_, v| {
             if *v.last_active.read() < cutoff {
@@ -205,7 +205,7 @@ impl DhtActivityTracker {
             .map(|entry| (*entry.key(), entry.count_recent(None)))
             .filter(|(_, count)| *count > 0)
             .collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
         entries.truncate(n);
         entries
     }
@@ -266,7 +266,7 @@ mod tests {
         let tracker = DhtActivityTracker::new();
         let ih1 = [1u8; 20];
         let ih2 = [2u8; 20];
-        let ih3 = [3u8; 20];
+        let _ih3 = [3u8; 20];
 
         for _ in 0..10 {
             tracker.record_get_peers(ih1);

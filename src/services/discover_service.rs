@@ -31,7 +31,7 @@ impl DiscoverService {
     pub async fn discover(&self, infohash: Infohash) -> anyhow::Result<DiscoveryResult> {
         let raw = self
             .registry
-            .discover_all(&infohash, 50, 8, Duration::from_secs(10))
+            .discover_all(&infohash, 50, 8, Duration::from_secs(10)) // [ALLOWED-HARDCODED]
             .await;
 
         let mut all_peers: Vec<PeerInfo> = Vec::new();
@@ -50,7 +50,7 @@ impl DiscoverService {
         }
 
         // 去重
-        all_peers.sort_by(|a, b| a.addr.cmp(&b.addr));
+        all_peers.sort_by_key(|a| a.addr);
         all_peers.dedup_by(|a, b| a.addr == b.addr);
 
         let result = DiscoveryResult {

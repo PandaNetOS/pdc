@@ -139,8 +139,8 @@ impl PortAllocator {
     /// 任一失败则释放本组已绑定的 socket，offset += 1 继续。
     pub fn allocate(&self) -> Result<PortAllocation> {
         for offset in 0..self.max_attempts {
-            let offset_u16 = u16::try_from(offset)
-                .map_err(|_| anyhow!("offset {} 超出 u16 范围", offset))?;
+            let offset_u16 =
+                u16::try_from(offset).map_err(|_| anyhow!("offset {} 超出 u16 范围", offset))?;
 
             let Some(ports) = self.ports_at(offset_u16) else {
                 // 端口溢出 u16，本组合法性已不存在，继续下一组无意义，直接报错
@@ -201,30 +201,30 @@ impl PortAllocator {
 
     /// 尝试绑定一整组端口。任一失败则返回 Err，且本组已绑定的 socket 自动 drop 释放。
     fn try_bind_group(&self, ports: &PortGroup) -> Result<PortAllocation> {
-        let api_listener = self.bind_tcp(ports.api_port).with_context(|| {
-            format!("API/HTTP 监控端口 {} (TCP) 绑定失败", ports.api_port)
-        })?;
-        let relay_listener = self.bind_tcp(ports.relay_port).with_context(|| {
-            format!("中继端口 {} (TCP) 绑定失败", ports.relay_port)
-        })?;
-        let dht_socket = self.bind_udp(ports.dht_listen_port).with_context(|| {
-            format!("DHT 发现端口 {} (UDP) 绑定失败", ports.dht_listen_port)
-        })?;
-        let crawler_socket = self.bind_udp(ports.crawler_port).with_context(|| {
-            format!("DHT 爬虫端口 {} (UDP) 绑定失败", ports.crawler_port)
-        })?;
+        let api_listener = self
+            .bind_tcp(ports.api_port)
+            .with_context(|| format!("API/HTTP 监控端口 {} (TCP) 绑定失败", ports.api_port))?;
+        let relay_listener = self
+            .bind_tcp(ports.relay_port)
+            .with_context(|| format!("中继端口 {} (TCP) 绑定失败", ports.relay_port))?;
+        let dht_socket = self
+            .bind_udp(ports.dht_listen_port)
+            .with_context(|| format!("DHT 发现端口 {} (UDP) 绑定失败", ports.dht_listen_port))?;
+        let crawler_socket = self
+            .bind_udp(ports.crawler_port)
+            .with_context(|| format!("DHT 爬虫端口 {} (UDP) 绑定失败", ports.crawler_port))?;
         let utp_socket = self
             .bind_udp(ports.utp_port)
             .with_context(|| format!("uTP 端口 {} (UDP) 绑定失败", ports.utp_port))?;
-        let tcp_pex_listener = self.bind_tcp(ports.tcp_pex_port).with_context(|| {
-            format!("TCP-PEX 端口 {} (TCP) 绑定失败", ports.tcp_pex_port)
-        })?;
-        let federation_tcp = self.bind_tcp(ports.federation_port).with_context(|| {
-            format!("联邦端口 {} (TCP) 绑定失败", ports.federation_port)
-        })?;
-        let federation_udp = self.bind_udp(ports.federation_port).with_context(|| {
-            format!("联邦端口 {} (UDP) 绑定失败", ports.federation_port)
-        })?;
+        let tcp_pex_listener = self
+            .bind_tcp(ports.tcp_pex_port)
+            .with_context(|| format!("TCP-PEX 端口 {} (TCP) 绑定失败", ports.tcp_pex_port))?;
+        let federation_tcp = self
+            .bind_tcp(ports.federation_port)
+            .with_context(|| format!("联邦端口 {} (TCP) 绑定失败", ports.federation_port))?;
+        let federation_udp = self
+            .bind_udp(ports.federation_port)
+            .with_context(|| format!("联邦端口 {} (UDP) 绑定失败", ports.federation_port))?;
 
         // 注意：relay(TCP) 与 dht(UDP) 可能共用同一端口号，TCP/UDP 协议栈独立，可共存。
         Ok(PortAllocation {
@@ -250,8 +250,8 @@ impl PortAllocator {
 
     fn bind_udp(&self, port: u16) -> Result<UdpSocket> {
         let addr = format!("{}:{}", self.bind_addr, port);
-        let s = UdpSocket::bind(&addr)
-            .with_context(|| format!("UdpSocket::bind({}) 失败", addr))?;
+        let s =
+            UdpSocket::bind(&addr).with_context(|| format!("UdpSocket::bind({}) 失败", addr))?;
         Ok(s)
     }
 }
@@ -328,12 +328,18 @@ mod tests {
         let allocator = PortAllocator::from_config(&config);
         // 默认配置下基础端口应与配置字段一致
         assert_eq!(allocator.base_ports.api_port, config.server.port);
-        assert_eq!(allocator.base_ports.relay_port, config.super_tracker.relay_port);
+        assert_eq!(
+            allocator.base_ports.relay_port,
+            config.super_tracker.relay_port
+        );
         assert_eq!(
             allocator.base_ports.dht_listen_port,
             config.discoverers.dht_listen_port
         );
-        assert_eq!(allocator.base_ports.crawler_port, config.crawler.listen_port);
+        assert_eq!(
+            allocator.base_ports.crawler_port,
+            config.crawler.listen_port
+        );
         assert_eq!(allocator.base_ports.utp_port, config.crawler.utp_port);
         assert_eq!(
             allocator.base_ports.tcp_pex_port,
@@ -411,10 +417,7 @@ mod tests {
         );
         assert_eq!(config.crawler.listen_port, allocation.ports.crawler_port);
         assert_eq!(config.crawler.utp_port, allocation.ports.utp_port);
-        assert_eq!(
-            config.crawler.tcp_pex_port,
-            allocation.ports.tcp_pex_port
-        );
+        assert_eq!(config.crawler.tcp_pex_port, allocation.ports.tcp_pex_port);
         assert_eq!(
             config.federation.listen_port,
             allocation.ports.federation_port

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -79,8 +79,12 @@ impl PeerRepoImpl {
         if built.is_empty() {
             return;
         }
-        let Some(merkle) = self.merkle.get() else { return; };
-        let Some(gossip) = self.gossip.get() else { return; };
+        let Some(merkle) = self.merkle.get() else {
+            return;
+        };
+        let Some(gossip) = self.gossip.get() else {
+            return;
+        };
         let refs: Vec<(&[u8], &[u8])> = built
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
@@ -129,13 +133,22 @@ impl PeerRepoImpl {
                         peer.connection_attempts = row.connection_attempts;
                         peer.connection_successes = row.connection_successes;
                         if row.last_active > 0 {
-                            peer.last_active = std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.last_active as u64);
+                            peer.last_active = std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(row.last_active as u64);
                         } else {
                             peer.last_active = SystemTime::now();
                         }
                         cache.global.insert(addr, peer);
-                        cache.by_infohash.entry(row.infohash).or_default().insert(addr);
-                        cache.infohash_refs.entry(addr).or_default().insert(row.infohash);
+                        cache
+                            .by_infohash
+                            .entry(row.infohash)
+                            .or_default()
+                            .insert(addr);
+                        cache
+                            .infohash_refs
+                            .entry(addr)
+                            .or_default()
+                            .insert(row.infohash);
                         count += 1;
                     }
                     info!("[federation] PeerRepo 重新加载完成: {} 个 peer", count);
@@ -151,7 +164,10 @@ impl PeerRepoImpl {
     /// 内部写入：批量新增 peer + 关联，不触发 Merkle/Gossip。
     /// 返回真正新增的 peer (addr, first_seen_secs, source)（按 addr 去重）。
     /// 联邦同步入站（apply_peer_sync）请改用 add_peers_only_internal，避免回环。
-    pub(crate) fn add_peers_sync_internal(&self, items: &[(Infohash, PeerInfo)]) -> Vec<(Infohash, SocketAddr, u64, String)> {
+    pub(crate) fn add_peers_sync_internal(
+        &self,
+        items: &[(Infohash, PeerInfo)],
+    ) -> Vec<(Infohash, SocketAddr, u64, String)> {
         if items.is_empty() {
             return Vec::new();
         }
@@ -160,26 +176,35 @@ impl PeerRepoImpl {
         let mut seen_keys: FxHashSet<(Infohash, SocketAddr)> = FxHashSet::default();
         for (infohash, peer) in items {
             let addr = peer.addr;
-            let is_new_peer = !cache.global.contains_key(&addr);
+            let _is_new_peer = !cache.global.contains_key(&addr);
             if let Some(existing) = cache.global.get_mut(&addr) {
                 existing.last_active = peer.last_active;
                 existing.source = peer.source;
                 if peer.peer_id.is_some() {
-                    existing.peer_id = peer.peer_id.clone();
+                    existing.peer_id = peer.peer_id;
                 }
             } else {
                 cache.global.insert(addr, peer.clone());
             }
             // 维护 (infohash, addr) 关联
-            let is_new_assoc = cache
-                .by_infohash
-                .entry(*infohash)
+            let is_new_assoc = cache.by_infohash.entry(*infohash).or_default().insert(addr);
+            cache
+                .infohash_refs
+                .entry(addr)
                 .or_default()
-                .insert(addr);
-            cache.infohash_refs.entry(addr).or_default().insert(*infohash);
+                .insert(*infohash);
             if is_new_assoc && seen_keys.insert((*infohash, addr)) {
-                let first_seen_secs = peer.first_seen.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                new_entries.push((*infohash, addr, first_seen_secs, peer.source.as_str().to_string()));
+                let first_seen_secs = peer
+                    .first_seen
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                new_entries.push((
+                    *infohash,
+                    addr,
+                    first_seen_secs,
+                    peer.source.as_str().to_string(),
+                ));
             }
         }
         drop(cache);
@@ -211,6 +236,7 @@ impl PeerRepoImpl {
 
     /// 内部写入：仅批量新增 peer（不维护 infohash 关联），不触发 Merkle/Gossip。
     /// 联邦同步入站（apply_peer_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    #[allow(dead_code)]
     pub(crate) fn add_peers_only_internal(&self, peers: &[PeerInfo]) {
         if peers.is_empty() {
             return;
@@ -222,7 +248,7 @@ impl PeerRepoImpl {
                 existing.last_active = peer.last_active;
                 existing.source = peer.source;
                 if peer.peer_id.is_some() {
-                    existing.peer_id = peer.peer_id.clone();
+                    existing.peer_id = peer.peer_id;
                 }
             } else {
                 cache.global.insert(addr, peer.clone());
@@ -285,9 +311,18 @@ impl PeerRepoImpl {
         let mut result: Vec<PeerInfo> = cache
             .by_infohash
             .get(infohash)
-            .map(|addrs| addrs.iter().filter_map(|a| cache.global.get(a).cloned()).collect())
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .filter_map(|a| cache.global.get(a).cloned())
+                    .collect()
+            })
             .unwrap_or_default();
-        result.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
+        result.sort_by(|a, b| {
+            b.priority_score
+                .partial_cmp(&a.priority_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         result.truncate(limit);
         result
     }
@@ -342,7 +377,12 @@ impl PeerRepoImpl {
     }
 
     pub fn len_for_infohash(&self, infohash: &Infohash) -> usize {
-        self.cache.read().by_infohash.get(infohash).map(|s| s.len()).unwrap_or(0)
+        self.cache
+            .read()
+            .by_infohash
+            .get(infohash)
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     pub fn peer_count_for_infohash(&self, infohash: &Infohash) -> usize {
@@ -414,16 +454,48 @@ impl PeerRepoImpl {
         Ok(())
     }
 
+    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
+    #[allow(dead_code)]
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        // 鐢ㄥ唴閮ㄤ綔鐢ㄥ煙纭繚 cache 閿佸湪 spawn_blocking 涔嬪墠閲婃斁
+        let batch = {
+            let cache = self.cache.read();
+            let mut batch = Vec::with_capacity(cache.global.len());
+            for (infohash, addrs) in &cache.by_infohash {
+                for addr in addrs {
+                    if let Some(peer) = cache.global.get(addr) {
+                        let last_active = peer
+                            .last_active
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        batch.push(crate::storage::db::PeerRow {
+                            infohash: *infohash,
+                            ip: addr.ip().to_string(),
+                            port: addr.port(),
+                            source: peer.source.as_str().to_string(),
+                            score: peer.priority_score,
+                            connection_attempts: peer.connection_attempts,
+                            connection_successes: peer.connection_successes,
+                            last_active,
+                        });
+                    }
+                }
+            }
+            batch
+        };
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.save_peers_batch(&batch)).await??;
+        Ok(())
+    }
+
     /// 浠?SQLite 鍔犺浇鍏ㄩ儴 peer锛堣繍琛屾椂娲昏穬 peer锛?
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_peers()?;
         let mut cache = self.cache.write();
         let mut count = 0;
         for row in &rows {
-            let addr = SocketAddr::new(
-                row.ip.parse().unwrap_or([127, 0, 0, 1].into()),
-                row.port,
-            );
+            let addr = SocketAddr::new(row.ip.parse().unwrap_or([127, 0, 0, 1].into()), row.port);
             let source = match row.source.as_str() {
                 "tracker" => PeerSource::Tracker,
                 "dht" => PeerSource::Dht,
@@ -438,13 +510,22 @@ impl PeerRepoImpl {
             peer.connection_attempts = row.connection_attempts;
             peer.connection_successes = row.connection_successes;
             if row.last_active > 0 {
-                peer.last_active = std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.last_active as u64);
+                peer.last_active =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.last_active as u64);
             } else {
                 peer.last_active = SystemTime::now();
             }
             cache.global.insert(addr, peer);
-            cache.by_infohash.entry(row.infohash).or_default().insert(addr);
-            cache.infohash_refs.entry(addr).or_default().insert(row.infohash);
+            cache
+                .by_infohash
+                .entry(row.infohash)
+                .or_default()
+                .insert(addr);
+            cache
+                .infohash_refs
+                .entry(addr)
+                .or_default()
+                .insert(row.infohash);
             count += 1;
         }
         Ok(count)
@@ -467,7 +548,9 @@ impl PeerRepository for PeerRepoImpl {
 
     async fn remove_peer(&self, infohash: &Infohash, addr: &SocketAddr) {
         let mut cache = self.cache.write();
-        if let Some(set) = cache.by_infohash.get_mut(infohash) { set.remove(addr); }
+        if let Some(set) = cache.by_infohash.get_mut(infohash) {
+            set.remove(addr);
+        }
         if let Some(refs) = cache.infohash_refs.get_mut(addr) {
             refs.remove(infohash);
             if refs.is_empty() {
@@ -515,7 +598,12 @@ impl PeerRepository for PeerRepoImpl {
     }
 
     async fn get_peer_infohash_count(&self, addr: &SocketAddr) -> u32 {
-        self.cache.read().infohash_refs.get(addr).map(|s| s.len() as u32).unwrap_or(0)
+        self.cache
+            .read()
+            .infohash_refs
+            .get(addr)
+            .map(|s| s.len() as u32)
+            .unwrap_or(0)
     }
 
     async fn cleanup_expired(&self, _ttl_secs: u64) {
@@ -524,6 +612,12 @@ impl PeerRepository for PeerRepoImpl {
 
     async fn save_all(&self) -> anyhow::Result<()> {
         PeerRepoImpl::save_all(self).await
+    }
+
+    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
+    #[allow(dead_code)]
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        PeerRepoImpl::save_dirty(self).await
     }
 
     async fn load_all(&self) -> anyhow::Result<usize> {
@@ -554,22 +648,25 @@ impl PeerRepository for PeerRepoImpl {
 
     async fn query_history(&self, infohash: &Infohash, limit: usize) -> Vec<PeerInfo> {
         match self.storage.query_peer_history(infohash, limit) {
-            Ok(rows) => rows.into_iter().map(|row| {
-                let addr = SocketAddr::new(
-                    row.ip.parse().unwrap_or([127, 0, 0, 1].into()), row.port);
-                let source = match row.source.as_str() {
-                    "tracker" => PeerSource::Tracker,
-                    "dht" => PeerSource::Dht,
-                    "pex" => PeerSource::Pex,
-                    "super_tracker" => PeerSource::SuperTracker,
-                    "lpd" => PeerSource::Lpd,
-                    "webseed" => PeerSource::WebSeed,
-                    _ => PeerSource::Manual,
-                };
-                let mut peer = PeerInfo::new(addr, source);
-                peer.priority_score = row.score;
-                peer
-            }).collect(),
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    let addr =
+                        SocketAddr::new(row.ip.parse().unwrap_or([127, 0, 0, 1].into()), row.port);
+                    let source = match row.source.as_str() {
+                        "tracker" => PeerSource::Tracker,
+                        "dht" => PeerSource::Dht,
+                        "pex" => PeerSource::Pex,
+                        "super_tracker" => PeerSource::SuperTracker,
+                        "lpd" => PeerSource::Lpd,
+                        "webseed" => PeerSource::WebSeed,
+                        _ => PeerSource::Manual,
+                    };
+                    let mut peer = PeerInfo::new(addr, source);
+                    peer.priority_score = row.score;
+                    peer
+                })
+                .collect(),
             Err(_) => Vec::new(),
         }
     }

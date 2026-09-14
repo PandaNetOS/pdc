@@ -4,11 +4,9 @@
 //! 将 key 空间按 shard_count 分片，每片维护独立的根哈希。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 
 use crate::federation::protocol::MerkleDigestMessage;
 
@@ -47,7 +45,7 @@ impl MerkleTree {
     fn shard_for_key(&self, key: &[u8]) -> u16 {
         let hash = blake3::hash(key);
         let bytes = hash.as_bytes();
-        (u16::from_le_bytes([bytes[0], bytes[1]]) % self.shard_count as u16)
+        u16::from_le_bytes([bytes[0], bytes[1]]) % self.shard_count
     }
 
     /// 重算指定分片的根哈希
@@ -78,9 +76,7 @@ impl MerkleTree {
     /// 更新/插入条目
     pub fn update(&self, key: &[u8], data: &[u8]) {
         let shard = self.shard_for_key(key);
-        self.entries
-            .write()
-            .insert(key.to_vec(), data.to_vec());
+        self.entries.write().insert(key.to_vec(), data.to_vec());
         // 收/发全量同步期间跳过单条重算，结束后由 rebuild_all 一次性重算
         if !self.full_sync_active() {
             self.recompute_shard(shard);

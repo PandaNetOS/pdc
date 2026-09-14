@@ -72,7 +72,8 @@ impl MerkleUpdateQueue {
             if self.is_empty() {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            // [ALLOWED-SLEEP] wait_empty 带超时的同步轮询等待，非周期性
+            std::thread::sleep(Duration::from_millis(10)); // [ALLOWED-HARDCODED]
         }
         self.is_empty()
     }

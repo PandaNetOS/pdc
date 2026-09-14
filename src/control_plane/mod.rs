@@ -206,7 +206,7 @@ mod tests {
         let bus = EventBus::default();
         let mut cp = ControlPlane::new(config, registry, bus);
         cp.init_default_discoverers();
-        // 默认启用 tracker + dht + pex = 3 个
-        assert_eq!(cp.registry().len(), 3);
+        // 默认启用 tracker + dht + pex + lpd + webseed = 5 个
+        assert_eq!(cp.registry().len(), 5);
     }
 }

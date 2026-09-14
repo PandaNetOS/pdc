@@ -7,17 +7,17 @@
 
 pub mod config;
 pub mod connection;
-pub mod discovery;
 pub mod dht_discovery;
+pub mod discovery;
 pub mod gossip;
 pub mod merkle;
 pub mod metrics;
 pub mod nat_integration;
-pub mod relay;
 pub mod node_id;
 pub mod node_table;
 pub mod peer_cache;
 pub mod protocol;
+pub mod relay;
 pub mod sharded_lru;
 pub mod signaling;
 pub mod sync;
@@ -31,19 +31,17 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
 use crate::federation::connection::ConnectionManager;
-use pnos_net::transport::{IrohTransportConfig, TransportMode};
-use pnos_net::{NetAgent, NetAgentConfig};
-use crate::federation::discovery::DiscoveryService;
 use crate::federation::dht_discovery::DhtDiscoveryService;
+use crate::federation::discovery::DiscoveryService;
 use crate::federation::gossip::GossipEngine;
 use crate::federation::metrics::{FederationMetrics, FederationMetricsSnapshot};
 use crate::federation::nat_integration::NatIntegration;
-use crate::federation::node_id::{NodeIdentity, NodeId};
+use crate::federation::node_id::{NodeId, NodeIdentity};
 use crate::federation::node_table::NodeTable;
 use crate::federation::relay::RelayManager;
 use crate::federation::signaling::SignalingService;
@@ -172,6 +170,7 @@ pub struct FederationService {
 
 impl FederationService {
     /// 创建联邦服务（初始化所有子模块，但不启动后台任务）
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: FederationConfig,
         nat_manager: Arc<NatManager>,
@@ -187,7 +186,7 @@ impl FederationService {
         let identity = Arc::new(NodeIdentity::load_or_create(data_dir)?);
 
         if let Some(ref id_str) = config.node_id {
-            if let Ok(custom_id) = NodeId::from_hex(id_str) {
+            if let Ok(_custom_id) = NodeId::from_hex(id_str) {
                 info!(
                     "[federation] 配置指定 node_id: {}（实际使用: {}）",
                     id_str,
@@ -270,10 +269,7 @@ impl FederationService {
         ));
 
         // 10. 创建 UDP 传输层（与 TCP 同端口）
-        let udp_addr: SocketAddr = SocketAddr::new(
-            "0.0.0.0".parse().unwrap(),
-            config.listen_port,
-        );
+        let udp_addr: SocketAddr = SocketAddr::new("0.0.0.0".parse().unwrap(), config.listen_port);
         let udp_transport = UdpTransport::try_bind(udp_addr)?;
 
         // 11. 创建打洞信令服务
@@ -358,11 +354,11 @@ impl FederationService {
         let iroh_config = if mode != TransportMode::TcpOnly {
             Some(IrohTransportConfig {
                 node_id: self.identity.node_id.0,
-                listen_port: self.config.listen_port,  // 与 TCP 复用端口（QUIC 基于 UDP）
+                listen_port: self.config.listen_port, // 与 TCP 复用端口（QUIC 基于 UDP）
                 data_dir: self.data_dir.join("iroh"),
                 derp_enabled: true,
                 derp_urls: Vec::new(),
-                connect_timeout: std::time::Duration::from_secs(10),
+                connect_timeout: std::time::Duration::from_secs(10), // [ALLOWED-HARDCODED]
                 alpn: b"pdc-federation/1.0".to_vec(),
             })
         } else {
@@ -375,9 +371,9 @@ impl FederationService {
             api_port: self.config.api_port,
             data_dir: self.data_dir.clone(),
             lpd_multicast_port: 6771,
-            lpd_enabled: false,       // PDC 已有独立 LPD
+            lpd_enabled: false,        // PDC 已有独立 LPD
             peer_cache_enabled: false, // PDC 已有独立 peer_cache
-            nat_enabled: false,       // PDC 已有独立 NAT
+            nat_enabled: false,        // PDC 已有独立 NAT
             hole_punch_enabled: false, // PDC 已有独立打洞
             connect_config: Default::default(),
             transport_mode: mode,
@@ -399,21 +395,15 @@ impl FederationService {
         self.init_net_agent().await?;
 
         // 1. 启动 TCP 监听
-        self.connection_manager
-            .clone()
-            .start_listen()
-            .await?;
+        self.connection_manager.clone().start_listen().await?;
 
         // 2. 心跳任务已迁移到 TaskScheduler（fed_heartbeat）
 
-        // 3. 启动 PEX 交换任务
-        self.discovery.clone().spawn_pex_exchange();
+        // 3. PEX 交换任务已迁移到 TaskScheduler（fed_pex_exchange）
 
-        // 3.1 启动连接维护任务（定期重置卡住的连接状态并重连）
-        self.discovery.clone().spawn_connection_maintainer();
+        // 3.1 连接维护任务已迁移到 TaskScheduler（fed_connection_maintain）
 
-        // 4. 启动 NAT 地址刷新任务（含 STUN 探测）
-        self.nat_integration.clone().spawn_address_refresh();
+        // 4. NAT 地址刷新任务已迁移到 TaskScheduler（fed_nat_refresh）
 
         // 4.1 启动时先执行一次 STUN 探测，确保 setup_mapping 能拿到 STUN 结果
         //     否则首次 setup_mapping 时 last_stun 为 None，reachability 会误判为 Unknown
@@ -422,7 +412,7 @@ impl FederationService {
         let stun_handle = tokio::task::spawn_blocking(move || {
             nat_clone.stun_probe();
         });
-        let _ = tokio::time::timeout(Duration::from_secs(3), stun_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), stun_handle).await; // [ALLOWED-HARDCODED]
 
         // 5. 设置 NAT 映射
         self.nat_integration.setup_mapping();
@@ -431,42 +421,21 @@ impl FederationService {
         let public_addr = self.nat_integration.get_public_address();
         self.discovery.set_public_addr(public_addr);
 
-        // 5.2 定期同步公网地址（NAT 映射可能变化）
-        let nat_clone = self.nat_integration.clone();
-        let discovery_clone = self.discovery.clone();
-        let mut shutdown_rx = self.shutdown.subscribe();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(300));
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let addr = nat_clone.get_public_address();
-                        discovery_clone.set_public_addr(addr);
-                    }
-                    _ = shutdown_rx.recv() => break,
-                }
-            }
-        });
+        // 5.2 公网地址同步已迁移到 TaskScheduler（fed_public_addr_sync）
 
         // 6. Node 同步任务已迁移到 TaskScheduler（fed_node_sync）
 
-        // 6.1 启动 Merkle 异步批量 flush 任务（apply 入队后后台批量更新 Merkle 树）
-        self.sync_manager.clone().spawn_merkle_flusher();
+        // 6.1 Merkle 异步批量 flush 已迁移到 TaskScheduler（fed_merkle_flush）
 
         // 6.2 启动时从 repo 全量重建 Merkle 树（修复启动时 Merkle 为空导致差量同步推不全）
         self.sync_manager.clone().spawn_merkle_rebuilder();
 
-        // 7. 启动 Gossip 传播任务
-        self.gossip_engine.clone().spawn_gossip_propagation();
+        // 7. Gossip 传播任务已迁移到 TaskScheduler（fed_gossip_propagation）
 
         // 7.1 Merkle 反熵任务已迁移到 TaskScheduler（fed_merkle_anti_entropy）
 
-        // 7.2 启动 Push-Pull Gossip 任务（每30秒交换最近变更，兜底 Push 丢失的消息）
-        self.sync_manager.clone().spawn_push_pull_gossip();
-
-        // 8. 启动中继通道清理
-        self.relay_manager.clone().spawn_channel_cleanup();
+        // 7.2 Push-Pull Gossip 已迁移到 TaskScheduler（fed_push_pull_gossip）
+        // 8. 中继通道清理已迁移到 TaskScheduler（fed_relay_channel_cleanup）
 
         // 9. 引导连接种子节点
         self.discovery.clone().bootstrap().await;
@@ -487,6 +456,12 @@ impl FederationService {
         Ok(())
     }
 
+    /// 同步公网地址到 DiscoveryService（由 TaskScheduler 按间隔调度）
+    pub fn sync_public_addr(&self) {
+        let addr = self.nat_integration.get_public_address();
+        self.discovery.set_public_addr(addr);
+    }
+
     /// 优雅关闭（阶段3增强）
     pub async fn shutdown(&self) {
         info!("[federation] 开始优雅关闭...");
@@ -497,8 +472,9 @@ impl FederationService {
         // 2. 关闭所有中继通道
         self.relay_manager.close_all();
 
+        // [ALLOWED-SLEEP] 关闭流程中一次性等待消息发出，非周期性
         // 3. 等待500ms让消息发出
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await; // [ALLOWED-HARDCODED]
 
         // 4. 关闭所有 TCP 连接
         self.connection_manager.shutdown_all().await;
@@ -512,23 +488,20 @@ impl FederationService {
 
         // 连接列表
         let conns = self.connection_manager.all_connections();
-        let now = std::time::Instant::now();
+        let _now = std::time::Instant::now();
         let connections: Vec<ConnectionInfo> = conns
             .iter()
             .map(|c| ConnectionInfo {
                 node_id: c.node_id.to_hex(),
                 addr: c.addr.to_string(),
                 connected_at_secs: c.connected_at.elapsed().as_secs(),
-                rtt_ms: self
-                    .node_table
-                    .get(&c.node_id)
-                    .and_then(|e| e.rtt_ms),
+                rtt_ms: self.node_table.get(&c.node_id).and_then(|e| e.rtt_ms),
             })
             .collect();
 
         // 节点列表（最多100个）
         let nodes_all = self.node_table.all_nodes();
-        let total_nodes = nodes_all.len();
+        let _total_nodes = nodes_all.len();
         let nodes: Vec<NodeInfo> = nodes_all
             .iter()
             .take(100)
@@ -610,8 +583,8 @@ impl FederationService {
         limit: usize,
         timeout: Duration,
     ) -> Vec<SocketAddr> {
-        use std::collections::HashSet;
         use crate::federation::protocol::{MessageType, PeerQueryRequestMessage};
+        use std::collections::HashSet;
 
         let conns = self.connection_manager.all_connections();
         if conns.is_empty() {
@@ -636,6 +609,7 @@ impl FederationService {
             }
         }
 
+        // [ALLOWED-SLEEP] 等待响应到达的一次性超时，非周期性
         // 等待响应到达（统一超时，不阻塞调用方超过 timeout）
         tokio::time::sleep(timeout).await;
 
@@ -752,12 +726,23 @@ mod tests {
         let node_repo = Arc::new(NodeRepoImpl::new(storage));
 
         let service = Arc::new(
-            FederationService::new(make_test_config(), nat, node_repo.clone(), &dir, None, None, None, None, None)
-                .unwrap(),
+            FederationService::new(
+                make_test_config(),
+                nat,
+                node_repo.clone(),
+                &dir,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
         );
 
         service.clone().start().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // [ALLOWED-SLEEP] 测试代码中的一次性等待
+        tokio::time::sleep(Duration::from_millis(200)).await; // [ALLOWED-HARDCODED]
 
         let status = service.status();
         assert!(status.enabled);

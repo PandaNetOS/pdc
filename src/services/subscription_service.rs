@@ -43,7 +43,7 @@ impl SubscriptionService {
     /// 创建新的订阅源服务
     pub fn new(config: SubscriptionConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30)) // [ALLOWED-HARDCODED]
             .user_agent("PandaNetOS-PDC/0.2.0")
             .build()
             .expect("failed to build reqwest client");
@@ -61,29 +61,13 @@ impl SubscriptionService {
         self
     }
 
-    /// 启动订阅源服务（定期拉取）
-    pub async fn start(self: Arc<Self>) {
+    /// 执行一次订阅源拉取（由 TaskScheduler 按间隔调度）
+    pub async fn run_once(&self) {
         if self.config.feeds.is_empty() {
-            info!("[subscription] 未配置订阅源，跳过");
             return;
         }
 
-        info!(
-            "[subscription] 启动订阅源服务: {} 个源, 间隔 {}s",
-            self.config.feeds.len(),
-            self.config.interval_secs
-        );
-
-        // 启动时立即拉取一次
         self.fetch_all().await;
-
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.interval_secs));
-
-        loop {
-            interval.tick().await;
-            self.fetch_all().await;
-        }
     }
 
     /// 拉取所有订阅源
@@ -123,10 +107,8 @@ impl SubscriptionService {
             if ih_start + 40 <= body.len() {
                 let ih_hex = &body[ih_start..ih_start + 40];
                 let mut ih = [0u8; 20];
-                if hex::decode_to_slice(ih_hex, &mut ih).is_ok() {
-                    if !infohashes.contains(&ih) {
-                        infohashes.push(ih);
-                    }
+                if hex::decode_to_slice(ih_hex, &mut ih).is_ok() && !infohashes.contains(&ih) {
+                    infohashes.push(ih);
                 }
             }
             search_start = ih_start + 40;

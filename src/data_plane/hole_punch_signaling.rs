@@ -4,7 +4,7 @@
 //! 然后同时开始 UDP 打洞。
 //!
 //! 流程：
-//! ```
+//! ```text
 //! 节点 A                    信令服务器                    节点 B
 //!   │                           │                           │
 //!   │── POST /initiate ───────→│                           │
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,11 @@ pub struct HolePunchSession {
 
 impl HolePunchSession {
     /// 创建新会话
-    pub fn new(initiator_peer_id: String, target_peer_id: String, initiator_addr: SocketAddr) -> Self {
+    pub fn new(
+        initiator_peer_id: String,
+        target_peer_id: String,
+        initiator_addr: SocketAddr,
+    ) -> Self {
         let now = Instant::now();
         Self {
             session_id: Uuid::new_v4().to_string(),
@@ -90,7 +94,7 @@ impl HolePunchSession {
 
     /// 是否过期（超过 60 秒无活动）
     pub fn is_expired(&self) -> bool {
-        self.last_active.elapsed() > Duration::from_secs(60)
+        self.last_active.elapsed() > Duration::from_secs(60) // [ALLOWED-HARDCODED]
     }
 
     /// 双方地址是否都已就绪
@@ -179,7 +183,9 @@ impl HolePunchSignaling {
 
     /// 发起打洞
     pub fn initiate(&self, req: InitiateRequest) -> anyhow::Result<InitiateResponse> {
-        let initiator_addr: SocketAddr = req.initiator_addr.parse()
+        let initiator_addr: SocketAddr = req
+            .initiator_addr
+            .parse()
             .map_err(|e| anyhow::anyhow!("无效的发起方地址: {}", e))?;
 
         // 检查发起方是否已有活跃会话
@@ -189,7 +195,10 @@ impl HolePunchSignaling {
                 let sessions = self.sessions.read();
                 if let Some(existing) = sessions.get(existing_id) {
                     if !existing.is_expired() && existing.status != SessionStatus::Completed {
-                        debug!("[signaling] 发起方 {} 已有活跃会话 {}", req.initiator_peer_id, existing_id);
+                        debug!(
+                            "[signaling] 发起方 {} 已有活跃会话 {}",
+                            req.initiator_peer_id, existing_id
+                        );
                         return Ok(InitiateResponse {
                             session_id: existing_id.clone(),
                             status: "waiting".to_string(),
@@ -213,7 +222,9 @@ impl HolePunchSignaling {
         );
 
         self.sessions.write().insert(session_id.clone(), session);
-        self.peer_sessions.write().insert(req.initiator_peer_id, session_id.clone());
+        self.peer_sessions
+            .write()
+            .insert(req.initiator_peer_id, session_id.clone());
 
         Ok(InitiateResponse {
             session_id,
@@ -225,11 +236,17 @@ impl HolePunchSignaling {
     ///
     /// 目标方调用此方法，传入自己的地址，等待发起方的地址。
     /// 发起方也可以调用此方法，等待目标方加入。
-    pub async fn wait(&self, session_id: &str, peer_id: &str, my_addr: &str) -> anyhow::Result<WaitResponse> {
-        let my_addr: SocketAddr = my_addr.parse()
+    pub async fn wait(
+        &self,
+        session_id: &str,
+        peer_id: &str,
+        my_addr: &str,
+    ) -> anyhow::Result<WaitResponse> {
+        let my_addr: SocketAddr = my_addr
+            .parse()
             .map_err(|e| anyhow::anyhow!("无效的地址: {}", e))?;
 
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(30); // [ALLOWED-HARDCODED]
 
         loop {
             // 检查会话是否存在
@@ -244,7 +261,11 @@ impl HolePunchSignaling {
                     let is_target = session.target_peer_id == peer_id;
 
                     if !is_initiator && !is_target {
-                        return Err(anyhow::anyhow!("peer_id {} 不属于会话 {}", peer_id, session_id));
+                        return Err(anyhow::anyhow!(
+                            "peer_id {} 不属于会话 {}",
+                            peer_id,
+                            session_id
+                        ));
                     }
 
                     // 记录地址
@@ -284,15 +305,21 @@ impl HolePunchSignaling {
                 return Err(anyhow::anyhow!("等待对端加入超时"));
             }
 
+            // [ALLOWED-SLEEP] 打洞信令一次性重试等待，非周期性
             // 等待 500ms 后重试
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await; // [ALLOWED-HARDCODED]
         }
     }
 
     /// 上报打洞结果
-    pub fn complete(&self, session_id: &str, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
+    pub fn complete(
+        &self,
+        session_id: &str,
+        req: CompleteRequest,
+    ) -> anyhow::Result<CompleteResponse> {
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(session_id)
+        let session = sessions
+            .get_mut(session_id)
             .ok_or_else(|| anyhow::anyhow!("会话 {} 不存在", session_id))?;
 
         session.last_active = Instant::now();
@@ -346,9 +373,18 @@ impl HolePunchSignaling {
     /// 获取会话统计
     pub fn stats(&self) -> SignalingStats {
         let sessions = self.sessions.read();
-        let waiting = sessions.values().filter(|s| s.status == SessionStatus::Waiting).count();
-        let ready = sessions.values().filter(|s| s.status == SessionStatus::Ready).count();
-        let completed = sessions.values().filter(|s| s.status == SessionStatus::Completed).count();
+        let waiting = sessions
+            .values()
+            .filter(|s| s.status == SessionStatus::Waiting)
+            .count();
+        let ready = sessions
+            .values()
+            .filter(|s| s.status == SessionStatus::Ready)
+            .count();
+        let completed = sessions
+            .values()
+            .filter(|s| s.status == SessionStatus::Completed)
+            .count();
         SignalingStats {
             total: sessions.len(),
             waiting,

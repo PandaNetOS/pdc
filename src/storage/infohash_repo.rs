@@ -66,8 +66,12 @@ impl InfohashRepoImpl {
         if built.is_empty() {
             return;
         }
-        let Some(merkle) = self.merkle.get() else { return; };
-        let Some(gossip) = self.gossip.get() else { return; };
+        let Some(merkle) = self.merkle.get() else {
+            return;
+        };
+        let Some(gossip) = self.gossip.get() else {
+            return;
+        };
         let refs: Vec<(&[u8], &[u8])> = built
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
@@ -107,7 +111,10 @@ impl InfohashRepoImpl {
     /// 内部批量注册：更新引用计数 + 新 infohash 入 pending 缓冲区，不触发 Merkle/Gossip。
     /// 返回真正新增的 (infohash, source)（引用计数 0→1）。
     /// 联邦同步入站（apply_infohash_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
-    pub(crate) fn register_batch_internal(&self, items: &[(Infohash, String, u64)]) -> Vec<(Infohash, String)> {
+    pub(crate) fn register_batch_internal(
+        &self,
+        items: &[(Infohash, String, u64)],
+    ) -> Vec<(Infohash, String)> {
         if items.is_empty() {
             return Vec::new();
         }
@@ -120,10 +127,11 @@ impl InfohashRepoImpl {
                     continue;
                 }
             }
-            let entry = cache
-                .entries
-                .entry(*infohash)
-                .or_insert((0, source.clone(), 0.0, *last_seen));
+            let entry =
+                cache
+                    .entries
+                    .entry(*infohash)
+                    .or_insert((0, source.clone(), 0.0, *last_seen));
             entry.0 += 1;
             // 更新 last_seen（取较大值）
             if *last_seen > entry.3 {
@@ -211,9 +219,13 @@ impl InfohashRepoImpl {
                 storage.save_infohash(infohash, 1, source, 0.0)?;
             }
             Ok::<(), anyhow::Error>(())
-        }).await??;
+        })
+        .await??;
 
-        tracing::debug!("[infohash_repo] flush_pending 批量写入 {} 个新 infohash", count);
+        tracing::debug!(
+            "[infohash_repo] flush_pending 批量写入 {} 个新 infohash",
+            count
+        );
         Ok(count)
     }
 
@@ -241,7 +253,33 @@ impl InfohashRepoImpl {
                 storage.save_infohash(infohash, *ref_count, source, *score)?;
             }
             Ok::<(), anyhow::Error>(())
-        }).await??;
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
+    #[allow(dead_code)]
+    async fn save_dirty(&self) -> anyhow::Result<()> {
+        // 先 flush pending 新 infohash
+        self.flush_pending().await?;
+
+        let entries: Vec<(Infohash, u32, String, f64)> = self
+            .cache
+            .read()
+            .entries
+            .iter()
+            .map(|(ih, (count, src, score, _ls))| (*ih, *count, src.clone(), *score))
+            .collect();
+
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            for (infohash, ref_count, source, score) in &entries {
+                storage.save_infohash(infohash, *ref_count, source, *score)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 
@@ -251,9 +289,10 @@ impl InfohashRepoImpl {
         let mut cache = self.cache.write();
         let mut count = 0;
         for row in rows {
-            cache
-                .entries
-                .insert(row.infohash, (row.ref_count, row.first_source, row.score, 0));
+            cache.entries.insert(
+                row.infohash,
+                (row.ref_count, row.first_source, row.score, 0),
+            );
             count += 1;
         }
         Ok(count)

@@ -12,17 +12,16 @@
 //! 注意：DhtDiscoverer 是独立实例，使用独立的路由表，不会影响主 DHT 爬虫功能。
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::discoverers::dht::{DhtConfig, DhtDiscoverer};
-use crate::federation::ConnectionManager;
 use crate::federation::node_id::{NodeAddress, NodeId, Reachability};
 use crate::federation::node_table::NodeTable;
+use crate::federation::ConnectionManager;
 use crate::storage::node_repo::NodeRepoImpl;
-use crate::traits::{AnnounceEvent, PeerDiscoverer};
 use crate::types::Infohash;
 use pnos_net::types::{DiscoveredNode, DiscoverySource, Reachability as NetReachability};
 
@@ -49,9 +48,9 @@ pub struct DhtDiscoveryService {
     /// 发现间隔（秒）
     interval_secs: u64,
     /// 关闭信号
-    shutdown: broadcast::Sender<()>,
+    _shutdown: broadcast::Sender<()>,
     /// pnos-net 发现事件发送端
-    discovered_tx: Option<broadcast::Sender<DiscoveredNode>>,
+    _discovered_tx: Option<broadcast::Sender<DiscoveredNode>>,
     /// 连接管理器（发现节点后触发自动连接）
     connection_manager: Option<Arc<ConnectionManager>>,
 }
@@ -68,20 +67,21 @@ impl DhtDiscoveryService {
         node_table: Arc<NodeTable>,
         federation_port: u16,
         interval_secs: u64,
-        shutdown: broadcast::Sender<()>,
+        _shutdown: broadcast::Sender<()>,
         node_repo: Option<Arc<NodeRepoImpl>>,
         external_dht: Option<Arc<DhtDiscoverer>>,
         connection_manager: Option<Arc<ConnectionManager>>,
     ) -> Self {
-        let dht = external_dht.unwrap_or_else(|| Arc::new(DhtDiscoverer::new(DhtConfig::default())));
+        let dht =
+            external_dht.unwrap_or_else(|| Arc::new(DhtDiscoverer::new(DhtConfig::default())));
         Self {
             dht,
             node_table,
             node_repo,
             federation_port,
             interval_secs,
-            shutdown,
-            discovered_tx: None,
+            _shutdown,
+            _discovered_tx: None,
             connection_manager,
         }
     }
@@ -97,7 +97,9 @@ impl DhtDiscoveryService {
     pub async fn init_and_first_tick(self: Arc<Self>) {
         // 0. 从主爬虫 NodeRepo 注入种子节点（仅自建 DHT 时）
         if let Some(repo) = &self.node_repo {
-            let seeds: Vec<(String, u16)> = repo.top_nodes_sync(2000).into_iter()
+            let seeds: Vec<(String, u16)> = repo
+                .top_nodes_sync(2000)
+                .into_iter()
                 .map(|e| (e.addr.ip().to_string(), e.addr.port()))
                 .collect();
             let injected = self.dht.seed_from_entries(&seeds);
@@ -182,6 +184,7 @@ fn current_unix_secs() -> u64 {
 }
 
 /// 处理 DHT 发现的 peer 列表：加入节点表 + 发送到 pnos-net 事件通道
+#[allow(dead_code)]
 fn process_peers(
     peers: &[crate::types::PeerInfo],
     node_table: &Arc<NodeTable>,

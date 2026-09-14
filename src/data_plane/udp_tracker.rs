@@ -17,11 +17,11 @@ use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::storage::PeerRepoImpl;
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::http_tracker::SuperTrackerState;
-use crate::types::{AnnounceEvent, ScrapeEntry};
 use crate::data_plane::rate_limiter::{RateLimiter, RequestType};
+use crate::storage::PeerRepoImpl;
+use crate::types::{AnnounceEvent, ScrapeEntry};
 
 // BEP 15 协议常量
 const PROTOCOL_ID: u64 = 0x41727101980;
@@ -29,6 +29,8 @@ const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
 const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
+/// BEP 15 建议连接 ID 有效期：2 分钟
+const CONNECTION_TTL: Duration = Duration::from_secs(120); // [ALLOWED-HARDCODED]
 
 /// connection_id 条目
 struct ConnectionEntry {
@@ -88,6 +90,25 @@ impl UdpTrackerServer {
         self
     }
 
+    /// 清理过期的 connection_id 映射（BEP 15：连接 ID 建议 2 分钟过期）。
+    ///
+    /// 由 TaskScheduler 周期性调用（本模块自身不跑定时循环），
+    /// 避免 connections 映射随时间无界增长。
+    pub async fn cleanup_expired_connections(&self) {
+        let now = Instant::now();
+        let mut conns = self.connections.write();
+        let before = conns.len();
+        conns.retain(|_, entry| now.duration_since(entry.created_at) < CONNECTION_TTL);
+        let removed = before - conns.len();
+        if removed > 0 {
+            debug!(
+                "[udp_tracker] 清理过期连接: 移除 {} 条, 剩余 {} 条",
+                removed,
+                conns.len()
+            );
+        }
+    }
+
     /// 启动 UDP Tracker 服务端（后台运行）
     pub async fn start(&self) -> anyhow::Result<()> {
         let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
@@ -103,21 +124,6 @@ impl UdpTrackerServer {
         let connections = self.connections.clone();
         let rate_limiter = self.rate_limiter.clone();
         let interval = config.interval.max(0) as u32;
-
-        // 启动过期清理任务
-        let conn_clone = connections.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let mut conns = conn_clone.write();
-                let before = conns.len();
-                conns.retain(|_, entry| entry.created_at.elapsed() < Duration::from_secs(120));
-                let removed = before - conns.len();
-                if removed > 0 {
-                    debug!("[udp_tracker] 清理了 {} 个过期 connection_id", removed);
-                }
-            }
-        });
 
         let mut buf = vec![0u8; 4096]; // P2优化：超级Tracker接收缓冲区翻倍
         loop {
@@ -239,6 +245,7 @@ impl UdpTrackerServer {
     }
 
     /// 处理 announce 请求
+    #[allow(clippy::too_many_arguments)]
     async fn handle_announce(
         data: &[u8],
         transaction_id: u32,

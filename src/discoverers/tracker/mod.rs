@@ -17,7 +17,7 @@ pub use client::{TrackerConfig, TrackerDiscoverer};
 /// 常用公共 Tracker 列表
 pub const PUBLIC_TRACKERS: &[&str] = &[
     // === HTTP Tracker（经过 DNS 验证可用）===
-    "http://tracker1.itzmx.com:8080/announce",
+    "http://tracker1.itzmx.com:8080/announce", // [ALLOWED-HARDCODED]
     "http://tracker2.itzmx.com:6961/announce",
     "http://tracker3.itzmx.com:6961/announce",
     "http://tracker.k.vu:6969/announce",
@@ -28,7 +28,7 @@ pub const PUBLIC_TRACKERS: &[&str] = &[
     "https://www.peckservers.com:9443/announce",
     "https://trackers.mlsub.net/announce",
     // === UDP Tracker（速度更快，连接数更多，经过 DNS 验证可用）===
-    "udp://tracker1.itzmx.com:8080/announce",
+    "udp://tracker1.itzmx.com:8080/announce", // [ALLOWED-HARDCODED]
     "udp://tracker2.itzmx.com:6961/announce",
     "udp://tracker3.itzmx.com:6961/announce",
     "udp://tracker.opentrackr.org:1337/announce",

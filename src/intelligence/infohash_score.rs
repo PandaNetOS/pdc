@@ -16,7 +16,6 @@ use async_trait::async_trait;
 use crate::intelligence::scorer_config::InfohashScoreConfig;
 use crate::intelligence::scorer_traits::{InfohashScoreInput, InfohashScorer};
 use crate::storage::repo_traits::InfohashRepository;
-use crate::types::Infohash;
 
 /// Infohash 评分器实现
 pub struct InfohashScorerImpl {
@@ -49,7 +48,9 @@ impl Default for InfohashScorerImpl {
 impl InfohashScorer for InfohashScorerImpl {
     async fn rescore_all(&self, _repo: &dyn InfohashRepository) {
         // 全量重算由 ScoreMaintainer 协调：从多源聚合数据 → calculate → update_score
-        tracing::debug!("[infohash_scorer] rescore_all called (aggregation handled by ScoreMaintainer)");
+        tracing::debug!(
+            "[infohash_scorer] rescore_all called (aggregation handled by ScoreMaintainer)"
+        );
     }
 
     fn calculate(&self, input: &InfohashScoreInput) -> f64 {
@@ -71,7 +72,7 @@ fn log_scale(value: f64, reference: f64) -> f64 {
         return 0.0;
     }
     let normalized = (value + 1.0).ln() / (reference + 1.0).ln();
-    normalized.min(1.0).max(0.0)
+    normalized.clamp(0.0, 1.0)
 }
 
 /// 线性归一化：将值映射到 0.0~1.0
@@ -79,7 +80,7 @@ fn linear_scale(value: f64, max: f64) -> f64 {
     if max <= 0.0 {
         return 0.0;
     }
-    (value / max).min(1.0).max(0.0)
+    (value / max).clamp(0.0, 1.0)
 }
 
 /// 计算单个 infohash 的热门度评分（0-100）使用指定配置
@@ -96,7 +97,8 @@ pub fn calculate_infohash_score_with_config(
     // ===== 3. 综合评分 =====
     let total_weight = config.popularity_total_weight + config.health_total_weight;
     let raw_score = if total_weight > 0.0 {
-        (popularity * config.popularity_total_weight + health * config.health_total_weight) / total_weight
+        (popularity * config.popularity_total_weight + health * config.health_total_weight)
+            / total_weight
     } else {
         (popularity + health) / 2.0
     };
@@ -114,7 +116,7 @@ pub fn calculate_infohash_score_with_config(
         raw_score
     };
 
-    final_score.max(0.0).min(100.0)
+    final_score.clamp(0.0, 100.0)
 }
 
 /// 计算流行度（Popularity）0-100
@@ -122,8 +124,8 @@ fn calculate_popularity(input: &InfohashScoreInput, config: &InfohashScoreConfig
     let p = &config.popularity;
 
     // 1. unique_peers（35%）：对数缩放，高覆盖率数据源
-    let unique_peers_score = log_scale(input.unique_peers as f64, config.log_scale_unique_peers)
-        * p.unique_peers_weight;
+    let unique_peers_score =
+        log_scale(input.unique_peers as f64, config.log_scale_unique_peers) * p.unique_peers_weight;
 
     // 2. dht_query_rate（25%）：对数缩放，高覆盖率数据源
     let dht_query_score = log_scale(input.dht_query_rate as f64, config.log_scale_dht_query_rate)
@@ -138,12 +140,11 @@ fn calculate_popularity(input: &InfohashScoreInput, config: &InfohashScoreConfig
     };
 
     // 4. source_count（15%）：线性缩放，高覆盖率数据源，≥5个来源满分
-    let source_score = linear_scale(input.source_count as f64, 5.0)
-        * p.source_diversity_weight;
+    let source_score = linear_scale(input.source_count as f64, 5.0) * p.source_diversity_weight;
 
     // 5. growth_rate（10%）：-1.0~1.0 映射到 0~100
-    let growth_score = ((input.peer_growth_rate + 1.0) / 2.0).max(0.0).min(1.0)
-        * p.growth_rate_weight;
+    let growth_score =
+        ((input.peer_growth_rate + 1.0) / 2.0).clamp(0.0, 1.0) * p.growth_rate_weight;
 
     unique_peers_score + dht_query_score + announce_score + source_score + growth_score
 }
@@ -165,8 +166,8 @@ fn calculate_health(input: &InfohashScoreInput, config: &InfohashScoreConfig) ->
     } else {
         0.0
     };
-    let seeders_score = log_scale(seeders_for_score, config.log_scale_seeders)
-        * h.seeders_count_weight;
+    let seeders_score =
+        log_scale(seeders_for_score, config.log_scale_seeders) * h.seeders_count_weight;
 
     // 3. longevity（20%）：持续时长，线性缩放，≥7天满分
     let longevity_score = linear_scale(
@@ -293,7 +294,11 @@ mod tests {
             total_size: 1024 * 1024 * 1024,
         };
         let score = calculate_infohash_score(&input);
-        assert!(score > 80.0, "perfect infohash should score high, got {}", score);
+        assert!(
+            score > 80.0,
+            "perfect infohash should score high, got {}",
+            score
+        );
         assert!(score <= 100.0);
     }
 
@@ -323,7 +328,11 @@ mod tests {
             total_size: 0,
         };
         let score = calculate_infohash_score(&input);
-        assert!(score > 10.0 && score < 70.0, "medium infohash should score moderate, got {}", score);
+        assert!(
+            score > 10.0 && score < 70.0,
+            "medium infohash should score moderate, got {}",
+            score
+        );
     }
 
     #[test]
@@ -331,22 +340,26 @@ mod tests {
         // 关键测试：热门infohash但没有向超级Tracker发announce
         // 应该通过 unique_peers + dht_query_rate + source_count 得到高分，不被误判
         let input = InfohashScoreInput {
-            unique_peers: 500,           // 很多peer
-            dht_query_rate: 150,         // DHT上很活跃
-            announce_rate_5m: None,      // 没有向PDC发announce
-            source_count: 4,             // 多来源发现
-            peer_growth_rate: 0.3,       // 正增长
+            unique_peers: 500,      // 很多peer
+            dht_query_rate: 150,    // DHT上很活跃
+            announce_rate_5m: None, // 没有向PDC发announce
+            source_count: 4,        // 多来源发现
+            peer_growth_rate: 0.3,  // 正增长
             seeders: None,
             leechers: None,
             external_seeders: Some(100), // 外部scrape有做种者
             external_leechers: Some(200),
-            longevity_secs: 172800,      // 2天
+            longevity_secs: 172800, // 2天
             availability_proxy: 1.0,
             has_metadata: true,
             total_size: 2 * 1024 * 1024 * 1024,
         };
         let score = calculate_infohash_score(&input);
-        assert!(score > 60.0, "hot infohash without announce should still score high, got {}", score);
+        assert!(
+            score > 60.0,
+            "hot infohash without announce should still score high, got {}",
+            score
+        );
     }
 
     #[test]
@@ -398,11 +411,26 @@ mod tests {
 
     #[test]
     fn test_hotness_level() {
-        assert_eq!(InfohashHotnessLevel::from_score(95.0), InfohashHotnessLevel::Trending);
-        assert_eq!(InfohashHotnessLevel::from_score(80.0), InfohashHotnessLevel::Hot);
-        assert_eq!(InfohashHotnessLevel::from_score(60.0), InfohashHotnessLevel::Warm);
-        assert_eq!(InfohashHotnessLevel::from_score(40.0), InfohashHotnessLevel::Normal);
-        assert_eq!(InfohashHotnessLevel::from_score(20.0), InfohashHotnessLevel::Cold);
+        assert_eq!(
+            InfohashHotnessLevel::from_score(95.0),
+            InfohashHotnessLevel::Trending
+        );
+        assert_eq!(
+            InfohashHotnessLevel::from_score(80.0),
+            InfohashHotnessLevel::Hot
+        );
+        assert_eq!(
+            InfohashHotnessLevel::from_score(60.0),
+            InfohashHotnessLevel::Warm
+        );
+        assert_eq!(
+            InfohashHotnessLevel::from_score(40.0),
+            InfohashHotnessLevel::Normal
+        );
+        assert_eq!(
+            InfohashHotnessLevel::from_score(20.0),
+            InfohashHotnessLevel::Cold
+        );
     }
 
     #[test]
@@ -437,6 +465,10 @@ mod tests {
         };
         let score = calculate_infohash_score(&input);
         // 负增长应该拉低流行度
-        assert!(score < 50.0, "declining infohash should score lower, got {}", score);
+        assert!(
+            score < 50.0,
+            "declining infohash should score lower, got {}",
+            score
+        );
     }
 }

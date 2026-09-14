@@ -10,12 +10,9 @@
 //! 【参考】Neglia et al. "Availability in BitTorrent Systems", Infocom 2007
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
-use tracing::debug;
 
 use crate::types::Infohash;
 
@@ -106,13 +103,19 @@ impl AvailabilityCalculator {
         Self {
             cache: DashMap::new(),
             bitfields: DashMap::new(),
-            cache_ttl: Duration::from_secs(300),
-            bitfield_ttl: Duration::from_secs(1800),
+            cache_ttl: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            bitfield_ttl: Duration::from_secs(1800), // [ALLOWED-HARDCODED]
         }
     }
 
     /// 记录一个 peer 的 bitfield（用于精确计算）
-    pub fn record_bitfield(&self, infohash: Infohash, peer_addr: &str, pieces: Vec<u32>, total_pieces: u32) {
+    pub fn record_bitfield(
+        &self,
+        infohash: Infohash,
+        peer_addr: &str,
+        pieces: Vec<u32>,
+        total_pieces: u32,
+    ) {
         let is_seeder = pieces.len() as u32 >= total_pieces;
         let bitfield = PeerBitfield {
             peer_addr: peer_addr.to_string(),
@@ -121,7 +124,7 @@ impl AvailabilityCalculator {
             last_seen: Instant::now(),
         };
 
-        let mut entry = self.bitfields.entry(infohash).or_insert_with(Vec::new);
+        let mut entry = self.bitfields.entry(infohash).or_default();
         // 移除同一 peer 的旧记录
         entry.retain(|p| p.peer_addr != peer_addr);
         entry.push(bitfield);
@@ -135,7 +138,11 @@ impl AvailabilityCalculator {
     }
 
     /// 精确计算可用性（基于已记录的 bitfield）
-    pub fn calculate_exact(&self, infohash: Infohash, total_pieces: u32) -> Option<AvailabilityResult> {
+    pub fn calculate_exact(
+        &self,
+        infohash: Infohash,
+        total_pieces: u32,
+    ) -> Option<AvailabilityResult> {
         let bitfields = self.bitfields.get(&infohash)?;
         if bitfields.is_empty() {
             return None;
@@ -143,10 +150,8 @@ impl AvailabilityCalculator {
 
         // 清理过期的 bitfield
         let cutoff = Instant::now() - self.bitfield_ttl;
-        let valid_bitfields: Vec<&PeerBitfield> = bitfields
-            .iter()
-            .filter(|p| p.last_seen >= cutoff)
-            .collect();
+        let valid_bitfields: Vec<&PeerBitfield> =
+            bitfields.iter().filter(|p| p.last_seen >= cutoff).collect();
 
         if valid_bitfields.is_empty() {
             return None;
@@ -254,7 +259,7 @@ impl AvailabilityCalculator {
             let p_unavailable = base.powi(total_peers as i32);
             // P(分片可用) = 1 - P(不可用)
             let p_available: f64 = 1.0 - p_unavailable;
-            p_available.min(1.0_f64).max(0.0_f64)
+            p_available.clamp(0.0_f64, 1.0_f64)
         };
 
         let available_pieces = (total_pieces as f64 * availability_ratio) as u32;
@@ -395,11 +400,11 @@ mod tests {
         let infohash = [4u8; 20];
 
         // 记录2个做种者
-        calc.record_seeder(infohash, "1.1.1.1:6881", 10);
-        calc.record_seeder(infohash, "2.2.2.2:6881", 10);
+        calc.record_seeder(infohash, "1.1.1.1:6881", 10); // [ALLOWED-HARDCODED]
+        calc.record_seeder(infohash, "2.2.2.2:6881", 10); // [ALLOWED-HARDCODED]
 
         // 记录1个部分peer（拥有分片0-4）
-        calc.record_bitfield(infohash, "3.3.3.3:6881", vec![0, 1, 2, 3, 4], 10);
+        calc.record_bitfield(infohash, "3.3.3.3:6881", vec![0, 1, 2, 3, 4], 10); // [ALLOWED-HARDCODED]
 
         let result = calc.calculate_exact(infohash, 10).unwrap();
         assert_eq!(result.total_pieces, 10);
@@ -419,7 +424,7 @@ mod tests {
         let infohash = [5u8; 20];
 
         // 只记录1个部分peer（拥有分片0-4）
-        calc.record_bitfield(infohash, "1.1.1.1:6881", vec![0, 1, 2, 3, 4], 10);
+        calc.record_bitfield(infohash, "1.1.1.1:6881", vec![0, 1, 2, 3, 4], 10); // [ALLOWED-HARDCODED]
 
         let result = calc.calculate_exact(infohash, 10).unwrap();
         assert_eq!(result.available_pieces, 5);
@@ -435,7 +440,7 @@ mod tests {
 
         assert!(calc.get_cached(&infohash).is_none());
 
-        let result = calc.estimate(infohash, 100, 1, 5);
+        let _result = calc.estimate(infohash, 100, 1, 5);
         assert!(calc.get_cached(&infohash).is_some());
         assert_eq!(calc.cached_count(), 1);
     }

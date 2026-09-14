@@ -1,4 +1,4 @@
-﻿//! HTTP Tracker 协议适配层（超级 Tracker）
+//! HTTP Tracker 协议适配层（超级 Tracker）
 //!
 //! 实现 BEP 3（HTTP Tracker 协议）和 BEP 48（Tracker 扩展），
 //! 对 qBittorrent 等 BT 客户端暴露标准 /announce 和 /scrape 接口。
@@ -38,10 +38,10 @@ const FEDERATION_QUERY_TIMEOUT_MS: u64 = 500;
 /// scrape 统计时从 PeerRepo 拉取的 peer 上限
 const SCRAPE_REPO_PEER_LIMIT: usize = 1000;
 
-use crate::storage::PeerRepoImpl;
-use crate::storage::repo_traits::PeerRepository;
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::AppState;
+use crate::storage::repo_traits::PeerRepository;
+use crate::storage::PeerRepoImpl;
 use crate::types::{
     AnnounceEvent, Infohash, PeerInfo, PeerSource, ScrapeEntry, TrackerAnnounceRequest,
     TrackerAnnounceResponse, TrackerScrapeResponse,
@@ -83,14 +83,12 @@ pub struct SuperTrackerState {
 impl SuperTrackerState {
     /// 创建新的超级 Tracker 状态
     pub fn new(config: SuperTrackerConfig) -> Self {
-        let state = Self {
+        Self {
             peers: Arc::new(DashMap::new()),
             config: Arc::new(tokio::sync::RwLock::new(config)),
             peer_repo: None,
             federation: None,
-        };
-        state.spawn_cleanup_task();
-        state
+        }
     }
 
     /// 注入 PeerRepo（announce peer 双写到统一归口）
@@ -179,7 +177,11 @@ impl SuperTrackerState {
 
         TrackerAnnounceResponse {
             interval: config.interval,
-            min_interval: if config.min_interval > 0 { Some(config.min_interval) } else { None },
+            min_interval: if config.min_interval > 0 {
+                Some(config.min_interval)
+            } else {
+                None
+            },
             tracker_id: Some("pdc".to_string()),
             complete,
             incomplete,
@@ -202,7 +204,10 @@ impl SuperTrackerState {
                     .map(|e| e.keys().copied().collect())
                     .unwrap_or_default();
                 let repo_peers = repo.get_peers_sync(ih, SCRAPE_REPO_PEER_LIMIT);
-                let extra = repo_peers.iter().filter(|p| !live.contains(&p.addr)).count();
+                let extra = repo_peers
+                    .iter()
+                    .filter(|p| !live.contains(&p.addr))
+                    .count();
                 incomplete += extra as i64;
             }
             files.insert(
@@ -289,29 +294,22 @@ impl SuperTrackerState {
             .unwrap_or((0, 0))
     }
 
-    /// 启动过期清理任务
-    fn spawn_cleanup_task(&self) {
-        let peers = self.peers.clone();
-        let config = self.config.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let ttl = config.read().await.peer_ttl_secs;
-                let mut removed = 0;
-                peers.retain(|_, entry| {
-                    entry.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(ttl));
-                    if entry.is_empty() {
-                        removed += 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
-                if removed > 0 {
-                    debug!("[super_tracker] 清理了 {} 个空 infohash 条目", removed);
-                }
+    /// 执行一次过期 peer 清理（由 TaskScheduler 按间隔调度）
+    pub async fn cleanup_expired(&self) {
+        let ttl = self.config.read().await.peer_ttl_secs;
+        let mut removed = 0;
+        self.peers.retain(|_, entry| {
+            entry.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(ttl));
+            if entry.is_empty() {
+                removed += 1;
+                false
+            } else {
+                true
             }
         });
+        if removed > 0 {
+            debug!("[super_tracker] 清理了 {} 个空 infohash 条目", removed);
+        }
     }
 
     /// 获取当前存储的 infohash 数量
@@ -394,7 +392,8 @@ impl SuperTrackerState {
 
         // 双写到 PeerRepo（统一数据归口）
         if event != AnnounceEvent::Stopped {
-            let mut peer_info = crate::types::PeerInfo::new(peer_addr, crate::types::PeerSource::SuperTracker);
+            let mut peer_info =
+                crate::types::PeerInfo::new(peer_addr, crate::types::PeerSource::SuperTracker);
             peer_info.peer_id = Some(peer_id);
             cache.add_peers_sync(&infohash, &[peer_info]);
         }
@@ -510,7 +509,11 @@ async fn announce_handler(
     };
 
     // 解析 peer_id
-    let peer_id_str = params.get("peer_id").and_then(|v| v.first()).cloned().unwrap_or_default();
+    let peer_id_str = params
+        .get("peer_id")
+        .and_then(|v| v.first())
+        .cloned()
+        .unwrap_or_default();
     let peer_id = parse_peer_id(&peer_id_str).unwrap_or_default();
 
     // 解析 port
@@ -529,13 +532,41 @@ async fn announce_handler(
         info_hash,
         peer_id,
         port,
-        uploaded: params.get("uploaded").and_then(|v| v.first()).and_then(|s| s.parse().ok()).unwrap_or(0),
-        downloaded: params.get("downloaded").and_then(|v| v.first()).and_then(|s| s.parse().ok()).unwrap_or(0),
-        left: params.get("left").and_then(|v| v.first()).and_then(|s| s.parse().ok()).unwrap_or(0),
-        event: params.get("event").and_then(|v| v.first()).and_then(|s| s.parse().ok()),
-        compact: params.get("compact").and_then(|v| v.first()).and_then(|s| s.parse::<u8>().ok()).unwrap_or(1) == 1,
-        numwant: params.get("numwant").and_then(|v| v.first()).and_then(|s| s.parse().ok()),
-        no_peer_id: params.get("no_peer_id").and_then(|v| v.first()).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0) == 1,
+        uploaded: params
+            .get("uploaded")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        downloaded: params
+            .get("downloaded")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        left: params
+            .get("left")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        event: params
+            .get("event")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse().ok()),
+        compact: params
+            .get("compact")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(1)
+            == 1,
+        numwant: params
+            .get("numwant")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse().ok()),
+        no_peer_id: params
+            .get("no_peer_id")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0)
+            == 1,
         key: params.get("key").and_then(|v| v.first()).cloned(),
         trackerid: params.get("trackerid").and_then(|v| v.first()).cloned(),
         remote_addr: client_addr,
@@ -581,10 +612,7 @@ async fn announce_handler(
 }
 
 /// scrape 处理函数
-async fn scrape_handler(
-    State(state): State<AppState>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
+async fn scrape_handler(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     // 手动解析查询参数（scrape 可能有多个 info_hash）
     let query_str = raw_query.as_deref().unwrap_or("");
     let params = parse_query_params(query_str);
@@ -637,7 +665,10 @@ fn parse_query_params(raw_query: &str) -> FxHashMap<String, Vec<String>> {
         };
 
         // key 都是 ASCII，直接使用；value 保留原始 percent-encoded 字符串
-        params.entry(key.to_string()).or_default().push(value.to_string());
+        params
+            .entry(key.to_string())
+            .or_default()
+            .push(value.to_string());
     }
 
     params
@@ -799,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_parse_query_params_basic() {
-        let params = parse_query_params("port=6881&uploaded=100&downloaded=0");
+        let params = parse_query_params("port=6881&uploaded=100&downloaded=0"); // [ALLOWED-HARDCODED]
         assert_eq!(params.get("port").unwrap()[0], "6881");
         assert_eq!(params.get("uploaded").unwrap()[0], "100");
         assert_eq!(params.get("downloaded").unwrap()[0], "0");
@@ -836,7 +867,7 @@ mod tests {
         let req = TrackerAnnounceRequest {
             info_hash: infohash,
             peer_id: [0u8; 20],
-            port: 6881,
+            port: 6881, // [ALLOWED-HARDCODED]
             uploaded: 0,
             downloaded: 0,
             left: 1000,
@@ -859,7 +890,7 @@ mod tests {
         let req2 = TrackerAnnounceRequest {
             info_hash: infohash,
             peer_id: [1u8; 20],
-            port: 6882,
+            port: 6882, // [ALLOWED-HARDCODED]
             uploaded: 0,
             downloaded: 0,
             left: 0, // 做种者

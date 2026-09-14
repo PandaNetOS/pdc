@@ -8,17 +8,17 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
-use dashmap::DashMap;
 use tokio::sync::{broadcast, Mutex as TokioMutex, Notify, OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::node_id::{NodeAddress, NodeId};
+use crate::federation::metrics::FederationMetrics;
+use crate::federation::node_id::NodeId;
 use crate::federation::node_table::{NodeStatus, NodeTable};
 use crate::federation::protocol::*;
-use crate::federation::metrics::FederationMetrics;
 use crate::federation::signaling::SignalingService;
 use crate::federation::transport::TcpTransport;
 use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
@@ -225,7 +225,10 @@ impl ConnectionManager {
                 local_entry_counts: counts,
             };
             if let Err(e) = connection.send_message(MessageType::PeerInfo, &msg).await {
-                debug!("[federation] PeerInfo 发送到 {} 失败: {}", connection.node_id, e);
+                debug!(
+                    "[federation] PeerInfo 发送到 {} 失败: {}",
+                    connection.node_id, e
+                );
             }
         }
     }
@@ -274,7 +277,8 @@ impl ConnectionManager {
                 }
                 Err(e) => {
                     warn!("[federation] 接受连接失败: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // [ALLOWED-SLEEP] 接受连接失败后一次性退避等待，非周期性
+                    tokio::time::sleep(Duration::from_millis(100)).await; // [ALLOWED-HARDCODED]
                 }
             }
         }
@@ -363,11 +367,7 @@ impl ConnectionManager {
                     "[federation] 节点 {} 在重连冷却期内（剩余 {:?}），跳过连接",
                     node_id, remaining
                 );
-                anyhow::bail!(
-                    "节点 {} 在重连冷却期内（剩余 {:?}）",
-                    node_id,
-                    remaining
-                );
+                anyhow::bail!("节点 {} 在重连冷却期内（剩余 {:?}）", node_id, remaining);
             }
         }
 
@@ -385,62 +385,61 @@ impl ConnectionManager {
         self.node_table.mark_connecting(&node_id);
 
         // 建立 TCP 连接：优先使用 NetAgent（直连→打洞→中继），回退到原始连接
-        let transport = if let Some(agent) = self.net_agent.get() {
-            let net_node_id = pnos_net::types::NodeId(node_id.0);
-            let (reachability, nat_type) = self
-                .node_table
-                .get(&node_id)
-                .map(|e| {
-                    let r = match e.info.reachability {
-                        crate::federation::node_id::Reachability::PublicIpv6 => {
-                            pnos_net::types::Reachability::PublicIpv6
-                        }
-                        crate::federation::node_id::Reachability::Mapped => {
-                            pnos_net::types::Reachability::Mapped
-                        }
-                        crate::federation::node_id::Reachability::HolePunchable => {
-                            pnos_net::types::Reachability::HolePunchable
-                        }
-                        crate::federation::node_id::Reachability::OutboundOnly => {
-                            pnos_net::types::Reachability::OutboundOnly
-                        }
-                        crate::federation::node_id::Reachability::Unknown => {
-                            pnos_net::types::Reachability::Unknown
-                        }
-                    };
-                    (r, e.info.nat_type.clone())
-                })
-                .unwrap_or((pnos_net::types::Reachability::Unknown, None));
+        let transport =
+            if let Some(agent) = self.net_agent.get() {
+                let net_node_id = pnos_net::types::NodeId(node_id.0);
+                let (reachability, nat_type) = self
+                    .node_table
+                    .get(&node_id)
+                    .map(|e| {
+                        let r = match e.info.reachability {
+                            crate::federation::node_id::Reachability::PublicIpv6 => {
+                                pnos_net::types::Reachability::PublicIpv6
+                            }
+                            crate::federation::node_id::Reachability::Mapped => {
+                                pnos_net::types::Reachability::Mapped
+                            }
+                            crate::federation::node_id::Reachability::HolePunchable => {
+                                pnos_net::types::Reachability::HolePunchable
+                            }
+                            crate::federation::node_id::Reachability::OutboundOnly => {
+                                pnos_net::types::Reachability::OutboundOnly
+                            }
+                            crate::federation::node_id::Reachability::Unknown => {
+                                pnos_net::types::Reachability::Unknown
+                            }
+                        };
+                        (r, e.info.nat_type.clone())
+                    })
+                    .unwrap_or((pnos_net::types::Reachability::Unknown, None));
 
-            match agent
-                .connect_to(net_node_id, &[addr], reachability, nat_type)
-                .await
-            {
-                Ok(result) => TcpTransport::new(result.connection)
-                    .with_metrics(self.metrics.clone())
-                    .with_write_timeout(Duration::from_secs(
-                        self.config.transport_write_timeout_secs,
-                    )),
-                Err(e) => {
-                    self.connecting.write().remove(&addr);
-                    self.node_table.mark_failed(&node_id);
-                    return Err(e);
+                match agent
+                    .connect_to(net_node_id, &[addr], reachability, nat_type)
+                    .await
+                {
+                    Ok(result) => TcpTransport::new(result.connection)
+                        .with_metrics(self.metrics.clone())
+                        .with_write_timeout(Duration::from_secs(
+                            self.config.transport_write_timeout_secs,
+                        )),
+                    Err(e) => {
+                        self.connecting.write().remove(&addr);
+                        self.node_table.mark_failed(&node_id);
+                        return Err(e);
+                    }
                 }
-            }
-        } else {
-            match TcpTransport::connect(addr).await {
-                Ok(t) => t
-                    .with_metrics(self.metrics.clone())
-                    .with_write_timeout(Duration::from_secs(
-                        self.config.transport_write_timeout_secs,
-                    )),
-                Err(e) => {
-                    self.connecting.write().remove(&addr);
-                    self.node_table.mark_failed(&node_id);
-                    return Err(e);
+            } else {
+                match TcpTransport::connect(addr).await {
+                    Ok(t) => t.with_metrics(self.metrics.clone()).with_write_timeout(
+                        Duration::from_secs(self.config.transport_write_timeout_secs),
+                    ),
+                    Err(e) => {
+                        self.connecting.write().remove(&addr);
+                        self.node_table.mark_failed(&node_id);
+                        return Err(e);
+                    }
                 }
-            }
-        };
+            };
 
         // 出站握手
         let transport = transport;
@@ -490,7 +489,10 @@ impl ConnectionManager {
                         );
                     }
                     Err(e) => {
-                        debug!("[federation] 出站连接后自动建立中继失败 peer={}: {}", peer_id, e);
+                        debug!(
+                            "[federation] 出站连接后自动建立中继失败 peer={}: {}",
+                            peer_id, e
+                        );
                     }
                 }
             }
@@ -503,7 +505,7 @@ impl ConnectionManager {
     async fn handshake_outbound(
         &self,
         transport: &TcpTransport,
-        expected_node_id: NodeId,
+        _expected_node_id: NodeId,
     ) -> anyhow::Result<NodeId> {
         let hello = HelloMessage::sign_and_build(
             &self.identity,
@@ -529,7 +531,10 @@ impl ConnectionManager {
         let peer_id = NodeId(ack.node_id);
         // 自连接过滤：不允许连接自己（通过 PEX/DHT 发现到自身地址后误连）
         if peer_id == self.identity.node_id {
-            warn!("[federation] 检测到自连接（出站），已拒绝: node_id={}", peer_id);
+            warn!(
+                "[federation] 检测到自连接（出站），已拒绝: node_id={}",
+                peer_id
+            );
             anyhow::bail!("拒绝自连接: {}", peer_id);
         }
         debug!(
@@ -561,7 +566,10 @@ impl ConnectionManager {
 
         // 自连接过滤：不允许连接自己（入站方向）
         if peer_id == self.identity.node_id {
-            warn!("[federation] 检测到自连接（入站），已拒绝: node_id={}", peer_id);
+            warn!(
+                "[federation] 检测到自连接（入站），已拒绝: node_id={}",
+                peer_id
+            );
             anyhow::bail!("拒绝自连接: {}", peer_id);
         }
 
@@ -596,7 +604,9 @@ impl ConnectionManager {
         for seed in &self.config.seed_nodes {
             if let Ok(seed_addr) = seed.parse::<SocketAddr>() {
                 if seed_addr.ip() == conn_ip {
-                    self.seed_node_ids.write().insert(seed_addr, connection.node_id);
+                    self.seed_node_ids
+                        .write()
+                        .insert(seed_addr, connection.node_id);
                     debug!(
                         "[federation] 记录种子节点映射: {} -> {}",
                         seed_addr, connection.node_id
@@ -610,7 +620,9 @@ impl ConnectionManager {
     pub fn remove_connection(&self, node_id: &NodeId) {
         // 记录重连冷却到期时间，防止立即重连形成循环
         let cooldown = Duration::from_secs(self.config.reconnect_cooldown_secs);
-        self.cooldown_until.write().insert(*node_id, Instant::now() + cooldown);
+        self.cooldown_until
+            .write()
+            .insert(*node_id, Instant::now() + cooldown);
 
         let conn = self.connections.write().remove(node_id);
         if let Some(conn) = conn {
@@ -627,24 +639,7 @@ impl ConnectionManager {
 
     /// 启动心跳后台任务（已迁移到 TaskScheduler，此方法保留兼容但不再被调用）
     pub fn spawn_heartbeat(self: Arc<Self>) {
-        let interval = Duration::from_secs(self.config.heartbeat_interval_secs);
-        let mut shutdown_rx = self.shutdown.subscribe();
-
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.heartbeat_tick().await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] 心跳任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] 心跳任务已启动（间隔 {}s）", interval.as_secs());
+        // 已迁移到 TaskScheduler
     }
 
     /// 心跳单次执行（由 TaskScheduler 调度）
@@ -672,36 +667,23 @@ impl ConnectionManager {
         }
     }
 
+    /// 遍历所有连接并 flush 各自 gossip buffer（由 TaskScheduler 定期调度）
+    pub async fn flush_all_gossip_buffers(self: Arc<Self>) {
+        let max_batches = self.config.gossip_flush_max_batches;
+        for conn in self.all_connections() {
+            self.clone().flush_gossip_buffer(conn, max_batches).await;
+        }
+    }
+
     /// 启动消息处理循环（每条连接一个任务）
     async fn spawn_message_handler(self: Arc<Self>, connection: Arc<Connection>) {
         let mut shutdown_rx = self.shutdown.subscribe();
         let conn_id = connection.node_id;
 
-        // P1: 启动 per-connection GossipBatch 攒批 flush 任务
-        let flush_interval_ms = self.config.gossip_flush_interval_ms;
-        let max_batches = self.config.gossip_flush_max_batches;
-        let conn_flush = connection.clone();
-        let cm_flush = self.clone();
-        let mut flush_shutdown_rx = self.shutdown.subscribe();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(flush_interval_ms));
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        cm_flush.clone().flush_gossip_buffer(conn_flush.clone(), max_batches).await;
-                    }
-                    _ = conn_flush.gossip_flush_notify.notified() => {
-                        cm_flush.clone().flush_gossip_buffer(conn_flush.clone(), max_batches).await;
-                    }
-                    _ = flush_shutdown_rx.recv() => {
-                        debug!("[federation] Gossip flush 任务 {} 收到关闭信号", conn_id);
-                        break;
-                    }
-                }
-            }
-        });
+        // Gossip flush 已迁移到 TaskScheduler：由 flush_all_gossip_buffers() 定期遍历所有连接 flush
 
         tokio::spawn(async move {
+            // [ALLOWED-INTERVAL] 协议级网络接收循环（每条连接一个），阻塞在 recv_message，非定时任务，不迁移
             let pending_threshold = self.config.receive_pending_threshold;
             loop {
                 tokio::select! {
@@ -766,8 +748,12 @@ impl ConnectionManager {
             }
             MessageType::Pong => {
                 if let Ok(pong) = bincode::deserialize::<PongMessage>(&payload) {
-                    self.node_table.update_rtt(&connection.node_id, pong.rtt_estimate_ms);
-                    debug!("[federation] 收到 Pong from {} (rtt={}ms)", connection.node_id, pong.rtt_estimate_ms);
+                    self.node_table
+                        .update_rtt(&connection.node_id, pong.rtt_estimate_ms);
+                    debug!(
+                        "[federation] 收到 Pong from {} (rtt={}ms)",
+                        connection.node_id, pong.rtt_estimate_ms
+                    );
                 }
                 false
             }
@@ -811,7 +797,10 @@ impl ConnectionManager {
                 // 由后台 flush 任务统一处理。N 个 batch 只需要 1 次 permit + 1 次 spawn。
                 // P0-2: flush 任务内不使用 spawn_blocking（纯内存操作）。
                 if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
-                    warn!("[federation][perf] 收到 GossipBatch: entries={}", batch.entries.len());
+                    warn!(
+                        "[federation][perf] 收到 GossipBatch: entries={}",
+                        batch.entries.len()
+                    );
                     {
                         let mut buf = connection.gossip_buffer.lock();
                         let diag_repo_type = batch.repo_type;
@@ -832,7 +821,10 @@ impl ConnectionManager {
                     let count = bulk.batches.len();
                     // 计算所有 batch 的 entries 总数（在 move 进 buffer 之前）
                     let total_entries: usize = bulk.batches.iter().map(|b| b.entries.len()).sum();
-                    warn!("[federation][perf] 收到 GossipBatchBulk: {} 个 batch, 总条目 {}", count, total_entries);
+                    warn!(
+                        "[federation][perf] 收到 GossipBatchBulk: {} 个 batch, 总条目 {}",
+                        count, total_entries
+                    );
                     {
                         let mut buf = connection.gossip_buffer.lock();
                         for batch in bulk.batches {
@@ -843,7 +835,9 @@ impl ConnectionManager {
                     // 主循环已对每条消息 +1，Bulk 包含 N 个 batch，需补 +(N-1) 使计数与
                     // flush_gossip_buffer 按 batch 数 -group_len 递减匹配，避免 pending 下溢为巨大值触发虚假背压。
                     if count > 1 {
-                        connection.pending.fetch_add((count - 1) as u32, Ordering::Relaxed);
+                        connection
+                            .pending
+                            .fetch_add((count - 1) as u32, Ordering::Relaxed);
                     }
                     connection.gossip_flush_notify.notify_one();
                 }
@@ -917,7 +911,9 @@ impl ConnectionManager {
                         sync_mgr.update_diff_progress();
                         // 回复 Ack
                         let ack = FullSyncAckMessage { repo_type, seq };
-                        let _ = connection.send_message(MessageType::FullSyncAck, &ack).await;
+                        let _ = connection
+                            .send_message(MessageType::FullSyncAck, &ack)
+                            .await;
                         debug!(
                             "[federation] FullSyncBatch 应用: repo_type={}, seq={}, entries={}",
                             repo_type, seq, count
@@ -1042,7 +1038,8 @@ impl ConnectionManager {
                 // 实时 peer 查询请求：从本地 PeerRepo 查询该 infohash 的 peer 并回复
                 self.metrics.record_message_recv();
                 if let Ok(req) = bincode::deserialize::<PeerQueryRequestMessage>(&payload) {
-                    let peers: Vec<PeerQueryEntry> = if let Some(sync_mgr) = self.sync_manager.get() {
+                    let peers: Vec<PeerQueryEntry> = if let Some(sync_mgr) = self.sync_manager.get()
+                    {
                         sync_mgr.query_peers_for_infohash(&req.infohash, req.limit as usize)
                     } else {
                         Vec::new()
@@ -1080,7 +1077,10 @@ impl ConnectionManager {
                 false
             }
             _ => {
-                debug!("[federation] 收到未处理消息类型 {:?} from {}", msg_type, connection.node_id);
+                debug!(
+                    "[federation] 收到未处理消息类型 {:?} from {}",
+                    msg_type, connection.node_id
+                );
                 false
             }
         };
@@ -1093,6 +1093,7 @@ impl ConnectionManager {
     /// 先从 `heavy_task_semaphore` 获取 permit（有界并发），再用
     /// `spawn_blocking` 把阻塞型 DB 写入移出异步运行时线程。
     /// 任务完成后递减该连接的 pending 待处理计数。
+    #[allow(dead_code)]
     fn spawn_heavy_handler<F>(&self, conn: Arc<Connection>, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -1145,12 +1146,16 @@ impl ConnectionManager {
     /// 各自获取 1 个 `heavy_task_semaphore` permit 后顺序处理本组 batch。
     /// 组间并行，组内顺序；每个 task 完成后按本组 batch 数递减 `conn.pending`。
     async fn flush_gossip_buffer(self: Arc<Self>, conn: Arc<Connection>, _max_batches: usize) {
-        warn!("[federation][DIAG] flush_gossip_buffer ENTER, buffer_len={}", conn.gossip_buffer.lock().len());
+        warn!(
+            "[federation][DIAG] flush_gossip_buffer ENTER, buffer_len={}",
+            conn.gossip_buffer.lock().len()
+        );
         // 限频：每10次 flush tick 输出1次，用于确认 flush task 存活并观察 buffer 积压。
         // 放在 drain/early-return 之前，即使 buffer 为空也能看到 tick。
-        static FLUSH_TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FLUSH_TICK_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let tick = FLUSH_TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if tick % 10 == 0 {
+        if tick.is_multiple_of(10) {
             let buffer_len = conn.gossip_buffer.lock().len();
             warn!("[federation][perf] flush tick: buffer_len={}", buffer_len);
         }
@@ -1184,7 +1189,11 @@ impl ConnectionManager {
                 .collect();
             let dropped = before - filtered.len();
             if dropped > 0 {
-                warn!("[federation][perf] flush 提前去重: 丢弃 {} 条重复 batch（剩余 {}）", dropped, filtered.len());
+                warn!(
+                    "[federation][perf] flush 提前去重: 丢弃 {} 条重复 batch（剩余 {}）",
+                    dropped,
+                    filtered.len()
+                );
             }
             filtered
         } else {
@@ -1209,7 +1218,10 @@ impl ConnectionManager {
                 repo_type::INFOHASH => infohash_group.push(batch),
                 repo_type::TRACKER => tracker_group.push(batch),
                 _ => {
-                    debug!("[federation] flush GossipBatch 遇到未知 repo_type={}, 丢弃", batch.repo_type);
+                    debug!(
+                        "[federation] flush GossipBatch 遇到未知 repo_type={}, 丢弃",
+                        batch.repo_type
+                    );
                 }
             }
         }
@@ -1230,7 +1242,9 @@ impl ConnectionManager {
                 let _permit = match sem.acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
-                        conn_task.pending.fetch_sub(group_len as u32, Ordering::Relaxed);
+                        conn_task
+                            .pending
+                            .fetch_sub(group_len as u32, Ordering::Relaxed);
                         return;
                     }
                 };
@@ -1241,7 +1255,9 @@ impl ConnectionManager {
                     }
                 }
                 drop(_permit);
-                conn_task.pending.fetch_sub(group_len as u32, Ordering::Relaxed);
+                conn_task
+                    .pending
+                    .fetch_sub(group_len as u32, Ordering::Relaxed);
             });
         }
 
@@ -1307,7 +1323,8 @@ impl ConnectionManager {
         if now_secs.saturating_sub(last) < cooldown {
             return;
         }
-        self.last_reconnect_attempt.store(now_secs, Ordering::Relaxed);
+        self.last_reconnect_attempt
+            .store(now_secs, Ordering::Relaxed);
 
         let mut targets: Vec<(NodeId, SocketAddr)> = Vec::new();
         // 1) 种子节点已记录的真实 node_id + 地址（握手后获知，可信）
@@ -1388,7 +1405,7 @@ impl ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::node_id::{NodeIdentity, Reachability};
+    use crate::federation::node_id::NodeIdentity;
 
     fn make_test_config() -> FederationConfig {
         FederationConfig {
@@ -1404,7 +1421,13 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let mgr = ConnectionManager::new(node_table, identity, make_test_config(), shutdown_tx, Arc::new(FederationMetrics::new()));
+        let mgr = ConnectionManager::new(
+            node_table,
+            identity,
+            make_test_config(),
+            shutdown_tx,
+            Arc::new(FederationMetrics::new()),
+        );
         assert_eq!(mgr.connection_count(), 0);
         assert!(mgr.all_connections().is_empty());
     }
@@ -1425,7 +1448,10 @@ mod tests {
             assert_eq!(msg_type, MessageType::Ping);
             let ping: PingMessage = bincode::deserialize(&payload).unwrap();
             assert_eq!(ping.timestamp, 42);
-            let pong = PongMessage { timestamp: 42, rtt_estimate_ms: 5 };
+            let pong = PongMessage {
+                timestamp: 42,
+                rtt_estimate_ms: 5,
+            };
             conn.send_message(MessageType::Pong, &pong).await.unwrap();
         });
 
@@ -1459,7 +1485,8 @@ mod tests {
                 stream,
                 TransportKind::Tcp,
             )));
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // [ALLOWED-SLEEP] 测试代码中的一次性等待
+            tokio::time::sleep(Duration::from_secs(1)).await; // [ALLOWED-HARDCODED]
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1503,20 +1530,23 @@ mod tests {
         let mgr2_clone = mgr2.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+            let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
                 stream,
                 TransportKind::Tcp,
             )));
-            let (peer_id, _) = mgr2_clone.handshake_inbound(&mut transport).await.unwrap();
+            let (peer_id, _) = mgr2_clone.handshake_inbound(&transport).await.unwrap();
             assert_eq!(peer_id, identity1.node_id);
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+        let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
             stream,
             TransportKind::Tcp,
         )));
-        let peer_id = mgr1.handshake_outbound(&mut transport, identity2.node_id).await.unwrap();
+        let peer_id = mgr1
+            .handshake_outbound(&transport, identity2.node_id)
+            .await
+            .unwrap();
         assert_eq!(peer_id, identity2.node_id);
 
         server.await.unwrap();

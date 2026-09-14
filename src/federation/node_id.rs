@@ -26,7 +26,10 @@ impl NodeId {
 
     pub fn from_hex(s: &str) -> anyhow::Result<Self> {
         if s.len() != 40 {
-            anyhow::bail!("节点 ID 必须是 40 字符十六进制字符串，实际长度: {}", s.len());
+            anyhow::bail!(
+                "节点 ID 必须是 40 字符十六进制字符串，实际长度: {}",
+                s.len()
+            );
         }
         let mut id = [0u8; 20];
         for i in 0..20 {
@@ -85,7 +88,10 @@ impl<'de> Deserialize<'de> for NodeId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes = <Vec<u8>>::deserialize(deserializer)?;
         if bytes.len() != 20 {
-            return Err(serde::de::Error::custom(format!("NodeId 需要 20 字节，实际 {}", bytes.len())));
+            return Err(serde::de::Error::custom(format!(
+                "NodeId 需要 20 字节，实际 {}",
+                bytes.len()
+            )));
         }
         let mut arr = [0u8; 20];
         arr.copy_from_slice(&bytes);
@@ -176,8 +182,7 @@ impl NodeIdentity {
 
     /// 从公钥字节构造 VerifyingKey
     pub fn verifying_key_from_bytes(bytes: &[u8; 32]) -> anyhow::Result<VerifyingKey> {
-        VerifyingKey::from_bytes(bytes)
-            .map_err(|e| anyhow::anyhow!("无效公钥: {}", e))
+        VerifyingKey::from_bytes(bytes).map_err(|e| anyhow::anyhow!("无效公钥: {}", e))
     }
 
     /// 从数据目录加载或创建身份
@@ -287,13 +292,16 @@ mod tests {
     fn test_node_address_preferred() {
         let addr = NodeAddress {
             node_id: [0u8; 20],
-            ipv4_addr: Some("127.0.0.1:6885".parse().unwrap()),
+            ipv4_addr: Some("127.0.0.1:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
             ipv6_addr: None,
             reachability: Reachability::Mapped,
             last_seen: 0,
             nat_type: None,
         };
-        assert_eq!(addr.preferred_addr(), Some("127.0.0.1:6885".parse().unwrap()));
+        assert_eq!(
+            addr.preferred_addr(),
+            Some("127.0.0.1:6885".parse().unwrap()) // [ALLOWED-HARDCODED]
+        );
     }
 
     #[test]
@@ -357,7 +365,7 @@ mod tests {
         assert!(identity.addresses_snapshot().is_empty());
         let addr = NodeAddress {
             node_id: identity.node_id.0,
-            ipv4_addr: Some("1.2.3.4:6885".parse().unwrap()),
+            ipv4_addr: Some("1.2.3.4:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
             ipv6_addr: None,
             reachability: Reachability::Mapped,
             last_seen: 100,

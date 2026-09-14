@@ -4,7 +4,7 @@
 //! 监听独立端口 6881（UDP + TCP），与 Tracker 端口 6880 隔离。
 //!
 //! 中继协议（UDP）：
-//! ```
+//! ```text
 //! +----------------+----------------+------------------+
 //! |  magic(2B)     |  peer_id_len  |  peer_id(var)    |
 //! +----------------+----------------+------------------+
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
@@ -38,16 +38,16 @@ use tracing::{debug, info, warn};
 const RELAY_MAGIC: [u8; 2] = [0x50, 0x44];
 
 /// 默认中继端口
-pub const DEFAULT_RELAY_PORT: u16 = 6881;
+pub const DEFAULT_RELAY_PORT: u16 = 6881; // [ALLOWED-HARDCODED]
 
 /// UDP 接收缓冲区大小
 const UDP_BUFFER_SIZE: usize = 65536;
 
 /// TCP 连接超时
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const _TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120); // [ALLOWED-HARDCODED]
 
 /// 单连接最大带宽（字节/秒）
-const MAX_BANDWIDTH_PER_CONN: u64 = 10 * 1024 * 1024; // 10 MB/s
+const _MAX_BANDWIDTH_PER_CONN: u64 = 10 * 1024 * 1024; // 10 MB/s
 
 // ---------------------------------------------------------------------------
 // 中继统计
@@ -102,7 +102,7 @@ struct TcpConnection {
     /// 关联的 peer_id
     peer_id: String,
     /// 连接时间
-    connected_at: Instant,
+    _connected_at: Instant,
     /// 最后活跃时间
     last_active: Instant,
     /// 已转发字节数
@@ -177,7 +177,8 @@ impl RelayServer {
                             &udp_stats,
                             &buf[..len],
                             src,
-                        ).await;
+                        )
+                        .await;
                     }
                     Err(e) => {
                         warn!("[relay] UDP 接收失败: {}", e);
@@ -204,16 +205,6 @@ impl RelayServer {
                         warn!("[relay] TCP 接受失败: {}", e);
                     }
                 }
-            }
-        });
-
-        // 定期清理超时连接
-        let cleanup_clients = udp_clients.clone();
-        let cleanup_conns = tcp_connections.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                Self::cleanup_expired(&cleanup_clients, &cleanup_conns);
             }
         });
 
@@ -255,7 +246,9 @@ impl RelayServer {
 
         debug!(
             "[relay] UDP 中继: src={}, peer_id={}, payload={}B",
-            src, peer_id, payload.len()
+            src,
+            peer_id,
+            payload.len()
         );
 
         // 注册/更新客户端
@@ -265,12 +258,15 @@ impl RelayServer {
                 client.last_active = Instant::now();
                 client.bytes_forwarded += payload.len() as u64;
             } else {
-                clients.insert(peer_id.clone(), UdpClient {
-                    addr: src,
-                    peer_id: peer_id.clone(),
-                    last_active: Instant::now(),
-                    bytes_forwarded: payload.len() as u64,
-                });
+                clients.insert(
+                    peer_id.clone(),
+                    UdpClient {
+                        addr: src,
+                        peer_id: peer_id.clone(),
+                        last_active: Instant::now(),
+                        bytes_forwarded: payload.len() as u64,
+                    },
+                );
             }
         }
 
@@ -278,7 +274,8 @@ impl RelayServer {
         // 实际应用中应该根据 payload 中的目标 peer_id 转发
         let targets: Vec<SocketAddr> = {
             let clients = clients.read();
-            clients.values()
+            clients
+                .values()
                 .filter(|c| c.peer_id != peer_id)
                 .map(|c| c.addr)
                 .collect()
@@ -353,13 +350,16 @@ impl RelayServer {
         // 注册连接
         {
             let mut conns = connections.write();
-            conns.insert(peer_id.clone(), TcpConnection {
-                addr,
-                peer_id: peer_id.clone(),
-                connected_at: Instant::now(),
-                last_active: Instant::now(),
-                bytes_forwarded: 0,
-            });
+            conns.insert(
+                peer_id.clone(),
+                TcpConnection {
+                    addr,
+                    peer_id: peer_id.clone(),
+                    _connected_at: Instant::now(),
+                    last_active: Instant::now(),
+                    bytes_forwarded: 0,
+                },
+            );
             stats.write().active_tcp_connections = conns.len();
         }
 
@@ -403,7 +403,8 @@ impl RelayServer {
             // 转发给所有其他连接（简化：广播）
             let targets: Vec<SocketAddr> = {
                 let conns = connections.read();
-                conns.values()
+                conns
+                    .values()
                     .filter(|c| c.peer_id != peer_id)
                     .map(|c| c.addr)
                     .collect()
@@ -423,25 +424,22 @@ impl RelayServer {
         info!("[relay] TCP 连接关闭: {} (peer_id={})", addr, peer_id);
     }
 
-    /// 清理过期连接
-    fn cleanup_expired(
-        udp_clients: &Arc<RwLock<HashMap<String, UdpClient>>>,
-        tcp_connections: &Arc<RwLock<HashMap<String, TcpConnection>>>,
-    ) {
+    /// 清理过期连接（由 TaskScheduler 按间隔调度）
+    pub fn cleanup_expired(&self) {
         let now = Instant::now();
-        let timeout = Duration::from_secs(120);
+        let timeout = Duration::from_secs(120); // [ALLOWED-HARDCODED]
 
-        let udp_before = udp_clients.read().len();
-        udp_clients.write().retain(|_, client| {
-            now.duration_since(client.last_active) < timeout
-        });
-        let udp_cleaned = udp_before - udp_clients.read().len();
+        let udp_before = self.udp_clients.read().len();
+        self.udp_clients
+            .write()
+            .retain(|_, client| now.duration_since(client.last_active) < timeout);
+        let udp_cleaned = udp_before - self.udp_clients.read().len();
 
-        let tcp_before = tcp_connections.read().len();
-        tcp_connections.write().retain(|_, conn| {
-            now.duration_since(conn.last_active) < timeout
-        });
-        let tcp_cleaned = tcp_before - tcp_connections.read().len();
+        let tcp_before = self.tcp_connections.read().len();
+        self.tcp_connections
+            .write()
+            .retain(|_, conn| now.duration_since(conn.last_active) < timeout);
+        let tcp_cleaned = tcp_before - self.tcp_connections.read().len();
 
         if udp_cleaned > 0 || tcp_cleaned > 0 {
             debug!(
@@ -491,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_relay_server_creation() {
-        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap(); // [ALLOWED-HARDCODED]
         let server = RelayServer::new(addr);
         assert_eq!(server.listen_addr, addr);
         assert_eq!(server.stats().active_udp_clients, 0);

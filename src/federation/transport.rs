@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -15,7 +15,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::protocol::{
-    decode_frame, encode_message, frame_size_in_buffer, MessageType, FRAME_HEADER_SIZE,
+    decode_frame, encode_message, frame_size_in_buffer, MessageType,
 };
 
 /// TCP 读取端（含读取缓冲区）
@@ -59,7 +59,7 @@ impl TcpTransport {
             peer,
             local,
             metrics: None,
-            write_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30), // [ALLOWED-HARDCODED]
         }
     }
 
@@ -78,13 +78,15 @@ impl TcpTransport {
     /// 主动连接到远端
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
         let stream = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(10), // [ALLOWED-HARDCODED]
             tokio::net::TcpStream::connect(addr),
         )
         .await
         .map_err(|_| anyhow::anyhow!("连接超时: {}", addr))?
         .map_err(|e| anyhow::anyhow!("连接失败 {}: {}", addr, e))?;
-        stream.set_nodelay(true).map_err(|e| anyhow::anyhow!("set_nodelay 失败: {}", e))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| anyhow::anyhow!("set_nodelay 失败: {}", e))?;
         let transport_stream: Box<dyn TransportStream> =
             Box::new(TcpTransportStream::new(stream, TransportKind::Tcp));
         Ok(Self::new(transport_stream))
@@ -109,9 +111,7 @@ impl TcpTransport {
         let mut writer = self.writer.lock().await;
         tokio::time::timeout(self.write_timeout, writer.writer.write_all(&frame))
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout")
-            })?
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))?
             .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
         // 累加序列化后的完整帧字节数（含帧头）
         if let Some(metrics) = &self.metrics {
@@ -125,9 +125,7 @@ impl TcpTransport {
         let mut writer = self.writer.lock().await;
         tokio::time::timeout(self.write_timeout, writer.writer.write_all(frame))
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout")
-            })?
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))?
             .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
         Ok(())
     }
@@ -170,7 +168,8 @@ impl TcpTransport {
 
     /// 获取本地地址
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
-        self.local.ok_or_else(|| anyhow::anyhow!("获取本地地址失败"))
+        self.local
+            .ok_or_else(|| anyhow::anyhow!("获取本地地址失败"))
     }
 
     /// 关闭连接
@@ -193,7 +192,6 @@ impl std::fmt::Debug for TcpTransport {
             .finish()
     }
 }
-
 
 /// UDP 打洞传输层
 ///
@@ -240,7 +238,8 @@ impl UdpTransport {
         packet.extend_from_slice(node_id);
 
         let start = std::time::Instant::now();
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        // [ALLOWED-INTERVAL] 联邦协议级维护循环，后续 ICC 阶段迁移到 TaskScheduler
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100)); // [ALLOWED-HARDCODED]
 
         while start.elapsed() < duration {
             interval.tick().await;
@@ -312,7 +311,7 @@ mod tests {
         });
 
         // 客户端连接
-        let mut client = TcpTransport::connect(server_addr).await.unwrap();
+        let client = TcpTransport::connect(server_addr).await.unwrap();
         let ping = PingMessage { timestamp: 42 };
         client.send_message(MessageType::Ping, &ping).await.unwrap();
 
@@ -334,7 +333,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = TcpTransport::new(Box::new(TcpTransportStream::new(
+            let transport = TcpTransport::new(Box::new(TcpTransportStream::new(
                 stream,
                 TransportKind::Tcp,
             )));
@@ -346,7 +345,7 @@ mod tests {
             }
         });
 
-        let mut client = TcpTransport::connect(server_addr).await.unwrap();
+        let client = TcpTransport::connect(server_addr).await.unwrap();
         for i in 0..5 {
             let ping = PingMessage { timestamp: i };
             client.send_message(MessageType::Ping, &ping).await.unwrap();
@@ -379,7 +378,7 @@ mod tests {
         sender.send_to(data, recv_addr).await.unwrap();
 
         let mut buf = [0u8; 64];
-        let (len, from) = receiver.recv_from(&mut buf).await.unwrap();
+        let (len, _from) = receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(len, data.len());
         assert_eq!(&buf[..len], data);
     }

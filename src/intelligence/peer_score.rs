@@ -63,11 +63,7 @@ impl PeerScorer for PeerScorerImpl {
         let dht_score = if supports_dht { 100.0 } else { 30.0 };
 
         // 4. 存活时间 10%（≥24h满分）
-        let uptime_secs = peer
-            .first_seen
-            .elapsed()
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let uptime_secs = peer.first_seen.elapsed().map(|d| d.as_secs()).unwrap_or(0);
         let uptime_score = (uptime_secs.min(86400) as f64 / 86400.0) * 100.0;
 
         // 5. 多 infohash 共享 10%（≥3个满分）
@@ -77,7 +73,10 @@ impl PeerScorer for PeerScorerImpl {
             infohash_count as f64 / 3.0 * 100.0
         };
 
-        source_score * 0.30 + reachability * 0.30 + dht_score * 0.20 + uptime_score * 0.10
+        source_score * 0.30
+            + reachability * 0.30
+            + dht_score * 0.20
+            + uptime_score * 0.10
             + shared_score * 0.10
     }
 }
@@ -104,7 +103,8 @@ mod tests {
         let mut peer = PeerInfo::new(addr, PeerSource::Tracker);
         peer.connection_attempts = 10;
         peer.connection_successes = 9;
-        peer.metadata.insert("supports_dht".to_string(), "true".to_string());
+        peer.metadata
+            .insert("supports_dht".to_string(), "true".to_string());
 
         let score = scorer.calculate(&peer, 3);
         // 来源30 + 可达27 + DHT20 + 存活~0 + 共享10 = ~87

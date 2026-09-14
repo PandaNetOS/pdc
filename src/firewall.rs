@@ -32,10 +32,7 @@ impl FirewallManager {
     /// 创建防火墙管理器
     /// node_id: 20字节节点ID，取前4字节（8位十六进制）用于规则命名
     pub fn new(node_id: &[u8; 20], enabled: bool) -> Self {
-        let prefix: String = node_id[0..4]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
+        let prefix: String = node_id[0..4].iter().map(|b| format!("{:02x}", b)).collect();
         Self {
             node_id_prefix: prefix,
             enabled,
@@ -210,11 +207,7 @@ mod imp {
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    let detail = if !stderr.is_empty() {
-                        stderr
-                    } else {
-                        stdout
-                    };
+                    let detail = if !stderr.is_empty() { stderr } else { stdout };
                     result.failed.push((rule_name.clone(), detail.clone()));
                     tracing::warn!(
                         "[firewall] 添加规则失败（可能非管理员权限）: {} — {}",
@@ -224,11 +217,7 @@ mod imp {
                 }
                 Err(e) => {
                     result.failed.push((rule_name.clone(), e.to_string()));
-                    tracing::warn!(
-                        "[firewall] 执行 netsh 命令失败: {} — {}",
-                        rule_name,
-                        e
-                    );
+                    tracing::warn!("[firewall] 执行 netsh 命令失败: {} — {}", rule_name, e);
                 }
             }
         }
@@ -350,9 +339,8 @@ mod tests {
     fn test_firewall_manager_creation() {
         // 构造一个已知的 node_id
         let node_id: [u8; 20] = [
-            0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-            0x11, 0x12, 0x13, 0x14,
+            0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
         ];
         let manager = FirewallManager::new(&node_id, true);
         // 前 4 字节 = a1 b2 c3 d4 → "a1b2c3d4"
@@ -382,7 +370,7 @@ mod tests {
         // api 和 super-tracker 都是 TCP 6880，应去重只保留一条
         let ports: Vec<(u16, &str, &str)> = vec![
             (6880, "TCP", "api"),
-            (6880, "TCP", "super-tracker"), // 重复，应被跳过
+            (6880, "TCP", "super-tracker"),     // 重复，应被跳过
             (6880, "UDP", "super-tracker-udp"), // 同端口不同协议，保留
             (6881, "TCP", "relay"),
             (6881, "UDP", "dht"), // 同端口不同协议，保留
@@ -424,10 +412,7 @@ mod tests {
         let manager = FirewallManager::new(&node_id, false);
 
         // disabled 时 add_rules 应直接返回空结果，不执行任何命令
-        let ports: Vec<(u16, &str, &str)> = vec![
-            (6880, "TCP", "api"),
-            (6882, "UDP", "crawler"),
-        ];
+        let ports: Vec<(u16, &str, &str)> = vec![(6880, "TCP", "api"), (6882, "UDP", "crawler")];
 
         let result = manager.add_rules(&ports).unwrap();
         assert!(result.added.is_empty());
@@ -459,7 +444,7 @@ mod tests {
         let enabled = FirewallManager::is_firewall_enabled();
         // 函数必须能正常调用并返回 bool，不 panic
         let _ = enabled;
-        assert!(enabled == true || enabled == false);
+        assert!(enabled || !enabled);
     }
 
     #[test]

@@ -21,18 +21,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::discoverers::dht::message::DhtMessage;
 use crate::dht::routing_table::RoutingTable;
+use crate::discoverers::dht::message::DhtMessage;
 use crate::storage::{NodeRepoImpl, PeerRepoImpl};
 
 /// 并发探测数
 const MAX_CONCURRENT: usize = 20;
 /// ping 超时
-const PING_TIMEOUT: Duration = Duration::from_secs(3);
+const PING_TIMEOUT: Duration = Duration::from_secs(3); // [ALLOWED-HARDCODED]
 /// 已探测地址缓存上限（防止内存膨胀）
 const MAX_PROBED_CACHE: usize = 100_000;
 /// 从 PeerRepo 拉取未探测 peer 的间隔
-const PEER_REPO_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const _PEER_REPO_POLL_INTERVAL: Duration = Duration::from_secs(15); // [ALLOWED-HARDCODED]
 /// 每次从 PeerRepo 拉取的最大 peer 数
 const MAX_PEERS_PER_POLL: usize = 100;
 
@@ -49,6 +49,8 @@ pub struct DhtProbe {
     pub total_added: Arc<AtomicU64>,
     /// 全量同步暂停门：为 true 时暂停从 PeerRepo 拉取新探测任务
     pause_gate: Option<Arc<AtomicBool>>,
+    /// PeerRepo 引用（用于定期拉取未探测 peer）
+    peer_repo: Option<Arc<PeerRepoImpl>>,
 }
 
 impl DhtProbe {
@@ -73,84 +75,87 @@ impl DhtProbe {
             total_success: Arc::new(AtomicU64::new(0)),
             total_added: Arc::new(AtomicU64::new(0)),
             pause_gate,
+            peer_repo,
         };
 
         probe.start(receiver);
-        // 启动 PeerRepo 定期拉取任务（统一探测来源）
-        if let Some(repo) = peer_repo {
-            probe.start_peer_repo_poller(repo);
-        }
         probe
     }
 
-    /// 启动 PeerRepo 定期拉取任务：从 PeerRepo 获取未探测的 peer，加入探测队列
+    /// 执行一次 PeerRepo 拉取（由 TaskScheduler 按间隔调度）
     /// 统一探测来源，所有 peer 都经过 PeerRepo，避免遗漏和重复代码
-    fn start_peer_repo_poller(&self, peer_repo: Arc<PeerRepoImpl>) {
-        let probed = self.probed.clone();
-        let sender = self.sender.clone();
-        let pause_gate = self.pause_gate.clone();
+    pub async fn run_once(&self) {
+        let peer_repo = match &self.peer_repo {
+            Some(repo) => repo.clone(),
+            None => return,
+        };
 
-        tokio::spawn(async move {
-            info!("[dht_probe] PeerRepo 拉取任务已启动（间隔 {:?}）", PEER_REPO_POLL_INTERVAL);
-            let mut interval = tokio::time::interval(PEER_REPO_POLL_INTERVAL);
-            interval.tick().await; // 跳过第一次立即触发
+        // 全量同步期间暂停拉取新探测任务，把带宽/CPU 让给联邦同步
+        if self
+            .pause_gate
+            .as_ref()
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            return;
+        }
 
-            loop {
-                interval.tick().await;
+        // 从 PeerRepo 获取所有 peer
+        let all_peers = peer_repo.all_peers_sync();
+        if all_peers.is_empty() {
+            return;
+        }
 
-                // 全量同步期间暂停拉取新探测任务，把带宽/CPU 让给联邦同步
-                if pause_gate.as_ref().map(|g| g.load(Ordering::Relaxed)).unwrap_or(false) {
+        // 过滤掉已探测的，按优先级排序（高优先级优先探测）
+        let mut to_probe: Vec<_> = {
+            let probed_set = self.probed.read();
+            all_peers
+                .into_iter()
+                .filter(|p| !probed_set.contains(&p.addr))
+                .collect()
+        };
+
+        if to_probe.is_empty() {
+            return;
+        }
+
+        // 按优先级降序排序（高优先级优先）
+        to_probe.sort_by(|a, b| {
+            b.priority_score
+                .partial_cmp(&a.priority_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        to_probe.truncate(MAX_PEERS_PER_POLL);
+
+        // 加入探测队列
+        let mut count = 0;
+        {
+            let mut probed_set = self.probed.write();
+            for peer in &to_probe {
+                if probed_set.contains(&peer.addr) {
                     continue;
                 }
-
-                // 从 PeerRepo 获取所有 peer
-                let all_peers = peer_repo.all_peers_sync();
-                if all_peers.is_empty() {
-                    continue;
-                }
-
-                // 过滤掉已探测的，按优先级排序（高优先级优先探测）
-                let mut to_probe: Vec<_> = {
-                    let probed_set = probed.read();
-                    all_peers
-                        .into_iter()
-                        .filter(|p| !probed_set.contains(&p.addr))
-                        .collect()
-                };
-
-                if to_probe.is_empty() {
-                    debug!("[dht_probe] PeerRepo 中所有 peer 都已探测，跳过");
-                    continue;
-                }
-
-                // 按优先级降序排序（高优先级优先）
-                to_probe.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
-                to_probe.truncate(MAX_PEERS_PER_POLL);
-
-                // 加入探测队列
-                let mut count = 0;
-                {
-                    let mut probed_set = probed.write();
-                    for peer in &to_probe {
-                        if probed_set.contains(&peer.addr) {
-                            continue;
-                        }
-                        probed_set.insert(peer.addr);
-                        // 防止缓存无限膨胀
-                        if probed_set.len() > MAX_PROBED_CACHE {
-                            let keys: Vec<SocketAddr> = probed_set.iter().take(MAX_PROBED_CACHE / 2).copied().collect();
-                            for k in keys {
-                                probed_set.remove(&k);
-                            }
-                        }
-                        let _ = sender.send(peer.addr);
-                        count += 1;
+                probed_set.insert(peer.addr);
+                // 防止缓存无限膨胀
+                if probed_set.len() > MAX_PROBED_CACHE {
+                    let keys: Vec<SocketAddr> = probed_set
+                        .iter()
+                        .take(MAX_PROBED_CACHE / 2)
+                        .copied()
+                        .collect();
+                    for k in keys {
+                        probed_set.remove(&k);
                     }
                 }
-
-                info!("[dht_probe] 从 PeerRepo 拉取 {} 个未探测 peer 加入队列（优先级最高的前 {} 个）", count, MAX_PEERS_PER_POLL);
+                let _ = self.sender.send(peer.addr);
+                count += 1;
             }
-        });
+        }
+
+        info!(
+            "[dht_probe] 从 PeerRepo 拉取 {} 个未探测 peer 加入队列（优先级最高的前 {} 个）",
+            count, MAX_PEERS_PER_POLL
+        );
     }
 
     /// 获取发送端（用于提交待探测地址）
@@ -169,7 +174,8 @@ impl DhtProbe {
             // 防止缓存无限膨胀
             if probed.len() > MAX_PROBED_CACHE {
                 // 简单策略：清空一半（FIFO 不保证，用随机淘汰）
-                let keys: Vec<SocketAddr> = probed.iter().take(MAX_PROBED_CACHE / 2).copied().collect();
+                let keys: Vec<SocketAddr> =
+                    probed.iter().take(MAX_PROBED_CACHE / 2).copied().collect();
                 for k in keys {
                     probed.remove(&k);
                 }
@@ -254,11 +260,18 @@ impl DhtProbe {
                                 }
                                 let repo_added = if let Some(repo) = &node_repo {
                                     repo.add_node_sync(responder_id, addr)
-                                } else { false };
+                                } else {
+                                    false
+                                };
                                 if rt_added || repo_added {
                                     total_added.fetch_add(1, Ordering::Relaxed);
-                                    info!("[dht_probe] 节点加入: {} (id={}) 路由表={} NodeRepo={}",
-                                        addr, hex::encode(&responder_id[..4]), rt_added, repo_added);
+                                    info!(
+                                        "[dht_probe] 节点加入: {} (id={}) 路由表={} NodeRepo={}",
+                                        addr,
+                                        hex::encode(&responder_id[..4]),
+                                        rt_added,
+                                        repo_added
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -337,15 +350,14 @@ impl DhtProbe {
     ///
     /// 返回 Ok(true) 表示支持 DHT，Ok(false) 表示在线但不支持 DHT，
     /// Err 表示连接失败或握手失败。
+    #[allow(dead_code)]
     async fn tcp_handshake_check(addr: SocketAddr) -> anyhow::Result<bool> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
         // TCP 连接（超时 5 秒）
-        let stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(addr),
-        ).await??;
+        let stream =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??; // [ALLOWED-HARDCODED]
 
         // 构造 BT 握手
         let mut handshake = Vec::with_capacity(68);
@@ -370,7 +382,7 @@ impl DhtProbe {
 
         // 读取响应握手（68 字节）
         let mut resp = vec![0u8; 68];
-        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut resp)).await??;
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut resp)).await??; // [ALLOWED-HARDCODED]
 
         // 验证响应格式
         if resp[0] != 19 || &resp[1..20] != b"BitTorrent protocol" {

@@ -66,7 +66,9 @@ impl HealthScorer for HealthScorerImpl {
         let score_dimension = avg_tracker_score;
 
         // 维度4：协议多样性（20%）— HTTP + UDP 都有 = 满分，只有一种 = 50分
-        let has_http = all_trackers.iter().any(|t| t.url.starts_with("http://") || t.url.starts_with("https://"));
+        let has_http = all_trackers
+            .iter()
+            .any(|t| t.url.starts_with("http://") || t.url.starts_with("https://"));
         let has_udp = all_trackers.iter().any(|t| t.url.starts_with("udp://"));
         let protocol_diversity = match (has_http, has_udp) {
             (true, true) => 100.0,
@@ -104,9 +106,17 @@ impl HealthScorer for HealthScorerImpl {
         let peer_count = peers.peer_count().await;
 
         // infohash 覆盖度：>50 个 infohash 满分
-        let ih_score = if ih_count >= 50 { 100.0 } else { ih_count as f64 * 2.0 };
+        let ih_score = if ih_count >= 50 {
+            100.0
+        } else {
+            ih_count as f64 * 2.0
+        };
         // peer 丰富度：>500 个 peer 满分
-        let peer_score = if peer_count >= 500 { 100.0 } else { peer_count as f64 * 0.2 };
+        let peer_score = if peer_count >= 500 {
+            100.0
+        } else {
+            peer_count as f64 * 0.2
+        };
         // 基础分：缓存系统正常运行给 20 分
         let base_score = 20.0;
         let peer_layer = ih_score * 0.4 + peer_score * 0.4 + base_score;
@@ -132,7 +142,6 @@ mod tests {
 
     #[test]
     fn test_health_scorer_creation() {
-        let scorer = HealthScorerImpl::new();
-        assert!(true);
+        let _scorer = HealthScorerImpl::new();
     }
 }

@@ -3,8 +3,8 @@
 //! 帧格式：`[4字节大端长度][1字节消息类型][payload]`
 //! payload 使用 bincode 序列化。
 
-use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::federation::node_id::NodeAddress;
 
@@ -479,7 +479,8 @@ pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// 帧格式：`[4字节大端长度(含类型字节)][1字节类型][bincode payload]`
 pub fn encode_message<T: Serialize>(msg_type: MessageType, msg: &T) -> anyhow::Result<Vec<u8>> {
-    let payload = bincode::serialize(msg).map_err(|e| anyhow::anyhow!("bincode 序列化失败: {}", e))?;
+    let payload =
+        bincode::serialize(msg).map_err(|e| anyhow::anyhow!("bincode 序列化失败: {}", e))?;
     let total_len = 1 + payload.len(); // 1 字节类型 + payload
     if total_len > MAX_FRAME_SIZE {
         anyhow::bail!("帧过大: {} 字节 > {} 字节", total_len, MAX_FRAME_SIZE);
@@ -497,7 +498,11 @@ pub fn encode_message<T: Serialize>(msg_type: MessageType, msg: &T) -> anyhow::R
 /// 返回 `(消息类型, payload 切片)`。
 pub fn decode_frame(data: &[u8]) -> anyhow::Result<(MessageType, &[u8])> {
     if data.len() < FRAME_HEADER_SIZE {
-        anyhow::bail!("数据不足，需要至少 {} 字节，实际 {}", FRAME_HEADER_SIZE, data.len());
+        anyhow::bail!(
+            "数据不足，需要至少 {} 字节，实际 {}",
+            FRAME_HEADER_SIZE,
+            data.len()
+        );
     }
     let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if length == 0 || length > MAX_FRAME_SIZE {
@@ -552,7 +557,10 @@ mod tests {
     fn test_encode_decode_ping() {
         let ping = PingMessage { timestamp: 12345 };
         let frame = encode_message(MessageType::Ping, &ping).unwrap();
-        assert_eq!(frame.len(), FRAME_HEADER_SIZE + bincode::serialized_size(&ping).unwrap() as usize);
+        assert_eq!(
+            frame.len(),
+            FRAME_HEADER_SIZE + bincode::serialized_size(&ping).unwrap() as usize
+        );
 
         let (msg_type, payload) = decode_frame(&frame).unwrap();
         assert_eq!(msg_type, MessageType::Ping);
@@ -595,7 +603,7 @@ mod tests {
             session_id: 42,
             from_node: [1; 20],
             to_node: [2; 20],
-            from_addr: Some("1.2.3.4:6885".parse().unwrap()),
+            from_addr: Some("1.2.3.4:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
             nat_type: Some("FullCone".to_string()),
             action: 0,
         };
@@ -604,7 +612,7 @@ mod tests {
         assert_eq!(decoded.session_id, 42);
         assert_eq!(decoded.from_node, [1; 20]);
         assert_eq!(decoded.action, 0);
-        assert_eq!(decoded.from_addr, Some("1.2.3.4:6885".parse().unwrap()));
+        assert_eq!(decoded.from_addr, Some("1.2.3.4:6885".parse().unwrap())); // [ALLOWED-HARDCODED]
     }
 
     #[test]
@@ -613,13 +621,13 @@ mod tests {
             repo_type: repo_type::NODE,
             entries: vec![
                 SyncEntry {
-                    key: b"127.0.0.1:6885".to_vec(),
+                    key: b"127.0.0.1:6885".to_vec(), // [ALLOWED-HARDCODED]
                     operation: operation::UPSERT,
                     version: 1,
                     payload: vec![1, 2, 3],
                 },
                 SyncEntry {
-                    key: b"10.0.0.1:6885".to_vec(),
+                    key: b"10.0.0.1:6885".to_vec(), // [ALLOWED-HARDCODED]
                     operation: operation::UPSERT,
                     version: 2,
                     payload: vec![4, 5, 6],
@@ -632,7 +640,7 @@ mod tests {
         let decoded: SyncBatchMessage = bincode::deserialize(payload).unwrap();
         assert_eq!(decoded.repo_type, 1);
         assert_eq!(decoded.entries.len(), 2);
-        assert_eq!(decoded.entries[0].key, b"127.0.0.1:6885");
+        assert_eq!(decoded.entries[0].key, b"127.0.0.1:6885"); // [ALLOWED-HARDCODED]
         assert_eq!(decoded.entries[1].version, 2);
     }
 
