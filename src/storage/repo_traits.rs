@@ -62,11 +62,8 @@ pub trait NodeRepository: Send + Sync {
     async fn rescore_all(&self);
 
     // 持久化
-    async fn save_all(&self) -> anyhow::Result<()>;
-    /// 增量持久化：只保存脏数据（默认实现为全量保存，后续可优化为增量）
-    async fn save_dirty(&self) -> anyhow::Result<()> {
-        self.save_all().await
-    }
+    /// 增量持久化：只保存 dirty 节点（新增/更新/删除均标记 dirty）
+    async fn save_dirty(&self) -> anyhow::Result<()>;
     async fn load_all(&self) -> anyhow::Result<usize>;
 }
 
@@ -100,10 +97,6 @@ pub trait PeerRepository: Send + Sync {
 
     // 全量持久化
     async fn save_all(&self) -> anyhow::Result<()>;
-    /// 增量持久化：只保存脏数据（默认实现为全量保存，后续可优化为增量）
-    async fn save_dirty(&self) -> anyhow::Result<()> {
-        self.save_all().await
-    }
     async fn load_all(&self) -> anyhow::Result<usize>;
 
     // 历史持久化
@@ -170,9 +163,5 @@ pub trait TrackerRepository: Send + Sync {
 
     // 持久化
     async fn save_all(&self) -> anyhow::Result<()>;
-    /// 增量持久化：只保存脏数据（默认实现为全量保存，后续可优化为增量）
-    async fn save_dirty(&self) -> anyhow::Result<()> {
-        self.save_all().await
-    }
     async fn load_all(&self) -> anyhow::Result<usize>;
 }

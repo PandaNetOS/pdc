@@ -215,11 +215,6 @@ mod tests {
             Vec::new()
         }
         async fn rescore_all(&self) {}
-        async fn save_all(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
         async fn save_dirty(&self) -> anyhow::Result<()> {
             Ok(())
         }

@@ -734,7 +734,7 @@ async fn main() -> anyhow::Result<()> {
                 let st = st.clone();
                 async move {
                     let mut saved = 0u64;
-                    match nr.save_all().await {
+                    match nr.save_dirty().await {
                         Ok(_) => saved += 1,
                         Err(e) => warn!("[persistence] NodeRepo 保存失败: {}", e),
                     }
@@ -1956,7 +1956,7 @@ async fn main() -> anyhow::Result<()> {
 
             // 全量保存所有 Repo 到 SQLite（统一数据归口）
             if let Some(ref repo) = app_state.node_repo {
-                match repo.save_all().await {
+                match repo.save_dirty().await {
                     Ok(_) => info!("[main] NodeRepo 已保存（{} 个节点）", repo.node_count().await),
                     Err(e) => warn!("[main] NodeRepo 保存失败: {}", e),
                 }

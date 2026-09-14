@@ -251,6 +251,11 @@ impl TrackerRepoImpl {
             }
         }
     }
+
+    /// 增量持久化（全量保存模式：所有数据均视为 dirty，直接全量保存）
+    pub async fn save_dirty(&self) -> anyhow::Result<()> {
+        self.save_all().await
+    }
 }
 
 #[async_trait]
@@ -296,31 +301,6 @@ impl TrackerRepository for TrackerRepoImpl {
     }
 
     async fn save_all(&self) -> anyhow::Result<()> {
-        let trackers = self.all_trackers_sync();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            for t in &trackers {
-                storage.save_tracker(
-                    &t.url,
-                    t.score,
-                    t.total_requests,
-                    t.success_requests,
-                    t.failed_requests,
-                    t.total_peers_discovered,
-                    t.avg_response_time_ms,
-                    t.consecutive_failures,
-                    t.disabled,
-                )?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        Ok(())
-    }
-
-    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
-    #[allow(dead_code)]
-    async fn save_dirty(&self) -> anyhow::Result<()> {
         let trackers = self.all_trackers_sync();
         let storage = self.storage.clone();
         tokio::task::spawn_blocking(move || {

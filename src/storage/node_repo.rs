@@ -318,9 +318,11 @@ impl NodeRepoImpl {
     /// 批量更新评分（一次写锁，避免逐个更新的锁竞争）
     pub fn update_scores_batch_sync(&self, scores: &[(SocketAddr, f64)]) {
         let mut nodes = self.nodes.write();
+        let mut dirty = self.dirty.write();
         for (addr, score) in scores {
             if let Some(entry) = nodes.get_mut(addr) {
                 entry.score = *score;
+                dirty.insert(*addr);
             }
         }
     }
@@ -434,59 +436,10 @@ impl NodeRepository for NodeRepoImpl {
         // 评分由 ScoreMaintainer 统一维护，Repo 不具备算分权限
     }
 
-    async fn save_all(&self) -> anyhow::Result<()> {
-        // 【增量持久化】只保存 dirty 节点，避免全量保存千万级数据
-        let dirty_addrs = self.take_dirty_sync();
-        if dirty_addrs.is_empty() {
-            return Ok(());
-        }
-
-        // 用独立作用域构建 batch，确保 read guard 在作用域结束时释放
-        let batch: Vec<crate::storage::db::DhtNodeRow> = {
-            let nodes = self.nodes.read();
-            dirty_addrs
-                .iter()
-                .filter_map(|addr| nodes.get(addr))
-                .map(|node| {
-                    let state_str = match node.state {
-                        NodeState::Good => "Good",
-                        NodeState::Questionable => "Questionable",
-                        NodeState::Bad => "Bad",
-                    };
-                    crate::storage::db::DhtNodeRow {
-                        id: node.id,
-                        ip: node.addr.ip().to_string(),
-                        port: node.addr.port(),
-                        score: node.score,
-                        state: state_str.to_string(),
-                        query_count: node.query_count,
-                        success_count: node.success_count,
-                        total_latency_ms: node.total_latency_ms,
-                        consecutive_failures: node.consecutive_failures,
-                        nodes_returned: node.nodes_returned,
-                        last_query_time: node.last_query_time.map(|t| t.elapsed().as_secs() as i64),
-                    }
-                })
-                .collect()
-        };
-
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        let storage = self.storage.clone();
-        let count = batch.len();
-        tracing::debug!("[node_repo] 增量保存 {} 个 dirty 节点", count);
-        // 用 spawn_blocking 包装数据库操作，避免阻塞 tokio 工作线程
-        tokio::task::spawn_blocking(move || storage.save_dht_nodes_batch(&batch)).await??;
-        Ok(())
-    }
-
-    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
-    #[allow(dead_code)]
     async fn save_dirty(&self) -> anyhow::Result<()> {
         // 【增量持久化】只保存 dirty 节点，避免全量保存千万级数据
-        let dirty_addrs = self.take_dirty_sync();
+        // 先查看 dirty（不清空），保存成功后再清空，失败则保留 dirty 下次重试
+        let dirty_addrs = self.dirty_nodes_sync();
         if dirty_addrs.is_empty() {
             return Ok(());
         }
@@ -521,6 +474,11 @@ impl NodeRepository for NodeRepoImpl {
         };
 
         if batch.is_empty() {
+            // 内存中已不存在的 dirty 节点（可能已被删除），清理标记
+            let mut dirty = self.dirty.write();
+            for addr in &dirty_addrs {
+                dirty.remove(addr);
+            }
             return Ok(());
         }
 
@@ -528,8 +486,23 @@ impl NodeRepository for NodeRepoImpl {
         let count = batch.len();
         tracing::debug!("[node_repo] 增量保存 {} 个 dirty 节点", count);
         // 用 spawn_blocking 包装数据库操作，避免阻塞 tokio 工作线程
-        tokio::task::spawn_blocking(move || storage.save_dht_nodes_batch(&batch)).await??;
-        Ok(())
+        let result =
+            tokio::task::spawn_blocking(move || storage.save_dht_nodes_batch(&batch)).await?;
+        match result {
+            Ok(()) => {
+                // 保存成功后才清空 dirty
+                let mut dirty = self.dirty.write();
+                for addr in &dirty_addrs {
+                    dirty.remove(addr);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // 保存失败，保留 dirty 下次重试
+                tracing::warn!("[node_repo] 增量保存失败（保留 dirty 待重试）: {}", e);
+                Err(e)
+            }
+        }
     }
 
     async fn load_all(&self) -> anyhow::Result<usize> {

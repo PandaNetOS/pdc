@@ -258,32 +258,12 @@ impl InfohashRepoImpl {
         Ok(())
     }
 
-    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
-    #[allow(dead_code)]
-    async fn save_dirty(&self) -> anyhow::Result<()> {
-        // 先 flush pending 新 infohash
-        self.flush_pending().await?;
-
-        let entries: Vec<(Infohash, u32, String, f64)> = self
-            .cache
-            .read()
-            .entries
-            .iter()
-            .map(|(ih, (count, src, score, _ls))| (*ih, *count, src.clone(), *score))
-            .collect();
-
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            for (infohash, ref_count, source, score) in &entries {
-                storage.save_infohash(infohash, *ref_count, source, *score)?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        Ok(())
+    /// 从 SQLite 加载全部 infohash
+    /// 增量持久化（全量保存模式：所有数据均视为 dirty，直接全量保存）
+    pub async fn save_dirty(&self) -> anyhow::Result<()> {
+        self.save_all().await
     }
 
-    /// 从 SQLite 加载全部 infohash
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_infohashes()?;
         let mut cache = self.cache.write();

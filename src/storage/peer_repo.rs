@@ -454,42 +454,12 @@ impl PeerRepoImpl {
         Ok(())
     }
 
-    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
-    #[allow(dead_code)]
-    async fn save_dirty(&self) -> anyhow::Result<()> {
-        // 鐢ㄥ唴閮ㄤ綔鐢ㄥ煙纭繚 cache 閿佸湪 spawn_blocking 涔嬪墠閲婃斁
-        let batch = {
-            let cache = self.cache.read();
-            let mut batch = Vec::with_capacity(cache.global.len());
-            for (infohash, addrs) in &cache.by_infohash {
-                for addr in addrs {
-                    if let Some(peer) = cache.global.get(addr) {
-                        let last_active = peer
-                            .last_active
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        batch.push(crate::storage::db::PeerRow {
-                            infohash: *infohash,
-                            ip: addr.ip().to_string(),
-                            port: addr.port(),
-                            source: peer.source.as_str().to_string(),
-                            score: peer.priority_score,
-                            connection_attempts: peer.connection_attempts,
-                            connection_successes: peer.connection_successes,
-                            last_active,
-                        });
-                    }
-                }
-            }
-            batch
-        };
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || storage.save_peers_batch(&batch)).await??;
-        Ok(())
+    /// 浠?SQLite 鍔犺浇鍏ㄩ儴 peer锛堣繍琛屾椂娲昏穬 peer锛?
+    /// 增量持久化（全量保存模式：所有数据均视为 dirty，直接全量保存）
+    pub async fn save_dirty(&self) -> anyhow::Result<()> {
+        self.save_all().await
     }
 
-    /// 浠?SQLite 鍔犺浇鍏ㄩ儴 peer锛堣繍琛屾椂娲昏穬 peer锛?
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_peers()?;
         let mut cache = self.cache.write();
@@ -612,12 +582,6 @@ impl PeerRepository for PeerRepoImpl {
 
     async fn save_all(&self) -> anyhow::Result<()> {
         PeerRepoImpl::save_all(self).await
-    }
-
-    /// 增量持久化：只保存脏数据（当前实现为全量保存，后续可优化为增量）
-    #[allow(dead_code)]
-    async fn save_dirty(&self) -> anyhow::Result<()> {
-        PeerRepoImpl::save_dirty(self).await
     }
 
     async fn load_all(&self) -> anyhow::Result<usize> {
