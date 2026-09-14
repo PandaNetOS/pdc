@@ -27,13 +27,25 @@ pub struct WriteStats {
 
 /// 存储层
 pub struct Storage {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     write_stats: Arc<Mutex<WriteStats>>,
 }
 
 impl Storage {
-    /// 打开或创建数据库
+    /// 打开或创建数据库（使用默认 SQLite 配置）
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        Self::open_with_config(path, &crate::config::SqliteConfig::default())
+    }
+
+    /// 打开或创建数据库（使用指定 SQLite 配置）
+    ///
+    /// 所有 PRAGMA 参数均来自配置，禁止硬编码。
+    /// mmap_size 默认 2GB：Windows 上 mmap 虽可能造成额外磁盘 IO，但对千万级数据量
+    /// 的查询性能提升显著，作为性能调优选项可配置为 0 禁用。
+    pub fn open_with_config<P: AsRef<Path>>(
+        path: P,
+        config: &crate::config::SqliteConfig,
+    ) -> anyhow::Result<Self> {
         let path_ref = path.as_ref();
         if let Some(parent) = path_ref.parent() {
             if !parent.exists() {
@@ -42,12 +54,18 @@ impl Storage {
         }
 
         let conn = Connection::open(path_ref)?;
-        // WAL 模式 + NORMAL 同步 + 2000 页自动 checkpoint（减少 checkpoint 频率，提升写入性能）
-        // 注意：不使用 mmap，Windows 上 mmap 会造成持续磁盘 IO（内存页面持续刷盘）
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=2000; PRAGMA temp_store=MEMORY;")?;
+        let pragma_sql = format!(
+            "PRAGMA journal_mode=WAL;              PRAGMA synchronous={};              PRAGMA mmap_size={};              PRAGMA cache_size={};              PRAGMA temp_store={};              PRAGMA wal_autocheckpoint={};",
+            config.synchronous,
+            config.mmap_size,
+            config.cache_size,
+            config.temp_store,
+            config.wal_autocheckpoint,
+        );
+        conn.execute_batch(&pragma_sql)?;
 
         let storage = Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
         };
         storage.init_tables()?;
@@ -59,7 +77,7 @@ impl Storage {
     pub fn memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         let storage = Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
         };
         storage.init_tables()?;
@@ -69,6 +87,11 @@ impl Storage {
     /// 获取写入统计
     pub fn write_stats(&self) -> WriteStats {
         self.write_stats.lock().unwrap().clone()
+    }
+
+    /// 获取底层连接的 Arc<Mutex<Connection>>（用于 WriteQueue）
+    pub fn connection(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
     }
 
     /// 记录写入统计
@@ -329,6 +352,14 @@ impl Storage {
         }
         self.record_write("dht_nodes", nodes.len() as u64);
         let conn = self.conn.lock().unwrap();
+        Self::save_dht_nodes_batch_conn(&conn, nodes)
+    }
+
+    /// 使用给定连接批量保存 DHT 节点（供 WriteQueue 闭包调用，避免重复加锁）
+    pub fn save_dht_nodes_batch_conn(
+        conn: &Connection,
+        nodes: &[DhtNodeRow],
+    ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let tx = conn.unchecked_transaction()?;
         {

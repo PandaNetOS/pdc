@@ -74,6 +74,7 @@ pub mod firewall;
 pub mod health_check;
 pub mod intelligence;
 pub mod nat;
+pub mod net;
 pub mod port_allocator;
 pub mod services;
 pub mod storage;

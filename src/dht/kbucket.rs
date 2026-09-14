@@ -35,6 +35,9 @@ pub struct KBucketEntry {
     /// 最后一次查询时间（用于统计时效性衰减，不持久化）
     #[serde(skip)]
     pub last_query_time: Option<Instant>,
+    /// 最后一次被访问/选中时间（内存字段，不持久化，用于冷热分层）
+    #[serde(skip)]
+    pub last_accessed: Option<Instant>,
     /// 连续失败次数
     pub consecutive_failures: u32,
     /// 总查询次数
@@ -83,6 +86,7 @@ impl KBucketEntry {
             addr,
             last_active: Instant::now(),
             last_query_time: None,
+            last_accessed: None,
             consecutive_failures: 0,
             query_count: 0,
             success_count: 0,

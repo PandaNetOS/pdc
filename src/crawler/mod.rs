@@ -6,8 +6,10 @@
 //! 注意：当前为接口定义 + 空实现，实际 DHT 爬行逻辑待后续填充。
 
 pub mod active_pex;
+pub mod buffer_pool;
 pub mod engine;
 pub mod pex_receiver;
+pub mod rate_limiter;
 pub mod tcp_pex_server;
 pub mod utp_server;
 

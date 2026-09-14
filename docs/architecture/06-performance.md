@@ -768,6 +768,61 @@ impl CrawlerConcurrency {
 
 ---
 
+## 13. 性能优化五轮改造完成 (2026-09-14)
+
+> 在第 12 章（2026-09-08 基线）之上完成五轮改造，核心方向：多 socket 爬虫架构、全链路配置化、按分类分级调度、自适应限速。所有新增配置均带 `#[serde(default)]`，向后兼容；`socket_count=1` 时行为与改造前完全一致。
+
+### 13.1 本轮新增/升级优化项
+
+| # | 优化项 | 级别 | 实现要点 |
+|---|--------|------|----------|
+| R1 | 多 socket 爬虫架构 | P2 | CrawlerEngine 单 socket → 多 socket（`socket_count` 可配，上限 10）；tid 高 4 位编码 socket 索引；每 socket 派生独立 node_id |
+| R2 | PortAllocator 端口分配 | P2 | 偏移策略 step=100，10 个百位段循环（6880→6980→6080→…），支持多 socket 端口分配 |
+| R3 | UDP 缓冲区统一封装 | P2 | `socket_opts`：SO_RCVBUF=4MB、SO_SNDBUF=1MB；爬虫接收缓冲区 8KB→64KB |
+| R4 | pending 表分片 | P1 | 单 HashMap → 16 分片（按 `tid[0]%16`），降低并发写冲突 |
+| R5 | NodeRepo 索引与异步写入 | P0/P1 | /24 网段索引、WriteQueue 异步写入、冷热分层索引框架落地 |
+| R6 | SQLite 调优配置化 | P0 | mmap_size=2GB、cache_size=256MB、wal_autocheckpoint=1000，全部走配置 |
+| R7 | TaskScheduler 分级并发 | P1 | 单一并发度 → 按分类：Crawl=4、Persistence=1、Monitor=2、Network=4 |
+| R8 | 自适应限速 | P2 | 按 socket 响应率：<30% 限速、>50% 恢复 |
+| R9 | 接收缓冲区对象池 | P2 | CrawlerBufferPool 复用接收缓冲区 |
+| R10 | announce 响应优化 | P1 | 按活跃时间排序 + 5 秒缓存（`announce_cache_ttl_secs`） |
+| R11 | 监控指标扩展 | P1 | CrawlerState / TaskScheduler / NodeRepo 新增多项指标 |
+| R12 | 启动预热 + 配置热更新 | P1 | 预热引导并发 + `config_reload_interval_secs` 热更新框架 |
+
+### 13.2 更新后实施进度总览（截至 2026-09-14）
+
+| 级别 | 状态变化 | 本轮关键成果 |
+|---|---|---|
+| **P0** | 进一步推进 | NodeRepo 冷热分层索引框架落地、SQLite mmap/cache/wal 全配置化、WriteQueue 异步写入接入 |
+| **P1** | 多项由部分完成→完成 | pending 16 分片、TaskScheduler 分级并发、announce 排序+缓存、监控指标扩展、预热/热更新框架 |
+| **P2** | 基本完成 | 多 socket 架构、PortAllocator、UDP 4MB/1MB 缓冲区、自适应限速、CrawlerBufferPool 对象池 |
+| **P3** | 仍待实施 | 多实例分片、内核 bypass、CPU 亲和性、SQLite 分区表 |
+
+### 13.3 新增配置项（全部带默认值，向后兼容）
+
+| 配置字段 | 默认值 | 说明 |
+|---|---|---|
+| `crawler.socket_count` | 1（上限 10） | 爬虫 socket 数量 |
+| `crawler.adaptive_rate_limit` | true | 自适应限速开关 |
+| `crawler.warmup_node_count` | 100000 | 启动预热节点数 |
+| `crawler.warmup_bootstrap_concurrent` | 8 | 预热引导并发 |
+| `super_tracker.announce_cache_ttl_secs` | 5 | announce 缓存 TTL（秒） |
+| `task_scheduler.crawl_concurrency` | 4 | 爬虫分类并发 |
+| `task_scheduler.persistence_concurrency` | 1 | 持久化分类并发 |
+| `task_scheduler.monitor_concurrency` | 2 | 监控分类并发 |
+| `task_scheduler.network_concurrency` | 4 | 网络分类并发 |
+| `pdc.config_reload_interval_secs` | 30 | 配置热更新间隔（秒） |
+
+### 13.4 验证状态
+
+```
+✅ cargo check 零 error
+✅ 单元测试 312+ passed
+✅ socket_count=1 时行为与改造前完全一致（默认路径零风险、向后兼容）
+```
+
+---
+
 ## 参考
 
 - [ADR-004: 千万级数据性能目标与优化架构](../adr/004-performance-targets.md)

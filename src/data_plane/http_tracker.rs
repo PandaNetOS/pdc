@@ -72,6 +72,8 @@ struct AnnouncedPeer {
 pub struct SuperTrackerState {
     /// infohash -> (peer_addr -> AnnouncedPeer)
     peers: Arc<DashMap<Infohash, FxHashMap<SocketAddr, AnnouncedPeer>>>,
+    /// announce 响应缓存（infohash -> (缓存时间, 按最近活跃排序的 peer 列表)）
+    announce_cache: Arc<DashMap<Infohash, (Instant, Vec<SocketAddr>)>>,
     /// 配置
     config: Arc<tokio::sync::RwLock<SuperTrackerConfig>>,
     /// 统一 PeerRepo（双写）
@@ -85,6 +87,7 @@ impl SuperTrackerState {
     pub fn new(config: SuperTrackerConfig) -> Self {
         Self {
             peers: Arc::new(DashMap::new()),
+            announce_cache: Arc::new(DashMap::new()),
             config: Arc::new(tokio::sync::RwLock::new(config)),
             peer_repo: None,
             federation: None,
@@ -120,10 +123,14 @@ impl SuperTrackerState {
         // 1. 存储/更新 announce 上来的 peer
         self.store_peer(&req).await;
 
-        // 2. 收集 peer：announce 存储 + 缓存
-        let mut peers = self.get_peers_for_infohash(&req.info_hash, &req.remote_addr);
+        // 2. 收集 peer：带 TTL 缓存的排序 peer 列表（不含请求方过滤，后面统一过滤）
+        let mut peers =
+            self.get_cached_announce_peers(&req.info_hash, config.announce_cache_ttl_secs);
 
-        // 从缓存补充
+        // 排除请求方
+        peers.retain(|a| a != &req.remote_addr);
+
+        // 从 PeerRepo 缓存补充
         let cached = cache.get_peers_sync(&req.info_hash, config.max_numwant);
         for peer in cached {
             if !peers.contains(&peer.addr) && peer.addr != req.remote_addr {
@@ -261,18 +268,37 @@ impl SuperTrackerState {
         }
     }
 
-    /// 获取指定 infohash 的 peer 列表（排除请求方）
-    fn get_peers_for_infohash(&self, infohash: &Infohash, exclude: &SocketAddr) -> Vec<SocketAddr> {
+    /// 获取指定 infohash 的所有 peer，按最近活跃时间倒序（不排除请求方）
+    fn get_peers_sorted_by_recency(&self, infohash: &Infohash) -> Vec<SocketAddr> {
         self.peers
             .get(infohash)
             .map(|entry| {
-                entry
-                    .values()
-                    .filter(|p| &p.addr != exclude)
-                    .map(|p| p.addr)
-                    .collect()
+                let mut peers: Vec<(SocketAddr, Instant)> =
+                    entry.values().map(|p| (p.addr, p.last_seen)).collect();
+                peers.sort_by_key(|&(_, t)| std::cmp::Reverse(t));
+                peers.into_iter().map(|(addr, _)| addr).collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 获取 announce peer 列表（带 TTL 缓存，按最近活跃排序，不排除请求方）
+    ///
+    /// 缓存命中时直接返回；未命中时从 peers map 收集、排序并写入缓存。
+    /// 请求方地址由调用方在返回前过滤。
+    fn get_cached_announce_peers(&self, infohash: &Infohash, ttl_secs: u64) -> Vec<SocketAddr> {
+        if ttl_secs > 0 {
+            if let Some(entry) = self.announce_cache.get(infohash) {
+                if entry.0.elapsed() < Duration::from_secs(ttl_secs) {
+                    return entry.1.clone();
+                }
+            }
+        }
+        let list = self.get_peers_sorted_by_recency(infohash);
+        if ttl_secs > 0 {
+            self.announce_cache
+                .insert(*infohash, (Instant::now(), list.clone()));
+        }
+        list
     }
 
     /// 统计做种者(complete)和下载者(incomplete)
@@ -398,10 +424,13 @@ impl SuperTrackerState {
             cache.add_peers_sync(&infohash, &[peer_info]);
         }
 
-        // 收集 peer
-        let mut peers = self.get_peers_for_infohash(&infohash, &peer_addr);
+        // 收集 peer：带 TTL 缓存的排序 peer 列表
+        let mut peers = self.get_cached_announce_peers(&infohash, config.announce_cache_ttl_secs);
 
-        // 从缓存补充
+        // 排除请求方
+        peers.retain(|a| a != &peer_addr);
+
+        // 从 PeerRepo 缓存补充
         let cached = cache.get_peers_sync(&infohash, config.max_numwant);
         for peer in cached {
             if !peers.contains(&peer.addr) && peer.addr != peer_addr {

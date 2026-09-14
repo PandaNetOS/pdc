@@ -10,6 +10,9 @@
 //! - 超级 Tracker 收到 announce → 发布 AnnounceRequest
 //! - 控制面发布 ConfigChanged → 所有模块订阅
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -22,6 +25,10 @@ use crate::types::Event;
 #[derive(Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<Event>,
+    /// 发布失败（通道满/无订阅者）累计计数
+    publish_failures: Arc<AtomicU64>,
+    /// 累计发布事件数
+    publish_total: Arc<AtomicU64>,
 }
 
 impl EventBus {
@@ -31,7 +38,11 @@ impl EventBus {
     /// - `capacity`: 广播通道容量，建议 1024-4096
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        Self {
+            sender,
+            publish_failures: Arc::new(AtomicU64::new(0)),
+            publish_total: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// 发布事件
@@ -40,8 +51,14 @@ impl EventBus {
     /// 如果通道满了，最旧的事件会被丢弃（broadcast 的 lag 行为）。
     pub fn publish(&self, event: Event) {
         match self.sender.send(event) {
-            Ok(n) => debug!("[event_bus] 事件已发布，{} 个订阅者收到", n),
-            Err(_) => debug!("[event_bus] 事件发布失败（无订阅者）"),
+            Ok(n) => {
+                self.publish_total.fetch_add(1, Ordering::Relaxed);
+                debug!("[event_bus] 事件已发布，{} 个订阅者收到", n);
+            }
+            Err(_) => {
+                self.publish_failures.fetch_add(1, Ordering::Relaxed);
+                debug!("[event_bus] 事件发布失败（无订阅者）");
+            }
         }
     }
 
@@ -56,6 +73,32 @@ impl EventBus {
     /// 当前订阅者数量
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
+    }
+
+    /// 累计发布失败次数（通道满/无订阅者导致的丢失）
+    pub fn publish_failures(&self) -> u64 {
+        self.publish_failures.load(Ordering::Relaxed)
+    }
+
+    /// 累计发布成功事件数
+    pub fn publish_total(&self) -> u64 {
+        self.publish_total.load(Ordering::Relaxed)
+    }
+
+    /// 延迟/丢失事件计数（与 publish_failures 同义，供监控查询）
+    pub fn lag_count(&self) -> u64 {
+        self.publish_failures.load(Ordering::Relaxed)
+    }
+
+    /// 创建关键事件的独立 mpsc 通道（CrawlProgress、SaveComplete 等高频/重要事件）
+    ///
+    /// 避免 broadcast 通道满时丢失关键事件。
+    /// 这是一个便捷方法，不改变现有 broadcast 机制；实际使用由调用方决定。
+    pub fn critical_channel() -> (
+        tokio::sync::mpsc::Sender<Event>,
+        tokio::sync::mpsc::Receiver<Event>,
+    ) {
+        tokio::sync::mpsc::channel(1024)
     }
 }
 

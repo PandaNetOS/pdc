@@ -8,8 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::Mutex as ParkingMutex;
 use rusqlite::Connection;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc;
 
 /// 写入请求（闭包形式，调用 Storage 已有方法）
@@ -26,14 +27,18 @@ pub struct WriteStats {
 /// 写入队列
 pub struct WriteQueue {
     sender: mpsc::UnboundedSender<WriteRequest>,
-    stats: Arc<Mutex<WriteStats>>,
+    stats: Arc<ParkingMutex<WriteStats>>,
 }
 
 impl WriteQueue {
     /// 创建写入队列并启动 writer task
-    pub fn new(conn: Arc<Mutex<Connection>>, batch_size: usize, flush_interval: Duration) -> Self {
+    pub fn new(
+        conn: Arc<StdMutex<Connection>>,
+        batch_size: usize,
+        flush_interval: Duration,
+    ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel::<WriteRequest>();
-        let stats = Arc::new(Mutex::new(WriteStats::default()));
+        let stats = Arc::new(ParkingMutex::new(WriteStats::default()));
 
         let stats_clone = stats.clone();
         tokio::spawn(async move {
@@ -59,11 +64,11 @@ impl WriteQueue {
 
     /// writer 主循环
     async fn writer_loop(
-        conn: Arc<Mutex<Connection>>,
+        conn: Arc<StdMutex<Connection>>,
         mut receiver: mpsc::UnboundedReceiver<WriteRequest>,
         batch_size: usize,
         flush_interval: Duration,
-        stats: Arc<Mutex<WriteStats>>,
+        stats: Arc<ParkingMutex<WriteStats>>,
     ) {
         let mut batch: Vec<WriteRequest> = Vec::with_capacity(batch_size);
         // [ALLOWED-INTERVAL] 写入队列消费者事件循环，定时 flush 是 select! 的一个分支，非独立定时任务
@@ -98,14 +103,14 @@ impl WriteQueue {
 
     /// 批量写入（单事务）
     fn flush_batch(
-        conn: &Arc<Mutex<Connection>>,
+        conn: &Arc<StdMutex<Connection>>,
         batch: &mut Vec<WriteRequest>,
-        stats: &Arc<Mutex<WriteStats>>,
+        stats: &Arc<ParkingMutex<WriteStats>>,
     ) {
         let requests = std::mem::take(batch);
         let count = requests.len();
 
-        let conn = conn.lock();
+        let conn = conn.lock().unwrap();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {

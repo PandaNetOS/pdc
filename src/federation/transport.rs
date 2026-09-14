@@ -13,6 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::net::socket_opts::{create_std_udp_socket, create_udp_socket};
+
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::protocol::{
     decode_frame, encode_message, frame_size_in_buffer, MessageType,
@@ -206,7 +208,7 @@ pub const HOLE_PUNCH_MAGIC: u32 = 0x5044_4346;
 impl UdpTransport {
     /// 绑定 UDP 端口
     pub async fn bind(addr: std::net::SocketAddr) -> anyhow::Result<Arc<Self>> {
-        let socket = tokio::net::UdpSocket::bind(addr)
+        let socket = create_udp_socket(addr)
             .await
             .map_err(|e| anyhow::anyhow!("UDP 绑定失败 {}: {}", addr, e))?;
         Ok(Arc::new(Self { socket }))
@@ -214,7 +216,7 @@ impl UdpTransport {
 
     /// 同步绑定（用于非 async 上下文）
     pub fn try_bind(addr: std::net::SocketAddr) -> anyhow::Result<Arc<Self>> {
-        let std_socket = std::net::UdpSocket::bind(addr)
+        let std_socket = create_std_udp_socket(addr)
             .map_err(|e| anyhow::anyhow!("UDP 绑定失败 {}: {}", addr, e))?;
         std_socket
             .set_nonblocking(true)

@@ -36,8 +36,8 @@ pub use scorer_config::{
 pub use scorer_traits::*;
 pub use select_system::SelectSystem;
 pub use task_scheduler::{
-    ResourceLevel, ResourceMonitor, ResourceProfile, ResourceState, TaskMetadata, TaskPriority,
-    TaskScheduler, TaskSchedulerSummary, TaskStats,
+    CategoryConcurrency, ResourceLevel, ResourceMonitor, ResourceProfile, ResourceState,
+    TaskCategory, TaskMetadata, TaskPriority, TaskScheduler, TaskSchedulerSummary, TaskStats,
 };
 pub use tier_manager::{DataTier, TierConfig, TierManager, TierStats};
 pub use tier_system::{NodeTierManagerAdapter, TierManageable as TierSystemManageable, TierSystem};

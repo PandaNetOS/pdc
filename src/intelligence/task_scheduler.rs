@@ -13,7 +13,7 @@
 //! - 执行监控（耗时统计、超时检测、失败重试）
 //! - 自适应调度（基于历史数据动态调整）
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,56 @@ impl TaskPriority {
             TaskPriority::Important => Duration::from_secs(30), // [ALLOWED-HARDCODED]
             TaskPriority::Normal => Duration::from_secs(300), // [ALLOWED-HARDCODED]
             TaskPriority::Background => Duration::from_secs(600), // [ALLOWED-HARDCODED]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 任务分类（分级并发控制）
+// ---------------------------------------------------------------------------
+
+/// 任务分类（用于分级并发控制）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TaskCategory {
+    /// 爬虫类（主动爬行、get_peers、sample 等）
+    Crawl,
+    /// 持久化类（增量保存、checkpoint 等）
+    Persistence,
+    /// 监控类（资源监控、状态采集、健康检查等）
+    #[default]
+    Monitor,
+    /// 网络类（发现器、联邦同步、NAT 等）
+    Network,
+}
+
+/// 各分类并发度配置
+#[derive(Debug, Clone, Copy)]
+pub struct CategoryConcurrency {
+    pub crawl: u32,
+    pub persistence: u32,
+    pub monitor: u32,
+    pub network: u32,
+}
+
+impl Default for CategoryConcurrency {
+    fn default() -> Self {
+        Self {
+            crawl: 4,
+            persistence: 1,
+            monitor: 2,
+            network: 4,
+        }
+    }
+}
+
+impl CategoryConcurrency {
+    /// 查询指定分类的最大并发度
+    pub fn max_for(&self, cat: TaskCategory) -> u32 {
+        match cat {
+            TaskCategory::Crawl => self.crawl,
+            TaskCategory::Persistence => self.persistence,
+            TaskCategory::Monitor => self.monitor,
+            TaskCategory::Network => self.network,
         }
     }
 }
@@ -117,6 +167,8 @@ pub struct TaskMetadata {
     pub timeout: Duration,
     /// 失败最大重试次数
     pub max_retries: u32,
+    /// 任务分类（用于分级并发控制）
+    pub category: TaskCategory,
 }
 
 impl TaskMetadata {
@@ -135,6 +187,7 @@ impl TaskMetadata {
             estimated_duration: Duration::from_secs(5), // [ALLOWED-HARDCODED]
             timeout: Duration::from_secs(300),     // [ALLOWED-HARDCODED]
             max_retries: 3,
+            category: TaskCategory::default(),
         }
     }
 
@@ -173,6 +226,11 @@ impl TaskMetadata {
         self.dependencies = deps;
         self
     }
+
+    pub fn with_category(mut self, c: TaskCategory) -> Self {
+        self.category = c;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +249,8 @@ pub struct TaskStats {
     pub last_execution: Option<Instant>,
     pub last_duration: Option<Duration>,
     pub consecutive_failures: u32,
+    /// 最近10次执行耗时（毫秒），用于滑动窗口均值
+    pub recent_durations_ms: VecDeque<u64>,
 }
 
 impl TaskStats {
@@ -208,6 +268,14 @@ impl TaskStats {
         }
     }
 
+    /// 最近10次执行耗时均值（毫秒）
+    pub fn recent_avg_duration_ms(&self) -> u64 {
+        if self.recent_durations_ms.is_empty() {
+            return 0;
+        }
+        self.recent_durations_ms.iter().sum::<u64>() / self.recent_durations_ms.len() as u64
+    }
+
     fn record_success(&mut self, duration: Duration) {
         self.total_executions += 1;
         self.success_count += 1;
@@ -216,6 +284,11 @@ impl TaskStats {
         self.max_duration_ms = self.max_duration_ms.max(ms);
         if self.min_duration_ms == 0 || ms < self.min_duration_ms {
             self.min_duration_ms = ms;
+        }
+        // 滑动窗口：保留最近10条
+        self.recent_durations_ms.push_back(ms);
+        if self.recent_durations_ms.len() > 10 {
+            self.recent_durations_ms.pop_front();
         }
         self.last_execution = Some(Instant::now());
         self.last_duration = Some(duration);
@@ -383,8 +456,10 @@ pub struct TaskScheduler {
     task_fns: RwLock<HashMap<String, TaskFn>>,
     stats: RwLock<HashMap<String, TaskStats>>,
     queue: RwLock<BinaryHeap<ScheduledItem>>,
-    running_full_tasks: RwLock<u32>,
-    max_concurrent_full_tasks: u32,
+    /// 各分类当前运行任务数
+    running_by_category: RwLock<HashMap<TaskCategory, u32>>,
+    /// 各分类最大并发度
+    max_concurrency: CategoryConcurrency,
     resource_monitor: Arc<ResourceMonitor>,
     seq_counter: RwLock<u64>,
     completed_dependencies: RwLock<HashSet<String>>,
@@ -398,8 +473,15 @@ impl TaskScheduler {
             task_fns: RwLock::new(HashMap::new()),
             stats: RwLock::new(HashMap::new()),
             queue: RwLock::new(BinaryHeap::new()),
-            running_full_tasks: RwLock::new(0),
-            max_concurrent_full_tasks: 2,
+            running_by_category: RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(TaskCategory::Crawl, 0);
+                m.insert(TaskCategory::Persistence, 0);
+                m.insert(TaskCategory::Monitor, 0);
+                m.insert(TaskCategory::Network, 0);
+                m
+            }),
+            max_concurrency: CategoryConcurrency::default(),
             resource_monitor: Arc::new(ResourceMonitor::new()),
             seq_counter: RwLock::new(0),
             completed_dependencies: RwLock::new(HashSet::new()),
@@ -411,9 +493,20 @@ impl TaskScheduler {
         self.resource_monitor.clone()
     }
 
-    pub fn with_max_concurrent_full_tasks(mut self, max: u32) -> Self {
-        self.max_concurrent_full_tasks = max;
+    /// 设置各分类并发度
+    pub fn with_category_concurrency(mut self, config: CategoryConcurrency) -> Self {
+        self.max_concurrency = config;
         self
+    }
+
+    /// 查询指定分类当前运行任务数
+    pub fn running_count(&self, cat: TaskCategory) -> u32 {
+        *self.running_by_category.read().get(&cat).unwrap_or(&0)
+    }
+
+    /// 查询指定分类最大并发度
+    pub fn max_concurrency_for(&self, cat: TaskCategory) -> u32 {
+        self.max_concurrency.max_for(cat)
     }
 
     /// 注册任务
@@ -488,8 +581,11 @@ impl TaskScheduler {
         });
 
         info!(
-            "[task_scheduler] 智能任务调度中心已启动（最大并发全量任务={}）",
-            self.max_concurrent_full_tasks
+            "[task_scheduler] 智能任务调度中心已启动（分级并发: crawl={}, persistence={}, monitor={}, network={}）",
+            self.max_concurrency.crawl,
+            self.max_concurrency.persistence,
+            self.max_concurrency.monitor,
+            self.max_concurrency.network
         );
     }
 
@@ -523,11 +619,16 @@ impl TaskScheduler {
                 // [ALLOWED-HARDCODED]
                 // [ALLOWED-HARDCODED]
                 let queue_len = self.queue.read().len();
+                let by_cat = self.running_by_category.read();
                 info!(
-                    "[task_scheduler] 调度器心跳: 队列待执行={}, 运行中全量任务={}",
+                    "[task_scheduler] 调度器心跳: 队列待执行={}, 运行中[crawl={}, persistence={}, monitor={}, network={}]",
                     queue_len,
-                    *self.running_full_tasks.read()
+                    by_cat.get(&TaskCategory::Crawl).unwrap_or(&0),
+                    by_cat.get(&TaskCategory::Persistence).unwrap_or(&0),
+                    by_cat.get(&TaskCategory::Monitor).unwrap_or(&0),
+                    by_cat.get(&TaskCategory::Network).unwrap_or(&0),
                 );
+                drop(by_cat);
                 heartbeat = Instant::now();
             }
             Self::process_queue(self.clone()).await;
@@ -620,13 +721,15 @@ impl TaskScheduler {
                 }
             }
 
-            // 令牌桶：全量任务并发限制
-            if meta.resource.is_full_task {
-                let running = *scheduler.running_full_tasks.read();
-                if running >= scheduler.max_concurrent_full_tasks {
+            // 分级并发控制：按任务分类限流
+            {
+                let cat = meta.category;
+                let running = scheduler.running_count(cat);
+                let max = scheduler.max_concurrency_for(cat);
+                if running >= max {
                     debug!(
-                        "[task_scheduler] 全量任务并发已满（{}/{}），延迟: {}",
-                        running, scheduler.max_concurrent_full_tasks, meta.name
+                        "[task_scheduler] 分类并发已满（{:?} {}/{}），延迟: {}",
+                        cat, running, max, meta.name
                     );
                     scheduler.schedule_task(
                         &item.task_id,
@@ -670,10 +773,12 @@ impl TaskScheduler {
             None => return,
         };
 
-        let is_full = meta.resource.is_full_task;
-        if is_full {
-            *scheduler.running_full_tasks.write() += 1;
-        }
+        let category = meta.category;
+        *scheduler
+            .running_by_category
+            .write()
+            .entry(category)
+            .or_insert(0) += 1;
 
         let task_id = item.task_id.clone();
 
@@ -714,15 +819,17 @@ impl TaskScheduler {
                         "[task_scheduler] 任务失败: {} - {} (连续失败 {})",
                         meta.name, e, consecutive
                     );
-                    // 标记依赖完成 + 释放 full task 计数（重试路径也需要）
+                    // 标记依赖完成 + 释放分类计数（重试路径也需要）
                     scheduler
                         .completed_dependencies
                         .write()
                         .insert(task_id.clone());
-                    if is_full {
-                        let mut running = scheduler.running_full_tasks.write();
-                        if *running > 0 {
-                            *running -= 1;
+                    {
+                        let mut running = scheduler.running_by_category.write();
+                        if let Some(cnt) = running.get_mut(&category) {
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
                         }
                     }
                     // 失败重试（指数退避），重试后 return 避免与下方正常周期重复安排
@@ -754,10 +861,12 @@ impl TaskScheduler {
                 .write()
                 .insert(task_id.clone());
 
-            if is_full {
-                let mut running = scheduler.running_full_tasks.write();
-                if *running > 0 {
-                    *running -= 1;
+            {
+                let mut running = scheduler.running_by_category.write();
+                if let Some(cnt) = running.get_mut(&category) {
+                    if *cnt > 0 {
+                        *cnt -= 1;
+                    }
                 }
             }
 
@@ -796,7 +905,8 @@ impl TaskScheduler {
     pub fn summary(&self) -> TaskSchedulerSummary {
         let tasks = self.tasks.read();
         let stats = self.stats.read();
-        let running_full = *self.running_full_tasks.read();
+        let running_by_cat = self.running_by_category.read().clone();
+        let max_conc = self.max_concurrency;
         let queue_len = self.queue.read().len();
 
         let mut total_executions = 0u64;
@@ -808,13 +918,44 @@ impl TaskScheduler {
 
         TaskSchedulerSummary {
             registered_tasks: tasks.len(),
-            running_full_tasks: running_full,
-            max_concurrent_full_tasks: self.max_concurrent_full_tasks,
+            running_by_category: running_by_cat,
+            max_concurrency: max_conc,
             queued_tasks: queue_len,
             total_executions,
             total_failures,
             resource: self.resource_monitor.current(),
         }
+    }
+
+    /// 各分类当前运行任务数（按分类名聚合，供监控查询）
+    pub fn running_by_category(&self) -> HashMap<String, u32> {
+        self.running_by_category
+            .read()
+            .iter()
+            .map(|(cat, n)| {
+                let name = match cat {
+                    TaskCategory::Crawl => "crawl",
+                    TaskCategory::Persistence => "persistence",
+                    TaskCategory::Monitor => "monitor",
+                    TaskCategory::Network => "network",
+                };
+                (name.to_string(), *n)
+            })
+            .collect()
+    }
+
+    /// 任务等待队列长度
+    pub fn queue_len(&self) -> usize {
+        self.queue.read().len()
+    }
+
+    /// 各任务最近10次平均耗时（毫秒）
+    pub fn task_recent_avg_durations(&self) -> HashMap<String, u64> {
+        self.stats
+            .read()
+            .iter()
+            .map(|(id, s)| (id.clone(), s.recent_avg_duration_ms()))
+            .collect()
     }
 }
 
@@ -831,8 +972,10 @@ impl Default for TaskScheduler {
 #[derive(Debug, Clone)]
 pub struct TaskSchedulerSummary {
     pub registered_tasks: usize,
-    pub running_full_tasks: u32,
-    pub max_concurrent_full_tasks: u32,
+    /// 各分类当前运行任务数
+    pub running_by_category: HashMap<TaskCategory, u32>,
+    /// 各分类最大并发度
+    pub max_concurrency: CategoryConcurrency,
     pub queued_tasks: usize,
     pub total_executions: u64,
     pub total_failures: u64,
@@ -948,7 +1091,8 @@ mod tests {
 
         let summary = scheduler.summary();
         assert_eq!(summary.registered_tasks, 1);
-        assert_eq!(summary.max_concurrent_full_tasks, 2);
+        assert_eq!(summary.max_concurrency.crawl, 4);
+        assert_eq!(summary.max_concurrency.persistence, 1);
 
         let tasks = scheduler.list_tasks();
         assert_eq!(tasks.len(), 1);

@@ -30,6 +30,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
+use crate::net::socket_opts::create_udp_socket;
+
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
@@ -152,7 +154,7 @@ impl RelayServer {
         info!("[relay] 启动中继服务器，监听 {}", self.listen_addr);
 
         // 启动 UDP 中继
-        let udp_socket = UdpSocket::bind(self.listen_addr).await?;
+        let udp_socket = create_udp_socket(self.listen_addr).await?;
         info!("[relay] UDP 中继已启动: {}", self.listen_addr);
 
         // 启动 TCP 中继

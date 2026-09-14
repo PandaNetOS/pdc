@@ -57,6 +57,12 @@ pub struct StatsResponse {
     pub tracker_scores: Vec<TrackerScoreInfo>,
     #[serde(default)]
     pub fetcher_stats: Option<FetcherStats>,
+    #[serde(default)]
+    pub crawler_metrics: Option<CrawlerMetrics>,
+    #[serde(default)]
+    pub task_scheduler_metrics: Option<TaskSchedulerMetrics>,
+    #[serde(default)]
+    pub node_repo_metrics: Option<NodeRepoMetrics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +98,33 @@ pub struct CacheStats {
 pub struct SuperTrackerStats {
     pub total_infohashes: usize,
     pub total_peers: usize,
+}
+
+/// 爬虫深度监控指标（C3 扩展）
+#[derive(Debug, Serialize, Default)]
+pub struct CrawlerMetrics {
+    pub socket_send_pps: Vec<u64>,
+    pub socket_recv_pps: Vec<u64>,
+    pub socket_response_rates: Vec<f64>,
+    pub pending_shard_lens: Vec<usize>,
+    pub udp_packet_loss_estimate: f64,
+    pub node_select_avg_us: u64,
+}
+
+/// 任务调度器监控指标（C3 扩展）
+#[derive(Debug, Serialize, Default)]
+pub struct TaskSchedulerMetrics {
+    pub running_by_category: std::collections::HashMap<String, u32>,
+    pub queue_len: usize,
+    pub task_recent_avg_durations: std::collections::HashMap<String, u64>,
+}
+
+/// NodeRepo 监控指标（C3 扩展）
+#[derive(Debug, Serialize, Default)]
+pub struct NodeRepoMetrics {
+    pub dirty_count: usize,
+    pub write_queue_len: usize,
+    pub subnet_count: usize,
 }
 
 /// 发现请求
@@ -400,6 +433,26 @@ async fn stats_handler(State(state): State<AppState>) -> Response {
                 .total_peers_fetched
                 .load(std::sync::atomic::Ordering::Relaxed),
             infohash_repo_count: f.infohash_count(),
+        }),
+        // C3: 爬虫深度指标
+        crawler_metrics: state.crawler_state.as_ref().map(|cs| {
+            let s = cs.read();
+            CrawlerMetrics {
+                socket_send_pps: s.socket_send_pps.clone(),
+                socket_recv_pps: s.socket_recv_pps.clone(),
+                socket_response_rates: s.socket_response_rates.clone(),
+                pending_shard_lens: s.pending_shard_lens.clone(),
+                udp_packet_loss_estimate: s.udp_packet_loss_estimate,
+                node_select_avg_us: s.node_select_avg_us,
+            }
+        }),
+        // C3: 任务调度器指标（AppState 暂未注入 task_scheduler）
+        task_scheduler_metrics: None,
+        // C3: NodeRepo 深度指标
+        node_repo_metrics: state.node_repo.as_ref().map(|nr| NodeRepoMetrics {
+            dirty_count: nr.dirty_count_sync(),
+            write_queue_len: nr.write_queue_len_sync(),
+            subnet_count: nr.subnet_count_sync(),
         }),
     };
 

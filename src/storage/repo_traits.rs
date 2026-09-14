@@ -35,6 +35,24 @@ pub trait NodeRepository: Send + Sync {
     fn top_nodes_sync(&self, n: usize) -> Vec<KBucketEntry>;
     fn len_sync(&self) -> usize;
 
+    // /24 网段索引查询（默认空/0 实现，NodeRepoImpl 覆盖；其他实现者无需改动）
+    /// 获取指定 /24 网段的节点 ID 列表（O(1) 定位网段）
+    fn nodes_by_subnet_sync(&self, _subnet: [u8; 3]) -> Vec<NodeId> {
+        Vec::new()
+    }
+    /// /24 网段数量（网络多样性监控用）
+    fn subnet_count_sync(&self) -> usize {
+        0
+    }
+
+    // 冷热分层索引（默认空/空操作实现，NodeRepoImpl 覆盖；其他实现者无需改动）
+    /// 获取热节点列表（最近被访问的节点）
+    fn hot_nodes_sync(&self) -> Vec<KBucketEntry> {
+        Vec::new()
+    }
+    /// 标记节点被访问（移入热集合）
+    fn mark_accessed_sync(&self, _addr: SocketAddr) {}
+
     // 评分与统计（由智能层计算后写入）
     async fn update_score(&self, addr: &SocketAddr, score: f64);
     /// 批量更新评分（一次事务，避免逐个更新的锁竞争）

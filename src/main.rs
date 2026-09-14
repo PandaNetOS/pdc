@@ -34,10 +34,11 @@ use PeerDiscoveryCenter::federation::FederationService;
 use PeerDiscoveryCenter::firewall::FirewallManager;
 use PeerDiscoveryCenter::health_check::{HealthCheckConfig, HealthCheckTask};
 use PeerDiscoveryCenter::intelligence::{
-    AvailabilityCalculator, DhtActivityTracker, PeerHistoryManager, ResourceLevel, ResourceProfile,
-    TaskMetadata, TaskPriority, TaskScheduler,
+    AvailabilityCalculator, CategoryConcurrency, DhtActivityTracker, PeerHistoryManager,
+    ResourceLevel, ResourceProfile, TaskCategory, TaskMetadata, TaskPriority, TaskScheduler,
 };
 use PeerDiscoveryCenter::nat::NatManager;
+use PeerDiscoveryCenter::net::socket_opts::create_udp_socket;
 use PeerDiscoveryCenter::port_allocator::PortAllocator;
 use PeerDiscoveryCenter::services::{MetadataService, ScrapeService};
 use PeerDiscoveryCenter::storage::{InfohashRepository, NodeRepository, TrackerRepository};
@@ -87,8 +88,7 @@ impl WorkDir {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // 0. 初始化统一工作目录（pnos-spec WorkDir）
     //    --work-dir 参数 → Standalone 模式；PNOS_APP_ID 环境变量 → Managed 模式；否则 Standalone(当前目录)
     let work_dir = if let Some(dir) = parse_work_dir_arg() {
@@ -158,8 +158,35 @@ async fn main() -> anyhow::Result<()> {
     config.storage.path = work_dir.db_file("pdc").to_string_lossy().to_string();
     info!("[main] 数据路径: {}", config.storage.path);
 
+    // 构建 Tokio runtime（worker 线程数可配置，0=按 CPU 核数自动，下限 4）
+    // 多 socket 爬虫 + blocking 线程池需要更多 worker 线程，避免 API 饥饿。
+    let worker_threads = if config.runtime_worker_threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    } else {
+        config.runtime_worker_threads
+    };
+    let worker_threads = worker_threads.max(4);
+    info!("[main] Tokio runtime worker_threads={}", worker_threads);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main(work_dir, config_path, config))
+}
+
+/// 异步主逻辑：所有 .await 操作在此运行（由 main 中的手动 runtime 驱动）
+async fn async_main(
+    work_dir: WorkDir,
+    config_path: Option<String>,
+    mut config: PdcConfig,
+) -> anyhow::Result<()> {
     // 2.2 加载或生成 PEX/uTP 节点身份（持久化到 work_dir.node_id_file()）
     let pex_node_id = load_or_generate_node_id(&work_dir.node_id_file());
+
+    // 2.4 声明 crawler socket 列表（端口探测后填充，传递给 CrawlerEngine）
+    let mut crawler_sockets: Vec<Arc<tokio::net::UdpSocket>> = Vec::new();
 
     // 2.5 端口自动探测（零配置核心：自动寻找可用端口组）
     // 必须在创建任何服务/NAT/联邦/HTTP 之前完成，确保后续所有模块使用实际分配的端口。
@@ -175,7 +202,16 @@ async fn main() -> anyhow::Result<()> {
                 allocation.apply_to_config(&mut config);
                 // 同步 federation.api_port（与 API 端口一致）
                 config.federation.api_port = config.server.api_port;
-                // 释放探测 socket（实际监听器会立即重新绑定）
+                // 提取 crawler socket（不释放，转为 tokio UdpSocket 后传给 CrawlerEngine）
+                crawler_sockets = allocation
+                    .crawler_sockets
+                    .drain(..)
+                    .flatten()
+                    .filter_map(|std_s| tokio::net::UdpSocket::from_std(std_s).ok())
+                    .map(Arc::new)
+                    .collect();
+                info!("[main] 提取 {} 个 crawler socket", crawler_sockets.len());
+                // 释放其他探测 socket（实际监听器会立即重新绑定）
                 allocation.release_all();
             }
             Err(e) => {
@@ -200,8 +236,11 @@ async fn main() -> anyhow::Result<()> {
     let storage = if config.storage.enabled {
         info!("[main] 初始化持久化存储: {}", config.storage.path);
         Arc::new(
-            PeerDiscoveryCenter::storage::Storage::open(&config.storage.path)
-                .expect("无法打开数据库"),
+            PeerDiscoveryCenter::storage::Storage::open_with_config(
+                &config.storage.path,
+                &config.sqlite,
+            )
+            .expect("无法打开数据库"),
         )
     } else {
         info!("[main] 持久化存储未启用，使用内存模式");
@@ -218,10 +257,17 @@ async fn main() -> anyhow::Result<()> {
     let tracker_repo = Arc::new(PeerDiscoveryCenter::storage::TrackerRepoImpl::new(
         storage.clone(),
     ));
-    let node_repo = Arc::new(PeerDiscoveryCenter::storage::NodeRepoImpl::new(
-        storage.clone(),
+    // 创建 WriteQueue（异步入队 + 攒批事务写入，减少 SQLite fsync）
+    let write_queue = Arc::new(PeerDiscoveryCenter::storage::WriteQueue::new(
+        storage.connection(),
+        config.persistence.batch_size,
+        std::time::Duration::from_secs(10), // [ALLOWED-HARDCODED] WriteQueue flush 间隔
     ));
-    info!("[main] 数据层 Repo 已初始化（Node/Peer/Infohash/Tracker）");
+    let node_repo = Arc::new(
+        PeerDiscoveryCenter::storage::NodeRepoImpl::new(storage.clone())
+            .with_write_queue(write_queue),
+    );
+    info!("[main] 数据层 Repo 已初始化（Node/Peer/Infohash/Tracker，WriteQueue 已接入）");
 
     // 3.7 从 SQLite 加载持久化数据
     match tracker_repo.load_all().await {
@@ -408,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
     // 7. 创建爬虫引擎（如果启用），在 AppState 之前创建以便共享状态
     let (crawler_state, crawler_routing_table, crawler_ref) = if config.crawler.enabled {
         let crawler = CrawlerEngine::new(config.crawler.clone(), event_bus.clone())
+            .with_sockets(crawler_sockets)
             .with_peer_repo(peer_repo.clone())
             .with_storage(storage.clone())
             .with_infohash_repo(infohash_repo.clone())
@@ -423,6 +470,11 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = crawler_clone.start().await {
                 warn!("[main] 爬虫引擎启动失败: {}", e);
             }
+        });
+        // 启动预热（不阻塞，预热完成前主动爬行会跳过）
+        let crawler_warmup = crawler.clone();
+        tokio::spawn(async move {
+            crawler_warmup.warmup().await;
         });
         info!("[main] 爬虫引擎已启动（主动模式）");
         (Some(state_arc), Some(routing_table), Some(crawler))
@@ -513,7 +565,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // uTP 服务端（UDP）
-    let utp_server = match tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", utp_port)).await {
+    let utp_server = match create_udp_socket(([0, 0, 0, 0], utp_port).into()).await {
         Ok(socket) => {
             let server =
                 PeerDiscoveryCenter::crawler::utp_server::UtpServer::new(Arc::new(socket), node_id)
@@ -672,8 +724,15 @@ async fn main() -> anyhow::Result<()> {
         .with_pause_gate(full_sync_gate.clone()),
     );
 
-    // 8.5 创建统一 TaskScheduler（所有后台任务纳管）
-    let task_scheduler = Arc::new(TaskScheduler::new().with_max_concurrent_full_tasks(2));
+    // 8.5 创建统一 TaskScheduler（所有后台任务纳管，按分类分级并发）
+    let task_scheduler = Arc::new(TaskScheduler::new().with_category_concurrency(
+        CategoryConcurrency {
+            crawl: config.task_scheduler.crawl_concurrency,
+            persistence: config.task_scheduler.persistence_concurrency,
+            monitor: config.task_scheduler.monitor_concurrency,
+            network: config.task_scheduler.network_concurrency,
+        },
+    ));
 
     // 8.5.1 资源监控任务（每5秒，Critical，non_deferrable，读取真实系统资源）
     {
@@ -684,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
                 "系统资源监控",
                 std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Critical)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -716,6 +776,7 @@ async fn main() -> anyhow::Result<()> {
                 "定期增量持久化",
                 std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Persistence)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -776,6 +837,7 @@ async fn main() -> anyhow::Result<()> {
                 "健康检查主循环",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -802,6 +864,7 @@ async fn main() -> anyhow::Result<()> {
                 "健康统计输出",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -829,6 +892,7 @@ async fn main() -> anyhow::Result<()> {
                 "过期Peer缓存清理",
                 std::time::Duration::from_secs(600), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -898,6 +962,7 @@ async fn main() -> anyhow::Result<()> {
                 "增量评分重算",
                 std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -924,6 +989,7 @@ async fn main() -> anyhow::Result<()> {
                 "全量评分重算",
                 std::time::Duration::from_secs(600), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::High,
@@ -952,6 +1018,7 @@ async fn main() -> anyhow::Result<()> {
                 "Peer快照",
                 std::time::Duration::from_secs(120), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -979,6 +1046,7 @@ async fn main() -> anyhow::Result<()> {
                 "评分缓存清理",
                 std::time::Duration::from_secs(600), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1011,6 +1079,7 @@ async fn main() -> anyhow::Result<()> {
                 "冷热分层检查",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1041,6 +1110,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦心跳",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1067,6 +1137,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦节点同步",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1095,6 +1166,7 @@ async fn main() -> anyhow::Result<()> {
                     "联邦DHT发现",
                     std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
                 )
+                .with_category(TaskCategory::Network)
                 .with_priority(TaskPriority::Normal)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -1123,6 +1195,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦Merkle反熵",
                 std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -1151,6 +1224,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦公网地址同步",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1177,6 +1251,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦Push-Pull Gossip",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1203,6 +1278,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦中继通道清理",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1229,6 +1305,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦PEX节点交换",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1255,6 +1332,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦连接维护",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1281,6 +1359,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦节点缓存保存",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1307,6 +1386,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦NAT地址刷新",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1334,6 +1414,7 @@ async fn main() -> anyhow::Result<()> {
                     "联邦Tracker全量同步",
                     std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
                 )
+                .with_category(TaskCategory::Network)
                 .with_priority(TaskPriority::Background)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -1361,6 +1442,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦Gossip批量flush",
                 std::time::Duration::from_millis(50), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1386,6 +1468,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦Gossip传播",
                 std::time::Duration::from_millis(100), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -1411,6 +1494,7 @@ async fn main() -> anyhow::Result<()> {
                 "联邦Merkle批量flush",
                 std::time::Duration::from_millis(1000), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1436,7 +1520,8 @@ async fn main() -> anyhow::Result<()> {
         let _discoverer_ref = fetcher_ref.clone();
         let tracker_repo_clone = tracker_repo.clone();
         task_scheduler.register(
-            TaskMetadata::new("remote_tracker_refresh", "远程Tracker列表刷新", std::time::Duration::from_secs(3600)) // [ALLOWED-HARDCODED]
+            TaskMetadata::new("remote_tracker_refresh", "远程Tracker列表刷新", std::time::Duration::from_secs(3600))
+            .with_category(TaskCategory::Network) // [ALLOWED-HARDCODED]
                 .with_priority(TaskPriority::Background)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -1478,6 +1563,7 @@ async fn main() -> anyhow::Result<()> {
                 "Tracker主动拉取peer",
                 std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1505,6 +1591,7 @@ async fn main() -> anyhow::Result<()> {
             "外部订阅源拉取",
             std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
         )
+        .with_category(TaskCategory::Network)
         .with_priority(TaskPriority::Background)
         .with_resource(ResourceProfile {
             cpu: ResourceLevel::Low,
@@ -1531,6 +1618,7 @@ async fn main() -> anyhow::Result<()> {
             "DHT关键词搜索",
             std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
         )
+        .with_category(TaskCategory::Network)
         .with_priority(TaskPriority::Background)
         .with_resource(ResourceProfile {
             cpu: ResourceLevel::Low,
@@ -1558,6 +1646,7 @@ async fn main() -> anyhow::Result<()> {
                 "DHT探测PeerRepo拉取",
                 std::time::Duration::from_secs(15), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1585,6 +1674,7 @@ async fn main() -> anyhow::Result<()> {
                 "主动PEX请求",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1612,6 +1702,7 @@ async fn main() -> anyhow::Result<()> {
             "HTTP Tracker过期peer清理",
             std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
         )
+        .with_category(TaskCategory::Monitor)
         .with_priority(TaskPriority::Background)
         .with_resource(ResourceProfile {
             cpu: ResourceLevel::Low,
@@ -1638,6 +1729,7 @@ async fn main() -> anyhow::Result<()> {
                 "中继过期连接清理",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1666,6 +1758,7 @@ async fn main() -> anyhow::Result<()> {
                 "UDP Tracker连接ID过期清理",
                 std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1695,6 +1788,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫Bootstrap",
                 std::time::Duration::from_secs(120), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1721,6 +1815,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫节点保活",
                 std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1747,6 +1842,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫主动爬行",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -1772,6 +1868,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫主动get_peers",
                 std::time::Duration::from_secs(10), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1797,6 +1894,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫主动sample_infohashes",
                 std::time::Duration::from_secs(15), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1823,6 +1921,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫主动scrape",
                 std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1849,6 +1948,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫清理超时请求",
                 std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1874,6 +1974,7 @@ async fn main() -> anyhow::Result<()> {
                 "爬虫Bucket刷新",
                 std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
+            .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1891,6 +1992,94 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         );
+
+        // crawler_update_metrics: 刷新监控指标（PPS/响应率/pending分片长度/丢包估算），每5秒
+        let c9 = crawler.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "crawler_update_metrics",
+                "爬虫监控指标刷新",
+                std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
+            )
+            .with_category(TaskCategory::Monitor)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            }),
+            move || {
+                let c = c9.clone();
+                async move {
+                    c.update_metrics();
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.5.15 配置热更新监听任务（简化版：检查 mtime + 日志，不实际更新运行时参数）
+    {
+        let reload_interval = std::time::Duration::from_secs(config.config_reload_interval_secs);
+        if reload_interval.as_secs() > 0 {
+            let watch_path = config_path.clone();
+            let last_mtime: Arc<std::sync::Mutex<Option<std::time::SystemTime>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "config_reloader",
+                    "配置热更新监听",
+                    reload_interval,
+                )
+                .with_category(TaskCategory::Monitor)
+                .with_priority(TaskPriority::Normal)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                }),
+                move || {
+                    let watch_path = watch_path.clone();
+                    let last_mtime = last_mtime.clone();
+                    async move {
+                        let Some(ref path) = watch_path else { return Ok(()); };
+                        let metadata = match std::fs::metadata(path) {
+                            Ok(m) => m,
+                            Err(_) => return Ok(()),
+                        };
+                        let current_mtime = match metadata.modified() {
+                            Ok(t) => t,
+                            Err(_) => return Ok(()),
+                        };
+                        let mut last = last_mtime.lock().unwrap();
+                        match *last {
+                            None => {
+                                *last = Some(current_mtime);
+                            }
+                            Some(prev) if prev != current_mtime => {
+                                info!(
+                                    "[config] 检测到配置文件变化: {}（当前简化版仅记录日志，运行时参数暂不生效）",
+                                    path
+                                );
+                                *last = Some(current_mtime);
+                            }
+                            Some(_) => {}
+                        }
+                        Ok(())
+                    }
+                },
+            );
+            info!(
+                "[main] 配置热更新监听任务已注册（间隔 {} 秒）",
+                config.config_reload_interval_secs
+            );
+        } else {
+            info!("[main] 配置热更新已禁用（config_reload_interval_secs = 0）");
+        }
     }
 
     // 启动统一任务调度中心

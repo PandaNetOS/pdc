@@ -14,12 +14,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::http_tracker::SuperTrackerState;
 use crate::data_plane::rate_limiter::{RateLimiter, RequestType};
+use crate::net::socket_opts::create_udp_socket;
 use crate::storage::PeerRepoImpl;
 use crate::types::{AnnounceEvent, ScrapeEntry};
 
@@ -111,7 +111,7 @@ impl UdpTrackerServer {
 
     /// 启动 UDP Tracker 服务端（后台运行）
     pub async fn start(&self) -> anyhow::Result<()> {
-        let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
+        let socket = Arc::new(create_udp_socket(self.listen_addr).await?);
         info!(
             "[udp_tracker] UDP Tracker 服务端启动，监听 {}",
             self.listen_addr

@@ -38,6 +38,12 @@ pub struct PdcConfig {
     /// 持久化优化配置
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    /// SQLite 调优配置
+    #[serde(default)]
+    pub sqlite: SqliteConfig,
+    /// TaskScheduler 各分类并发度
+    #[serde(default)]
+    pub task_scheduler: TaskSchedulerConfig,
     /// 联邦网络配置
     #[serde(default)]
     pub federation: crate::federation::config::FederationConfig,
@@ -53,6 +59,56 @@ pub struct PdcConfig {
     /// 是否自动添加 Windows 防火墙入站规则
     #[serde(default = "default_auto_firewall_rule")]
     pub auto_firewall_rule: bool,
+    /// 配置热更新间隔（秒，0=禁用）
+    #[serde(default = "default_config_reload_interval_secs")]
+    pub config_reload_interval_secs: u64,
+    /// Tokio runtime worker 线程数（0=自动按 CPU 核数，默认 12）
+    #[serde(default = "default_runtime_worker_threads")]
+    pub runtime_worker_threads: usize,
+}
+
+/// TaskScheduler 各分类并发度配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSchedulerConfig {
+    /// 爬虫类并发度
+    #[serde(default = "default_crawl_concurrency")]
+    pub crawl_concurrency: u32,
+    /// 持久化类并发度
+    #[serde(default = "default_persistence_concurrency")]
+    pub persistence_concurrency: u32,
+    /// 监控类并发度
+    #[serde(default = "default_monitor_concurrency")]
+    pub monitor_concurrency: u32,
+    /// 网络类并发度
+    #[serde(default = "default_network_concurrency")]
+    pub network_concurrency: u32,
+}
+
+fn default_crawl_concurrency() -> u32 {
+    4
+}
+
+fn default_persistence_concurrency() -> u32 {
+    1
+}
+
+fn default_monitor_concurrency() -> u32 {
+    2
+}
+
+fn default_network_concurrency() -> u32 {
+    4
+}
+
+impl Default for TaskSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            crawl_concurrency: default_crawl_concurrency(),
+            persistence_concurrency: default_persistence_concurrency(),
+            monitor_concurrency: default_monitor_concurrency(),
+            network_concurrency: default_network_concurrency(),
+        }
+    }
 }
 
 /// 持久化存储配置
@@ -159,6 +215,54 @@ impl Default for PersistenceConfig {
     }
 }
 
+/// SQLite 深度调优配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteConfig {
+    /// mmap 大小（字节，0=禁用）
+    #[serde(default = "default_sqlite_mmap_size")]
+    pub mmap_size: i64,
+    /// 页缓存大小（负数表示页数，如 -262144 = 256MB 页缓存）
+    #[serde(default = "default_sqlite_cache_size")]
+    pub cache_size: i64,
+    /// WAL 自动 checkpoint 页数
+    #[serde(default = "default_sqlite_wal_autocheckpoint")]
+    pub wal_autocheckpoint: u32,
+    /// 临时存储模式（MEMORY/FILE）
+    #[serde(default = "default_sqlite_temp_store")]
+    pub temp_store: String,
+    /// 同步模式（NORMAL/FULL/OFF）
+    #[serde(default = "default_sqlite_synchronous")]
+    pub synchronous: String,
+}
+
+fn default_sqlite_mmap_size() -> i64 {
+    2_147_483_648 // 2GB
+}
+fn default_sqlite_cache_size() -> i64 {
+    -262_144 // 256MB 页缓存（负数表示页数）
+}
+fn default_sqlite_wal_autocheckpoint() -> u32 {
+    1000
+}
+fn default_sqlite_temp_store() -> String {
+    "MEMORY".to_string()
+}
+fn default_sqlite_synchronous() -> String {
+    "NORMAL".to_string()
+}
+
+impl Default for SqliteConfig {
+    fn default() -> Self {
+        Self {
+            mmap_size: default_sqlite_mmap_size(),
+            cache_size: default_sqlite_cache_size(),
+            wal_autocheckpoint: default_sqlite_wal_autocheckpoint(),
+            temp_store: default_sqlite_temp_store(),
+            synchronous: default_sqlite_synchronous(),
+        }
+    }
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -175,6 +279,14 @@ fn default_auto_firewall_rule() -> bool {
     true
 }
 
+fn default_config_reload_interval_secs() -> u64 {
+    30
+}
+
+fn default_runtime_worker_threads() -> usize {
+    12
+}
+
 impl Default for PdcConfig {
     fn default() -> Self {
         Self {
@@ -187,11 +299,15 @@ impl Default for PdcConfig {
             nat: NatConfig::default(),
             storage: StorageConfig::default(),
             persistence: PersistenceConfig::default(),
+            sqlite: SqliteConfig::default(),
+            task_scheduler: TaskSchedulerConfig::default(),
             federation: Default::default(),
             log_level: default_log_level(),
             port_auto_alloc: default_port_auto_alloc(),
             port_step: default_port_step(),
             auto_firewall_rule: default_auto_firewall_rule(),
+            config_reload_interval_secs: default_config_reload_interval_secs(),
+            runtime_worker_threads: default_runtime_worker_threads(),
         }
     }
 }
@@ -319,6 +435,9 @@ pub struct SuperTrackerConfig {
     /// 中继服务器端口（UDP+TCP，打洞失败时流量转发）
     #[serde(default = "default_relay_port")]
     pub relay_port: u16,
+    /// announce 结果缓存 TTL（秒，0=禁用）
+    #[serde(default = "default_announce_cache_ttl_secs")]
+    pub announce_cache_ttl_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -345,6 +464,9 @@ fn default_peer_ttl() -> u64 {
 fn default_relay_port() -> u16 {
     6881
 }
+fn default_announce_cache_ttl_secs() -> u64 {
+    5
+}
 
 impl Default for SuperTrackerConfig {
     fn default() -> Self {
@@ -359,6 +481,7 @@ impl Default for SuperTrackerConfig {
             trigger_backend_discovery: default_true(),
             udp_port: None,
             relay_port: default_relay_port(),
+            announce_cache_ttl_secs: default_announce_cache_ttl_secs(),
         }
     }
 }
@@ -554,9 +677,27 @@ pub struct CrawlerConfig {
     /// TCP-PEX 服务端监听端口（TCP）
     #[serde(default = "default_tcp_pex_port")]
     pub tcp_pex_port: u16,
+    /// 爬虫 UDP socket 数量（多 socket 并行收包，上限10）
+    #[serde(default = "default_crawler_socket_count")]
+    pub socket_count: u16,
+    /// 是否启用对端响应率自适应限速
+    #[serde(default = "default_adaptive_rate_limit")]
+    pub adaptive_rate_limit: bool,
+    /// 自适应限速滑动窗口大小（秒）
+    #[serde(default = "default_rate_limit_window_secs")]
+    pub rate_limit_window_secs: u64,
     /// Bootstrap 节点列表
     #[serde(default = "default_crawler_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<(String, u16)>,
+    /// 启动预热节点数（从数据库加载最近活跃节点到内存）
+    #[serde(default = "default_warmup_node_count")]
+    pub warmup_node_count: u32,
+    /// 预热时并行 bootstrap 引导节点数
+    #[serde(default = "default_warmup_bootstrap_concurrent")]
+    pub warmup_bootstrap_concurrent: u32,
+    /// 消息处理并发上限（0=自动，按 CPU 核数/4 计算）
+    #[serde(default = "default_max_concurrent_msg_handlers")]
+    pub max_concurrent_msg_handlers: u32,
 }
 
 /// NAT 穿透协议类型
@@ -676,6 +817,15 @@ fn default_utp_port() -> u16 {
 fn default_tcp_pex_port() -> u16 {
     6884
 }
+fn default_crawler_socket_count() -> u16 {
+    1
+}
+fn default_adaptive_rate_limit() -> bool {
+    true
+}
+fn default_rate_limit_window_secs() -> u64 {
+    60
+}
 fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
         // 主流公共 DHT 路由器
@@ -695,6 +845,18 @@ fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     ]
 }
 
+fn default_warmup_node_count() -> u32 {
+    100_000
+}
+
+fn default_warmup_bootstrap_concurrent() -> u32 {
+    8
+}
+
+fn default_max_concurrent_msg_handlers() -> u32 {
+    0 // 0 = 自动（CPU 核数 / 4）
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -705,7 +867,13 @@ impl Default for CrawlerConfig {
             listen_port: default_crawler_listen_port(),
             utp_port: default_utp_port(),
             tcp_pex_port: default_tcp_pex_port(),
+            socket_count: default_crawler_socket_count(),
+            adaptive_rate_limit: default_adaptive_rate_limit(),
+            rate_limit_window_secs: default_rate_limit_window_secs(),
             bootstrap_nodes: default_crawler_bootstrap_nodes(),
+            warmup_node_count: default_warmup_node_count(),
+            warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),
+            max_concurrent_msg_handlers: default_max_concurrent_msg_handlers(),
         }
     }
 }

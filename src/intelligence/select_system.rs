@@ -19,13 +19,13 @@ impl SelectSystem {
         Self
     }
 
-    /// 多样性选择节点（爬虫用）
+    /// 多样性选择节点（爬虫用）— 冷热分层：优先 hot，不足从全量补充
     ///
     /// 选取规则：
-    /// 1. 过滤 Bad 状态节点，按评分降序取 top 候选池
-    /// 2. Kademlia ID 空间分桶轮询（按 ID 高 4 位分 16 桶），保证 ID 空间多样性
-    /// 3. IP /24 网段去重（同一网段最多选 max_per_subnet 个），保证网络多样性
-    /// 4. 每轮从各桶取评分最高的节点，轮询直到选满 count 个
+    /// 1. 优先从热节点（最近被访问）中按多样性选取
+    /// 2. 热节点不足时，从全量 top 节点补充
+    /// 3. Kademlia ID 空间分桶轮询（按 ID 高 4 位分 16 桶），保证 ID 空间多样性
+    /// 4. IP /24 网段去重（同一网段最多选 max_per_subnet 个），保证网络多样性
     ///
     /// 【优化】遍历引用不克隆，只在最后返回选中节点时克隆
     pub fn select_diverse_nodes(
@@ -33,37 +33,81 @@ impl SelectSystem {
         count: usize,
         max_per_subnet: usize,
     ) -> Vec<KBucketEntry> {
-        // 1. 取候选池：用 top_nodes_sync 获取 top 500（内部已排序），避免全量克隆
-        let candidates: Vec<KBucketEntry> = repo
-            .top_nodes_sync(500)
+        let mut result: Vec<KBucketEntry> = Vec::with_capacity(count);
+        let mut subnet_count: FxHashMap<[u8; 3], usize> = FxHashMap::default();
+
+        // 1. 优先从热节点选取
+        let hot_candidates: Vec<KBucketEntry> = repo
+            .hot_nodes_sync()
             .into_iter()
             .filter(|n| n.state != NodeState::Bad)
             .collect();
+        Self::pick_from_candidates(
+            &hot_candidates,
+            count,
+            max_per_subnet,
+            &mut result,
+            &mut subnet_count,
+        );
 
-        if candidates.is_empty() {
-            return Vec::new();
+        // 2. 热节点不足，从全量 top 节点补充（排除已选）
+        if result.len() < count {
+            let existing_addrs: std::collections::HashSet<_> =
+                result.iter().map(|n| n.addr).collect();
+            let all_candidates: Vec<KBucketEntry> = repo
+                .top_nodes_sync(500)
+                .into_iter()
+                .filter(|n| n.state != NodeState::Bad && !existing_addrs.contains(&n.addr))
+                .collect();
+            Self::pick_from_candidates(
+                &all_candidates,
+                count,
+                max_per_subnet,
+                &mut result,
+                &mut subnet_count,
+            );
         }
 
-        // 2. 按 ID 高 4 位分桶（16 桶）
-        let mut buckets: FxHashMap<u8, Vec<KBucketEntry>> = FxHashMap::default();
+        // 3. 标记选中节点为热节点（更新 last_accessed，移入 hot 集合）
+        for node in &result {
+            repo.mark_accessed_sync(node.addr);
+        }
+
+        result
+    }
+
+    /// 从候选节点中按 ID 分桶 + /24 去重选取，结果追加到 result（内部辅助方法）
+    fn pick_from_candidates(
+        candidates: &[KBucketEntry],
+        target_count: usize,
+        max_per_subnet: usize,
+        result: &mut Vec<KBucketEntry>,
+        subnet_count: &mut FxHashMap<[u8; 3], usize>,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        if result.len() >= target_count {
+            return;
+        }
+
+        // 按 ID 高 4 位分桶（16 桶）
+        let mut buckets: FxHashMap<u8, Vec<&KBucketEntry>> = FxHashMap::default();
         for node in candidates {
             let bucket_key = node.id[0] >> 4; // 高4位 → 0-15
             buckets.entry(bucket_key).or_default().push(node);
         }
 
-        // 3. 轮询各桶选取，IP /24 去重
-        let mut result: Vec<KBucketEntry> = Vec::with_capacity(count);
-        let mut subnet_count: FxHashMap<[u8; 3], usize> = FxHashMap::default();
         let mut bucket_indices: FxHashMap<u8, usize> = FxHashMap::default();
         let bucket_keys: Vec<u8> = buckets.keys().copied().collect();
 
         'outer: loop {
-            if result.len() >= count {
+            if result.len() >= target_count {
                 break;
             }
             let mut picked_any = false;
             for &key in &bucket_keys {
-                if result.len() >= count {
+                if result.len() >= target_count {
                     break 'outer;
                 }
                 let idx = bucket_indices.entry(key).or_insert(0);
@@ -71,7 +115,6 @@ impl SelectSystem {
                     Some(b) => b,
                     None => continue,
                 };
-                // 跳过当前桶中已选完的
                 while *idx < bucket.len() {
                     let node = &bucket[*idx];
                     *idx += 1;
@@ -86,7 +129,7 @@ impl SelectSystem {
                         }
                         *cnt += 1;
                     }
-                    result.push(node.clone());
+                    result.push((*node).clone());
                     picked_any = true;
                     break;
                 }
@@ -95,8 +138,6 @@ impl SelectSystem {
                 break; // 所有桶都选完了
             }
         }
-
-        result
     }
 
     /// 按评分选 Top N 节点
