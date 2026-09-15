@@ -88,11 +88,15 @@ impl SocketRateStats {
     }
 
     /// 计算当前响应率（0.0 - 1.0）
+    ///
+    /// 注意：请求和响应是独立滑动窗口，可能出现响应数 > 请求数的情况
+    /// （请求过期被清理但响应还在窗口内），因此限制上限为 1.0。
+    /// 样本不足时返回 1.0，避免冷启动误判。
     pub fn response_rate(&self) -> f64 {
-        if self.requests.is_empty() {
-            return 1.0; // 无请求时视为100%
+        if self.requests.len() < self.min_samples {
+            return 1.0; // 样本不足时视为100%
         }
-        self.responses.len() as f64 / self.requests.len() as f64
+        (self.responses.len() as f64 / self.requests.len() as f64).min(1.0)
     }
 
     /// 更新并返回当前是否处于限速状态。
@@ -325,10 +329,11 @@ mod tests {
     #[test]
     fn test_response_rate_calculation() {
         let mut stats = SocketRateStats::new(TEST_WINDOW);
-        for _ in 0..10 {
+        // 发送100次请求（>= min_samples=50），收到30次响应 = 30%
+        for _ in 0..100 {
             stats.record_request();
         }
-        for _ in 0..3 {
+        for _ in 0..30 {
             stats.record_response();
         }
         assert!((stats.response_rate() - 0.3).abs() < f64::EPSILON);
@@ -396,14 +401,20 @@ mod tests {
     #[test]
     fn test_rate_limiter_multi_socket() {
         let limiter = RateLimiter::new(3, true, TEST_WINDOW);
-        limiter.record_request(0);
-        limiter.record_request(1);
-        limiter.record_response(0);
+        // 每个socket发送100次请求（>= min_samples=50）
+        for _ in 0..100 {
+            limiter.record_request(0);
+            limiter.record_request(1);
+        }
+        // socket#0: 100响应 = 100%, socket#1: 0响应 = 0%
+        for _ in 0..100 {
+            limiter.record_response(0);
+        }
         let rates = limiter.response_rates();
         assert_eq!(rates.len(), 3);
-        assert_eq!(rates[0], 1.0);
-        assert_eq!(rates[1], 0.0); // 1 request, 0 response
-        assert_eq!(rates[2], 1.0); // no requests -> 1.0
+        assert_eq!(rates[0], 1.0); // 100 request, 100 response = 100%
+        assert_eq!(rates[1], 0.0); // 100 request, 0 response = 0%
+        assert_eq!(rates[2], 1.0); // no requests -> 1.0 (样本不足)
     }
 
     #[test]
