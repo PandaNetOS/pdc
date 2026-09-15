@@ -158,8 +158,10 @@ fn main() -> anyhow::Result<()> {
     config.storage.path = work_dir.db_file("pdc").to_string_lossy().to_string();
     info!("[main] 数据路径: {}", config.storage.path);
 
-    // 构建 Tokio runtime（worker 线程数可配置，0=按 CPU 核数自动，下限 4）
-    // 多 socket 爬虫 + blocking 线程池需要更多 worker 线程，避免 API 饥饿。
+    // 构建三个独立 Tokio runtime，彻底隔离爬虫 / Tracker / API，避免互相抢占线程
+    // crawler_runtime: 爬虫、联邦、任务调度等核心业务（worker 可配置）
+    // tracker_runtime: 超级 Tracker HTTP + UDP（固定 4 线程）
+    // api_runtime: API/监控/WebSocket（固定 4 线程）
     let worker_threads = if config.runtime_worker_threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -168,12 +170,49 @@ fn main() -> anyhow::Result<()> {
         config.runtime_worker_threads
     };
     let worker_threads = worker_threads.max(4);
-    info!("[main] Tokio runtime worker_threads={}", worker_threads);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let tracker_threads = config.tracker_runtime_threads.max(2);
+    let api_threads = config.api_runtime_threads.max(2);
+    info!(
+        "[main] 三 runtime 隔离: crawler={}, tracker={}, api={}",
+        worker_threads, tracker_threads, api_threads
+    );
+
+    let crawler_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
+        .thread_name("pdc-crawler")
         .enable_all()
         .build()?;
-    runtime.block_on(async_main(work_dir, config_path, config))
+    let tracker_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tracker_threads)
+        .thread_name("pdc-tracker")
+        .enable_all()
+        .build()?;
+    let api_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(api_threads)
+        .thread_name("pdc-api")
+        .enable_all()
+        .build()?;
+
+    let tracker_handle = tracker_runtime.handle().clone();
+    let api_handle = api_runtime.handle().clone();
+    let shutdown_timeout = std::time::Duration::from_secs(config.runtime_shutdown_timeout_secs);
+
+    let result = crawler_runtime.block_on(async_main(
+        work_dir,
+        config_path,
+        config,
+        tracker_handle,
+        api_handle,
+    ));
+
+    // 关闭 tracker 和 api runtime（crawler_runtime 随 block_on 返回自然结束）
+    info!("[main] 关闭 tracker_runtime...");
+    tracker_runtime.shutdown_timeout(shutdown_timeout);
+    info!("[main] 关闭 api_runtime...");
+    api_runtime.shutdown_timeout(shutdown_timeout);
+    info!("[main] 所有 runtime 已关闭");
+
+    result
 }
 
 /// 异步主逻辑：所有 .await 操作在此运行（由 main 中的手动 runtime 驱动）
@@ -181,6 +220,8 @@ async fn async_main(
     work_dir: WorkDir,
     config_path: Option<String>,
     mut config: PdcConfig,
+    tracker_handle: tokio::runtime::Handle,
+    api_handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     // 2.2 加载或生成 PEX/uTP 节点身份（持久化到 work_dir.node_id_file()）
     let pex_node_id = load_or_generate_node_id(&work_dir.node_id_file());
@@ -1554,14 +1595,14 @@ async fn async_main(
         info!("[main] 远程 Tracker 列表刷新任务已注册到 TaskScheduler");
     }
 
-    // 8.10 tracker_fetcher: Tracker主动拉取peer（3600s）
+    // 8.10 tracker_fetcher: Tracker主动拉取peer（300s）
     if let Some(ref tf) = fetcher_ref {
         let t = tf.clone();
         task_scheduler.register(
             TaskMetadata::new(
                 "tracker_fetcher",
                 "Tracker主动拉取peer",
-                std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -2086,17 +2127,17 @@ async fn async_main(
     task_scheduler.start();
     info!("[main] TaskScheduler 已启动（统一调度所有后台任务，14个任务已注册）");
 
-    // 9. 启动 UDP Tracker 服务（BEP 15）
+    // 9. 启动 UDP Tracker 服务（BEP 15）—— 在 tracker_runtime 上运行，与爬虫隔离
     if config.super_tracker.enabled {
         let udp_state = app_state.clone();
-        tokio::spawn(async move {
+        tracker_handle.spawn(async move {
             if let Err(e) = DataPlane::serve_udp(udp_state).await {
                 warn!("[main] UDP Tracker 服务异常: {}", e);
             }
         });
         let udp_port = config.super_tracker.udp_port.unwrap_or(config.server.port);
         info!(
-            "[main] UDP Tracker 已启动: udp://{}:{}",
+            "[main] UDP Tracker 已启动(tracker_runtime): udp://{}:{}",
             config.server.listen, udp_port
         );
     }
@@ -2127,55 +2168,82 @@ async fn async_main(
         config.server.listen, config.server.api_port
     );
 
-    // 优雅关闭：等待 Ctrl+C 或 HTTP 服务退出
-    let shutdown = async {
-        tokio::signal::ctrl_c().await.ok();
-        info!("[main] 收到关闭信号，开始优雅关闭...");
-    };
-
-    tokio::select! {
-        result = DataPlane::serve(app_state.clone()) => {
-            match result {
-                Ok(()) => warn!("[main] HTTP 服务正常退出（serve 返回 Ok），触发关闭流程"),
-                Err(e) => warn!("[main] HTTP 服务异常退出: {}，触发关闭流程", e),
+    // 11. 启动 HTTP 服务（三 runtime 隔离：Tracker 在 tracker_runtime，API 在 api_runtime）
+    // 超级 Tracker HTTP 在 tracker_runtime 上运行
+    if config.super_tracker.enabled {
+        let tracker_state = app_state.clone();
+        tracker_handle.spawn(async move {
+            if let Err(e) = DataPlane::serve_tracker(tracker_state).await {
+                warn!("[main] 超级 Tracker HTTP 异常退出: {}", e);
             }
+        });
+        info!(
+            "[main] 超级 Tracker HTTP 已启动(tracker_runtime): http://{}:{}/announce",
+            config.server.listen, config.server.port
+        );
+    }
+
+    // API/监控 HTTP 在 api_runtime 上运行
+    let api_state = app_state.clone();
+    let api_join = api_handle.spawn(async move {
+        if let Err(e) = DataPlane::serve_api(api_state).await {
+            warn!("[main] API/监控 HTTP 异常退出: {}", e);
         }
-        _ = shutdown => {
-            info!("[main] 正在保存数据...");
+    });
+    info!(
+        "[main] API/监控 HTTP 已启动(api_runtime): http://{}:{}/api/v1/stats",
+        config.server.listen, config.server.api_port
+    );
 
-            // 全量保存所有 Repo 到 SQLite（统一数据归口）
-            if let Some(ref repo) = app_state.node_repo {
-                match repo.save_dirty().await {
-                    Ok(_) => info!("[main] NodeRepo 已保存（{} 个节点）", repo.node_count().await),
-                    Err(e) => warn!("[main] NodeRepo 保存失败: {}", e),
-                }
-            }
-            if let Some(ref repo) = app_state.tracker_repo {
-                match repo.save_all().await {
-                    Ok(_) => info!("[main] TrackerRepo 已保存（{} 个 tracker）", repo.count().await),
-                    Err(e) => warn!("[main] TrackerRepo 保存失败: {}", e),
-                }
-            }
-            if let Some(ref repo) = app_state.infohash_repo {
-                match repo.save_all().await {
-                    Ok(_) => info!("[main] InfohashRepo 已保存（{} 个 infohash）", repo.count().await),
-                    Err(e) => warn!("[main] InfohashRepo 保存失败: {}", e),
-                }
-            }
-            {
-                let repo = &app_state.peer_repo;
-                match repo.save_all().await {
-                    Ok(_) => info!("[main] PeerRepo 已保存（{} 个 peer）", repo.len()),
-                    Err(e) => warn!("[main] PeerRepo 保存失败: {}", e),
-                }
-            }
+    // 优雅关闭：等待 Ctrl+C
+    tokio::signal::ctrl_c().await.ok();
+    info!("[main] 收到关闭信号，开始优雅关闭...");
 
-            // 释放 UPnP 映射
-            app_state.nat.release_all().await;
-            info!("[main] UPnP 映射已释放");
-            info!("[main] 优雅关闭完成");
+    info!("[main] 正在保存数据...");
+
+    // 全量保存所有 Repo 到 SQLite（统一数据归口）
+    if let Some(ref repo) = app_state.node_repo {
+        match repo.save_dirty().await {
+            Ok(_) => info!(
+                "[main] NodeRepo 已保存（{} 个节点）",
+                repo.node_count().await
+            ),
+            Err(e) => warn!("[main] NodeRepo 保存失败: {}", e),
         }
     }
+    if let Some(ref repo) = app_state.tracker_repo {
+        match repo.save_all().await {
+            Ok(_) => info!(
+                "[main] TrackerRepo 已保存（{} 个 tracker）",
+                repo.count().await
+            ),
+            Err(e) => warn!("[main] TrackerRepo 保存失败: {}", e),
+        }
+    }
+    if let Some(ref repo) = app_state.infohash_repo {
+        match repo.save_all().await {
+            Ok(_) => info!(
+                "[main] InfohashRepo 已保存（{} 个 infohash）",
+                repo.count().await
+            ),
+            Err(e) => warn!("[main] InfohashRepo 保存失败: {}", e),
+        }
+    }
+    {
+        let repo = &app_state.peer_repo;
+        match repo.save_all().await {
+            Ok(_) => info!("[main] PeerRepo 已保存（{} 个 peer）", repo.len()),
+            Err(e) => warn!("[main] PeerRepo 保存失败: {}", e),
+        }
+    }
+
+    // 释放 UPnP 映射
+    app_state.nat.release_all().await;
+    info!("[main] UPnP 映射已释放");
+
+    // 中止 API 服务任务（tracker_runtime 和 api_runtime 由 main() 统一 shutdown）
+    api_join.abort();
+    info!("[main] 优雅关闭完成");
 
     info!("[main] 主函数正常返回，进程退出");
     Ok(())

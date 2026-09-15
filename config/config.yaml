@@ -43,6 +43,7 @@ crawler:
   max_nodes: 1000
   max_infohashes: 100000
   listen_port: 6882
+  socket_count: 8
   utp_port: 6883
   tcp_pex_port: 6884
   bootstrap_nodes:

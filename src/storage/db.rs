@@ -398,6 +398,46 @@ impl Storage {
         Ok(())
     }
 
+    /// 批量保存 DHT 节点（调用方已开启事务，不重复开启）
+    /// 供 WriteQueue 在批量事务中调用，避免事务嵌套。
+    pub fn save_dht_nodes_batch_in_tx(
+        conn: &Connection,
+        nodes: &[DhtNodeRow],
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut stmt = conn.prepare(
+            r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
+                total_latency_ms, consecutive_failures, nodes_returned, last_query_time,
+                last_active, first_seen)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+               ON CONFLICT(ip, port) DO UPDATE SET
+                id=excluded.id, score=excluded.score, state=excluded.state,
+                query_count=excluded.query_count, success_count=excluded.success_count,
+                total_latency_ms=excluded.total_latency_ms,
+                consecutive_failures=excluded.consecutive_failures,
+                nodes_returned=excluded.nodes_returned,
+                last_query_time=excluded.last_query_time,
+                last_active=excluded.last_active"#,
+        )?;
+        for node in nodes {
+            stmt.execute(params![
+                node.id.as_slice(),
+                node.ip.as_str(),
+                node.port as i64,
+                node.score,
+                node.state.as_str(),
+                node.query_count as i64,
+                node.success_count as i64,
+                node.total_latency_ms as i64,
+                node.consecutive_failures as i64,
+                node.nodes_returned as i64,
+                node.last_query_time,
+                now
+            ])?;
+        }
+        Ok(())
+    }
+
     // ---- Tracker ----
 
     /// 保存 tracker（upsert）

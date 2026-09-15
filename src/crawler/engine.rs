@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -32,6 +33,9 @@ use super::buffer_pool::CrawlerBufferPool;
 use super::rate_limiter::RateLimiter;
 
 use super::Crawler;
+
+/// PPS 统计快照类型（上次统计时间 + 各 socket 发送累计 + 接收累计）
+type PpsSnapshot = Option<(Instant, Vec<u64>, Vec<u64>)>;
 
 /// 内置热门 infohash（用于主动 get_peers，增加被查询概率）
 const POPULAR_INFOHASHES: &[&str] = &[
@@ -190,6 +194,12 @@ pub struct CrawlerEngine {
     warmup_done: Arc<AtomicBool>,
     /// 消息处理并发限制（避免多 recv_loop 同时阻塞 worker 线程导致 API 饥饿）
     message_semaphore: Arc<tokio::sync::Semaphore>,
+    /// 每 socket 累计发送数（用于计算 PPS，无锁原子计数，Arc 共享）
+    socket_send_total: Arc<Vec<AtomicU64>>,
+    /// 每 socket 累计接收数（用于计算 PPS，无锁原子计数，Arc 共享）
+    socket_recv_total: Arc<Vec<AtomicU64>>,
+    /// 上次统计 PPS 的时间和累计值（Mutex 保护，Arc 共享）
+    pps_last: Arc<Mutex<PpsSnapshot>>,
 }
 
 impl CrawlerEngine {
@@ -239,6 +249,9 @@ impl CrawlerEngine {
             buffer_pool: Arc::new(CrawlerBufferPool::new(16)),
             warmup_done: Arc::new(AtomicBool::new(false)),
             message_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            socket_send_total: Arc::new((0..16).map(|_| AtomicU64::new(0)).collect()),
+            socket_recv_total: Arc::new((0..16).map(|_| AtomicU64::new(0)).collect()),
+            pps_last: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -326,6 +339,32 @@ impl CrawlerEngine {
         let n = self.sockets.len().max(1);
         state.socket_send_pps.resize(n, 0);
         state.socket_recv_pps.resize(n, 0);
+
+        // 计算 PPS（滑动窗口：当前累计 - 上次累计 / 时间差）
+        let now = Instant::now();
+        let current_send: Vec<u64> = (0..n)
+            .map(|i| self.socket_send_total[i].load(Ordering::Relaxed))
+            .collect();
+        let current_recv: Vec<u64> = (0..n)
+            .map(|i| self.socket_recv_total[i].load(Ordering::Relaxed))
+            .collect();
+        let mut pps_last = self.pps_last.lock().unwrap();
+        if let Some((last_time, last_send, last_recv)) = pps_last.as_ref() {
+            let elapsed = now.duration_since(*last_time).as_secs_f64();
+            if elapsed > 0.0 {
+                state.socket_send_pps = current_send
+                    .iter()
+                    .zip(last_send.iter())
+                    .map(|(c, l)| ((c.saturating_sub(*l)) as f64 / elapsed) as u64)
+                    .collect();
+                state.socket_recv_pps = current_recv
+                    .iter()
+                    .zip(last_recv.iter())
+                    .map(|(c, l)| ((c.saturating_sub(*l)) as f64 / elapsed) as u64)
+                    .collect();
+            }
+        }
+        *pps_last = Some((now, current_send, current_recv));
         // UDP 丢包估算：1 - (messages_received / requests_sent)，粗略估算
         if state.requests_sent > 0 {
             state.udp_packet_loss_estimate =
@@ -517,6 +556,7 @@ impl CrawlerEngine {
         }
 
         if socket.send_to(&msg, addr).await.is_ok() {
+            self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
             let mut state = self.state.write();
             state.requests_sent += 1;
             if let Some(rl) = &self.rate_limiter {
@@ -589,6 +629,7 @@ impl CrawlerEngine {
             }
 
             if socket.send_to(&msg, node.addr).await.is_ok() {
+                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 let mut state = self.state.write();
                 state.requests_sent += 1;
                 if let Some(rl) = &self.rate_limiter {
@@ -688,6 +729,7 @@ impl CrawlerEngine {
                 }
 
                 if socket.send_to(&msg, node.addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                     let mut state = self.state.write();
                     state.requests_sent += 1;
                     if let Some(rl) = &self.rate_limiter {
@@ -760,6 +802,7 @@ impl CrawlerEngine {
             }
 
             if socket.send_to(&msg, node.addr).await.is_ok() {
+                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 requests_sent += 1;
             }
         }
@@ -836,6 +879,7 @@ impl CrawlerEngine {
             }
 
             if socket.send_to(&msg, node.addr).await.is_ok() {
+                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 requests_sent += 1;
             }
         }
@@ -899,6 +943,7 @@ impl CrawlerEngine {
             }
 
             if socket.send_to(&msg, node.addr).await.is_ok() {
+                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 let mut state = self.state.write();
                 state.requests_sent += 1;
                 if let Some(rl) = &self.rate_limiter {
@@ -962,6 +1007,7 @@ impl CrawlerEngine {
                 }
 
                 if socket.send_to(&msg, node.addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                     let mut state = self.state.write();
                     state.requests_sent += 1;
                     if let Some(rl) = &self.rate_limiter {
@@ -1485,6 +1531,7 @@ impl CrawlerEngine {
         }
 
         if socket.send_to(&msg, addr).await.is_ok() {
+            self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
             let mut state = self.state.write();
             state.requests_sent += 1;
             if let Some(rl) = &self.rate_limiter {
@@ -1571,8 +1618,9 @@ impl CrawlerEngine {
                         Ok((n, from)) => {
                             let data = &buf[..n];
 
-                            // 更新消息计数
+                            // 更新消息计数 + PPS 接收计数
                             {
+                                self.socket_recv_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                                 let mut state = self.state.write();
                                 state.messages_received += 1;
                             }
@@ -1713,7 +1761,7 @@ impl CrawlerEngine {
         if self.sockets.is_empty() {
             return;
         }
-        let (_socket_idx, socket) = self.next_send_socket();
+        let (socket_idx, socket) = self.next_send_socket();
         let top_nodes: Vec<std::net::SocketAddr> = {
             let table = self.known_nodes.read();
             table
@@ -1730,6 +1778,7 @@ impl CrawlerEngine {
             let tid = rand::random::<[u8; 2]>();
             let msg = DhtMessage::build_ping(&tid, &self.node_id);
             if socket.send_to(&msg, addr).await.is_ok() {
+                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 sent += 1;
             }
         }
@@ -1858,6 +1907,9 @@ impl CrawlerEngine {
             buffer_pool: self.buffer_pool.clone(),
             warmup_done: self.warmup_done.clone(),
             message_semaphore: self.message_semaphore.clone(),
+            socket_send_total: self.socket_send_total.clone(),
+            socket_recv_total: self.socket_recv_total.clone(),
+            pps_last: self.pps_last.clone(),
         }
     }
 }

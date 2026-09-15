@@ -666,7 +666,7 @@ impl NodeRepository for NodeRepoImpl {
             }
             let wq = wq.clone();
             let count = batch.len();
-            wq.send(move |conn| Storage::save_dht_nodes_batch_conn(conn, &batch));
+            wq.send(move |conn| Storage::save_dht_nodes_batch_in_tx(conn, &batch));
             tracing::debug!("[node_repo] 异步入队保存 {} 个 dirty 节点", count);
             Ok(())
         } else {

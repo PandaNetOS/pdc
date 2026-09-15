@@ -50,6 +50,7 @@ impl FirewallManager {
     }
 
     /// 生成完整规则名：PDC-<prefix>-<rule_type>
+    #[allow(dead_code)]
     fn build_rule_name(prefix: &str, rule_type: &str) -> String {
         format!("PDC-{}-{}", prefix, rule_type)
     }

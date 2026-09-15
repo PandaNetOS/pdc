@@ -65,6 +65,15 @@ pub struct PdcConfig {
     /// Tokio runtime worker 线程数（0=自动按 CPU 核数，默认 12）
     #[serde(default = "default_runtime_worker_threads")]
     pub runtime_worker_threads: usize,
+    /// Tracker runtime 线程数（默认 4）
+    #[serde(default = "default_tracker_runtime_threads")]
+    pub tracker_runtime_threads: usize,
+    /// API runtime 线程数（默认 4）
+    #[serde(default = "default_api_runtime_threads")]
+    pub api_runtime_threads: usize,
+    /// Runtime 关闭超时（秒，默认 5）
+    #[serde(default = "default_runtime_shutdown_timeout_secs")]
+    pub runtime_shutdown_timeout_secs: u64,
 }
 
 /// TaskScheduler 各分类并发度配置
@@ -287,6 +296,18 @@ fn default_runtime_worker_threads() -> usize {
     12
 }
 
+fn default_tracker_runtime_threads() -> usize {
+    4
+}
+
+fn default_api_runtime_threads() -> usize {
+    4
+}
+
+fn default_runtime_shutdown_timeout_secs() -> u64 {
+    5
+}
+
 impl Default for PdcConfig {
     fn default() -> Self {
         Self {
@@ -308,6 +329,9 @@ impl Default for PdcConfig {
             auto_firewall_rule: default_auto_firewall_rule(),
             config_reload_interval_secs: default_config_reload_interval_secs(),
             runtime_worker_threads: default_runtime_worker_threads(),
+            tracker_runtime_threads: default_tracker_runtime_threads(),
+            api_runtime_threads: default_api_runtime_threads(),
+            runtime_shutdown_timeout_secs: default_runtime_shutdown_timeout_secs(),
         }
     }
 }
