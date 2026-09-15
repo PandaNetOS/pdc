@@ -859,38 +859,46 @@ impl SyncManager {
         );
     }
 
-    /// 差量同步超时监控（按repo独立）。
-    fn spawn_diff_sync_watcher(self: Arc<Self>, repo_type: u8) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-        tokio::spawn(async move {
-            // [ALLOWED-INTERVAL] 联邦协议级维护循环，后续 ICC 阶段迁移到 TaskScheduler
-            let mut ticker = tokio::time::interval(Duration::from_secs(30)); // [ALLOWED-HARDCODED]
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let state = self.diff_sync_states.read().get(&repo_type).copied();
-                        match state {
-                            None => break,
-                            Some((peer, start, last_progress)) => {
-                                let now = Instant::now();
-                                if now.duration_since(last_progress).as_secs() >= 300 {
-                                    warn!("[federation] 差异全量5分钟无进度，取消（repo={}, 对端={}）", repo_type, peer);
-                                    self.finish_diff_sync(repo_type);
-                                    break;
-                                }
-                                if now.duration_since(start).as_secs() >= 3600 {
-                                    warn!("[federation] 差异全量1小时硬超时，取消（repo={}, 对端={}）", repo_type, peer);
-                                    self.finish_diff_sync(repo_type);
-                                    break;
-                                }
-                            }
-                        }
+    /// 差量同步超时监控（已迁移到 TaskScheduler）
+    ///
+    /// 周期性超时检查由 TaskScheduler 调用 check_diff_sync_timeouts() 驱动。
+    /// 此方法保留为空以兼容现有调用点，不再内部 spawn。
+    fn spawn_diff_sync_watcher(self: Arc<Self>, _repo_type: u8) {
+        // 已迁移：差量同步超时监控由 TaskScheduler 调度 check_diff_sync_timeouts()
+    }
+
+    /// 检查所有差量同步的超时状态（由 TaskScheduler 定期调用）
+    ///
+    /// - 5 分钟无进度 -> 取消
+    /// - 1 小时硬超时 -> 取消
+    pub fn check_diff_sync_timeouts(&self) {
+        let expired: Vec<u8> = {
+            let states = self.diff_sync_states.read();
+            let now = Instant::now();
+            states
+                .iter()
+                .filter_map(|(repo_type, (peer, start, last_progress))| {
+                    if now.duration_since(*last_progress).as_secs() >= 300 {
+                        warn!(
+                            "[federation] 差异全量5分钟无进度，取消（repo={}, 对端={}）",
+                            repo_type, peer
+                        );
+                        Some(*repo_type)
+                    } else if now.duration_since(*start).as_secs() >= 3600 {
+                        warn!(
+                            "[federation] 差异全量1小时硬超时，取消（repo={}, 对端={}）",
+                            repo_type, peer
+                        );
+                        Some(*repo_type)
+                    } else {
+                        None
                     }
-                    _ = shutdown_rx.recv() => break,
-                }
-            }
-        });
+                })
+                .collect()
+        };
+        for repo_type in expired {
+            self.finish_diff_sync(repo_type);
+        }
     }
 
     // ========================================================================

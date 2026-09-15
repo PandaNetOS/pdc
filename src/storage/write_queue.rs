@@ -25,27 +25,44 @@ pub struct WriteStats {
 }
 
 /// 写入队列
+///
+/// 事件驱动消费者 + TaskScheduler 定时 flush 双模式：
+/// - writer_loop 持续监听 mpsc 通道，攒批后批量写入
+/// - flush() 由 TaskScheduler 定期调用，强制刷出未达批量阈值的数据
 pub struct WriteQueue {
     sender: mpsc::UnboundedSender<WriteRequest>,
     stats: Arc<ParkingMutex<WriteStats>>,
+    batch: Arc<ParkingMutex<Vec<WriteRequest>>>,
+    conn: Arc<StdMutex<Connection>>,
 }
 
 impl WriteQueue {
     /// 创建写入队列并启动 writer task
+    ///
+    /// `flush_interval` 参数保留用于向后兼容，实际定时 flush 由 TaskScheduler 调用 `flush()` 驱动。
     pub fn new(
         conn: Arc<StdMutex<Connection>>,
         batch_size: usize,
-        flush_interval: Duration,
+        _flush_interval: Duration,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel::<WriteRequest>();
         let stats = Arc::new(ParkingMutex::new(WriteStats::default()));
+        let batch = Arc::new(ParkingMutex::new(Vec::with_capacity(batch_size)));
 
+        let batch_clone = batch.clone();
+        let conn_clone = conn.clone();
         let stats_clone = stats.clone();
+
         tokio::spawn(async move {
-            Self::writer_loop(conn, receiver, batch_size, flush_interval, stats_clone).await;
+            Self::writer_loop(conn_clone, receiver, batch_size, batch_clone, stats_clone).await;
         });
 
-        Self { sender, stats }
+        Self {
+            sender,
+            stats,
+            batch,
+            conn,
+        }
     }
 
     /// 发送写入请求
@@ -57,45 +74,44 @@ impl WriteQueue {
         self.stats.lock().total_requests += 1;
     }
 
+    /// 强制 flush 当前批次（由 TaskScheduler 定期调用）
+    pub fn flush(&self) {
+        let mut batch = self.batch.lock();
+        if !batch.is_empty() {
+            Self::flush_batch(&self.conn, &mut batch, &self.stats);
+        }
+    }
+
     /// 获取统计
     pub fn stats(&self) -> WriteStats {
         self.stats.lock().clone()
     }
 
-    /// writer 主循环
+    /// writer 主循环（纯事件驱动，无独立定时）
     async fn writer_loop(
         conn: Arc<StdMutex<Connection>>,
         mut receiver: mpsc::UnboundedReceiver<WriteRequest>,
         batch_size: usize,
-        flush_interval: Duration,
+        batch: Arc<ParkingMutex<Vec<WriteRequest>>>,
         stats: Arc<ParkingMutex<WriteStats>>,
     ) {
-        let mut batch: Vec<WriteRequest> = Vec::with_capacity(batch_size);
-        // [ALLOWED-INTERVAL] 写入队列消费者事件循环，定时 flush 是 select! 的一个分支，非独立定时任务
-        let mut interval = tokio::time::interval(flush_interval);
-
         loop {
-            tokio::select! {
-                req = receiver.recv() => {
-                    match req {
-                        Some(req) => {
-                            batch.push(req);
-                            if batch.len() >= batch_size {
-                                Self::flush_batch(&conn, &mut batch, &stats);
-                            }
-                        }
-                        None => {
-                            if !batch.is_empty() {
-                                Self::flush_batch(&conn, &mut batch, &stats);
-                            }
-                            break;
-                        }
+            match receiver.recv().await {
+                Some(req) => {
+                    let mut b = batch.lock();
+                    b.push(req);
+                    if b.len() >= batch_size {
+                        drop(b);
+                        let mut guard = batch.lock();
+                        Self::flush_batch(&conn, &mut guard, &stats);
                     }
                 }
-                _ = interval.tick() => {
-                    if !batch.is_empty() {
-                        Self::flush_batch(&conn, &mut batch, &stats);
+                None => {
+                    let mut b = batch.lock();
+                    if !b.is_empty() {
+                        Self::flush_batch(&conn, &mut b, &stats);
                     }
+                    break;
                 }
             }
         }

@@ -710,6 +710,18 @@ pub struct CrawlerConfig {
     /// 自适应限速滑动窗口大小（秒）
     #[serde(default = "default_rate_limit_window_secs")]
     pub rate_limit_window_secs: u64,
+    /// 进入限速的响应率阈值（响应率低于此值进入限速）
+    #[serde(default = "default_rate_limit_enter_threshold")]
+    pub rate_limit_enter_threshold: f64,
+    /// 解除限速的响应率阈值（响应率高于此值退出限速）
+    #[serde(default = "default_rate_limit_exit_threshold")]
+    pub rate_limit_exit_threshold: f64,
+    /// 限速判断所需最小请求样本数
+    #[serde(default = "default_rate_limit_min_samples")]
+    pub rate_limit_min_samples: usize,
+    /// 限速时跳过发送的比例（0.5 = 跳过 50% 的请求）
+    #[serde(default = "default_rate_limit_throttle_skip_ratio")]
+    pub rate_limit_throttle_skip_ratio: f64,
     /// Bootstrap 节点列表
     #[serde(default = "default_crawler_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<(String, u16)>,
@@ -850,6 +862,18 @@ fn default_adaptive_rate_limit() -> bool {
 fn default_rate_limit_window_secs() -> u64 {
     60
 }
+fn default_rate_limit_enter_threshold() -> f64 {
+    0.15
+}
+fn default_rate_limit_exit_threshold() -> f64 {
+    0.30
+}
+fn default_rate_limit_min_samples() -> usize {
+    50
+}
+fn default_rate_limit_throttle_skip_ratio() -> f64 {
+    0.5
+}
 fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
         // 主流公共 DHT 路由器
@@ -894,6 +918,10 @@ impl Default for CrawlerConfig {
             socket_count: default_crawler_socket_count(),
             adaptive_rate_limit: default_adaptive_rate_limit(),
             rate_limit_window_secs: default_rate_limit_window_secs(),
+            rate_limit_enter_threshold: default_rate_limit_enter_threshold(),
+            rate_limit_exit_threshold: default_rate_limit_exit_threshold(),
+            rate_limit_min_samples: default_rate_limit_min_samples(),
+            rate_limit_throttle_skip_ratio: default_rate_limit_throttle_skip_ratio(),
             bootstrap_nodes: default_crawler_bootstrap_nodes(),
             warmup_node_count: default_warmup_node_count(),
             warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),

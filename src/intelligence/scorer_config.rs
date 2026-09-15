@@ -18,11 +18,11 @@ pub struct NodeScoreConfig {
     pub uptime_weight: f64,
     /// Questionable 状态惩罚系数（默认 0.7）
     pub questionable_penalty: f64,
-    /// 时间衰减起始时间（小时，默认 24）
+    /// 时间衰减起始时间（小时，默认 2）
     pub decay_start_hours: f64,
-    /// 时间衰减结束时间（小时，默认 168=7天）
+    /// 时间衰减结束时间（小时，默认 24）
     pub decay_end_hours: f64,
-    /// 时间衰减最低系数（默认 0.5）
+    /// 时间衰减最低系数（默认 0.2）
     pub decay_min_factor: f64,
 }
 
@@ -34,9 +34,9 @@ impl Default for NodeScoreConfig {
             nodes_output_weight: 25.0,
             uptime_weight: 15.0,
             questionable_penalty: 0.7,
-            decay_start_hours: 24.0,
-            decay_end_hours: 168.0,
-            decay_min_factor: 0.5,
+            decay_start_hours: 2.0,
+            decay_end_hours: 24.0,
+            decay_min_factor: 0.2,
         }
     }
 }

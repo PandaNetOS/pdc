@@ -91,7 +91,7 @@ pub fn calculate_node_score_with_config(entry: &KBucketEntry, config: &NodeScore
     let response_rate = if entry.query_count > 0 {
         entry.success_count as f64 / entry.query_count as f64
     } else {
-        0.5 // 无查询记录给中性分
+        0.2 // 无查询记录给保守中性分（DHT节点在线率约30%，保守取20%）
     };
     let response_rate_score = response_rate * config.response_rate_weight;
 

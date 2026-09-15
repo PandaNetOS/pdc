@@ -114,6 +114,8 @@ pub struct CrawlerState {
     pub socket_recv_pps: Vec<u64>,
     /// 每 socket 响应率（0.0-1.0，复用 RateLimiter 数据）
     pub socket_response_rates: Vec<f64>,
+    /// 全局综合响应率（0.0-1.0，RateLimiter 聚合所有 socket）
+    pub global_response_rate: f64,
     /// pending 表各分片长度
     pub pending_shard_lens: Vec<usize>,
     /// UDP 丢包估算（发送-响应-超时，最近60s）
@@ -186,6 +188,8 @@ pub struct CrawlerEngine {
     sockets: Vec<Arc<UdpSocket>>,
     /// 轮询发送的 socket 索引（原子操作，跨 clone 共享）
     send_socket_idx: Arc<AtomicUsize>,
+    /// 全部限速时的轮询计数器（原子操作，跨 clone 共享，避免兜底固定单端口）
+    throttled_round_robin: Arc<AtomicUsize>,
     /// 对端响应率自适应限速器（None=禁用）
     rate_limiter: Option<Arc<RateLimiter>>,
     /// 接收缓冲区对象池（多 socket 共享，避免每次 64KB 分配）
@@ -245,6 +249,7 @@ impl CrawlerEngine {
             pause_gate: None,
             sockets: Vec::new(),
             send_socket_idx: Arc::new(AtomicUsize::new(0)),
+            throttled_round_robin: Arc::new(AtomicUsize::new(0)),
             rate_limiter: None,
             buffer_pool: Arc::new(CrawlerBufferPool::new(16)),
             warmup_done: Arc::new(AtomicBool::new(false)),
@@ -334,6 +339,7 @@ impl CrawlerEngine {
         // 响应率（从 rate_limiter 取）
         if let Some(rl) = &self.rate_limiter {
             state.socket_response_rates = rl.response_rates();
+            state.global_response_rate = rl.global_response_rate();
         }
         // socket 数量对齐
         let n = self.sockets.len().max(1);
@@ -396,8 +402,9 @@ impl CrawlerEngine {
             }
             return (idx, self.sockets[idx].clone());
         }
-        // 全部被限速，返回第一个
-        (0, self.sockets[0].clone())
+        // 全部被限速：轮询所有 socket 发送，避免兜底固定在单端口（#0）导致发送集中
+        let idx = self.throttled_round_robin.fetch_add(1, Ordering::Relaxed) % n;
+        (idx, self.sockets[idx].clone())
     }
 
     /// 根据 socket 索引派生独立 node_id（node_id[0] ^ socket_idx）
@@ -1903,6 +1910,7 @@ impl CrawlerEngine {
             pause_gate: self.pause_gate.clone(),
             sockets: self.sockets.clone(),
             send_socket_idx: self.send_socket_idx.clone(),
+            throttled_round_robin: self.throttled_round_robin.clone(),
             rate_limiter: self.rate_limiter.clone(),
             buffer_pool: self.buffer_pool.clone(),
             warmup_done: self.warmup_done.clone(),

@@ -306,7 +306,7 @@ async fn async_main(
     ));
     let node_repo = Arc::new(
         PeerDiscoveryCenter::storage::NodeRepoImpl::new(storage.clone())
-            .with_write_queue(write_queue),
+            .with_write_queue(write_queue.clone()),
     );
     info!("[main] 数据层 Repo 已初始化（Node/Peer/Infohash/Tracker，WriteQueue 已接入）");
 
@@ -869,6 +869,35 @@ async fn async_main(
         );
     }
 
+    // 8.5.2b WriteQueue 定时 flush（每5秒，Persistence）
+    {
+        let wq = write_queue.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "write_queue_flush",
+                "WriteQueue定时刷盘",
+                std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::High,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            move || {
+                let wq = wq.clone();
+                async move {
+                    wq.flush();
+                    Ok(())
+                }
+            },
+        );
+    }
+
     // 8.5.3 健康检查任务（3个：主检查/统计输出/缓存清理）
     {
         let hc = health_check.clone();
@@ -1333,6 +1362,33 @@ async fn async_main(
                 let r = rm.clone();
                 async move {
                     r.cleanup_expired();
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_diff_sync_watcher: 差量同步超时监控（30s）
+        let sm_watch = fed.sync_manager.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "fed_diff_sync_watcher",
+                "联邦差量同步超时监控",
+                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+            )
+            .with_category(TaskCategory::Network)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            move || {
+                let sm = sm_watch.clone();
+                async move {
+                    sm.check_diff_sync_timeouts();
                     Ok(())
                 }
             },

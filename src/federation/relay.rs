@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
@@ -148,7 +147,6 @@ pub struct RelayManager {
     metrics: Arc<FederationMetrics>,
     bandwidth_tracker: Arc<BandwidthTracker>,
     next_channel_id: AtomicU64,
-    shutdown: broadcast::Sender<()>,
 }
 
 impl RelayManager {
@@ -157,7 +155,6 @@ impl RelayManager {
         identity: Arc<NodeIdentity>,
         config: FederationConfig,
         metrics: Arc<FederationMetrics>,
-        shutdown: broadcast::Sender<()>,
     ) -> Self {
         let bandwidth_tracker = Arc::new(BandwidthTracker::new(
             config.relay_bandwidth_limit_mbps,
@@ -171,7 +168,6 @@ impl RelayManager {
             metrics,
             bandwidth_tracker,
             next_channel_id: AtomicU64::new(1),
-            shutdown,
         }
     }
 
@@ -435,28 +431,12 @@ impl RelayManager {
         (bytes as f64 * 8.0) / (1024.0 * 1024.0)
     }
 
-    /// 启动通道清理后台任务
+    /// 启动通道清理后台任务（已迁移到 TaskScheduler）
+    ///
+    /// 周期性通道清理由 TaskScheduler 调用 `cleanup_expired()` 驱动。
+    /// 此方法保留为空以兼容现有调用点，不再内部 spawn。
     pub fn spawn_channel_cleanup(self: Arc<Self>) {
-        let mut shutdown_rx = self.shutdown.subscribe();
-
-        tokio::spawn(async move {
-            // [ALLOWED-INTERVAL] 联邦协议级维护循环，后续 ICC 阶段迁移到 TaskScheduler
-            let mut ticker = tokio::time::interval(Duration::from_secs(30)); // [ALLOWED-HARDCODED]
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.clone().cleanup_expired();
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("[federation] 中继清理任务收到关闭信号");
-                        break;
-                    }
-                }
-            }
-        });
-        info!("[federation] 中继通道清理任务已启动（间隔 30s，超时 120s）");
+        // 已迁移：中继通道清理由 TaskScheduler 调度 cleanup_expired()
     }
 
     /// 清理超时通道（>120秒无活动，由 TaskScheduler 调度）
@@ -501,8 +481,7 @@ mod tests {
     fn make_relay_manager() -> Arc<RelayManager> {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
-        let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
+        let (cm_shutdown, _) = tokio::sync::broadcast::channel(1);
         let cm = Arc::new(ConnectionManager::new(
             node_table,
             identity.clone(),
@@ -511,13 +490,7 @@ mod tests {
             Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
-        Arc::new(RelayManager::new(
-            cm,
-            identity,
-            make_config(),
-            metrics,
-            shutdown_tx,
-        ))
+        Arc::new(RelayManager::new(cm, identity, make_config(), metrics))
     }
 
     #[test]
@@ -561,8 +534,7 @@ mod tests {
         config.enable_relay = false;
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
-        let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
+        let (cm_shutdown, _) = tokio::sync::broadcast::channel(1);
         let cm = Arc::new(ConnectionManager::new(
             node_table,
             identity.clone(),
@@ -571,7 +543,7 @@ mod tests {
             Arc::new(FederationMetrics::new()),
         ));
         let metrics = Arc::new(FederationMetrics::new());
-        let relay = RelayManager::new(cm, identity, config, metrics, shutdown_tx);
+        let relay = RelayManager::new(cm, identity, config, metrics);
 
         let result = relay.setup_relay(NodeId([2; 20]));
         assert!(result.is_err());

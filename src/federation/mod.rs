@@ -241,7 +241,6 @@ impl FederationService {
             identity.clone(),
             config.clone(),
             metrics.clone(),
-            shutdown_tx.clone(),
         ));
 
         // 9. 创建同步管理器（含 PeerSync / InfohashSync / TrackerSync）
