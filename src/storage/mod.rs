@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod infohash_repo;
+pub mod io_scheduler;
 pub mod node_repo;
 pub mod peer_repo;
 pub mod repo_traits;
@@ -14,6 +15,7 @@ pub mod write_queue;
 
 pub use db::{DhtNodeRow, InfohashRow, PeerHistoryRow, PeerRow, Storage, TrackerRow};
 pub use infohash_repo::InfohashRepoImpl;
+pub use io_scheduler::{IoPriority, IoScheduler, IoSchedulerStats};
 pub use node_repo::NodeRepoImpl;
 pub use peer_repo::PeerRepoImpl;
 pub use repo_traits::*;

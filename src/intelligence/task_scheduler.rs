@@ -14,7 +14,7 @@
 //! - 自适应调度（基于历史数据动态调整）
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -193,6 +193,11 @@ pub struct TaskMetadata {
     pub category: TaskCategory,
     /// 是否为保活类任务（心跳/健康检查），不受资源准入限制
     pub is_keepalive: bool,
+    /// 自适应闭环：当前实际执行间隔（秒）。默认等于基准 interval.as_secs()。
+    /// 自适应关闭时始终等于基准间隔，行为与改造前一致。
+    pub current_interval_secs: u64,
+    /// 自适应闭环：当前间隔相对基准间隔的比例（1.0 = 未偏离）。
+    pub adaptive_deviation: f32,
 }
 
 /// TaskMetadata::new 的默认字段值
@@ -221,6 +226,8 @@ impl TaskMetadata {
             max_retries: DEFAULT_MAX_RETRIES,
             category: TaskCategory::default(),
             is_keepalive: false,
+            current_interval_secs: interval.as_secs(),
+            adaptive_deviation: 1.0,
         }
     }
 
@@ -269,6 +276,14 @@ impl TaskMetadata {
     pub fn with_keepalive(mut self) -> Self {
         self.is_keepalive = true;
         self
+    }
+
+    /// 是否参与自适应间隔闭环。
+    ///
+    /// 保活任务（心跳/健康检查）与亚秒级任务（gossip flush 等）不参与，
+    /// 始终使用基准间隔。
+    pub fn adaptive_eligible(&self) -> bool {
+        !self.is_keepalive && self.interval.as_secs() >= 1
     }
 }
 
@@ -476,6 +491,24 @@ pub struct SchedulerKnobs {
     pub profile_ewma_alpha: f32,
     /// 系统负载采样间隔（秒）
     pub load_sample_interval_secs: u64,
+    /// 预测式调度总开关（S1-P2，默认 false）
+    pub predictive_scheduling_enabled: bool,
+    /// 负载预测 EWMA 平滑系数 alpha
+    pub predict_ewma_alpha: f32,
+    /// 负载预测历史窗口大小（采样点数）
+    pub predict_history_size: usize,
+    /// 预测前向 tick 数
+    pub predict_lookahead_ticks: u32,
+    /// 自适应执行间隔总开关（S1-P3，默认 false）
+    pub adaptive_interval_enabled: bool,
+    /// 自适应间隔目标负载（0.0-1.0）
+    pub adaptive_target_load: f32,
+    /// 自适应间隔最小缩放比例
+    pub adaptive_min_ratio: f32,
+    /// 自适应间隔最大缩放比例
+    pub adaptive_max_ratio: f32,
+    /// 闭环重算自适应间隔的 tick 周期
+    pub adaptive_recalc_ticks: u32,
 }
 
 impl Default for SchedulerKnobs {
@@ -489,6 +522,15 @@ impl Default for SchedulerKnobs {
             random_jitter_ratio: 0.1,
             profile_ewma_alpha: 0.2,
             load_sample_interval_secs: 5,
+            predictive_scheduling_enabled: false,
+            predict_ewma_alpha: 0.3,
+            predict_history_size: 20,
+            predict_lookahead_ticks: 3,
+            adaptive_interval_enabled: false,
+            adaptive_target_load: 0.6,
+            adaptive_min_ratio: 0.5,
+            adaptive_max_ratio: 2.0,
+            adaptive_recalc_ticks: 5,
         }
     }
 }
@@ -572,6 +614,141 @@ fn admission_decide(
     } else {
         AdmissionDecision::Allow
     }
+}
+
+// ---------------------------------------------------------------------------
+// S1-P2: EWMA 负载预测器
+// ---------------------------------------------------------------------------
+
+/// 负载预测状态快照（供监控查询）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PredictorSummary {
+    /// 历史窗口当前采样点数
+    pub history_len: usize,
+    /// EWMA 平滑后的当前 CPU 负载
+    pub cpu_ewma: f64,
+    /// EWMA 平滑后的当前 IO 负载
+    pub io_ewma: f64,
+    /// 预测未来 1 tick 的 CPU 负载
+    pub predicted_cpu_1tick: f64,
+    /// 预测未来 1 tick 的 IO 负载
+    pub predicted_io_1tick: f64,
+}
+
+/// EWMA 负载预测器：基于历史 LoadSample 对 CPU/IO 做趋势外推。
+///
+/// - 维护最近 `history_size` 个采样点（VecDeque 环形）。
+/// - 对 CPU / IO 分别维护 EWMA 水平值与 EWMA 趋势增量。
+/// - `predict(ticks_ahead)` = 当前 EWMA 水平 + alpha * 趋势 * ticks_ahead，clamp 到 [0,1]。
+pub struct LoadPredictor {
+    alpha: f64,
+    history_size: usize,
+    history: VecDeque<LoadSample>,
+    cpu_ewma: f64,
+    cpu_trend: f64,
+    io_ewma: f64,
+    io_trend: f64,
+    initialized: bool,
+}
+
+impl LoadPredictor {
+    pub fn new(alpha: f32, history_size: usize) -> Self {
+        Self {
+            alpha: alpha.clamp(0.0, 1.0) as f64,
+            history_size: history_size.max(1),
+            history: VecDeque::with_capacity(history_size.max(1)),
+            cpu_ewma: 0.0,
+            cpu_trend: 0.0,
+            io_ewma: 0.0,
+            io_trend: 0.0,
+            initialized: false,
+        }
+    }
+
+    /// 喂入一个新采样点，更新 EWMA 水平与趋势。
+    pub fn record(&mut self, sample: LoadSample) {
+        self.history.push_back(sample);
+        if self.history.len() > self.history_size {
+            self.history.pop_front();
+        }
+        if !self.initialized {
+            self.cpu_ewma = sample.cpu.clamp(0.0, 1.0);
+            self.io_ewma = sample.io.clamp(0.0, 1.0);
+            self.cpu_trend = 0.0;
+            self.io_trend = 0.0;
+            self.initialized = true;
+            return;
+        }
+        let a = self.alpha;
+        // 趋势：delta 的 EWMA
+        let cpu_delta = sample.cpu - self.cpu_ewma;
+        let io_delta = sample.io - self.io_ewma;
+        self.cpu_trend = a * cpu_delta + (1.0 - a) * self.cpu_trend;
+        self.io_trend = a * io_delta + (1.0 - a) * self.io_trend;
+        // 水平：采样值的 EWMA
+        self.cpu_ewma = a * sample.cpu + (1.0 - a) * self.cpu_ewma;
+        self.io_ewma = a * sample.io + (1.0 - a) * self.io_ewma;
+    }
+
+    /// 预测未来 `ticks_ahead` 个 tick 后的 CPU/IO 负载，clamp 到 [0,1]。
+    pub fn predict(&self, ticks_ahead: u32) -> LoadSample {
+        let t = ticks_ahead as f64;
+        let cpu = (self.cpu_ewma + self.alpha * self.cpu_trend * t).clamp(0.0, 1.0);
+        let io = (self.io_ewma + self.alpha * self.io_trend * t).clamp(0.0, 1.0);
+        LoadSample { cpu, io }
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    pub fn summary(&self) -> PredictorSummary {
+        let p1 = self.predict(1);
+        PredictorSummary {
+            history_len: self.history.len(),
+            cpu_ewma: self.cpu_ewma,
+            io_ewma: self.io_ewma,
+            predicted_cpu_1tick: p1.cpu,
+            predicted_io_1tick: p1.io,
+        }
+    }
+}
+
+/// 是否为预测式调度可推迟的低优先级任务（Normal/Background，非保活）。
+///
+/// 高优先级（Critical/Important）与保活任务不受预测式调度影响。
+fn is_predictive_deferrable(meta: &TaskMetadata) -> bool {
+    !meta.is_keepalive
+        && (meta.priority == TaskPriority::Normal || meta.priority == TaskPriority::Background)
+}
+
+/// 预测负载是否超过准入阈值（CPU 或 IO 任一超阈值即视为高负载）。
+fn predictive_over_threshold(knobs: &SchedulerKnobs, predicted: LoadSample) -> bool {
+    predicted.cpu >= knobs.admission_cpu_threshold as f64
+        || predicted.io >= knobs.admission_io_threshold as f64
+}
+
+/// S1-P3: 纯函数 —— 根据当前负载计算自适应执行间隔（秒）。
+///
+/// - 关闭/亚秒级/保活：由调用方过滤，本函数仅做数值计算。
+/// - `factor = clamp(load / target, min_ratio, max_ratio)`。
+/// - 结果再 clamp 到 `[base*min_ratio, base*max_ratio]`。
+fn compute_adaptive_interval_secs(
+    base_secs: u64,
+    load: f64,
+    target_load: f32,
+    min_ratio: f32,
+    max_ratio: f32,
+) -> u64 {
+    if base_secs == 0 {
+        return base_secs;
+    }
+    let target = (target_load as f64).max(0.01);
+    let factor = (load / target).clamp(min_ratio as f64, max_ratio as f64);
+    let lo = (base_secs as f64) * min_ratio as f64;
+    let hi = (base_secs as f64) * max_ratio as f64;
+    let adjusted = (base_secs as f64) * factor;
+    adjusted.clamp(lo, hi).round() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +911,16 @@ pub struct TaskScheduler {
     load_sampler: Arc<dyn LoadSampler>,
     /// 每个任务当前已被准入控制延迟的 tick 数（防饥饿）
     admission_delays: RwLock<HashMap<String, u32>>,
+    /// S1-P2: EWMA 负载预测器（仅在 predictive_scheduling_enabled 时喂数/查询）
+    load_predictor: RwLock<LoadPredictor>,
+    /// S1-P2: 每个任务当前已被预测式调度推迟的 tick 数（防饥饿）
+    predicted_delays: RwLock<HashMap<String, u32>>,
+    /// S1-P2: 预测式推迟累计计数（监控用）
+    predicted_defer_total: Arc<AtomicU64>,
+    /// S1-P3/三: 外部注入的 IO 背压级别 [0.0, 1.0]（IOScheduler Agent 调用）
+    external_io_backpressure: Arc<ParkingMutex<f32>>,
+    /// S1-P3: 外部注入的 dirty 积压量（闭环反馈信号之一）
+    dirty_backlog: Arc<AtomicI64>,
 }
 
 impl TaskScheduler {
@@ -768,6 +955,14 @@ impl TaskScheduler {
             )),
             load_sampler,
             admission_delays: RwLock::new(HashMap::new()),
+            load_predictor: RwLock::new(LoadPredictor::new(
+                SchedulerKnobs::default().predict_ewma_alpha,
+                SchedulerKnobs::default().predict_history_size,
+            )),
+            predicted_delays: RwLock::new(HashMap::new()),
+            predicted_defer_total: Arc::new(AtomicU64::new(0)),
+            external_io_backpressure: Arc::new(ParkingMutex::new(0.0)),
+            dirty_backlog: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -796,8 +991,55 @@ impl TaskScheduler {
     /// 所有新功能默认关闭，未注入时行为与改造前完全一致。
     pub fn with_knobs(mut self, knobs: SchedulerKnobs) -> Self {
         self.profile_store.set_alpha(knobs.profile_ewma_alpha);
+        // 重建负载预测器以采用新的 alpha / 历史窗口
+        *self.load_predictor.write() =
+            LoadPredictor::new(knobs.predict_ewma_alpha, knobs.predict_history_size);
         self.knobs = knobs;
         self
+    }
+
+    /// S1-P3/三: 注入外部 IO 背压级别 [0.0, 1.0]（IOScheduler Agent 在 main.rs 中调用）。
+    /// 0.0 表示无背压，1.0 表示满背压。注入后会与 ResourceMonitor 的 IO 负载取 max，
+    /// 使准入控制与自适应间隔感知 IO 队列积压。
+    pub fn set_external_io_backpressure(&self, level: f32) {
+        let clamped = level.clamp(0.0, 1.0);
+        *self.external_io_backpressure.lock() = clamped;
+    }
+
+    /// 查询当前外部 IO 背压级别 [0.0, 1.0]。
+    pub fn external_io_backpressure(&self) -> f32 {
+        *self.external_io_backpressure.lock()
+    }
+
+    /// 融合后的有效 IO 负载 = max(ResourceMonitor.io_usage, 外部背压)。
+    /// 外部背压为 0 时返回值与 ResourceMonitor 一致（向后兼容）。
+    pub fn io_load(&self) -> f32 {
+        let monitor_io = self.resource_monitor.current().io_usage as f32;
+        let bp = *self.external_io_backpressure.lock();
+        monitor_io.max(bp)
+    }
+
+    /// 注入 dirty 积压量（闭环反馈信号）。主要供持久化/外部任务调用。
+    pub fn set_dirty_backlog(&self, count: i64) {
+        self.dirty_backlog.store(count.max(0), Ordering::Relaxed);
+    }
+
+    /// 查询当前 dirty 积压量。
+    pub fn dirty_backlog(&self) -> i64 {
+        self.dirty_backlog.load(Ordering::Relaxed)
+    }
+
+    /// 融合外部 IO 背压后的负载采样（准入/预测/自适应统一使用此采样）。
+    fn effective_sample(&self) -> LoadSample {
+        let mut s = self.load_sampler.sample();
+        let bp = *self.external_io_backpressure.lock();
+        s.io = s.io.max(bp as f64);
+        s
+    }
+
+    /// S1-P2: 负载预测状态快照（供监控查询）。
+    pub fn predictor_summary(&self) -> PredictorSummary {
+        self.load_predictor.read().summary()
     }
 
     /// 注入自定义负载采样器（主要用于测试注入 mock）
@@ -966,9 +1208,16 @@ impl TaskScheduler {
         // [ALLOWED-INTERVAL] TaskScheduler 自身 tick，调度器内核
         let mut tick_interval = tokio::time::interval(SCHEDULER_TICK_INTERVAL);
         let mut heartbeat = Instant::now();
+        let mut adaptive_tick: u64 = 0;
 
         loop {
             tick_interval.tick().await;
+            // S1-P3: 闭环重算自适应间隔（每 N 个 tick；关闭时 no-op）
+            adaptive_tick = adaptive_tick.wrapping_add(1);
+            let recalc_period = self.knobs.adaptive_recalc_ticks.max(1) as u64;
+            if self.knobs.adaptive_interval_enabled && adaptive_tick.is_multiple_of(recalc_period) {
+                self.recalc_adaptive_intervals();
+            }
             if heartbeat.elapsed() >= SCHEDULER_HEARTBEAT_INTERVAL {
                 let queue_len = self.queue.read().len();
                 let by_cat = self.running_by_category.read();
@@ -1012,6 +1261,12 @@ impl TaskScheduler {
     async fn process_queue(scheduler: Arc<Self>) {
         let now = Instant::now();
         let resource = scheduler.resource_monitor.current();
+
+        // S1-P2: 每 tick 喂入融合背压后的采样点给负载预测器（仅在启用时）
+        if scheduler.knobs.predictive_scheduling_enabled {
+            let sample = scheduler.effective_sample();
+            scheduler.load_predictor.write().record(sample);
+        }
 
         // 收集到期的任务
         let mut due_tasks: Vec<ScheduledItem> = Vec::new();
@@ -1100,7 +1355,7 @@ impl TaskScheduler {
 
             // 资源感知准入控制（默认关闭；关闭后 admission_decide 恒为 Allow，行为不变）
             {
-                let sample = scheduler.load_sampler.sample();
+                let sample = scheduler.effective_sample();
                 let delayed = *scheduler
                     .admission_delays
                     .read()
@@ -1145,6 +1400,53 @@ impl TaskScheduler {
                 }
             }
 
+            // S1-P2: 预测式调度（默认关闭；仅推迟 Normal/Background 低优先级任务）
+            if scheduler.knobs.predictive_scheduling_enabled && is_predictive_deferrable(&meta) {
+                let predicted_over = {
+                    let p = scheduler.load_predictor.read();
+                    let lookahead = scheduler.knobs.predict_lookahead_ticks.max(1);
+                    (1..=lookahead)
+                        .any(|t| predictive_over_threshold(&scheduler.knobs, p.predict(t)))
+                };
+                if predicted_over {
+                    let delayed = *scheduler
+                        .predicted_delays
+                        .read()
+                        .get(&item.task_id)
+                        .unwrap_or(&0);
+                    if delayed >= scheduler.knobs.admission_max_delay_ticks {
+                        // 预测式推迟预算用尽，强制执行避免饥饿
+                        scheduler.predicted_delays.write().remove(&item.task_id);
+                        debug!(
+                            "[task_scheduler] 预测式推迟预算用尽，强制执行: {}",
+                            meta.name
+                        );
+                    } else {
+                        *scheduler
+                            .predicted_delays
+                            .write()
+                            .entry(item.task_id.clone())
+                            .or_insert(0) += 1;
+                        scheduler
+                            .predicted_defer_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            "[task_scheduler] 预测式推迟低优先级任务: {} (第 {} tick)",
+                            meta.name,
+                            delayed + 1
+                        );
+                        scheduler.schedule_task(
+                            &item.task_id,
+                            Instant::now() + SCHEDULER_TICK_INTERVAL,
+                            item.priority,
+                        );
+                        continue;
+                    }
+                } else {
+                    scheduler.predicted_delays.write().remove(&item.task_id);
+                }
+            }
+
             // 执行任务
             debug!(
                 "[task_scheduler] 执行任务: {} (优先级={:?})",
@@ -1165,6 +1467,53 @@ impl TaskScheduler {
         }
         let completed = self.completed_dependencies.read();
         meta.dependencies.iter().all(|dep| completed.contains(dep))
+    }
+
+    /// S1-P3: 闭环重算各任务自适应执行间隔。
+    ///
+    /// 反馈信号：融合外部背压后的 CPU/IO 负载 + dirty 积压量。
+    /// - 保活任务与亚秒级任务不参与（adaptive_eligible=false）。
+    /// - dirty 积压高时，优先延长非持久化任务间隔，给持久化让资源。
+    fn recalc_adaptive_intervals(&self) {
+        if !self.knobs.adaptive_interval_enabled {
+            return;
+        }
+        let sample = self.effective_sample();
+        let load = sample.cpu.max(sample.io);
+        let target = self.knobs.adaptive_target_load;
+        let min_ratio = self.knobs.adaptive_min_ratio;
+        let max_ratio = self.knobs.adaptive_max_ratio;
+        let dirty = self.dirty_backlog.load(Ordering::Relaxed);
+
+        // dirty 积压越重，非持久化任务间隔延长越多（线性到 max_ratio）
+        let dirty_extend = if dirty > 0 {
+            let ratio = (dirty as f64 / 1000.0).clamp(0.0, 1.0);
+            1.0 + ratio * (max_ratio as f64 - 1.0)
+        } else {
+            1.0
+        };
+
+        let mut tasks = self.tasks.write();
+        for meta in tasks.values_mut() {
+            if !meta.adaptive_eligible() {
+                continue;
+            }
+            let base = meta.interval.as_secs();
+            let mut adjusted =
+                compute_adaptive_interval_secs(base, load, target, min_ratio, max_ratio);
+            // dirty 积压高：延长非持久化任务
+            if meta.category != TaskCategory::Persistence && dirty_extend > 1.0 {
+                let lo = (base as f64) * min_ratio as f64;
+                let hi = (base as f64) * max_ratio as f64;
+                adjusted = ((adjusted as f64) * dirty_extend).clamp(lo, hi).round() as u64;
+            }
+            meta.current_interval_secs = adjusted;
+            meta.adaptive_deviation = if base > 0 {
+                adjusted as f32 / base as f32
+            } else {
+                1.0
+            };
+        }
     }
 
     /// 执行任务
@@ -1288,8 +1637,21 @@ impl TaskScheduler {
             } else {
                 0
             };
+            // S1-P3: 自适应间隔（关闭时回退基准 meta.interval，行为与改造前一致）
+            // 重新读取最新的 current_interval_secs（闭环可能在任务运行期间重算）
+            let base_interval = if scheduler.knobs.adaptive_interval_enabled {
+                scheduler
+                    .tasks
+                    .read()
+                    .get(&task_id)
+                    .filter(|m| m.adaptive_eligible())
+                    .map(|m| Duration::from_secs(m.current_interval_secs))
+                    .unwrap_or(meta.interval)
+            } else {
+                meta.interval
+            };
             let interval_with_ratio = apply_interval_jitter(
-                meta.interval,
+                base_interval,
                 scheduler.knobs.random_jitter_enabled,
                 scheduler.knobs.random_jitter_ratio,
             );
@@ -1339,6 +1701,20 @@ impl TaskScheduler {
             total_executions,
             total_failures,
             resource: self.resource_monitor.current(),
+            adaptive_interval_enabled: self.knobs.adaptive_interval_enabled,
+            adaptive_task_count: tasks.values().filter(|m| m.adaptive_eligible()).count(),
+            avg_adaptive_deviation: {
+                let elig: Vec<&TaskMetadata> =
+                    tasks.values().filter(|m| m.adaptive_eligible()).collect();
+                if elig.is_empty() {
+                    1.0
+                } else {
+                    elig.iter().map(|m| m.adaptive_deviation).sum::<f32>() / elig.len() as f32
+                }
+            },
+            predictive_defer_total: self.predicted_defer_total.load(Ordering::Relaxed),
+            external_io_backpressure: *self.external_io_backpressure.lock(),
+            dirty_backlog: self.dirty_backlog.load(Ordering::Relaxed),
         }
     }
 
@@ -1395,6 +1771,18 @@ pub struct TaskSchedulerSummary {
     pub total_executions: u64,
     pub total_failures: u64,
     pub resource: ResourceState,
+    /// S1-P3: 自适应间隔是否启用
+    pub adaptive_interval_enabled: bool,
+    /// S1-P3: 参与自适应闭环的任务数
+    pub adaptive_task_count: usize,
+    /// S1-P3: 参与自适应任务的平均偏离基准比例
+    pub avg_adaptive_deviation: f32,
+    /// S1-P2: 预测式推迟累计次数
+    pub predictive_defer_total: u64,
+    /// 三: 当前外部 IO 背压级别 [0.0, 1.0]
+    pub external_io_backpressure: f32,
+    /// S1-P3: 当前 dirty 积压量
+    pub dirty_backlog: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,5 +2106,149 @@ mod tests {
             admission_decide(&knobs, &meta, LoadSample { cpu: 0.1, io: 0.9 }, 0),
             AdmissionDecision::Delay
         );
+    }
+
+    // ---- S1-P2: LoadPredictor EWMA ----
+
+    #[test]
+    fn test_load_predictor_ewma() {
+        let mut p = LoadPredictor::new(0.3, 10);
+
+        // 先喂 10 个恒定低负载采样，收敛到水平值
+        for _ in 0..10 {
+            p.record(LoadSample { cpu: 0.2, io: 0.1 });
+        }
+        assert_eq!(p.history_len(), 10);
+        // 稳态下预测应接近当前值（趋势≈0）
+        let flat = p.predict(3);
+        assert!(
+            (flat.cpu - 0.2).abs() < 0.05,
+            "稳态 CPU 预测应≈0.2: {}",
+            flat.cpu
+        );
+
+        // 喂入一段上升序列，趋势应为正
+        for cpu in [0.3, 0.4, 0.5, 0.6, 0.7] {
+            p.record(LoadSample { cpu, io: 0.1 });
+        }
+        // 历史窗口=10，喂了15个采样后仍保持10
+        assert_eq!(p.history_len(), 10);
+
+        let now = p.predict(0);
+        let ahead = p.predict(3);
+        // 上升趋势下，前向预测应高于当前水平，且 clamp 到 [0,1]
+        assert!(
+            ahead.cpu > now.cpu,
+            "趋势外推应上升: {} -> {}",
+            now.cpu,
+            ahead.cpu
+        );
+        assert!(ahead.cpu <= 1.0 && ahead.cpu >= 0.0);
+        assert!(now.cpu <= 1.0 && now.cpu >= 0.0);
+        // IO 未变化，预测应保持低位
+        assert!(ahead.io < 0.2);
+    }
+
+    #[test]
+    fn test_predictive_scheduling_defers_low_priority() {
+        // Normal / Background 低优先级可被预测式推迟
+        let normal = TaskMetadata::new("n", "n", Duration::from_secs(60));
+        let background = TaskMetadata::new("b", "b", Duration::from_secs(60))
+            .with_priority(TaskPriority::Background);
+        assert!(is_predictive_deferrable(&normal));
+        assert!(is_predictive_deferrable(&background));
+
+        // Critical / Important 高优先级不受预测式调度影响
+        let critical = TaskMetadata::new("c", "c", Duration::from_secs(1))
+            .with_priority(TaskPriority::Critical);
+        let important = TaskMetadata::new("i", "i", Duration::from_secs(30))
+            .with_priority(TaskPriority::Important);
+        assert!(!is_predictive_deferrable(&critical));
+        assert!(!is_predictive_deferrable(&important));
+
+        // 保活任务即使是 Normal 也不被推迟
+        let keepalive = TaskMetadata::new("hb", "hb", Duration::from_secs(5)).with_keepalive();
+        assert!(!is_predictive_deferrable(&keepalive));
+
+        // 预测超阈值判定
+        let knobs = SchedulerKnobs {
+            admission_cpu_threshold: 0.8,
+            admission_io_threshold: 0.8,
+            ..Default::default()
+        };
+        assert!(predictive_over_threshold(
+            &knobs,
+            LoadSample { cpu: 0.9, io: 0.1 }
+        ));
+        assert!(predictive_over_threshold(
+            &knobs,
+            LoadSample { cpu: 0.1, io: 0.9 }
+        ));
+        assert!(!predictive_over_threshold(
+            &knobs,
+            LoadSample { cpu: 0.5, io: 0.5 }
+        ));
+    }
+
+    // ---- S1-P3: 自适应间隔 ----
+
+    #[test]
+    fn test_adaptive_interval_shrinks_in_low_load() {
+        // base=60s, target=0.6, min=0.5, max=2.0；load=0.2 -> factor clamp 到 0.5 -> 30s
+        let secs = compute_adaptive_interval_secs(60, 0.2, 0.6, 0.5, 2.0);
+        assert_eq!(secs, 30, "低负载应缩短到基准一半: {}", secs);
+    }
+
+    #[test]
+    fn test_adaptive_interval_extends_in_high_load() {
+        // load=0.9 -> factor=0.9/0.6=1.5 -> 90s
+        let secs = compute_adaptive_interval_secs(60, 0.9, 0.6, 0.5, 2.0);
+        assert_eq!(secs, 90, "高负载应延长: {}", secs);
+        // 极高负载仍受 max_ratio=2.0 上界约束
+        let capped = compute_adaptive_interval_secs(60, 2.0, 0.6, 0.5, 2.0);
+        assert_eq!(capped, 120, "不应超过基准两倍: {}", capped);
+    }
+
+    #[test]
+    fn test_adaptive_interval_keepalive_excluded() {
+        // 普通长周期任务参与自适应
+        let normal = TaskMetadata::new("n", "n", Duration::from_secs(60));
+        assert!(normal.adaptive_eligible());
+
+        // 保活任务不参与
+        let hb = TaskMetadata::new("hb", "hb", Duration::from_secs(5)).with_keepalive();
+        assert!(!hb.adaptive_eligible());
+
+        // 亚秒级任务（gossip flush）不参与
+        let fast = TaskMetadata::new("gf", "gf", Duration::from_millis(100));
+        assert!(!fast.adaptive_eligible());
+    }
+
+    // ---- 三: 外部 IO 背压注入 ----
+
+    #[tokio::test]
+    async fn test_external_io_backpressure_injection() {
+        let s = Arc::new(TaskScheduler::new());
+        assert!((s.external_io_backpressure() - 0.0).abs() < 1e-6);
+        assert!((s.io_load() - 0.0).abs() < 1e-6);
+
+        // 注入背压后，io_load 应反映该背压
+        s.set_external_io_backpressure(0.9);
+        assert!((s.external_io_backpressure() - 0.9).abs() < 1e-6);
+        assert!(
+            (s.io_load() - 0.9).abs() < 1e-6,
+            "io_load 应反映背压: {}",
+            s.io_load()
+        );
+
+        // 超出范围 clamp 到 [0,1]
+        s.set_external_io_backpressure(2.0);
+        assert!((s.external_io_backpressure() - 1.0).abs() < 1e-6);
+        s.set_external_io_backpressure(-0.5);
+        assert!((s.external_io_backpressure() - 0.0).abs() < 1e-6);
+
+        // summary 中也能查到
+        let sum = s.summary();
+        assert!((sum.external_io_backpressure - 0.0).abs() < 1e-6);
     }
 }

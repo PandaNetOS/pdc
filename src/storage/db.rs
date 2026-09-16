@@ -511,6 +511,17 @@ impl Storage {
     ) -> anyhow::Result<()> {
         self.record_write("infohashes", 1);
         let conn = self.conn.lock().unwrap();
+        Self::save_infohash_in_tx(&conn, infohash, ref_count, first_source, score)
+    }
+
+    /// 在已有连接（事务）上写入单个 infohash（供 WriteQueue/IOScheduler 闭包使用）
+    pub fn save_infohash_in_tx(
+        conn: &Connection,
+        infohash: &[u8; 20],
+        ref_count: u32,
+        first_source: &str,
+        score: f64,
+    ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score)
@@ -739,6 +750,17 @@ impl Storage {
         }
         self.record_write("peer_history", entries.len() as u64);
         let conn = self.conn.lock().unwrap();
+        Self::save_peer_history_batch_in_tx(&conn, entries)
+    }
+
+    /// 在已有连接上批量写入 peer_history（供 WriteQueue/IOScheduler 闭包使用）
+    pub fn save_peer_history_batch_in_tx(
+        conn: &Connection,
+        entries: &[PeerHistoryEntry],
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(

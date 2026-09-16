@@ -291,20 +291,59 @@ async fn async_main(
     };
 
     // 3.6 创建所有数据层 Repo（统一数据归口）
-    let peer_repo = Arc::new(PeerDiscoveryCenter::storage::PeerRepoImpl::new(
-        storage.clone(),
-    ));
-    let infohash_repo = Arc::new(PeerDiscoveryCenter::storage::InfohashRepoImpl::new(
-        storage.clone(),
-    ));
+    // P2: 先创建 WriteQueue/IOScheduler，再注入到各 Repo
+    let io_scheduler: Option<Arc<PeerDiscoveryCenter::storage::IoScheduler>> =
+        if config.io_scheduler.enabled {
+            use PeerDiscoveryCenter::storage::io_scheduler::SchedulerRuntimeConfig;
+            let rt_cfg = SchedulerRuntimeConfig {
+                max_queue_size: config.io_scheduler.max_queue_size,
+                token_bucket_rate: config.io_scheduler.token_bucket_rate,
+                token_bucket_max: config.io_scheduler.token_bucket_max,
+                low_watermark: config.io_scheduler.low_watermark,
+                high_watermark: config.io_scheduler.high_watermark,
+                batch_max_size: config.io_scheduler.batch_max_size,
+                batch_max_delay: std::time::Duration::from_millis(
+                    config.io_scheduler.batch_max_delay_ms,
+                ),
+                idle_prediction_enabled: config.io_scheduler.idle_prediction_enabled,
+                idle_window: std::time::Duration::from_secs(config.io_scheduler.idle_window_secs),
+                idle_wait: std::time::Duration::from_millis(config.io_scheduler.idle_wait_ms),
+                retry_wait: std::time::Duration::from_millis(config.io_scheduler.retry_wait_ms),
+            };
+            let sched =
+                PeerDiscoveryCenter::storage::IoScheduler::new(storage.connection(), rt_cfg);
+            info!(
+                "[main] IOScheduler 已启用（令牌桶 {} 行/秒，队列上限 {}）",
+                config.io_scheduler.token_bucket_rate, config.io_scheduler.max_queue_size
+            );
+            Some(sched)
+        } else {
+            None
+        };
+
+    let write_queue = if let Some(ref sched) = io_scheduler {
+        Arc::new(PeerDiscoveryCenter::storage::WriteQueue::with_scheduler(
+            storage.connection(),
+            sched.clone(),
+        ))
+    } else {
+        Arc::new(PeerDiscoveryCenter::storage::WriteQueue::new(
+            storage.connection(),
+            config.persistence.batch_size,
+            std::time::Duration::from_secs(config.persistence.flush_interval_secs),
+        ))
+    };
+
+    let peer_repo = Arc::new(
+        PeerDiscoveryCenter::storage::PeerRepoImpl::new(storage.clone())
+            .with_write_queue(write_queue.clone()),
+    );
+    let infohash_repo = Arc::new(
+        PeerDiscoveryCenter::storage::InfohashRepoImpl::new(storage.clone())
+            .with_write_queue(write_queue.clone()),
+    );
     let tracker_repo = Arc::new(PeerDiscoveryCenter::storage::TrackerRepoImpl::new(
         storage.clone(),
-    ));
-    // 创建 WriteQueue（异步入队 + 攒批事务写入，减少 SQLite fsync）
-    let write_queue = Arc::new(PeerDiscoveryCenter::storage::WriteQueue::new(
-        storage.connection(),
-        config.persistence.batch_size,
-        std::time::Duration::from_secs(config.persistence.flush_interval_secs),
     ));
     let node_repo = Arc::new(
         PeerDiscoveryCenter::storage::NodeRepoImpl::new(storage.clone())
@@ -935,6 +974,39 @@ async fn async_main(
         );
     }
 
+    // 8.5.2c IOScheduler 背压轮询（仅启用时注册）
+    if let Some(ref sched) = io_scheduler {
+        let sched_clone = sched.clone();
+        let rm = task_scheduler.resource_monitor();
+        let bp_interval = config.io_scheduler.backpressure_poll_interval_secs;
+        task_scheduler.register(
+            TaskMetadata::new(
+                "io_backpressure_poll",
+                "IOScheduler背压采样",
+                std::time::Duration::from_secs(bp_interval),
+            )
+            .with_category(TaskCategory::Monitor)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(bp_interval)),
+            move || {
+                let s = sched_clone.clone();
+                let r = rm.clone();
+                async move {
+                    let level = s.backpressure_level();
+                    r.set_io_load(level as f64);
+                    Ok(())
+                }
+            },
+        );
+    }
+
     // 8.5.3 健康检查任务（3个：主检查/统计输出/缓存清理）
     {
         let hc = health_check.clone();
@@ -1278,7 +1350,15 @@ async fn async_main(
             ))),
             move || {
                 let tm = tm.clone();
+                let io_sched = io_scheduler.clone();
                 async move {
+                    // P3: 仅在 IO 空闲时执行冷驱逐（避免与前台写入竞争）
+                    if let Some(ref s) = io_sched {
+                        if !s.is_idle() {
+                            tracing::debug!("[tier_check] IO 繁忙，跳过本轮冷驱逐");
+                            return Ok(());
+                        }
+                    }
                     tm.check_all().await;
                     Ok(())
                 }

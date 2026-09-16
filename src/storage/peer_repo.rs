@@ -20,6 +20,7 @@ use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::PeerRepository;
+use crate::storage::write_queue::WriteQueue;
 use crate::types::{Infohash, PeerInfo, PeerSource};
 
 /// 鍐呭瓨涓殑 peer 缂撳瓨锛堟寜 infohash 鍒嗙粍锛?
@@ -50,6 +51,8 @@ pub struct PeerRepoImpl {
     /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
     merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
+    /// 写入队列（可选，Some 时 history flush 通过 WriteQueue/IOScheduler 提交）
+    write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl PeerRepoImpl {
@@ -60,6 +63,7 @@ impl PeerRepoImpl {
             history_buffer: RwLock::new(Vec::new()),
             merkle: OnceLock::new(),
             gossip: OnceLock::new(),
+            write_queue: None,
         }
     }
 
@@ -70,6 +74,12 @@ impl PeerRepoImpl {
     pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
         let _ = self.merkle.set(merkle);
         let _ = self.gossip.set(gossip);
+    }
+
+    /// 注入写入队列（builder 模式）
+    pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
+        self.write_queue = Some(wq);
+        self
     }
 
     /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
@@ -226,10 +236,15 @@ impl PeerRepoImpl {
         if buffer.len() >= 100 {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            let storage = self.storage.clone();
-            tokio::spawn(async move {
-                let _ = storage.save_peer_history_batch(&batch);
-            });
+            if let Some(ref wq) = self.write_queue {
+                // 通过 WriteQueue/IOScheduler 提交（Normal 优先级）
+                wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
+            } else {
+                let storage = self.storage.clone();
+                tokio::spawn(async move {
+                    let _ = storage.save_peer_history_batch(&batch);
+                });
+            }
         }
         new_entries
     }
@@ -301,8 +316,12 @@ impl PeerRepoImpl {
             return Ok(0);
         }
         let count = batch.len();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || storage.save_peer_history_batch(&batch)).await??;
+        if let Some(ref wq) = self.write_queue {
+            wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
+        } else {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || storage.save_peer_history_batch(&batch)).await??;
+        }
         Ok(count)
     }
 

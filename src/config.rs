@@ -45,6 +45,9 @@ pub struct PdcConfig {
     /// TaskScheduler 各分类并发度
     #[serde(default)]
     pub task_scheduler: TaskSchedulerConfig,
+    /// IO 调度器配置
+    #[serde(default)]
+    pub io_scheduler: IoSchedulerConfig,
     /// 联邦网络配置
     #[serde(default)]
     pub federation: crate::federation::config::FederationConfig,
@@ -130,6 +133,33 @@ pub struct TaskSchedulerConfig {
     /// 系统负载采样间隔（秒）。采样任务由 main.rs 注册，本字段为参考配置。
     #[serde(default = "default_load_sample_interval_secs")]
     pub load_sample_interval_secs: u64,
+    /// 预测式调度总开关（S1-P2）。false（默认）时调度行为与改造前完全一致。
+    #[serde(default = "default_predictive_scheduling_enabled")]
+    pub predictive_scheduling_enabled: bool,
+    /// 负载预测 EWMA 平滑系数 alpha（0.0-1.0）。
+    #[serde(default = "default_predict_ewma_alpha")]
+    pub predict_ewma_alpha: f32,
+    /// 负载预测保留的历史采样点数量（环形缓冲区大小）。
+    #[serde(default = "default_predict_history_size")]
+    pub predict_history_size: usize,
+    /// 预测前向 tick 数（1-5），用于预测式调度。
+    #[serde(default = "default_predict_lookahead_ticks")]
+    pub predict_lookahead_ticks: u32,
+    /// 自适应执行间隔总开关（S1-P3）。false（默认）时使用固定周期。
+    #[serde(default = "default_adaptive_interval_enabled")]
+    pub adaptive_interval_enabled: bool,
+    /// 自适应间隔目标负载（0.0-1.0），当前负载围绕该值上下调整间隔。
+    #[serde(default = "default_adaptive_target_load")]
+    pub adaptive_target_load: f32,
+    /// 自适应间隔最小缩放比例（最短缩到基准的该比例倍）。
+    #[serde(default = "default_adaptive_min_ratio")]
+    pub adaptive_min_ratio: f32,
+    /// 自适应间隔最大缩放比例（最长延到基准的该比例倍）。
+    #[serde(default = "default_adaptive_max_ratio")]
+    pub adaptive_max_ratio: f32,
+    /// 闭环重新计算自适应间隔的 tick 周期数。
+    #[serde(default = "default_adaptive_recalc_ticks")]
+    pub adaptive_recalc_ticks: u32,
 }
 
 fn default_crawl_concurrency() -> u32 {
@@ -149,7 +179,7 @@ fn default_network_concurrency() -> u32 {
 }
 
 fn default_admission_control_enabled() -> bool {
-    false
+    true
 }
 
 fn default_admission_cpu_threshold() -> f32 {
@@ -165,7 +195,7 @@ fn default_admission_max_delay_ticks() -> u32 {
 }
 
 fn default_random_jitter_enabled() -> bool {
-    false
+    true
 }
 
 fn default_random_jitter_ratio() -> f32 {
@@ -177,6 +207,42 @@ fn default_profile_ewma_alpha() -> f32 {
 }
 
 fn default_load_sample_interval_secs() -> u64 {
+    5
+}
+
+fn default_predictive_scheduling_enabled() -> bool {
+    true
+}
+
+fn default_predict_ewma_alpha() -> f32 {
+    0.3
+}
+
+fn default_predict_history_size() -> usize {
+    20
+}
+
+fn default_predict_lookahead_ticks() -> u32 {
+    3
+}
+
+fn default_adaptive_interval_enabled() -> bool {
+    true
+}
+
+fn default_adaptive_target_load() -> f32 {
+    0.6
+}
+
+fn default_adaptive_min_ratio() -> f32 {
+    0.5
+}
+
+fn default_adaptive_max_ratio() -> f32 {
+    2.0
+}
+
+fn default_adaptive_recalc_ticks() -> u32 {
     5
 }
 
@@ -208,6 +274,15 @@ impl Default for TaskSchedulerConfig {
             random_jitter_ratio: default_random_jitter_ratio(),
             profile_ewma_alpha: default_profile_ewma_alpha(),
             load_sample_interval_secs: default_load_sample_interval_secs(),
+            predictive_scheduling_enabled: default_predictive_scheduling_enabled(),
+            predict_ewma_alpha: default_predict_ewma_alpha(),
+            predict_history_size: default_predict_history_size(),
+            predict_lookahead_ticks: default_predict_lookahead_ticks(),
+            adaptive_interval_enabled: default_adaptive_interval_enabled(),
+            adaptive_target_load: default_adaptive_target_load(),
+            adaptive_min_ratio: default_adaptive_min_ratio(),
+            adaptive_max_ratio: default_adaptive_max_ratio(),
+            adaptive_recalc_ticks: default_adaptive_recalc_ticks(),
         }
     }
 }
@@ -371,6 +446,111 @@ impl Default for SqliteConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IO 调度器配置
+// ---------------------------------------------------------------------------
+
+/// IO 调度器配置（统一 SQLite 写入调度：优先级队列 + 令牌桶 + 请求合并）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IoSchedulerConfig {
+    /// 是否启用 IO 调度器（false 时 WriteQueue 走原逻辑，完全向后兼容）
+    #[serde(default = "default_io_scheduler_enabled")]
+    pub enabled: bool,
+    /// 队列最大容量（超过此值拒绝非 Critical/Important 请求）
+    #[serde(default = "default_io_max_queue_size")]
+    pub max_queue_size: usize,
+    /// 令牌桶补充速率（行/秒）
+    #[serde(default = "default_io_token_bucket_rate")]
+    pub token_bucket_rate: usize,
+    /// 令牌桶最大容量（突发上限）
+    #[serde(default = "default_io_token_bucket_max")]
+    pub token_bucket_max: usize,
+    /// 背压低水位（低于此值无背压）
+    #[serde(default = "default_io_low_watermark")]
+    pub low_watermark: usize,
+    /// 背压高水位（高于此值满背压，拒绝 Background 请求）
+    #[serde(default = "default_io_high_watermark")]
+    pub high_watermark: usize,
+    /// 请求合并最大批大小
+    #[serde(default = "default_io_batch_max_size")]
+    pub batch_max_size: usize,
+    /// 请求合并最大延迟（毫秒）
+    #[serde(default = "default_io_batch_max_delay_ms")]
+    pub batch_max_delay_ms: u64,
+    /// 是否启用空闲预测
+    #[serde(default = "default_true")]
+    pub idle_prediction_enabled: bool,
+    /// 空闲预测滑动窗口（秒）
+    #[serde(default = "default_io_idle_window_secs")]
+    pub idle_window_secs: u64,
+    /// 背压轮询间隔（秒，注入 TaskScheduler）
+    #[serde(default = "default_io_backpressure_poll_interval_secs")]
+    pub backpressure_poll_interval_secs: u64,
+    /// 队列为空时的等待时间（毫秒）
+    #[serde(default = "default_io_idle_wait_ms")]
+    pub idle_wait_ms: u64,
+    /// 令牌不足时的重试等待时间（毫秒）
+    #[serde(default = "default_io_retry_wait_ms")]
+    pub retry_wait_ms: u64,
+}
+
+fn default_io_scheduler_enabled() -> bool {
+    true
+}
+fn default_io_max_queue_size() -> usize {
+    100_000
+}
+fn default_io_token_bucket_rate() -> usize {
+    10_000
+}
+fn default_io_token_bucket_max() -> usize {
+    20_000
+}
+fn default_io_low_watermark() -> usize {
+    1_000
+}
+fn default_io_high_watermark() -> usize {
+    50_000
+}
+fn default_io_batch_max_size() -> usize {
+    500
+}
+fn default_io_batch_max_delay_ms() -> u64 {
+    10
+}
+fn default_io_idle_window_secs() -> u64 {
+    60
+}
+fn default_io_backpressure_poll_interval_secs() -> u64 {
+    5
+}
+fn default_io_idle_wait_ms() -> u64 {
+    500
+}
+fn default_io_retry_wait_ms() -> u64 {
+    50
+}
+
+impl Default for IoSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_io_scheduler_enabled(),
+            max_queue_size: default_io_max_queue_size(),
+            token_bucket_rate: default_io_token_bucket_rate(),
+            token_bucket_max: default_io_token_bucket_max(),
+            low_watermark: default_io_low_watermark(),
+            high_watermark: default_io_high_watermark(),
+            batch_max_size: default_io_batch_max_size(),
+            batch_max_delay_ms: default_io_batch_max_delay_ms(),
+            idle_prediction_enabled: default_true(),
+            idle_window_secs: default_io_idle_window_secs(),
+            backpressure_poll_interval_secs: default_io_backpressure_poll_interval_secs(),
+            idle_wait_ms: default_io_idle_wait_ms(),
+            retry_wait_ms: default_io_retry_wait_ms(),
+        }
+    }
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -421,6 +601,7 @@ impl Default for PdcConfig {
             persistence: PersistenceConfig::default(),
             sqlite: SqliteConfig::default(),
             task_scheduler: TaskSchedulerConfig::default(),
+            io_scheduler: IoSchedulerConfig::default(),
             federation: Default::default(),
             log_level: default_log_level(),
             port_auto_alloc: default_port_auto_alloc(),
