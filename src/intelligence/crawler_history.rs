@@ -121,7 +121,7 @@ impl CrawlerHistory {
         }
     }
 
-    /// 从历史记录提取 10 维特征。数据不足（< 5 轮）时返回 None
+    /// 从历史记录提取 10 维特征（已归一化到 [-1, 1] 范围）。数据不足（< 5 轮）时返回 None
     pub fn extract_features(&self) -> Option<PredictionFeatures> {
         if self.records.len() < 5 {
             return None;
@@ -131,31 +131,37 @@ impl CrawlerHistory {
         let last3 = self.last_n(3);
         let last1 = self.records.back().expect("len >= 5 ensures non-empty");
 
-        // --- 响应率特征 ---
+        // --- 响应率特征（已在 0~1 范围）---
         let rate_last_1 = last1.response_rate;
         let rate_last_3 = mean(last3.iter().map(|r| r.response_rate));
         let rate_last_5 = mean(last5.iter().map(|r| r.response_rate));
         let rate_trend = linear_slope(&last5.iter().map(|r| r.response_rate).collect::<Vec<_>>());
+        // rate_trend 通常很小（-0.1~0.1），用 tanh 压缩到 -1~1
+        let rate_trend = rate_trend.tanh();
 
-        // --- pending 特征 ---
-        let pending_current = last1.pending_after as f64;
+        // --- pending 特征（log 压缩到 0~1）---
+        let pending_current = normalize_log(last1.pending_after as f64, 10.0);
         let pending_after_3: Vec<f64> = last3.iter().map(|r| r.pending_after as f64).collect();
-        // 最近 3 轮的平均增量 = (last - first) / (n-1)
         let pending_growth = if pending_after_3.len() >= 2 {
             let steps = (pending_after_3.len() - 1) as f64;
-            (pending_after_3.last().unwrap() - pending_after_3[0]) / steps
+            let growth = (pending_after_3.last().unwrap() - pending_after_3[0]) / steps;
+            // growth 可能为负，用 tanh 压缩到 -1~1（每轮变化 50 时接近饱和）
+            (growth / 50.0).tanh()
         } else {
             0.0
         };
 
-        // --- 延迟特征 ---
-        let latency_last_3 = mean(last3.iter().map(|r| r.avg_latency_ms));
-        let latency_trend =
-            linear_slope(&last3.iter().map(|r| r.avg_latency_ms).collect::<Vec<_>>());
+        // --- 延迟特征（除以 1000ms 缩放到 0~1，trend 用 tanh）---
+        let latency_last_3 =
+            (mean(last3.iter().map(|r| r.avg_latency_ms)) / 1000.0).clamp(0.0, 1.0);
+        let latency_trend = {
+            let trend = linear_slope(&last3.iter().map(|r| r.avg_latency_ms).collect::<Vec<_>>());
+            (trend / 100.0).tanh()
+        };
 
-        // --- 发包数特征 ---
-        let sent_last_1 = last1.packets_sent as f64;
-        let sent_last_3 = mean(last3.iter().map(|r| r.packets_sent as f64));
+        // --- 发包数特征（log 压缩到 0~1）---
+        let sent_last_1 = normalize_log(last1.packets_sent as f64, 10.0);
+        let sent_last_3 = normalize_log(mean(last3.iter().map(|r| r.packets_sent as f64)), 10.0);
 
         Some(PredictionFeatures {
             rate_last_1,
@@ -197,7 +203,7 @@ impl CrawlerHistory {
 pub struct ResponseRatePredictor {
     /// 10 维权重向量
     weights: Vec<f64>,
-    /// 偏置项
+    /// 偏置项（初始化为目标响应率 0.3，加速收敛）
     bias: f64,
     /// 学习率
     learning_rate: f64,
@@ -205,35 +211,53 @@ pub struct ResponseRatePredictor {
     update_count: u64,
     /// 开始预测所需的最小更新次数
     min_updates_for_prediction: u64,
+    /// 梯度裁剪阈值（单次权重更新最大幅度）
+    max_gradient: f64,
 }
 
 impl ResponseRatePredictor {
-    /// 创建新预测器（权重全零，偏置零，学习率 0.01，最小更新 50 次）
+    /// 创建新预测器（权重全零，偏置 0.3，学习率 0.01，最小更新 50 次，梯度裁剪 0.1）
     pub fn new() -> Self {
         Self {
             weights: vec![0.0; 10],
-            bias: 0.0,
+            bias: 0.3,
             learning_rate: 0.01,
             update_count: 0,
             min_updates_for_prediction: 50,
+            max_gradient: 0.1,
         }
     }
 
-    /// 预测下一轮响应率。update_count < min_updates_for_prediction 时返回 None
+    /// 预测下一轮响应率。update_count < min_updates_for_prediction 时返回 None。
+    /// 检测到 NaN/infinity 时自动重置权重并返回 None。
     pub fn predict(&self, features: &PredictionFeatures) -> Option<f64> {
         if self.update_count < self.min_updates_for_prediction {
             return None;
         }
+        // NaN 防护：检查权重
+        if self.weights.iter().any(|w| !w.is_finite()) || !self.bias.is_finite() {
+            return None;
+        }
         let fv = features.to_vector();
         let dot: f64 = self.weights.iter().zip(fv.iter()).map(|(w, f)| w * f).sum();
-        Some(dot + self.bias)
+        let result = dot + self.bias;
+        // NaN 防护：检查结果
+        if !result.is_finite() {
+            return None;
+        }
+        Some(result.clamp(0.0, 1.0))
     }
 
-    /// 用真实响应率更新模型（随机梯度下降）。
+    /// 用真实响应率更新模型（随机梯度下降 + 梯度裁剪）。
     /// 预测值 = dot(weights, features) + bias，
     /// 误差 = actual - predicted，
-    /// 更新 weights += lr * error * feature，bias += lr * error
+    /// 更新 weights += clip(lr * error * feature)，bias += clip(lr * error)
     pub fn update(&mut self, features: &PredictionFeatures, actual_rate: f64) {
+        // 更新前检查权重状态，如已损坏则重置
+        if self.weights.iter().any(|w| !w.is_finite()) || !self.bias.is_finite() {
+            self.reset_weights();
+        }
+
         let fv = features.to_vector();
         let predicted: f64 = self
             .weights
@@ -243,11 +267,25 @@ impl ResponseRatePredictor {
             .sum::<f64>()
             + self.bias;
         let error = actual_rate - predicted;
+        // 误差裁剪：防止单次更新过大
+        let error = error.clamp(-1.0, 1.0);
+
         for (w, &f) in self.weights.iter_mut().zip(fv.iter()) {
-            *w += self.learning_rate * error * f;
+            let delta = self.learning_rate * error * f;
+            // 梯度裁剪
+            let delta = delta.clamp(-self.max_gradient, self.max_gradient);
+            *w += delta;
         }
-        self.bias += self.learning_rate * error;
+        let bias_delta = self.learning_rate * error;
+        let bias_delta = bias_delta.clamp(-self.max_gradient, self.max_gradient);
+        self.bias += bias_delta;
         self.update_count += 1;
+    }
+
+    /// 重置权重为初始状态（偏置 0.3），用于 NaN 恢复
+    fn reset_weights(&mut self) {
+        self.weights.fill(0.0);
+        self.bias = 0.3;
     }
 
     /// 置信度 0.0 ~ 1.0，基于 update_count：min(1.0, update_count / 200.0)
@@ -278,6 +316,15 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
         return 0.0;
     }
     v.iter().sum::<f64>() / v.len() as f64
+}
+
+/// log 归一化：将正值压缩到 0~1 范围。
+/// scale 控制饱和点：value = 2^scale 时输出 1.0。
+fn normalize_log(value: f64, scale: f64) -> f64 {
+    if value <= 0.0 {
+        return 0.0;
+    }
+    (value.ln() / scale.ln() / scale).clamp(0.0, 1.0)
 }
 
 /// 对等间距 x = 0,1,2,...,n-1 的序列做最小二乘线性回归，返回斜率。
@@ -412,45 +459,45 @@ mod tests {
             "rate_last_5 got {}",
             f.rate_last_5
         );
-        // rate_trend: y=[0.5,0.6,0.7,0.8,0.9], x=[0,1,2,3,4] → slope=0.1
+        // rate_trend: y=[0.5,0.6,0.7,0.8,0.9], x=[0,1,2,3,4] → slope=0.1, tanh(0.1)≈0.0997
         assert!(
-            approx_eq(f.rate_trend, 0.1),
+            (f.rate_trend - 0.0997).abs() < 0.001,
             "rate_trend got {}",
             f.rate_trend
         );
-        // pending_current = 180.0
+        // pending_current = normalize_log(180, 10) ≈ 0.225
         assert!(
-            approx_eq(f.pending_current, 180.0),
+            (f.pending_current - 0.225).abs() < 0.01,
             "pending_current got {}",
             f.pending_current
         );
-        // pending_growth = (180-140)/2 = 20.0
+        // pending_growth = tanh(20/50) = tanh(0.4) ≈ 0.380
         assert!(
-            approx_eq(f.pending_growth, 20.0),
+            (f.pending_growth - 0.380).abs() < 0.01,
             "pending_growth got {}",
             f.pending_growth
         );
-        // latency_last_3 = (120+130+140)/3 = 130.0
+        // latency_last_3 = 130/1000 = 0.13
         assert!(
-            approx_eq(f.latency_last_3, 130.0),
+            approx_eq(f.latency_last_3, 0.13),
             "latency_last_3 got {}",
             f.latency_last_3
         );
-        // latency_trend: y=[120,130,140], x=[0,1,2] → slope=10.0
+        // latency_trend: slope=10.0, tanh(10/100)=tanh(0.1)≈0.0997
         assert!(
-            approx_eq(f.latency_trend, 10.0),
+            (f.latency_trend - 0.0997).abs() < 0.001,
             "latency_trend got {}",
             f.latency_trend
         );
-        // sent_last_1 = 1400.0
+        // sent_last_1 = normalize_log(1400, 10) ≈ 0.315
         assert!(
-            approx_eq(f.sent_last_1, 1400.0),
+            (f.sent_last_1 - 0.315).abs() < 0.01,
             "sent_last_1 got {}",
             f.sent_last_1
         );
-        // sent_last_3 = (1200+1300+1400)/3 = 1300.0
+        // sent_last_3 = normalize_log(1300, 10) ≈ 0.311
         assert!(
-            approx_eq(f.sent_last_3, 1300.0),
+            (f.sent_last_3 - 0.311).abs() < 0.01,
             "sent_last_3 got {}",
             f.sent_last_3
         );

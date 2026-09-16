@@ -61,26 +61,35 @@ impl AdaptiveController {
         }
     }
 
-    /// 核心：返回下一轮发送倍率（min~max）。冷启动（history.len() < warmup_rounds）返回 1.0
+    /// 返回当前发送倍率（只读，不调整）。冷启动或未启用时返回 1.0
     pub fn next_rate_multiplier(&self) -> f64 {
-        // 1. 未启用
         if !self.config.enabled {
             return 1.0;
         }
-
-        // 2. 冷启动
         let history_len = self.history.lock().unwrap().len();
         if history_len < self.config.warmup_rounds as usize {
             return 1.0;
         }
+        self.current_multiplier.load(Ordering::Relaxed)
+    }
 
-        // 3. 获取目标响应率
+    /// 根据预测/实际响应率调整倍率（每轮调用一次，在 report_round_result 末尾执行）
+    fn adjust_multiplier(&self) {
+        if !self.config.enabled {
+            return;
+        }
+        let history_len = self.history.lock().unwrap().len();
+        if history_len < self.config.warmup_rounds as usize {
+            return;
+        }
+
+        // 获取目标响应率
         let target = match *self.mode.lock().unwrap() {
             RunMode::Managed => self.target_response_rate.load(Ordering::Relaxed),
             RunMode::Standalone | RunMode::Degraded => self.config.target_rate_standalone,
         };
 
-        // 4. 获取预测响应率
+        // 获取预测响应率（无预测时用实际响应率）
         let predicted = {
             let history = self.history.lock().unwrap();
             match history.extract_features() {
@@ -92,7 +101,6 @@ impl AdaptiveController {
             }
         };
 
-        // 5. 决策
         let current = self.current_multiplier.load(Ordering::Relaxed);
         let new_mult = if let Some(pred) = predicted {
             if pred < target * 0.7 {
@@ -103,7 +111,6 @@ impl AdaptiveController {
                 current * self.config.rate_step_up
             }
         } else {
-            // 无预测值（置信度不足）：用最近一轮实际响应率做同样判断
             let actual = self.last_response_rate.load(Ordering::Relaxed);
             if actual < target * 0.7 {
                 current * self.config.rate_step_down_heavy
@@ -114,21 +121,18 @@ impl AdaptiveController {
             }
         };
 
-        // 6. Degraded 模式：倍率不超过 1.0
+        // Degraded 模式：倍率不超过 1.0
         let new_mult = match *self.mode.lock().unwrap() {
             RunMode::Degraded => new_mult.min(1.0),
             _ => new_mult,
         };
 
-        // 7. clamp 到 [min_multiplier, max_multiplier]
+        // clamp 到 [min_multiplier, max_multiplier]
         let new_mult = new_mult.clamp(self.config.min_multiplier, self.config.max_multiplier);
-
-        // 8. 存入原子并返回
         self.current_multiplier.store(new_mult, Ordering::Relaxed);
-        new_mult
     }
 
-    /// 报告一轮结果：记录历史、提取特征、更新预测模型。不立即调整倍率。
+    /// 报告一轮结果：记录历史、提取特征、更新预测模型、调整倍率（每轮一次）
     #[allow(clippy::too_many_arguments)]
     pub fn report_round_result(
         &self,
@@ -173,6 +177,10 @@ impl AdaptiveController {
                 predictor.update(&features, response_rate);
             }
         }
+
+        // 每轮结束后调整一次倍率（释放 history 锁后执行，避免死锁）
+        drop(history);
+        self.adjust_multiplier();
     }
 
     pub fn set_mode(&self, mode: RunMode) {
