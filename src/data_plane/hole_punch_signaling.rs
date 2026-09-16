@@ -30,6 +30,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+/// 打洞会话空闲过期时间
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 打洞等待总截止时间
+const HOLE_PUNCH_DEADLINE: Duration = Duration::from_secs(30);
+/// 打洞等待轮询间隔
+const HOLE_PUNCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 // ---------------------------------------------------------------------------
 // 会话状态
 // ---------------------------------------------------------------------------
@@ -94,7 +101,7 @@ impl HolePunchSession {
 
     /// 是否过期（超过 60 秒无活动）
     pub fn is_expired(&self) -> bool {
-        self.last_active.elapsed() > Duration::from_secs(60) // [ALLOWED-HARDCODED]
+        self.last_active.elapsed() > SESSION_IDLE_TIMEOUT
     }
 
     /// 双方地址是否都已就绪
@@ -246,7 +253,7 @@ impl HolePunchSignaling {
             .parse()
             .map_err(|e| anyhow::anyhow!("无效的地址: {}", e))?;
 
-        let deadline = Instant::now() + Duration::from_secs(30); // [ALLOWED-HARDCODED]
+        let deadline = Instant::now() + HOLE_PUNCH_DEADLINE;
 
         loop {
             // 检查会话是否存在
@@ -307,7 +314,7 @@ impl HolePunchSignaling {
 
             // [ALLOWED-SLEEP] 打洞信令一次性重试等待，非周期性
             // 等待 500ms 后重试
-            tokio::time::sleep(Duration::from_millis(500)).await; // [ALLOWED-HARDCODED]
+            tokio::time::sleep(HOLE_PUNCH_POLL_INTERVAL).await;
         }
     }
 

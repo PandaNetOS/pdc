@@ -16,6 +16,11 @@ use parking_lot::RwLock;
 
 use crate::types::Infohash;
 
+/// 活跃度事件保留窗口（1 小时）
+const ACTIVITY_WINDOW: Duration = Duration::from_secs(3600);
+/// 活跃度历史统计窗口（24 小时）
+const ACTIVITY_HISTORY_WINDOW: Duration = Duration::from_secs(86400);
+
 /// 单个活跃度事件
 #[derive(Debug, Clone)]
 struct ActivityEvent {
@@ -58,7 +63,7 @@ impl InfohashActivity {
             event_type,
         });
         // 清理超过1小时的旧事件
-        let cutoff = now - Duration::from_secs(3600); // [ALLOWED-HARDCODED]
+        let cutoff = now - ACTIVITY_WINDOW;
         while events.front().is_some_and(|e| e.timestamp < cutoff) {
             events.pop_front();
         }
@@ -68,7 +73,7 @@ impl InfohashActivity {
     /// 获取最近1小时内的事件数
     fn count_recent(&self, event_type: Option<ActivityEventType>) -> u32 {
         let now = Instant::now();
-        let cutoff = now - Duration::from_secs(3600); // [ALLOWED-HARDCODED]
+        let cutoff = now - ACTIVITY_WINDOW;
         let events = self.events.read();
         events
             .iter()
@@ -184,7 +189,7 @@ impl DhtActivityTracker {
 
     /// 清理长时间无活动的 infohash（超过24小时无活动则移除）
     pub fn cleanup_expired(&self) -> usize {
-        let cutoff = Instant::now() - Duration::from_secs(86400); // 24小时 // [ALLOWED-HARDCODED]
+        let cutoff = Instant::now() - ACTIVITY_HISTORY_WINDOW;
         let mut removed = 0;
         self.activities.retain(|_, v| {
             if *v.last_active.read() < cutoff {

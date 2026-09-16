@@ -30,7 +30,7 @@ const ACTION_ANNOUNCE: u32 = 1;
 const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 /// BEP 15 建议连接 ID 有效期：2 分钟
-const CONNECTION_TTL: Duration = Duration::from_secs(120); // [ALLOWED-HARDCODED]
+const CONNECTION_TTL: Duration = Duration::from_secs(120);
 
 /// connection_id 条目
 struct ConnectionEntry {

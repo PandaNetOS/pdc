@@ -28,11 +28,13 @@ use crate::storage::{NodeRepoImpl, PeerRepoImpl};
 /// 并发探测数
 const MAX_CONCURRENT: usize = 20;
 /// ping 超时
-const PING_TIMEOUT: Duration = Duration::from_secs(3); // [ALLOWED-HARDCODED]
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// TCP BT 握手连接与读取超时
+const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 已探测地址缓存上限（防止内存膨胀）
 const MAX_PROBED_CACHE: usize = 100_000;
 /// 从 PeerRepo 拉取未探测 peer 的间隔
-const _PEER_REPO_POLL_INTERVAL: Duration = Duration::from_secs(15); // [ALLOWED-HARDCODED]
+const _PEER_REPO_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// 每次从 PeerRepo 拉取的最大 peer 数
 const MAX_PEERS_PER_POLL: usize = 100;
 
@@ -357,7 +359,7 @@ impl DhtProbe {
 
         // TCP 连接（超时 5 秒）
         let stream =
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??; // [ALLOWED-HARDCODED]
+            tokio::time::timeout(TCP_HANDSHAKE_TIMEOUT, TcpStream::connect(addr)).await??;
 
         // 构造 BT 握手
         let mut handshake = Vec::with_capacity(68);
@@ -382,7 +384,7 @@ impl DhtProbe {
 
         // 读取响应握手（68 字节）
         let mut resp = vec![0u8; 68];
-        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut resp)).await??; // [ALLOWED-HARDCODED]
+        tokio::time::timeout(TCP_HANDSHAKE_TIMEOUT, stream.read_exact(&mut resp)).await??;
 
         // 验证响应格式
         if resp[0] != 19 || &resp[1..20] != b"BitTorrent protocol" {

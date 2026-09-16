@@ -279,12 +279,15 @@ pub struct PexReceiver {
 
 impl PexReceiver {
     /// 创建新的 PEX 接收器
+    /// 去重缓存默认过期时间
+    const DEFAULT_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
     pub fn new() -> Self {
         Self {
             peer_repo: None,
             stats: parking_lot::RwLock::new(PexReceiverStats::default()),
             dedup_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            dedup_ttl: std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+            dedup_ttl: Self::DEFAULT_DEDUP_TTL,
         }
     }
 
@@ -476,8 +479,8 @@ mod tests {
         ];
         let peers = parse_compact_peers(&data);
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].to_string(), "192.168.1.1:6881"); // [ALLOWED-HARDCODED]
-        assert_eq!(peers[1].to_string(), "10.0.0.1:8080"); // [ALLOWED-HARDCODED]
+        assert_eq!(peers[0].to_string(), "192.168.1.1:6881");
+        assert_eq!(peers[1].to_string(), "10.0.0.1:8080");
     }
 
     #[test]

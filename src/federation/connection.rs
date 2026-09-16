@@ -23,6 +23,9 @@ use crate::federation::signaling::SignalingService;
 use crate::federation::transport::TcpTransport;
 use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
 
+/// 接受连接失败后的退避等待
+const ACCEPT_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
+
 /// 单条连接
 pub struct Connection {
     /// TCP 传输层（内部读写分离，独立锁，可并发收发）
@@ -278,7 +281,7 @@ impl ConnectionManager {
                 Err(e) => {
                     warn!("[federation] 接受连接失败: {}", e);
                     // [ALLOWED-SLEEP] 接受连接失败后一次性退避等待，非周期性
-                    tokio::time::sleep(Duration::from_millis(100)).await; // [ALLOWED-HARDCODED]
+                    tokio::time::sleep(ACCEPT_FAILURE_BACKOFF).await;
                 }
             }
         }
@@ -1486,7 +1489,7 @@ mod tests {
                 TransportKind::Tcp,
             )));
             // [ALLOWED-SLEEP] 测试代码中的一次性等待
-            tokio::time::sleep(Duration::from_secs(1)).await; // [ALLOWED-HARDCODED]
+            tokio::time::sleep(Duration::from_secs(1)).await;
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();

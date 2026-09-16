@@ -14,11 +14,14 @@
 //! - 自适应调度（基于历史数据动态调整）
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+use crate::intelligence::adaptive_controller::AdaptiveController;
 
 // ---------------------------------------------------------------------------
 // 任务优先级
@@ -37,13 +40,32 @@ pub enum TaskPriority {
     Background = 3,
 }
 
+/// 各优先级对应的最大可延迟时间（协议级调度常量）
+const CRITICAL_MAX_DELAY: Duration = Duration::from_secs(0);
+const IMPORTANT_MAX_DELAY: Duration = Duration::from_secs(30);
+const NORMAL_MAX_DELAY: Duration = Duration::from_secs(300);
+const BACKGROUND_MAX_DELAY: Duration = Duration::from_secs(600);
+
+/// 调度器内核节奏常量
+const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const SCHEDULER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const DEPENDENCY_RETRY_DELAY: Duration = Duration::from_secs(30);
+const CRITICAL_RESOURCE_DELAY: Duration = Duration::from_secs(15);
+const STRESSED_FULL_TASK_DELAY: Duration = Duration::from_secs(10);
+const CONCURRENCY_FULL_DELAY: Duration = Duration::from_secs(5);
+
+/// Watchdog 检测间隔（秒）：独立 OS 线程定期检查心跳
+const WATCHDOG_CHECK_INTERVAL_SECS: u64 = 30;
+/// Watchdog 心跳超时阈值（秒）：超过此时长判定为线程饥饿
+const WATCHDOG_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
+
 impl TaskPriority {
     pub fn max_delay(&self) -> Duration {
         match self {
-            TaskPriority::Critical => Duration::from_secs(0), // [ALLOWED-HARDCODED]
-            TaskPriority::Important => Duration::from_secs(30), // [ALLOWED-HARDCODED]
-            TaskPriority::Normal => Duration::from_secs(300), // [ALLOWED-HARDCODED]
-            TaskPriority::Background => Duration::from_secs(600), // [ALLOWED-HARDCODED]
+            TaskPriority::Critical => CRITICAL_MAX_DELAY,
+            TaskPriority::Important => IMPORTANT_MAX_DELAY,
+            TaskPriority::Normal => NORMAL_MAX_DELAY,
+            TaskPriority::Background => BACKGROUND_MAX_DELAY,
         }
     }
 }
@@ -171,6 +193,14 @@ pub struct TaskMetadata {
     pub category: TaskCategory,
 }
 
+/// TaskMetadata::new 的默认字段值
+const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(0);
+const DEFAULT_JITTER: Duration = Duration::from_secs(10);
+const DEFAULT_ESTIMATED_DURATION: Duration = Duration::from_secs(5);
+const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(300);
+/// TaskMetadata::new 的默认最大重试次数
+const DEFAULT_MAX_RETRIES: u32 = 3;
+
 impl TaskMetadata {
     pub fn new(id: impl Into<String>, name: impl Into<String>, interval: Duration) -> Self {
         Self {
@@ -182,11 +212,11 @@ impl TaskMetadata {
             deferrable: true,
             max_delay: TaskPriority::Normal.max_delay(),
             dependencies: Vec::new(),
-            initial_delay: Duration::from_secs(0), // [ALLOWED-HARDCODED]
-            jitter: Duration::from_secs(10),       // [ALLOWED-HARDCODED]
-            estimated_duration: Duration::from_secs(5), // [ALLOWED-HARDCODED]
-            timeout: Duration::from_secs(300),     // [ALLOWED-HARDCODED]
-            max_retries: 3,
+            initial_delay: DEFAULT_INITIAL_DELAY,
+            jitter: DEFAULT_JITTER,
+            estimated_duration: DEFAULT_ESTIMATED_DURATION,
+            timeout: DEFAULT_TASK_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
             category: TaskCategory::default(),
         }
     }
@@ -194,7 +224,7 @@ impl TaskMetadata {
     pub fn with_priority(mut self, p: TaskPriority) -> Self {
         self.priority = p;
         if !self.deferrable {
-            self.max_delay = Duration::from_secs(0); // [ALLOWED-HARDCODED]
+            self.max_delay = Duration::ZERO;
         } else {
             self.max_delay = p.max_delay();
         }
@@ -218,7 +248,7 @@ impl TaskMetadata {
 
     pub fn non_deferrable(mut self) -> Self {
         self.deferrable = false;
-        self.max_delay = Duration::from_secs(0); // [ALLOWED-HARDCODED]
+        self.max_delay = Duration::ZERO;
         self
     }
 
@@ -464,6 +494,12 @@ pub struct TaskScheduler {
     seq_counter: RwLock<u64>,
     completed_dependencies: RwLock<HashSet<String>>,
     scheduler_started: RwLock<bool>,
+    /// 最近一次心跳时间戳（毫秒，UNIX epoch），供独立 watchdog 线程读取
+    last_heartbeat: Arc<AtomicI64>,
+    /// watchdog 线程运行标志（false 时 watchdog 线程退出）
+    watchdog_running: Arc<AtomicBool>,
+    /// 自适应控制器（可选，None 时行为与改造前完全一致）
+    adaptive_controller: Option<Arc<AdaptiveController>>,
 }
 
 impl TaskScheduler {
@@ -486,6 +522,9 @@ impl TaskScheduler {
             seq_counter: RwLock::new(0),
             completed_dependencies: RwLock::new(HashSet::new()),
             scheduler_started: RwLock::new(false),
+            last_heartbeat: Arc::new(AtomicI64::new(0)),
+            watchdog_running: Arc::new(AtomicBool::new(false)),
+            adaptive_controller: None,
         }
     }
 
@@ -493,9 +532,20 @@ impl TaskScheduler {
         self.resource_monitor.clone()
     }
 
+    /// 获取自适应控制器引用（供监控/外部访问）
+    pub fn adaptive_controller(&self) -> Option<Arc<AdaptiveController>> {
+        self.adaptive_controller.clone()
+    }
+
     /// 设置各分类并发度
     pub fn with_category_concurrency(mut self, config: CategoryConcurrency) -> Self {
         self.max_concurrency = config;
+        self
+    }
+
+    /// 注入自适应控制器（ICC 预测式自适应）
+    pub fn with_adaptive_controller(mut self, controller: Arc<AdaptiveController>) -> Self {
+        self.adaptive_controller = Some(controller);
         self
     }
 
@@ -580,6 +630,39 @@ impl TaskScheduler {
             scheduler.run().await;
         });
 
+        // P1-3: 启动独立 OS 线程 watchdog，不依赖 tokio runtime
+        // 即使 runtime 线程被全部占满，watchdog 仍能检测到心跳停止
+        self.watchdog_running.store(true, Ordering::Relaxed);
+        let watchdog_heartbeat = self.last_heartbeat.clone();
+        let watchdog_running = self.watchdog_running.clone();
+        std::thread::Builder::new()
+            .name("task-scheduler-watchdog".to_string())
+            .spawn(move || {
+                // [ALLOWED-SLEEP] 调度器自身 watchdog 独立 OS 线程（std::thread），非 tokio 任务，
+                // 目的是 runtime 线程全占满时仍能检测心跳停摆，不能注册到 TaskScheduler
+                loop {
+                    std::thread::sleep(Duration::from_secs(WATCHDOG_CHECK_INTERVAL_SECS));
+                    if !watchdog_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let last_ms = watchdog_heartbeat.load(Ordering::Relaxed);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    if last_ms > 0 {
+                        let elapsed_secs = (now_ms - last_ms) / 1000;
+                        if elapsed_secs > WATCHDOG_HEARTBEAT_TIMEOUT_SECS {
+                            error!(
+                                "[task_scheduler] WATCHDOG: 调度器心跳停止超过 {} 秒，可能发生线程饥饿！最后心跳: {} 秒前",
+                                WATCHDOG_HEARTBEAT_TIMEOUT_SECS, elapsed_secs
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn watchdog thread");
+
         info!(
             "[task_scheduler] 智能任务调度中心已启动（分级并发: crawl={}, persistence={}, monitor={}, network={}）",
             self.max_concurrency.crawl,
@@ -609,15 +692,12 @@ impl TaskScheduler {
         }
 
         // [ALLOWED-INTERVAL] TaskScheduler 自身 tick，调度器内核
-        let mut tick_interval = tokio::time::interval(Duration::from_millis(100)); // [ALLOWED-HARDCODED]
+        let mut tick_interval = tokio::time::interval(SCHEDULER_TICK_INTERVAL);
         let mut heartbeat = Instant::now();
 
         loop {
             tick_interval.tick().await;
-            if heartbeat.elapsed() >= Duration::from_secs(30) {
-                // [ALLOWED-HARDCODED]
-                // [ALLOWED-HARDCODED]
-                // [ALLOWED-HARDCODED]
+            if heartbeat.elapsed() >= SCHEDULER_HEARTBEAT_INTERVAL {
                 let queue_len = self.queue.read().len();
                 let by_cat = self.running_by_category.read();
                 info!(
@@ -630,6 +710,12 @@ impl TaskScheduler {
                 );
                 drop(by_cat);
                 heartbeat = Instant::now();
+                // P1-3: 更新原子心跳时间戳，供独立 watchdog 线程检测
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.last_heartbeat.store(now_ms, Ordering::Relaxed);
             }
             Self::process_queue(self.clone()).await;
         }
@@ -674,7 +760,7 @@ impl TaskScheduler {
                 // 依赖未完成，延迟30秒重试
                 scheduler.schedule_task(
                     &item.task_id,
-                    Instant::now() + Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                    Instant::now() + DEPENDENCY_RETRY_DELAY,
                     item.priority,
                 );
                 continue;
@@ -696,7 +782,7 @@ impl TaskScheduler {
                     );
                     scheduler.schedule_task(
                         &item.task_id,
-                        Instant::now() + Duration::from_secs(15), // [ALLOWED-HARDCODED]
+                        Instant::now() + CRITICAL_RESOURCE_DELAY,
                         item.priority,
                     );
                     continue;
@@ -714,7 +800,7 @@ impl TaskScheduler {
                     );
                     scheduler.schedule_task(
                         &item.task_id,
-                        Instant::now() + Duration::from_secs(10), // [ALLOWED-HARDCODED]
+                        Instant::now() + STRESSED_FULL_TASK_DELAY,
                         item.priority,
                     );
                     continue;
@@ -733,7 +819,7 @@ impl TaskScheduler {
                     );
                     scheduler.schedule_task(
                         &item.task_id,
-                        Instant::now() + Duration::from_secs(5), // [ALLOWED-HARDCODED]
+                        Instant::now() + CONCURRENCY_FULL_DELAY,
                         item.priority,
                     );
                     continue;
@@ -999,23 +1085,26 @@ mod tests {
 
     #[test]
     fn test_task_metadata_builder() {
-        let meta = TaskMetadata::new("test", "Test Task", Duration::from_secs(60)) // [ALLOWED-HARDCODED]
+        let meta = TaskMetadata::new("test", "Test Task", Duration::from_secs(60))
             .with_priority(TaskPriority::Important)
-            .with_initial_delay(Duration::from_secs(30)) // [ALLOWED-HARDCODED]
+            .with_initial_delay(Duration::from_secs(30))
             .non_deferrable();
 
         assert_eq!(meta.id, "test");
         assert_eq!(meta.priority, TaskPriority::Important);
-        assert_eq!(meta.initial_delay, Duration::from_secs(30)); // [ALLOWED-HARDCODED]
+        assert_eq!(meta.initial_delay, Duration::from_secs(30));
+
         assert!(!meta.deferrable);
-        assert_eq!(meta.max_delay, Duration::from_secs(0)); // [ALLOWED-HARDCODED]
+        assert_eq!(meta.max_delay, Duration::from_secs(0));
     }
 
     #[test]
     fn test_task_stats() {
         let mut stats = TaskStats::default();
-        stats.record_success(Duration::from_millis(100)); // [ALLOWED-HARDCODED]
-        stats.record_success(Duration::from_millis(200)); // [ALLOWED-HARDCODED]
+        stats.record_success(Duration::from_millis(100));
+
+        stats.record_success(Duration::from_millis(200));
+
         stats.record_failure();
 
         assert_eq!(stats.total_executions, 3);
@@ -1084,7 +1173,7 @@ mod tests {
         let scheduler = Arc::new(TaskScheduler::new());
 
         scheduler.register(
-            TaskMetadata::new("test1", "Test Task 1", Duration::from_secs(60)) // [ALLOWED-HARDCODED]
+            TaskMetadata::new("test1", "Test Task 1", Duration::from_secs(60))
                 .with_priority(TaskPriority::Important),
             || async { Ok(()) },
         );
@@ -1104,11 +1193,11 @@ mod tests {
         let scheduler = Arc::new(TaskScheduler::new());
 
         let metadatas = vec![
-            TaskMetadata::new("t1", "Task 1", Duration::from_secs(300)), // [ALLOWED-HARDCODED]
-            TaskMetadata::new("t2", "Task 2", Duration::from_secs(300)), // [ALLOWED-HARDCODED]
-            TaskMetadata::new("t3", "Task 3", Duration::from_secs(300)), // [ALLOWED-HARDCODED]
-            TaskMetadata::new("t4", "Task 4", Duration::from_secs(300)), // [ALLOWED-HARDCODED]
-            TaskMetadata::new("t5", "Task 5", Duration::from_secs(300)), // [ALLOWED-HARDCODED]
+            TaskMetadata::new("t1", "Task 1", Duration::from_secs(300)),
+            TaskMetadata::new("t2", "Task 2", Duration::from_secs(300)),
+            TaskMetadata::new("t3", "Task 3", Duration::from_secs(300)),
+            TaskMetadata::new("t4", "Task 4", Duration::from_secs(300)),
+            TaskMetadata::new("t5", "Task 5", Duration::from_secs(300)),
         ];
 
         let task_fns: Vec<_> = (0..5).map(|_| || async { Ok(()) }).collect();

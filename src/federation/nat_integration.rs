@@ -15,6 +15,9 @@ use crate::federation::node_id::{NodeAddress, NodeIdentity, Reachability};
 use crate::nat::stun::{detect_nat_type_multi, stun_binding_request_multi, StunResult};
 use crate::nat::NatManager;
 
+/// STUN 探测单次超时
+const STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// NAT 集成服务
 pub struct NatIntegration {
     /// NAT 管理器
@@ -61,7 +64,7 @@ impl NatIntegration {
         // 再次 bind 同一端口会直接 EADDRINUSE，导致所有 STUN 服务器看似全部失败。
         // STUN 只需要公网 IP 和 NAT 类型，映射端口后续由 UPnP/默认端口决定。
         let local_addr = "0.0.0.0:0";
-        let timeout = Duration::from_secs(5); // [ALLOWED-HARDCODED]
+        let timeout = STUN_PROBE_TIMEOUT;
 
         info!(
             "[federation] STUN 探测开始: 服务器数={}, 列表={:?}, 本地绑定={}",
@@ -328,7 +331,7 @@ mod tests {
     fn make_test_config() -> FederationConfig {
         FederationConfig {
             enabled: true,
-            listen_port: 6885, // [ALLOWED-HARDCODED]
+            listen_port: 6885,
             nat_mapping_enabled: true,
             stun_servers: vec!["stun.l.google.com:19302".to_string()],
             ..Default::default()
@@ -370,8 +373,8 @@ mod tests {
             reachability_score: 80,
             mappings: vec![crate::nat::NatMapping {
                 protocol: "TCP".to_string(),
-                internal_port: 6885, // [ALLOWED-HARDCODED]
-                external_port: 6885, // [ALLOWED-HARDCODED]
+                internal_port: 6885,
+                external_port: 6885,
                 description: "PDC Federation TCP".to_string(),
                 verified: true,
                 reachable: true,

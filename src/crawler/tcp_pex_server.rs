@@ -17,6 +17,9 @@ use crate::types::Infohash;
 
 use super::pex_receiver::PexReceiver;
 
+/// TCP PEX 消息等待总截止时间
+const TCP_PEX_WAIT_DEADLINE: Duration = Duration::from_secs(60);
+
 /// TCP PEX 服务端统计
 #[derive(Debug, Clone, Default)]
 pub struct TcpPexStats {
@@ -221,7 +224,7 @@ async fn handle_connection(
 
     // 5. 循环读取消息，等待 PEX 消息
     let mut ut_pex_id: Option<u8> = None;
-    let deadline = Instant::now() + Duration::from_secs(60); // [ALLOWED-HARDCODED]
+    let deadline = Instant::now() + TCP_PEX_WAIT_DEADLINE;
 
     while Instant::now() < deadline {
         // 读取消息长度

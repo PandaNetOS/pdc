@@ -20,6 +20,13 @@ use crate::federation::protocol::{
     decode_frame, encode_message, frame_size_in_buffer, MessageType,
 };
 
+/// 传输层默认写入超时
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 主动 TCP 连接超时
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 传输层事件轮询间隔
+const TRANSPORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// TCP 读取端（含读取缓冲区）
 struct TcpReader {
     reader: ReadHalf<Box<dyn TransportStream>>,
@@ -61,7 +68,7 @@ impl TcpTransport {
             peer,
             local,
             metrics: None,
-            write_timeout: Duration::from_secs(30), // [ALLOWED-HARDCODED]
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
         }
     }
 
@@ -79,13 +86,10 @@ impl TcpTransport {
 
     /// 主动连接到远端
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
-        let stream = tokio::time::timeout(
-            Duration::from_secs(10), // [ALLOWED-HARDCODED]
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("连接超时: {}", addr))?
-        .map_err(|e| anyhow::anyhow!("连接失败 {}: {}", addr, e))?;
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("连接超时: {}", addr))?
+            .map_err(|e| anyhow::anyhow!("连接失败 {}: {}", addr, e))?;
         stream
             .set_nodelay(true)
             .map_err(|e| anyhow::anyhow!("set_nodelay 失败: {}", e))?;
@@ -241,7 +245,7 @@ impl UdpTransport {
 
         let start = std::time::Instant::now();
         // [ALLOWED-INTERVAL] 联邦协议级维护循环，后续 ICC 阶段迁移到 TaskScheduler
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100)); // [ALLOWED-HARDCODED]
+        let mut interval = tokio::time::interval(TRANSPORT_POLL_INTERVAL);
 
         while start.elapsed() < duration {
             interval.tick().await;

@@ -18,6 +18,15 @@ use crate::data_plane::AppState;
 use crate::event_bus::EventBus;
 use crate::types::Event;
 
+/// 默认 uTP 监听端口（状态上报用）
+const DEFAULT_UTP_REPORT_PORT: u16 = 6883;
+/// 默认 TCP PEX 监听端口（状态上报用）
+const DEFAULT_TCP_PEX_REPORT_PORT: u16 = 6884;
+/// WebSocket 连接心跳间隔
+const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// WebSocket 状态推送间隔
+const WS_STATUS_PUSH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// 客户端订阅请求
 #[derive(Debug, serde::Deserialize)]
 struct SubscribeRequest {
@@ -257,6 +266,11 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
                 "infohashes_collected": s.infohashes_collected,
                 "peers_collected": s.peers_collected,
                 "nodes_crawled": s.nodes_crawled,
+                "adaptive_multiplier": s.adaptive_multiplier,
+                "predicted_response_rate": s.predicted_response_rate,
+                "model_update_count": s.model_update_count,
+                "history_len": s.history_len,
+                "concurrent_sockets_in_use": s.concurrent_sockets_in_use,
             })
         })
         .unwrap_or_else(|| serde_json::json!({"enabled": false}));
@@ -393,7 +407,7 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             let stats = s.stats();
             serde_json::json!({
                 "enabled": true,
-                "port": 6883, // [ALLOWED-HARDCODED]
+                "port": DEFAULT_UTP_REPORT_PORT,
                 "syn_received": stats.syn_received,
                 "connections_established": stats.connections_established,
                 "handshakes_received": stats.handshakes_received,
@@ -426,7 +440,7 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             let stats = s.stats();
             serde_json::json!({
                 "enabled": true,
-                "port": 6884, // [ALLOWED-HARDCODED]
+                "port": DEFAULT_TCP_PEX_REPORT_PORT,
                 "connections_accepted": stats.connections_accepted,
                 "handshakes_completed": stats.handshakes_completed,
                 "pex_messages": stats.pex_messages,
@@ -499,11 +513,11 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
     let _ = sender.send(Message::Text(status_json)).await;
 
     // [ALLOWED-INTERVAL] 连接级心跳，随 WebSocket 连接生命周期
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30)); // [ALLOWED-HARDCODED]
+    let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
     heartbeat.tick().await;
     // [ALLOWED-INTERVAL] 连接级状态推送，随 WebSocket 连接生命周期
     // 状态推送间隔 5 秒（避免每秒克隆 60000+ 节点造成大量内存分配和磁盘 IO）
-    let mut status_ticker = tokio::time::interval(Duration::from_secs(5)); // [ALLOWED-HARDCODED]
+    let mut status_ticker = tokio::time::interval(WS_STATUS_PUSH_INTERVAL);
     status_ticker.tick().await;
 
     loop {

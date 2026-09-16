@@ -8,6 +8,9 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+/// wait_drain 轮询粒度
+const WAIT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// 单条待更新条目：(repo_type, key, payload)
 pub type MerkleUpdateEntry = (u8, Vec<u8>, Vec<u8>);
 
@@ -73,7 +76,7 @@ impl MerkleUpdateQueue {
                 return true;
             }
             // [ALLOWED-SLEEP] wait_empty 带超时的同步轮询等待，非周期性
-            std::thread::sleep(Duration::from_millis(10)); // [ALLOWED-HARDCODED]
+            std::thread::sleep(WAIT_DRAIN_POLL_INTERVAL);
         }
         self.is_empty()
     }

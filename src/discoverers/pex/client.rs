@@ -25,6 +25,11 @@ use crate::types::{Infohash, PeerInfo, PeerSource};
 
 use super::message::{BtHandshake, ExtendedMessage, ExtensionHandshake, UtPexMessage};
 
+/// PEX 握手接收响应的总截止时间
+const PEX_RECEIVE_DEADLINE: Duration = Duration::from_secs(3);
+/// PEX 单次读取响应的超时
+const PEX_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// PEX 配置
 #[derive(Debug, Clone)]
 pub struct PexConfig {
@@ -58,12 +63,12 @@ impl Default for PexConfig {
 
         Self {
             our_peer_id: peer_id,
-            listen_port: 6881, // [ALLOWED-HARDCODED]
+            listen_port: 6881,
             max_connected_peers: 50,
-            pex_request_interval: Duration::from_secs(60), // [ALLOWED-HARDCODED]
+            pex_request_interval: Duration::from_secs(60),
             max_peers_per_request: 50,
-            peer_ttl: Duration::from_secs(1800), // [ALLOWED-HARDCODED]
-            connect_timeout: Duration::from_secs(10), // [ALLOWED-HARDCODED]
+            peer_ttl: Duration::from_secs(1800),
+            connect_timeout: Duration::from_secs(10),
             enabled: true,
         }
     }
@@ -284,13 +289,10 @@ impl PexDiscoverer {
 
         // 5. 接收 ut_pex 响应（等待一小段时间）
         let mut new_peers = vec![];
-        let receive_deadline = Instant::now() + Duration::from_secs(3); // [ALLOWED-HARDCODED]
+        let receive_deadline = Instant::now() + PEX_RECEIVE_DEADLINE;
         while Instant::now() < receive_deadline {
-            match tokio::time::timeout(
-                Duration::from_secs(2), // [ALLOWED-HARDCODED]
-                ExtendedMessage::read_message(&mut stream),
-            )
-            .await
+            match tokio::time::timeout(PEX_READ_TIMEOUT, ExtendedMessage::read_message(&mut stream))
+                .await
             {
                 Ok(Ok((msg_type, payload))) => {
                     if msg_type == 20 && !payload.is_empty() {

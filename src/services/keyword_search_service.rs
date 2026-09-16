@@ -24,6 +24,9 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
+/// BEP 44 查询响应接收超时
+const BEP44_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 关键词搜索配置
 #[derive(Debug, Clone)]
 pub struct KeywordSearchConfig {
@@ -191,7 +194,7 @@ impl KeywordSearchService {
 
         let mut buf = [0u8; 2048];
         let (len, _) =
-            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await??; // [ALLOWED-HARDCODED]
+            tokio::time::timeout(BEP44_QUERY_TIMEOUT, socket.recv_from(&mut buf)).await??;
 
         let value = parse_bep44_get_response(&buf[..len])?;
         Ok(value)

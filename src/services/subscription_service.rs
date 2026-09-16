@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// 订阅源 HTTP 客户端超时
+const SUBSCRIPTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 订阅源配置
 #[derive(Debug, Clone)]
 pub struct SubscriptionConfig {
@@ -43,7 +46,7 @@ impl SubscriptionService {
     /// 创建新的订阅源服务
     pub fn new(config: SubscriptionConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30)) // [ALLOWED-HARDCODED]
+            .timeout(SUBSCRIPTION_HTTP_TIMEOUT)
             .user_agent("PandaNetOS-PDC/0.2.0")
             .build()
             .expect("failed to build reqwest client");

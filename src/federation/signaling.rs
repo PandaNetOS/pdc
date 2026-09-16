@@ -18,6 +18,11 @@ use crate::federation::node_table::NodeTable;
 use crate::federation::protocol::*;
 use crate::federation::transport::UdpTransport;
 
+/// UDP 打洞持续时间
+const HOLE_PUNCH_DURATION: Duration = Duration::from_secs(5);
+/// 打洞会话过期时间（5 分钟）
+const SIGNALING_SESSION_TTL: Duration = Duration::from_secs(300);
+
 /// 信令动作
 pub mod signaling_action {
     pub const REQUEST: u8 = 0;
@@ -308,7 +313,7 @@ impl SignalingService {
                 session_id, target_addr
             );
             if let Err(e) = udp
-                .hole_punch(target_addr, &node_id, Duration::from_secs(5)) // [ALLOWED-HARDCODED]
+                .hole_punch(target_addr, &node_id, HOLE_PUNCH_DURATION)
                 .await
             {
                 debug!("[federation] 打洞异常 session={}: {}", session_id, e);
@@ -319,10 +324,7 @@ impl SignalingService {
     /// 清理过期会话（超过5分钟）
     pub fn cleanup_expired(&self) {
         let mut sessions = self.pending_sessions.write();
-        sessions.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(300));
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
+        sessions.retain(|_, s| s.created_at.elapsed() < SIGNALING_SESSION_TTL);
     }
 
     /// 活跃会话数
@@ -381,7 +383,7 @@ mod tests {
             session_id: 42,
             from_node: [1; 20],
             to_node: [2; 20],
-            from_addr: Some("1.2.3.4:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
+            from_addr: Some("1.2.3.4:6885".parse().unwrap()),
             nat_type: Some("FullCone".to_string()),
             action: signaling_action::REQUEST,
         };
@@ -389,6 +391,6 @@ mod tests {
         let decoded: SignalingMessage = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.session_id, 42);
         assert_eq!(decoded.action, 0);
-        assert_eq!(decoded.from_addr, Some("1.2.3.4:6885".parse().unwrap())); // [ALLOWED-HARDCODED]
+        assert_eq!(decoded.from_addr, Some("1.2.3.4:6885".parse().unwrap()));
     }
 }

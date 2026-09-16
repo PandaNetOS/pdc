@@ -808,8 +808,8 @@ mod tests {
         let data = [127, 0, 0, 1, 0x1A, 0xE1, 192, 168, 1, 1, 0x1A, 0xE2];
         let peers = parse_compact_peers(&data);
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].to_string(), "127.0.0.1:6881"); // [ALLOWED-HARDCODED]
-        assert_eq!(peers[1].to_string(), "192.168.1.1:6882"); // [ALLOWED-HARDCODED]
+        assert_eq!(peers[0].to_string(), "127.0.0.1:6881");
+        assert_eq!(peers[1].to_string(), "192.168.1.1:6882");
     }
 
     #[test]
@@ -825,7 +825,7 @@ mod tests {
 
         let node = DhtNode::from_compact(&data).unwrap();
         assert_eq!(node.id[0], 1);
-        assert_eq!(node.addr.to_string(), "127.0.0.1:6881"); // [ALLOWED-HARDCODED]
+        assert_eq!(node.addr.to_string(), "127.0.0.1:6881");
     }
 
     #[test]

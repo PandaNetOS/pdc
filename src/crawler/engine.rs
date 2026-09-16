@@ -31,8 +31,12 @@ use crate::types::{Event, Infohash, PeerInfo, PeerSource};
 
 use super::buffer_pool::CrawlerBufferPool;
 use super::rate_limiter::RateLimiter;
+use crate::intelligence::AdaptiveController;
 
 use super::Crawler;
+
+/// pending 请求超时（P2 优化：缩短以加速节点轮换）
+const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// PPS 统计快照类型（上次统计时间 + 各 socket 发送累计 + 接收累计）
 type PpsSnapshot = Option<(Instant, Vec<u64>, Vec<u64>)>;
@@ -122,6 +126,16 @@ pub struct CrawlerState {
     pub udp_packet_loss_estimate: f64,
     /// 节点选择耗时（最近10次均值，微秒）
     pub node_select_avg_us: u64,
+    /// 当前自适应发送倍率（0.2-2.0）
+    pub adaptive_multiplier: f64,
+    /// 预测的下一轮响应率（None=模型置信度不足）
+    pub predicted_response_rate: Option<f64>,
+    /// 预测模型更新次数
+    pub model_update_count: u64,
+    /// 历史记录条数
+    pub history_len: usize,
+    /// 当前实际使用的并发 socket 数
+    pub concurrent_sockets_in_use: usize,
 }
 
 /// 待响应的请求记录
@@ -192,6 +206,8 @@ pub struct CrawlerEngine {
     throttled_round_robin: Arc<AtomicUsize>,
     /// 对端响应率自适应限速器（None=禁用）
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// 自适应控制器（ICC 预测式自适应，None=禁用，行为与改造前一致）
+    adaptive_controller: Option<Arc<AdaptiveController>>,
     /// 接收缓冲区对象池（多 socket 共享，避免每次 64KB 分配）
     buffer_pool: Arc<CrawlerBufferPool>,
     /// 预热是否完成（完成前不触发全量爬行）
@@ -251,6 +267,7 @@ impl CrawlerEngine {
             send_socket_idx: Arc::new(AtomicUsize::new(0)),
             throttled_round_robin: Arc::new(AtomicUsize::new(0)),
             rate_limiter: None,
+            adaptive_controller: None,
             buffer_pool: Arc::new(CrawlerBufferPool::new(16)),
             warmup_done: Arc::new(AtomicBool::new(false)),
             message_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
@@ -296,6 +313,12 @@ impl CrawlerEngine {
         self
     }
 
+    /// 注入自适应控制器（ICC 预测式自适应）
+    pub fn with_adaptive_controller(mut self, controller: Arc<AdaptiveController>) -> Self {
+        self.adaptive_controller = Some(controller);
+        self
+    }
+
     /// 注入 UDP socket 列表（多 socket 并行收包）
     pub fn with_sockets(mut self, sockets: Vec<Arc<UdpSocket>>) -> Self {
         self.sockets = sockets;
@@ -318,6 +341,13 @@ impl CrawlerEngine {
             .as_ref()
             .map(|r| r.len_sync())
             .unwrap_or_else(|| self.known_nodes.read().len());
+        // 自适应控制器指标
+        if let Some(ac) = &self.adaptive_controller {
+            s.adaptive_multiplier = ac.current_multiplier();
+            s.predicted_response_rate = ac.predicted_rate();
+            s.model_update_count = ac.model_update_count();
+            s.history_len = ac.history_len();
+        }
         s
     }
 
@@ -358,6 +388,7 @@ impl CrawlerEngine {
         if let Some((last_time, last_send, last_recv)) = pps_last.as_ref() {
             let elapsed = now.duration_since(*last_time).as_secs_f64();
             if elapsed > 0.0 {
+                debug!("[crawler] PPS debug: elapsed={:.2}s current_recv={:?} last_recv={:?} current_send={:?} last_send={:?}", elapsed, current_recv, last_recv, current_send, last_send);
                 state.socket_send_pps = current_send
                     .iter()
                     .zip(last_send.iter())
@@ -378,6 +409,14 @@ impl CrawlerEngine {
         } else {
             state.udp_packet_loss_estimate = 0.0;
         }
+        // 自适应控制器指标
+        if let Some(ac) = &self.adaptive_controller {
+            state.adaptive_multiplier = ac.current_multiplier();
+            state.predicted_response_rate = ac.predicted_rate();
+            state.model_update_count = ac.model_update_count();
+            state.history_len = ac.history_len();
+        }
+        state.concurrent_sockets_in_use = self.config.concurrent_sockets.min(self.sockets.len());
     }
 
     /// 获取已收集的 infohash 集合（用于 TrackerPeerFetcher 同步）
@@ -397,13 +436,22 @@ impl CrawlerEngine {
             let idx = self.send_socket_idx.fetch_add(1, Ordering::Relaxed) % n;
             if let Some(rl) = &self.rate_limiter {
                 if rl.should_skip(idx) {
+                    debug!(
+                        "[crawler] next_send_socket: idx={} skipped (throttled)",
+                        idx
+                    );
                     continue;
                 }
             }
+            debug!("[crawler] next_send_socket: selected idx={}", idx);
             return (idx, self.sockets[idx].clone());
         }
         // 全部被限速：轮询所有 socket 发送，避免兜底固定在单端口（#0）导致发送集中
         let idx = self.throttled_round_robin.fetch_add(1, Ordering::Relaxed) % n;
+        debug!(
+            "[crawler] next_send_socket: all throttled, fallback idx={}",
+            idx
+        );
         (idx, self.sockets[idx].clone())
     }
 
@@ -575,44 +623,155 @@ impl CrawlerEngine {
         }
     }
 
-    /// 主动爬行：向已知节点发 find_node 探索网络
-    pub async fn active_crawl(&self) {
-        if !self.warmup_done.load(Ordering::Relaxed) {
-            debug!("[crawler] 预热未完成，跳过全量爬行");
-            return;
-        }
-        if self.sockets.is_empty() {
-            return;
-        }
-        let (socket_idx, socket) = self.next_send_socket();
-        // 从 NodeRepo 多样性选取高评分节点（高评分 + ID空间多样性 + IP网段多样性）
-        // 评分由 ScoreMaintainer 统一维护，爬虫不自行重算
-        let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(64, 3) // 选64个（P2优化：并发翻倍），同一/24网段最多3个
-        } else {
-            // 兼容：没有 NodeRepo 时从路由表选
-            let known = self.known_nodes.write();
-            if known.is_empty() {
-                return;
+    // ==================== 自适应 + 多 socket 并发发送辅助方法 ====================
+
+    /// 计算所有 pending 分片的总长度
+    fn pending_total(&self) -> usize {
+        self.pending.iter().map(|s| s.read().len()).sum()
+    }
+
+    /// 估算平均延迟（毫秒）：基于 pending 表中请求的平均等待时间
+    fn estimate_avg_latency_ms(&self) -> f64 {
+        let now = Instant::now();
+        let mut total_ms = 0f64;
+        let mut count = 0usize;
+        for shard in self.pending.iter() {
+            for req in shard.read().values() {
+                total_ms += now.duration_since(req.sent_at).as_secs_f64() * 1000.0;
+                count += 1;
             }
-            let mut all = known.all_nodes();
-            all.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            all.truncate(32);
-            all
-        };
+        }
+        if count > 0 {
+            total_ms / count as f64
+        } else {
+            100.0
+        }
+    }
 
-        if nodes.is_empty() {
-            return;
+    /// 估算本轮响应数：基于 rate_limiter 全局响应率
+    fn estimate_responded(&self, sent: u64) -> u64 {
+        if let Some(rl) = &self.rate_limiter {
+            let rate = rl.global_response_rate();
+            (sent as f64 * rate).round() as u64
+        } else {
+            (sent as f64 * 0.3).round() as u64
+        }
+    }
+
+    /// 解析实际并发 socket 数（clamp 到 [1, min(config.concurrent_sockets, sockets.len(), 8)]）
+    fn resolve_concurrent_sockets(&self, node_count: usize) -> usize {
+        let configured = self.config.concurrent_sockets.clamp(1, 8);
+        let available = self.sockets.len().max(1);
+        configured.min(available).min(node_count.max(1))
+    }
+
+    /// find_node 多 socket 并发发送（核心并发逻辑）
+    /// concurrent=1 时走单 socket 兼容路径，行为与改造前一致
+    async fn send_find_node_concurrent(&self, nodes: &[KBucketEntry], concurrent: usize) -> u64 {
+        if concurrent <= 1 || nodes.len() <= 1 {
+            let (socket_idx, socket) = self.next_send_socket();
+            return self
+                .send_find_node_to_socket(nodes, socket_idx, &socket)
+                .await;
         }
 
-        // target ID 多样化：生成 8 个不同 target（从4提升到8），覆盖更广的 ID 空间
-        let num_targets = 16; // P2优化：target多样化翻倍，覆盖更广ID空间
+        // 选取 concurrent 个 socket（轮询）
+        let base_idx = self.send_socket_idx.load(Ordering::Relaxed);
+        let socket_indices: Vec<usize> = (0..concurrent)
+            .map(|i| (base_idx + i) % self.sockets.len())
+            .collect();
+        self.send_socket_idx.store(
+            (base_idx + concurrent) % self.sockets.len(),
+            Ordering::Relaxed,
+        );
+
+        let per_group = nodes.len().div_ceil(concurrent);
+        let sent_total = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        for (group_idx, &socket_idx) in socket_indices.iter().enumerate() {
+            let start = group_idx * per_group;
+            let end = (start + per_group).min(nodes.len());
+            if start >= end {
+                continue;
+            }
+
+            let group: Vec<KBucketEntry> = nodes[start..end].to_vec();
+            let socket = self.sockets[socket_idx].clone();
+            let pending = self.pending.clone();
+            let state = self.state.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let socket_send_total = self.socket_send_total.clone();
+            let sent_counter = sent_total.clone();
+            let node_id = self.node_id;
+
+            handles.push(tokio::spawn(async move {
+                let mut local_sent = 0u64;
+                let num_targets = 16;
+                let targets: Vec<[u8; 20]> = (0..num_targets)
+                    .map(|_| {
+                        let mut t = [0u8; 20];
+                        rand::thread_rng().fill(&mut t);
+                        t
+                    })
+                    .collect();
+                let per_target = group.len().div_ceil(num_targets);
+
+                for (i, node) in group.iter().enumerate() {
+                    let target_idx = (i / per_target).min(num_targets - 1);
+                    let target = targets[target_idx];
+                    let mut tid = rand::thread_rng().gen::<[u8; 2]>();
+                    tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+
+                    let msg = DhtMessage::build_find_node(&tid, &node_id, &target);
+
+                    {
+                        let shard = (tid[0] as usize) % 16;
+                        let mut pending_map = pending[shard].write();
+                        pending_map.insert(
+                            tid.to_vec(),
+                            PendingRequest {
+                                _method: QueryMethod::FindNode,
+                                target,
+                                addr: node.addr,
+                                sent_at: Instant::now(),
+                            },
+                        );
+                    }
+
+                    if socket.send_to(&msg, node.addr).await.is_ok() {
+                        socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                        let mut s = state.write();
+                        s.requests_sent += 1;
+                        s.nodes_crawled += 1;
+                        if let Some(rl) = &rate_limiter {
+                            rl.record_request(socket_idx);
+                        }
+                        local_sent += 1;
+                    }
+                }
+                sent_counter.fetch_add(local_sent, Ordering::Relaxed);
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        sent_total.load(Ordering::Relaxed)
+    }
+
+    /// 单 socket find_node 发送（concurrent=1 兼容路径，行为与改造前一致）
+    async fn send_find_node_to_socket(
+        &self,
+        nodes: &[KBucketEntry],
+        socket_idx: usize,
+        socket: &UdpSocket,
+    ) -> u64 {
+        let num_targets = 16;
         let targets: Vec<[u8; 20]> = (0..num_targets).map(|_| self.random_target()).collect();
         let per_target = nodes.len().div_ceil(num_targets);
+        let mut sent = 0u64;
 
         for (i, node) in nodes.iter().enumerate() {
             let target_idx = (i / per_target).min(num_targets - 1);
@@ -639,11 +798,342 @@ impl CrawlerEngine {
                 self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 let mut state = self.state.write();
                 state.requests_sent += 1;
+                state.nodes_crawled += 1;
                 if let Some(rl) = &self.rate_limiter {
                     rl.record_request(socket_idx);
                 }
-                state.nodes_crawled += 1;
+                sent += 1;
             }
+        }
+        sent
+    }
+
+    /// get_peers 多 socket 并发发送
+    /// concurrent=1 时走单 socket 兼容路径，行为与改造前一致
+    async fn send_get_peers_concurrent(
+        &self,
+        nodes: &[KBucketEntry],
+        concurrent: usize,
+        infohashes: &[Infohash],
+    ) -> u64 {
+        if concurrent <= 1 || nodes.len() <= 1 {
+            let (socket_idx, socket) = self.next_send_socket();
+            return self
+                .send_get_peers_to_socket(nodes, socket_idx, &socket, infohashes)
+                .await;
+        }
+
+        let base_idx = self.send_socket_idx.load(Ordering::Relaxed);
+        let socket_indices: Vec<usize> = (0..concurrent)
+            .map(|i| (base_idx + i) % self.sockets.len())
+            .collect();
+        self.send_socket_idx.store(
+            (base_idx + concurrent) % self.sockets.len(),
+            Ordering::Relaxed,
+        );
+
+        let per_group = nodes.len().div_ceil(concurrent);
+        let sent_total = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        for (group_idx, &socket_idx) in socket_indices.iter().enumerate() {
+            let start = group_idx * per_group;
+            let end = (start + per_group).min(nodes.len());
+            if start >= end {
+                continue;
+            }
+
+            let group: Vec<KBucketEntry> = nodes[start..end].to_vec();
+            let socket = self.sockets[socket_idx].clone();
+            let pending = self.pending.clone();
+            let state = self.state.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let socket_send_total = self.socket_send_total.clone();
+            let sent_counter = sent_total.clone();
+            let infohashes = infohashes.to_vec();
+            let virtual_ids = self.virtual_node_ids.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut local_sent = 0u64;
+                for node in &group {
+                    for _ in 0..5 {
+                        let idx = rand::random::<usize>() % infohashes.len();
+                        let ih = infohashes[idx];
+                        let mut tid = rand::random::<[u8; 2]>();
+                        tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                        let vid_idx = rand::random::<usize>() % virtual_ids.len();
+                        let vid = virtual_ids[vid_idx];
+                        let msg = DhtMessage::build_get_peers(&tid, &vid, &ih);
+
+                        {
+                            let shard = (tid[0] as usize) % 16;
+                            let mut pending_map = pending[shard].write();
+                            pending_map.insert(
+                                tid.to_vec(),
+                                PendingRequest {
+                                    _method: QueryMethod::GetPeers,
+                                    target: ih,
+                                    addr: node.addr,
+                                    sent_at: Instant::now(),
+                                },
+                            );
+                        }
+
+                        if socket.send_to(&msg, node.addr).await.is_ok() {
+                            socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                            let mut s = state.write();
+                            s.requests_sent += 1;
+                            if let Some(rl) = &rate_limiter {
+                                rl.record_request(socket_idx);
+                            }
+                            local_sent += 1;
+                        }
+                    }
+                }
+                sent_counter.fetch_add(local_sent, Ordering::Relaxed);
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        sent_total.load(Ordering::Relaxed)
+    }
+
+    /// 单 socket get_peers 发送（concurrent=1 兼容路径）
+    async fn send_get_peers_to_socket(
+        &self,
+        nodes: &[KBucketEntry],
+        socket_idx: usize,
+        socket: &UdpSocket,
+        infohashes: &[Infohash],
+    ) -> u64 {
+        let mut sent = 0u64;
+        for node in nodes {
+            for _ in 0..5 {
+                let idx = rand::random::<usize>() % infohashes.len();
+                let ih = infohashes[idx];
+                let mut tid = rand::random::<[u8; 2]>();
+                tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                let vid = self.random_virtual_node_id();
+                let msg = DhtMessage::build_get_peers(&tid, &vid, &ih);
+
+                {
+                    let shard = pending_shard(&tid);
+                    let mut pending = self.pending[shard].write();
+                    pending.insert(
+                        tid.to_vec(),
+                        PendingRequest {
+                            _method: QueryMethod::GetPeers,
+                            target: ih,
+                            addr: node.addr,
+                            sent_at: Instant::now(),
+                        },
+                    );
+                }
+
+                if socket.send_to(&msg, node.addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                    let mut state = self.state.write();
+                    state.requests_sent += 1;
+                    if let Some(rl) = &self.rate_limiter {
+                        rl.record_request(socket_idx);
+                    }
+                    sent += 1;
+                }
+            }
+        }
+        sent
+    }
+
+    /// sample_infohashes 多 socket 并发发送
+    /// concurrent=1 时走单 socket 兼容路径，行为与改造前一致
+    async fn send_sample_infohashes_concurrent(
+        &self,
+        nodes: &[KBucketEntry],
+        concurrent: usize,
+    ) -> u64 {
+        if concurrent <= 1 || nodes.len() <= 1 {
+            let (socket_idx, socket) = self.next_send_socket();
+            return self.send_sample_to_socket(nodes, socket_idx, &socket).await;
+        }
+
+        let base_idx = self.send_socket_idx.load(Ordering::Relaxed);
+        let socket_indices: Vec<usize> = (0..concurrent)
+            .map(|i| (base_idx + i) % self.sockets.len())
+            .collect();
+        self.send_socket_idx.store(
+            (base_idx + concurrent) % self.sockets.len(),
+            Ordering::Relaxed,
+        );
+
+        let per_group = nodes.len().div_ceil(concurrent);
+        let sent_total = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        for (group_idx, &socket_idx) in socket_indices.iter().enumerate() {
+            let start = group_idx * per_group;
+            let end = (start + per_group).min(nodes.len());
+            if start >= end {
+                continue;
+            }
+
+            let group: Vec<KBucketEntry> = nodes[start..end].to_vec();
+            let socket = self.sockets[socket_idx].clone();
+            let pending = self.pending.clone();
+            let state = self.state.clone();
+            let socket_send_total = self.socket_send_total.clone();
+            let sent_counter = sent_total.clone();
+            let virtual_ids = self.virtual_node_ids.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut local_sent = 0u64;
+                for node in &group {
+                    let mut tid = rand::thread_rng().gen::<[u8; 2]>();
+                    tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                    let vid_idx = rand::random::<usize>() % virtual_ids.len();
+                    let vid = virtual_ids[vid_idx];
+                    let msg = DhtMessage::build_sample_infohashes(&tid, &vid);
+
+                    {
+                        let shard = (tid[0] as usize) % 16;
+                        let mut pending_map = pending[shard].write();
+                        pending_map.insert(
+                            tid.to_vec(),
+                            PendingRequest {
+                                _method: QueryMethod::SampleInfohashes,
+                                target: [0u8; 20],
+                                addr: node.addr,
+                                sent_at: Instant::now(),
+                            },
+                        );
+                    }
+
+                    if socket.send_to(&msg, node.addr).await.is_ok() {
+                        socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                        local_sent += 1;
+                    }
+                }
+                let mut s = state.write();
+                s.requests_sent += local_sent;
+                sent_counter.fetch_add(local_sent, Ordering::Relaxed);
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        sent_total.load(Ordering::Relaxed)
+    }
+
+    /// 单 socket sample_infohashes 发送（concurrent=1 兼容路径）
+    async fn send_sample_to_socket(
+        &self,
+        nodes: &[KBucketEntry],
+        socket_idx: usize,
+        socket: &UdpSocket,
+    ) -> u64 {
+        let mut sent = 0u64;
+        for node in nodes {
+            let mut tid = rand::thread_rng().gen::<[u8; 2]>();
+            tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+            let vid = self.random_virtual_node_id();
+            let msg = DhtMessage::build_sample_infohashes(&tid, &vid);
+
+            {
+                let shard = pending_shard(&tid);
+                let mut pending = self.pending[shard].write();
+                pending.insert(
+                    tid.to_vec(),
+                    PendingRequest {
+                        _method: QueryMethod::SampleInfohashes,
+                        target: [0u8; 20],
+                        addr: node.addr,
+                        sent_at: Instant::now(),
+                    },
+                );
+            }
+
+            if socket.send_to(&msg, node.addr).await.is_ok() {
+                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                sent += 1;
+            }
+        }
+        let mut state = self.state.write();
+        state.requests_sent += sent;
+        sent
+    }
+
+    /// 主动爬行：向已知节点发 find_node 探索网络
+    pub async fn active_crawl(&self) {
+        if !self.warmup_done.load(Ordering::Relaxed) {
+            debug!("[crawler] 预热未完成，跳过全量爬行");
+            return;
+        }
+        if self.sockets.is_empty() {
+            return;
+        }
+
+        // 1. 获取自适应倍率（唯一的倍率决策点）
+        let multiplier = self
+            .adaptive_controller
+            .as_ref()
+            .map(|c| c.next_rate_multiplier())
+            .unwrap_or(1.0);
+
+        // 2. 计算发送节点数（基础64 × 倍率，clamp 到 [8, 256]）
+        let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
+
+        // 3. 选取节点
+        let nodes = if self.node_repo.is_some() {
+            self.select_diverse_nodes(target_count, 3)
+        } else {
+            let known = self.known_nodes.write();
+            if known.is_empty() {
+                return;
+            }
+            let mut all = known.all_nodes();
+            all.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            all.truncate(target_count.min(32));
+            all
+        };
+        if nodes.is_empty() {
+            return;
+        }
+
+        // 4. 记录 pending_before
+        let pending_before = self.pending_total();
+
+        // 5. 多 socket 并发发送
+        let concurrent = self.resolve_concurrent_sockets(nodes.len());
+        {
+            let mut state = self.state.write();
+            state.concurrent_sockets_in_use = concurrent;
+        }
+        let sent_total = self.send_find_node_concurrent(&nodes, concurrent).await;
+
+        // 6. 记录 pending_after
+        let pending_after = self.pending_total();
+
+        // 7. 反馈本轮结果
+        if let Some(ac) = &self.adaptive_controller {
+            let avg_latency = self.estimate_avg_latency_ms();
+            let responded = self.estimate_responded(sent_total);
+            ac.report_round_result(
+                sent_total,
+                responded,
+                avg_latency,
+                pending_before,
+                pending_after,
+                0,
+                1.0,
+            );
         }
 
         {
@@ -662,10 +1152,18 @@ impl CrawlerEngine {
         if self.sockets.is_empty() {
             return;
         }
-        let (socket_idx, socket) = self.next_send_socket();
-        // 从 NodeRepo 多样性选取高评分节点（评分由 ScoreMaintainer 统一维护）
+
+        // 1. 获取自适应倍率
+        let multiplier = self
+            .adaptive_controller
+            .as_ref()
+            .map(|c| c.next_rate_multiplier())
+            .unwrap_or(1.0);
+        let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
+
+        // 2. 选取节点
         let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(64, 4) // 选64个，同一/24网段最多4个（加速传播）
+            self.select_diverse_nodes(target_count, 4)
         } else {
             let known = self.known_nodes.read();
             if known.is_empty() {
@@ -711,39 +1209,33 @@ impl CrawlerEngine {
             return;
         }
 
-        // 向每个节点发送随机 5 个 infohash 的 get_peers（加速传播）
-        for node in &nodes {
-            for _ in 0..5 {
-                let idx = rand::random::<usize>() % infohashes.len();
-                let ih = infohashes[idx];
-                let mut tid = rand::random::<[u8; 2]>();
-                tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
-                let vid = self.random_virtual_node_id();
-                let msg = DhtMessage::build_get_peers(&tid, &vid, &ih);
+        // 3. 记录 pending_before
+        let pending_before = self.pending_total();
 
-                {
-                    let shard = pending_shard(&tid);
-                    let mut pending = self.pending[shard].write();
-                    pending.insert(
-                        tid.to_vec(),
-                        PendingRequest {
-                            _method: QueryMethod::GetPeers,
-                            target: ih,
-                            addr: node.addr,
-                            sent_at: Instant::now(),
-                        },
-                    );
-                }
+        // 4. 多 socket 并发发送（每节点发5个 infohash 查询）
+        let concurrent = self.resolve_concurrent_sockets(nodes.len());
+        {
+            let mut state = self.state.write();
+            state.concurrent_sockets_in_use = concurrent;
+        }
+        let sent_total = self
+            .send_get_peers_concurrent(&nodes, concurrent, &infohashes)
+            .await;
 
-                if socket.send_to(&msg, node.addr).await.is_ok() {
-                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
-                    let mut state = self.state.write();
-                    state.requests_sent += 1;
-                    if let Some(rl) = &self.rate_limiter {
-                        rl.record_request(socket_idx);
-                    }
-                }
-            }
+        // 5. 记录 pending_after + 反馈
+        let pending_after = self.pending_total();
+        if let Some(ac) = &self.adaptive_controller {
+            let avg_latency = self.estimate_avg_latency_ms();
+            let responded = self.estimate_responded(sent_total);
+            ac.report_round_result(
+                sent_total,
+                responded,
+                avg_latency,
+                pending_before,
+                pending_after,
+                0,
+                1.0,
+            );
         }
 
         info!(
@@ -764,10 +1256,18 @@ impl CrawlerEngine {
         if self.sockets.is_empty() {
             return;
         }
-        let (socket_idx, socket) = self.next_send_socket();
-        // 从 NodeRepo 多样性选取高评分节点
+
+        // 1. 获取自适应倍率
+        let multiplier = self
+            .adaptive_controller
+            .as_ref()
+            .map(|c| c.next_rate_multiplier())
+            .unwrap_or(1.0);
+        let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
+
+        // 2. 选取节点
         let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(64, 3) // 选64个（P2优化：并发翻倍），同一/24网段最多3个
+            self.select_diverse_nodes(target_count, 3)
         } else {
             let known = self.known_nodes.read();
             if known.is_empty() {
@@ -787,41 +1287,38 @@ impl CrawlerEngine {
             return;
         }
 
-        let mut requests_sent = 0;
-        for node in &nodes {
-            let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-            tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
-            let vid = self.random_virtual_node_id();
-            let msg = DhtMessage::build_sample_infohashes(&tid, &vid);
+        // 3. 记录 pending_before
+        let pending_before = self.pending_total();
 
-            {
-                let shard = pending_shard(&tid);
-                let mut pending = self.pending[shard].write();
-                pending.insert(
-                    tid.to_vec(),
-                    PendingRequest {
-                        _method: QueryMethod::SampleInfohashes,
-                        target: [0u8; 20], // sample_infohashes 不需要 target
-                        addr: node.addr,
-                        sent_at: Instant::now(),
-                    },
-                );
-            }
-
-            if socket.send_to(&msg, node.addr).await.is_ok() {
-                self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
-                requests_sent += 1;
-            }
-        }
-
+        // 4. 多 socket 并发发送
+        let concurrent = self.resolve_concurrent_sockets(nodes.len());
         {
             let mut state = self.state.write();
-            state.requests_sent += requests_sent;
+            state.concurrent_sockets_in_use = concurrent;
+        }
+        let sent_total = self
+            .send_sample_infohashes_concurrent(&nodes, concurrent)
+            .await;
+
+        // 5. 记录 pending_after + 反馈
+        let pending_after = self.pending_total();
+        if let Some(ac) = &self.adaptive_controller {
+            let avg_latency = self.estimate_avg_latency_ms();
+            let responded = self.estimate_responded(sent_total);
+            ac.report_round_result(
+                sent_total,
+                responded,
+                avg_latency,
+                pending_before,
+                pending_after,
+                0,
+                1.0,
+            );
         }
 
         info!(
             "[crawler] 主动 sample_infohashes: 向 {} 节点发送了请求",
-            requests_sent
+            sent_total
         );
     }
 
@@ -1029,7 +1526,7 @@ impl CrawlerEngine {
 
     /// 清理超时的 pending 请求，并记录失败统计到 NodeRepo
     pub fn cleanup_pending(&self) {
-        let timeout = Duration::from_secs(15); // P2优化：超时缩短，加速节点轮换 // [ALLOWED-HARDCODED]
+        let timeout = PENDING_REQUEST_TIMEOUT;
 
         // 跨 16 个分片收集超时请求的地址，用于记录失败统计
         let mut expired_addrs: Vec<SocketAddr> = Vec::new();
@@ -1912,6 +2409,7 @@ impl CrawlerEngine {
             send_socket_idx: self.send_socket_idx.clone(),
             throttled_round_robin: self.throttled_round_robin.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            adaptive_controller: self.adaptive_controller.clone(),
             buffer_pool: self.buffer_pool.clone(),
             warmup_done: self.warmup_done.clone(),
             message_semaphore: self.message_semaphore.clone(),

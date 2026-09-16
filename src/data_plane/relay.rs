@@ -40,13 +40,14 @@ use crate::net::socket_opts::create_udp_socket;
 const RELAY_MAGIC: [u8; 2] = [0x50, 0x44];
 
 /// 默认中继端口
-pub const DEFAULT_RELAY_PORT: u16 = 6881; // [ALLOWED-HARDCODED]
+pub const DEFAULT_RELAY_PORT: u16 = 6881;
 
 /// UDP 接收缓冲区大小
 const UDP_BUFFER_SIZE: usize = 65536;
 
 /// TCP 连接超时
-const _TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120); // [ALLOWED-HARDCODED]
+/// 中继连接空闲超时（超过即回收）
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 单连接最大带宽（字节/秒）
 const _MAX_BANDWIDTH_PER_CONN: u64 = 10 * 1024 * 1024; // 10 MB/s
@@ -429,7 +430,7 @@ impl RelayServer {
     /// 清理过期连接（由 TaskScheduler 按间隔调度）
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
-        let timeout = Duration::from_secs(120); // [ALLOWED-HARDCODED]
+        let timeout = RELAY_IDLE_TIMEOUT;
 
         let udp_before = self.udp_clients.read().len();
         self.udp_clients
@@ -491,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_relay_server_creation() {
-        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap(); // [ALLOWED-HARDCODED]
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         let server = RelayServer::new(addr);
         assert_eq!(server.listen_addr, addr);
         assert_eq!(server.stats().active_udp_clients, 0);

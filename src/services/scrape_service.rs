@@ -24,6 +24,15 @@ use tracing::{debug, warn};
 use crate::storage::repo_traits::TrackerRepository;
 use crate::types::{Infohash, ScrapeEntry};
 
+/// Tracker 限流初始 last_request 回溯窗口（让首个请求立即放行）
+const RATE_LIMIT_INITIAL_BACKDATE: Duration = Duration::from_secs(3600);
+/// Scrape HTTP 请求超时
+const SCRAPE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 每个 Tracker 的最小请求间隔
+const SCRAPE_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// 连续失败后 Tracker 禁用时长
+const SCRAPE_COOLDOWN_DURATION: Duration = Duration::from_secs(300);
+
 /// 单个 infohash 的 scrape 结果（融合多个 Tracker 的结果）
 #[derive(Debug, Clone)]
 pub struct ScrapeResult {
@@ -64,7 +73,7 @@ struct TrackerRateLimit {
 impl TrackerRateLimit {
     fn new() -> Self {
         Self {
-            last_request: RwLock::new(Instant::now() - Duration::from_secs(3600)), // [ALLOWED-HARDCODED]
+            last_request: RwLock::new(Instant::now() - RATE_LIMIT_INITIAL_BACKDATE),
             consecutive_failures: RwLock::new(0),
             disabled_until: RwLock::new(None),
         }
@@ -128,7 +137,7 @@ impl ScrapeService {
     /// 创建新的 Scrape 服务
     pub fn new() -> Self {
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(10)) // [ALLOWED-HARDCODED]
+            .timeout(SCRAPE_REQUEST_TIMEOUT)
             .user_agent("PeerDiscoveryCenter/1.0")
             .build()
             .unwrap_or_default();
@@ -139,11 +148,11 @@ impl ScrapeService {
             rate_limits: DashMap::new(),
             tracker_repo: None,
             cache_ttl_secs: 300,
-            min_request_interval: Duration::from_secs(1), // [ALLOWED-HARDCODED]
+            min_request_interval: SCRAPE_MIN_REQUEST_INTERVAL,
             max_consecutive_failures: 3,
-            cooldown_duration: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            cooldown_duration: SCRAPE_COOLDOWN_DURATION,
             max_trackers_per_scrape: 5,
-            request_timeout: Duration::from_secs(10), // [ALLOWED-HARDCODED]
+            request_timeout: SCRAPE_REQUEST_TIMEOUT,
         }
     }
 
@@ -491,17 +500,17 @@ mod tests {
         let rl = TrackerRateLimit::new();
 
         // 初始状态应该可以请求
-        assert!(rl.can_request(Duration::from_secs(1))); // [ALLOWED-HARDCODED]
+        assert!(rl.can_request(Duration::from_secs(1)));
 
         // 记录成功后，应该被限流
         rl.record_success();
-        assert!(!rl.can_request(Duration::from_secs(10))); // [ALLOWED-HARDCODED]
+        assert!(!rl.can_request(Duration::from_secs(10)));
 
         // 记录失败
-        rl.record_failure(3, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
-        rl.record_failure(3, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
-        rl.record_failure(3, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
-                                                        // 第3次失败后应该被禁用
-        assert!(!rl.can_request(Duration::from_secs(0))); // [ALLOWED-HARDCODED]
+        rl.record_failure(3, Duration::from_secs(300));
+        rl.record_failure(3, Duration::from_secs(300));
+        rl.record_failure(3, Duration::from_secs(300));
+        // 第3次失败后应该被禁用
+        assert!(!rl.can_request(Duration::from_secs(0)));
     }
 }

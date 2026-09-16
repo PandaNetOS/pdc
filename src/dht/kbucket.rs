@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 /// 从 8 提升到 16，增加路由表容量（Phase 11 协议优化）
 pub const K: usize = 16;
 
+/// 节点进入 Questionable 状态的空闲时间阈值（15 分钟）
+const QUESTIONABLE_IDLE_THRESHOLD: Duration = Duration::from_secs(900);
+
 /// 节点状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
@@ -138,10 +141,7 @@ impl KBucketEntry {
         if self.state == NodeState::Bad {
             return;
         }
-        if self.last_active.elapsed() > Duration::from_secs(900) {
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
+        if self.last_active.elapsed() > QUESTIONABLE_IDLE_THRESHOLD {
             self.state = NodeState::Questionable;
         } else {
             self.state = NodeState::Good;

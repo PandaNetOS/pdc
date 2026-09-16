@@ -9,6 +9,13 @@ use crate::storage::repo_traits::{InfohashRepository, PeerRepository};
 use crate::storage::{InfohashRepoImpl, PeerRepoImpl};
 use crate::types::{DiscoveryResult, Infohash, PeerInfo, PeerSource};
 
+/// 单次主动发现：每源最多收集 peer 数
+const DISCOVER_MAX_RESULTS_PER_SOURCE: usize = 50;
+/// 单次主动发现：最大并发发现器数
+const DISCOVER_MAX_CONCURRENCY: usize = 8;
+/// 单次主动发现：超时
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct DiscoverService {
     registry: Arc<DiscovererRegistry>,
     peer_repo: Arc<PeerRepoImpl>,
@@ -31,7 +38,12 @@ impl DiscoverService {
     pub async fn discover(&self, infohash: Infohash) -> anyhow::Result<DiscoveryResult> {
         let raw = self
             .registry
-            .discover_all(&infohash, 50, 8, Duration::from_secs(10)) // [ALLOWED-HARDCODED]
+            .discover_all(
+                &infohash,
+                DISCOVER_MAX_RESULTS_PER_SOURCE,
+                DISCOVER_MAX_CONCURRENCY,
+                DISCOVER_TIMEOUT,
+            )
             .await;
 
         let mut all_peers: Vec<PeerInfo> = Vec::new();

@@ -99,12 +99,16 @@ pub struct AvailabilityCalculator {
 
 impl AvailabilityCalculator {
     /// 创建新的可用性计算器
+    /// 缓存与 bitfield 默认 TTL
+    const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+    const DEFAULT_BITFIELD_TTL: Duration = Duration::from_secs(1800);
+
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
             bitfields: DashMap::new(),
-            cache_ttl: Duration::from_secs(300), // [ALLOWED-HARDCODED]
-            bitfield_ttl: Duration::from_secs(1800), // [ALLOWED-HARDCODED]
+            cache_ttl: Self::DEFAULT_CACHE_TTL,
+            bitfield_ttl: Self::DEFAULT_BITFIELD_TTL,
         }
     }
 
@@ -400,11 +404,11 @@ mod tests {
         let infohash = [4u8; 20];
 
         // 记录2个做种者
-        calc.record_seeder(infohash, "1.1.1.1:6881", 10); // [ALLOWED-HARDCODED]
-        calc.record_seeder(infohash, "2.2.2.2:6881", 10); // [ALLOWED-HARDCODED]
+        calc.record_seeder(infohash, "1.1.1.1:6881", 10);
+        calc.record_seeder(infohash, "2.2.2.2:6881", 10);
 
         // 记录1个部分peer（拥有分片0-4）
-        calc.record_bitfield(infohash, "3.3.3.3:6881", vec![0, 1, 2, 3, 4], 10); // [ALLOWED-HARDCODED]
+        calc.record_bitfield(infohash, "3.3.3.3:6881", vec![0, 1, 2, 3, 4], 10);
 
         let result = calc.calculate_exact(infohash, 10).unwrap();
         assert_eq!(result.total_pieces, 10);
@@ -424,7 +428,7 @@ mod tests {
         let infohash = [5u8; 20];
 
         // 只记录1个部分peer（拥有分片0-4）
-        calc.record_bitfield(infohash, "1.1.1.1:6881", vec![0, 1, 2, 3, 4], 10); // [ALLOWED-HARDCODED]
+        calc.record_bitfield(infohash, "1.1.1.1:6881", vec![0, 1, 2, 3, 4], 10);
 
         let result = calc.calculate_exact(infohash, 10).unwrap();
         assert_eq!(result.available_pieces, 5);

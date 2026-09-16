@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 use crate::nat::{NatManager, NatStatus, NatType, ReachabilityResult};
 
+/// STUN UDP 可达性检测超时
+const STUN_REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct NatService {
     manager: Arc<NatManager>,
 }
@@ -70,11 +73,8 @@ impl NatService {
             return None;
         }
         let servers = config.stun_servers.clone();
-        let result = crate::nat::stun::check_udp_reachability(
-            &servers,
-            port,
-            std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
-        );
+        let result =
+            crate::nat::stun::check_udp_reachability(&servers, port, STUN_REACHABILITY_TIMEOUT);
         Some(result)
     }
 

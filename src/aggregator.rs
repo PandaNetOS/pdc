@@ -38,8 +38,8 @@ impl Default for PeerDiscoveryConfig {
     fn default() -> Self {
         Self {
             max_cached_peers: 10000,
-            peer_ttl: Duration::from_secs(86400), // [ALLOWED-HARDCODED]
-            discovery_timeout: Duration::from_secs(30), // [ALLOWED-HARDCODED]
+            peer_ttl: Duration::from_secs(86400),
+            discovery_timeout: Duration::from_secs(30),
             max_concurrent_discoverers: 10,
             max_peers_per_discovery: 200,
         }

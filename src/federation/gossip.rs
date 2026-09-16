@@ -21,6 +21,9 @@ use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
 use crate::federation::sharded_lru::ShardedLruCache;
 
+/// wait_outbox_empty 轮询间隔
+const OUTBOX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Gossip 引擎
 pub struct GossipEngine {
     /// 待传播队列
@@ -1034,7 +1037,7 @@ impl GossipEngine {
                 empty_streak = 0;
             }
             // [ALLOWED-SLEEP] wait_outbox_empty 带超时的轮询等待，非周期性
-            tokio::time::sleep(Duration::from_millis(100)).await; // [ALLOWED-HARDCODED]
+            tokio::time::sleep(OUTBOX_DRAIN_POLL_INTERVAL).await;
         }
         false
     }

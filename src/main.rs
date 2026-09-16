@@ -20,6 +20,7 @@ use rand::Rng;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use PeerDiscoveryCenter::config::get_interval_secs;
 use PeerDiscoveryCenter::config::PdcConfig;
 use PeerDiscoveryCenter::control_plane::ControlPlane;
 use PeerDiscoveryCenter::crawler::Crawler;
@@ -34,8 +35,9 @@ use PeerDiscoveryCenter::federation::FederationService;
 use PeerDiscoveryCenter::firewall::FirewallManager;
 use PeerDiscoveryCenter::health_check::{HealthCheckConfig, HealthCheckTask};
 use PeerDiscoveryCenter::intelligence::{
-    AvailabilityCalculator, CategoryConcurrency, DhtActivityTracker, PeerHistoryManager,
-    ResourceLevel, ResourceProfile, TaskCategory, TaskMetadata, TaskPriority, TaskScheduler,
+    AdaptiveController, AvailabilityCalculator, CategoryConcurrency, DhtActivityTracker,
+    PeerHistoryManager, ResourceLevel, ResourceProfile, TaskCategory, TaskMetadata, TaskPriority,
+    TaskScheduler,
 };
 use PeerDiscoveryCenter::nat::NatManager;
 use PeerDiscoveryCenter::net::socket_opts::create_udp_socket;
@@ -302,7 +304,7 @@ async fn async_main(
     let write_queue = Arc::new(PeerDiscoveryCenter::storage::WriteQueue::new(
         storage.connection(),
         config.persistence.batch_size,
-        std::time::Duration::from_secs(10), // [ALLOWED-HARDCODED] WriteQueue flush 间隔
+        std::time::Duration::from_secs(config.persistence.flush_interval_secs),
     ));
     let node_repo = Arc::new(
         PeerDiscoveryCenter::storage::NodeRepoImpl::new(storage.clone())
@@ -492,6 +494,10 @@ async fn async_main(
     let full_sync_gate: Option<Arc<AtomicBool>> =
         federation_service.as_ref().map(|s| s.full_sync_gate());
 
+    // 6.95 创建自适应控制器（ICC 预测式自适应，共享给 TaskScheduler 和 CrawlerEngine）
+    // 注意：倍率决策由 CrawlerEngine 调用 next_rate_multiplier() 完成，TaskScheduler 仅持有引用供监控/扩展使用
+    let adaptive_controller = Arc::new(AdaptiveController::new(config.adaptive.clone()));
+
     // 7. 创建爬虫引擎（如果启用），在 AppState 之前创建以便共享状态
     let (crawler_state, crawler_routing_table, crawler_ref) = if config.crawler.enabled {
         let crawler = CrawlerEngine::new(config.crawler.clone(), event_bus.clone())
@@ -500,7 +506,8 @@ async fn async_main(
             .with_storage(storage.clone())
             .with_infohash_repo(infohash_repo.clone())
             .with_node_repo(node_repo.clone())
-            .with_pause_gate(full_sync_gate.clone());
+            .with_pause_gate(full_sync_gate.clone())
+            .with_adaptive_controller(adaptive_controller.clone());
         let state_arc = crawler.state_arc();
         let routing_table = crawler.routing_table();
         let crawler = Arc::new(crawler);
@@ -651,7 +658,11 @@ async fn async_main(
             node_id,
         )
         .with_pex_receiver(pex_receiver.clone())
-        .with_interval(std::time::Duration::from_secs(30)) // [ALLOWED-HARDCODED]
+        .with_interval(std::time::Duration::from_secs(get_interval_secs(
+            &config.task_scheduler.intervals,
+            "active_pex",
+            30,
+        )))
         .with_batch_size(20)
         .with_pause_gate(full_sync_gate.clone());
         let requester = Arc::new(requester);
@@ -766,14 +777,20 @@ async fn async_main(
     );
 
     // 8.5 创建统一 TaskScheduler（所有后台任务纳管，按分类分级并发）
-    let task_scheduler = Arc::new(TaskScheduler::new().with_category_concurrency(
-        CategoryConcurrency {
-            crawl: config.task_scheduler.crawl_concurrency,
-            persistence: config.task_scheduler.persistence_concurrency,
-            monitor: config.task_scheduler.monitor_concurrency,
-            network: config.task_scheduler.network_concurrency,
-        },
-    ));
+    let task_scheduler = Arc::new(
+        TaskScheduler::new()
+            .with_category_concurrency(CategoryConcurrency {
+                crawl: config.task_scheduler.crawl_concurrency,
+                persistence: config.task_scheduler.persistence_concurrency,
+                monitor: config.task_scheduler.monitor_concurrency,
+                network: config.task_scheduler.network_concurrency,
+            })
+            .with_adaptive_controller(adaptive_controller.clone()),
+    );
+
+    // 任务间隔覆盖表：未配置的任务使用代码内默认值（与改造前行为一致）。
+    // key=任务名（或 <任务名>_initial_delay / <任务名>_jitter）。
+    let intervals = &config.task_scheduler.intervals;
 
     // 8.5.1 资源监控任务（每5秒，Critical，non_deferrable，读取真实系统资源）
     {
@@ -782,7 +799,7 @@ async fn async_main(
             TaskMetadata::new(
                 "resource_monitor",
                 "系统资源监控",
-                std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "resource_monitor", 5)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Critical)
@@ -815,7 +832,11 @@ async fn async_main(
             TaskMetadata::new(
                 "periodic_persistence",
                 "定期增量持久化",
-                std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "periodic_persistence",
+                    60,
+                )),
             )
             .with_category(TaskCategory::Persistence)
             .with_priority(TaskPriority::Background)
@@ -826,8 +847,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(30)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "periodic_persistence_initial_delay",
+                30,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "periodic_persistence_jitter",
+                10,
+            ))),
             move || {
                 let nr = nr.clone();
                 let tr = tr.clone();
@@ -876,7 +905,11 @@ async fn async_main(
             TaskMetadata::new(
                 "write_queue_flush",
                 "WriteQueue定时刷盘",
-                std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "write_queue_flush",
+                    5,
+                )),
             )
             .with_category(TaskCategory::Persistence)
             .with_priority(TaskPriority::Background)
@@ -887,7 +920,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "write_queue_flush_initial_delay",
+                10,
+            ))),
             move || {
                 let wq = wq.clone();
                 async move {
@@ -905,7 +942,11 @@ async fn async_main(
             TaskMetadata::new(
                 "health_check_main",
                 "健康检查主循环",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "health_check_main",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Important)
@@ -916,7 +957,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "health_check_main_jitter",
+                10,
+            ))),
             move || {
                 let hc = hc.clone();
                 async move {
@@ -932,7 +977,11 @@ async fn async_main(
             TaskMetadata::new(
                 "health_check_stats",
                 "健康统计输出",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "health_check_stats",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Normal)
@@ -943,8 +992,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(75)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "health_check_stats_initial_delay",
+                75,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "health_check_stats_jitter",
+                10,
+            ))),
             move || {
                 let hc = hc.clone();
                 async move {
@@ -960,7 +1017,11 @@ async fn async_main(
             TaskMetadata::new(
                 "health_cache_cleanup",
                 "过期Peer缓存清理",
-                std::time::Duration::from_secs(600), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "health_cache_cleanup",
+                    600,
+                )),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
@@ -971,8 +1032,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(420)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(15)) // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "health_cache_cleanup_initial_delay",
+                420,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "health_cache_cleanup_jitter",
+                15,
+            )))
             .with_dependencies(vec!["score_full".to_string()]),
             move || {
                 let hc = hc.clone();
@@ -1030,7 +1099,11 @@ async fn async_main(
             TaskMetadata::new(
                 "score_incremental",
                 "增量评分重算",
-                std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "score_incremental",
+                    60,
+                )),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Important)
@@ -1041,7 +1114,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "score_incremental_jitter",
+                10,
+            ))),
             move || {
                 let m = m.clone();
                 async move {
@@ -1057,7 +1134,7 @@ async fn async_main(
             TaskMetadata::new(
                 "score_full",
                 "全量评分重算",
-                std::time::Duration::from_secs(600), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "score_full", 600)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Normal)
@@ -1068,8 +1145,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: true,
             })
-            .with_initial_delay(std::time::Duration::from_secs(360)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(15)) // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "score_full_initial_delay",
+                360,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "score_full_jitter",
+                15,
+            )))
             .with_dependencies(vec!["periodic_persistence".to_string()]),
             move || {
                 let m = m.clone();
@@ -1086,7 +1171,7 @@ async fn async_main(
             TaskMetadata::new(
                 "score_snapshot",
                 "Peer快照",
-                std::time::Duration::from_secs(120), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "score_snapshot", 120)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Normal)
@@ -1097,8 +1182,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "score_snapshot_initial_delay",
+                60,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "score_snapshot_jitter",
+                10,
+            ))),
             move || {
                 let m = m.clone();
                 async move {
@@ -1114,7 +1207,7 @@ async fn async_main(
             TaskMetadata::new(
                 "cache_cleanup",
                 "评分缓存清理",
-                std::time::Duration::from_secs(600), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "cache_cleanup", 600)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
@@ -1125,8 +1218,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(420)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(15)) // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "cache_cleanup_initial_delay",
+                420,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "cache_cleanup_jitter",
+                15,
+            )))
             .with_dependencies(vec!["score_full".to_string()]),
             move || {
                 let m = m.clone();
@@ -1147,7 +1248,7 @@ async fn async_main(
             TaskMetadata::new(
                 "tier_check",
                 "冷热分层检查",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "tier_check", 300)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
@@ -1158,8 +1259,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(225)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "tier_check_initial_delay",
+                225,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "tier_check_jitter",
+                10,
+            ))),
             move || {
                 let tm = tm.clone();
                 async move {
@@ -1178,7 +1287,7 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_heartbeat",
                 "联邦心跳",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "fed_heartbeat", 30)),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
@@ -1189,7 +1298,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_jitter(std::time::Duration::from_secs(5)), // [ALLOWED-HARDCODED]
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_heartbeat_jitter",
+                5,
+            ))),
             move || {
                 let cm = cm.clone();
                 async move {
@@ -1205,7 +1318,7 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_node_sync",
                 "联邦节点同步",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "fed_node_sync", 300)),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1216,8 +1329,16 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(150)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_node_sync_initial_delay",
+                150,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_node_sync_jitter",
+                10,
+            ))),
             move || {
                 let sm = sm.clone();
                 async move {
@@ -1234,7 +1355,11 @@ async fn async_main(
                 TaskMetadata::new(
                     "fed_dht_discovery",
                     "联邦DHT发现",
-                    std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                    std::time::Duration::from_secs(get_interval_secs(
+                        intervals,
+                        "fed_dht_discovery",
+                        300,
+                    )),
                 )
                 .with_category(TaskCategory::Network)
                 .with_priority(TaskPriority::Normal)
@@ -1245,7 +1370,11 @@ async fn async_main(
                     network: ResourceLevel::Medium,
                     is_full_task: false,
                 })
-                .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+                .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_dht_discovery_jitter",
+                    10,
+                ))),
                 move || {
                     let dd = dd.clone();
                     async move {
@@ -1263,7 +1392,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_merkle_anti_entropy",
                 "联邦Merkle反熵",
-                std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_merkle_anti_entropy",
+                    60,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1274,8 +1407,16 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(45)) // [ALLOWED-HARDCODED]
-            .with_jitter(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_merkle_anti_entropy_initial_delay",
+                45,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_merkle_anti_entropy_jitter",
+                10,
+            ))),
             move || {
                 let g = g.clone();
                 let s = s.clone();
@@ -1292,7 +1433,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_public_addr_sync",
                 "联邦公网地址同步",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_public_addr_sync",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1303,7 +1448,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_public_addr_sync_initial_delay",
+                60,
+            ))),
             move || {
                 let f = fed_clone.clone();
                 async move {
@@ -1319,7 +1468,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_push_pull_gossip",
                 "联邦Push-Pull Gossip",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_push_pull_gossip",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1330,7 +1483,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(15)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_push_pull_gossip_initial_delay",
+                15,
+            ))),
             move || {
                 let sm = sm2.clone();
                 async move {
@@ -1346,7 +1503,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_relay_channel_cleanup",
                 "联邦中继通道清理",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_relay_channel_cleanup",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1357,7 +1518,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_relay_channel_cleanup_initial_delay",
+                60,
+            ))),
             move || {
                 let r = rm.clone();
                 async move {
@@ -1373,7 +1538,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_diff_sync_watcher",
                 "联邦差量同步超时监控",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_diff_sync_watcher",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1384,7 +1553,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_diff_sync_watcher_initial_delay",
+                60,
+            ))),
             move || {
                 let sm = sm_watch.clone();
                 async move {
@@ -1400,7 +1573,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_pex_exchange",
                 "联邦PEX节点交换",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_pex_exchange",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1411,7 +1588,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(30)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_pex_exchange_initial_delay",
+                30,
+            ))),
             move || {
                 let d = disc_pex.clone();
                 async move {
@@ -1427,7 +1608,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_connection_maintain",
                 "联邦连接维护",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_connection_maintain",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
@@ -1438,7 +1623,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(45)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_connection_maintain_initial_delay",
+                45,
+            ))),
             move || {
                 let d = disc_maint.clone();
                 async move {
@@ -1454,7 +1643,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_peer_cache_save",
                 "联邦节点缓存保存",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_peer_cache_save",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1465,7 +1658,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(120)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_peer_cache_save_initial_delay",
+                120,
+            ))),
             move || {
                 let d = disc_cache.clone();
                 async move {
@@ -1481,7 +1678,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_nat_refresh",
                 "联邦NAT地址刷新",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_nat_refresh",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1492,7 +1693,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_nat_refresh_initial_delay",
+                60,
+            ))),
             move || {
                 let n = nat.clone();
                 async move {
@@ -1509,7 +1714,11 @@ async fn async_main(
                 TaskMetadata::new(
                     "fed_tracker_sync",
                     "联邦Tracker全量同步",
-                    std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
+                    std::time::Duration::from_secs(get_interval_secs(
+                        intervals,
+                        "fed_tracker_sync",
+                        3600,
+                    )),
                 )
                 .with_category(TaskCategory::Network)
                 .with_priority(TaskPriority::Background)
@@ -1520,7 +1729,11 @@ async fn async_main(
                     network: ResourceLevel::Low,
                     is_full_task: false,
                 })
-                .with_initial_delay(std::time::Duration::from_secs(300)), // [ALLOWED-HARDCODED]
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_tracker_sync_initial_delay",
+                    300,
+                ))),
                 move || {
                     let t = ts_clone.clone();
                     async move {
@@ -1537,7 +1750,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_gossip_flush",
                 "联邦Gossip批量flush",
-                std::time::Duration::from_millis(50), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_millis(get_interval_secs(
+                    intervals,
+                    "fed_gossip_flush",
+                    50,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
@@ -1563,7 +1780,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_gossip_propagation",
                 "联邦Gossip传播",
-                std::time::Duration::from_millis(100), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_millis(get_interval_secs(
+                    intervals,
+                    "fed_gossip_propagation",
+                    100,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Important)
@@ -1589,7 +1810,11 @@ async fn async_main(
             TaskMetadata::new(
                 "fed_merkle_flush",
                 "联邦Merkle批量flush",
-                std::time::Duration::from_millis(1000), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_millis(get_interval_secs(
+                    intervals,
+                    "fed_merkle_flush",
+                    1000,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1600,7 +1825,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(10)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_merkle_flush_initial_delay",
+                10,
+            ))),
             move || {
                 let sm = sm_flush.clone();
                 async move {
@@ -1617,8 +1846,8 @@ async fn async_main(
         let _discoverer_ref = fetcher_ref.clone();
         let tracker_repo_clone = tracker_repo.clone();
         task_scheduler.register(
-            TaskMetadata::new("remote_tracker_refresh", "远程Tracker列表刷新", std::time::Duration::from_secs(3600))
-            .with_category(TaskCategory::Network) // [ALLOWED-HARDCODED]
+            TaskMetadata::new("remote_tracker_refresh", "远程Tracker列表刷新", std::time::Duration::from_secs(get_interval_secs(intervals, "remote_tracker_refresh", 3600)))
+            .with_category(TaskCategory::Network)
                 .with_priority(TaskPriority::Background)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -1627,7 +1856,7 @@ async fn async_main(
                     network: ResourceLevel::Low,
                     is_full_task: false,
                 })
-                .with_jitter(std::time::Duration::from_secs(30)), // [ALLOWED-HARDCODED]
+                .with_jitter(std::time::Duration::from_secs(get_interval_secs(intervals, "remote_tracker_refresh_jitter", 30))),
             move || {
                 let remote_url = remote_url.clone();
                 let tracker_repo = tracker_repo_clone.clone();
@@ -1658,7 +1887,11 @@ async fn async_main(
             TaskMetadata::new(
                 "tracker_fetcher",
                 "Tracker主动拉取peer",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "tracker_fetcher",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1669,7 +1902,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(120)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "tracker_fetcher_initial_delay",
+                120,
+            ))),
             move || {
                 let t = t.clone();
                 async move {
@@ -1686,7 +1923,11 @@ async fn async_main(
         TaskMetadata::new(
             "subscription_fetch",
             "外部订阅源拉取",
-            std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
+            std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "subscription_fetch",
+                3600,
+            )),
         )
         .with_category(TaskCategory::Network)
         .with_priority(TaskPriority::Background)
@@ -1697,7 +1938,11 @@ async fn async_main(
             network: ResourceLevel::Medium,
             is_full_task: false,
         })
-        .with_initial_delay(std::time::Duration::from_secs(180)), // [ALLOWED-HARDCODED]
+        .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+            intervals,
+            "subscription_fetch_initial_delay",
+            180,
+        ))),
         move || {
             let s = ss.clone();
             async move {
@@ -1713,7 +1958,7 @@ async fn async_main(
         TaskMetadata::new(
             "keyword_search",
             "DHT关键词搜索",
-            std::time::Duration::from_secs(3600), // [ALLOWED-HARDCODED]
+            std::time::Duration::from_secs(get_interval_secs(intervals, "keyword_search", 3600)),
         )
         .with_category(TaskCategory::Network)
         .with_priority(TaskPriority::Background)
@@ -1724,7 +1969,11 @@ async fn async_main(
             network: ResourceLevel::Medium,
             is_full_task: false,
         })
-        .with_initial_delay(std::time::Duration::from_secs(240)), // [ALLOWED-HARDCODED]
+        .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+            intervals,
+            "keyword_search_initial_delay",
+            240,
+        ))),
         move || {
             let k = ks.clone();
             async move {
@@ -1741,7 +1990,7 @@ async fn async_main(
             TaskMetadata::new(
                 "dht_probe_poll",
                 "DHT探测PeerRepo拉取",
-                std::time::Duration::from_secs(15), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "dht_probe_poll", 15)),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1769,7 +2018,7 @@ async fn async_main(
             TaskMetadata::new(
                 "active_pex",
                 "主动PEX请求",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "active_pex", 30)),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Normal)
@@ -1780,7 +2029,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(30)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "active_pex_initial_delay",
+                30,
+            ))),
             move || {
                 let a = a.clone();
                 async move {
@@ -1797,7 +2050,11 @@ async fn async_main(
         TaskMetadata::new(
             "http_tracker_cleanup",
             "HTTP Tracker过期peer清理",
-            std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+            std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "http_tracker_cleanup",
+                60,
+            )),
         )
         .with_category(TaskCategory::Monitor)
         .with_priority(TaskPriority::Background)
@@ -1824,7 +2081,7 @@ async fn async_main(
             TaskMetadata::new(
                 "relay_cleanup",
                 "中继过期连接清理",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "relay_cleanup", 30)),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1835,7 +2092,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "relay_cleanup_initial_delay",
+                60,
+            ))),
             move || {
                 let r = r.clone();
                 async move {
@@ -1853,7 +2114,11 @@ async fn async_main(
             TaskMetadata::new(
                 "udp_tracker_cleanup",
                 "UDP Tracker连接ID过期清理",
-                std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "udp_tracker_cleanup",
+                    60,
+                )),
             )
             .with_category(TaskCategory::Network)
             .with_priority(TaskPriority::Background)
@@ -1864,7 +2129,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(120)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "udp_tracker_cleanup_initial_delay",
+                120,
+            ))),
             move || {
                 let u = ut_clone.clone();
                 async move {
@@ -1883,7 +2152,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_bootstrap",
                 "爬虫Bootstrap",
-                std::time::Duration::from_secs(120), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_bootstrap",
+                    120,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
@@ -1894,7 +2167,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(120)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "crawler_bootstrap_initial_delay",
+                120,
+            ))),
             move || {
                 let c = c1.clone();
                 async move {
@@ -1910,7 +2187,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_keepalive",
                 "爬虫节点保活",
-                std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_keepalive",
+                    60,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
@@ -1921,7 +2202,11 @@ async fn async_main(
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "crawler_keepalive_initial_delay",
+                60,
+            ))),
             move || {
                 let c = c2.clone();
                 async move {
@@ -1937,7 +2222,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_active_crawl",
                 "爬虫主动爬行",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_active_crawl",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Important)
@@ -1963,7 +2252,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_get_peers",
                 "爬虫主动get_peers",
-                std::time::Duration::from_secs(10), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_get_peers",
+                    10,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Important)
@@ -1989,7 +2282,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_sample_infohashes",
                 "爬虫主动sample_infohashes",
-                std::time::Duration::from_secs(15), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_sample_infohashes",
+                    15,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
@@ -2000,7 +2297,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(30)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "crawler_sample_infohashes_initial_delay",
+                30,
+            ))),
             move || {
                 let c = c5.clone();
                 async move {
@@ -2016,7 +2317,7 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_scrape",
                 "爬虫主动scrape",
-                std::time::Duration::from_secs(60), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(intervals, "crawler_scrape", 60)),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
@@ -2027,7 +2328,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(60)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "crawler_scrape_initial_delay",
+                60,
+            ))),
             move || {
                 let c = c6.clone();
                 async move {
@@ -2043,7 +2348,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_cleanup_pending",
                 "爬虫清理超时请求",
-                std::time::Duration::from_secs(30), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_cleanup_pending",
+                    30,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Background)
@@ -2069,7 +2378,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_bucket_refresh",
                 "爬虫Bucket刷新",
-                std::time::Duration::from_secs(300), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_bucket_refresh",
+                    300,
+                )),
             )
             .with_category(TaskCategory::Crawl)
             .with_priority(TaskPriority::Normal)
@@ -2080,7 +2393,11 @@ async fn async_main(
                 network: ResourceLevel::Medium,
                 is_full_task: false,
             })
-            .with_initial_delay(std::time::Duration::from_secs(300)), // [ALLOWED-HARDCODED]
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "crawler_bucket_refresh_initial_delay",
+                300,
+            ))),
             move || {
                 let c = c8.clone();
                 async move {
@@ -2096,7 +2413,11 @@ async fn async_main(
             TaskMetadata::new(
                 "crawler_update_metrics",
                 "爬虫监控指标刷新",
-                std::time::Duration::from_secs(5), // [ALLOWED-HARDCODED]
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "crawler_update_metrics",
+                    5,
+                )),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
@@ -2527,7 +2848,7 @@ fn parse_config_path() -> Option<String> {
                 println!("  <work_dir>/pdc-agent/logs/               日志目录");
                 println!();
                 println!("默认配置:");
-                println!("  监听: 0.0.0.0:6880"); // [ALLOWED-HARDCODED]
+                println!("  监听: 0.0.0.0，默认端口 6880");
                 println!("  超级 Tracker: 启用");
                 println!("  发现器: tracker + dht + pex");
                 std::process::exit(0);

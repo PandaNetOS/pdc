@@ -53,13 +53,13 @@ impl Default for LpdConfig {
             .collect();
 
         Self {
-            listen_port: 6881, // [ALLOWED-HARDCODED]
+            listen_port: 6881,
             multicast_addr: LPD_MULTICAST_ADDR.parse().unwrap(),
             multicast_port: LPD_MULTICAST_PORT,
             cookie,
-            min_broadcast_interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
-            query_wait_time: Duration::from_secs(3),          // [ALLOWED-HARDCODED]
-            peer_ttl: Duration::from_secs(1800),              // [ALLOWED-HARDCODED]
+            min_broadcast_interval: Duration::from_secs(300),
+            query_wait_time: Duration::from_secs(3),
+            peer_ttl: Duration::from_secs(1800),
             enabled: true,
         }
     }
@@ -371,7 +371,7 @@ mod tests {
         let text = String::from_utf8_lossy(&msg);
         assert!(text.contains("BT-SEARCH"));
         assert!(text.contains("Infohash: 0101010101010101010101010101010101010101"));
-        assert!(text.contains("Port: 6881")); // [ALLOWED-HARDCODED]
+        assert!(text.contains("Port: 6881"));
         assert!(text.contains("cookie: testcookie"));
     }
 

@@ -292,7 +292,7 @@ mod tests {
     fn test_node_address_preferred() {
         let addr = NodeAddress {
             node_id: [0u8; 20],
-            ipv4_addr: Some("127.0.0.1:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
+            ipv4_addr: Some("127.0.0.1:6885".parse().unwrap()),
             ipv6_addr: None,
             reachability: Reachability::Mapped,
             last_seen: 0,
@@ -300,7 +300,7 @@ mod tests {
         };
         assert_eq!(
             addr.preferred_addr(),
-            Some("127.0.0.1:6885".parse().unwrap()) // [ALLOWED-HARDCODED]
+            Some("127.0.0.1:6885".parse().unwrap())
         );
     }
 
@@ -365,7 +365,7 @@ mod tests {
         assert!(identity.addresses_snapshot().is_empty());
         let addr = NodeAddress {
             node_id: identity.node_id.0,
-            ipv4_addr: Some("1.2.3.4:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
+            ipv4_addr: Some("1.2.3.4:6885".parse().unwrap()),
             ipv6_addr: None,
             reachability: Reachability::Mapped,
             last_seen: 100,

@@ -3,7 +3,9 @@
 //! 提供 Node Score、Peer Score、Tracker Score、Health Score 等综合评分能力。
 //! 【架构原则】评分系统是唯一维护评分的地方，所有 Repo 评分由 ScoreMaintainer 统一重算。
 
+pub mod adaptive_controller;
 pub mod availability;
+pub mod crawler_history;
 pub mod dht_activity;
 pub mod health_scorer;
 pub mod infohash_score;
@@ -19,7 +21,11 @@ pub mod tier_manager;
 pub mod tier_system;
 pub mod tracker_score;
 
+pub use adaptive_controller::{AdaptiveController, RunMode};
 pub use availability::{AvailabilityCalculator, AvailabilityMethod, AvailabilityResult};
+pub use crawler_history::{
+    CrawlerHistory, CrawlerRoundRecord, PredictionFeatures, ResponseRatePredictor,
+};
 pub use dht_activity::{ActivityEventType, DhtActivityTracker};
 pub use health_scorer::HealthScorerImpl;
 pub use infohash_score::{

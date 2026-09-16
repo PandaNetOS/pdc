@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
+/// 异常 IP 默认封禁时长
+const DEFAULT_BAN_DURATION: Duration = Duration::from_secs(60);
+/// 滑动窗口统计精度（1 秒）
+const WINDOW_PRECISION: Duration = Duration::from_secs(1);
+
 /// QPS 统计（滑动窗口，1 秒精度）
 #[derive(Debug, Clone, Default)]
 pub struct QpsStats {
@@ -85,8 +90,8 @@ impl RateLimiter {
             ip_states: Mutex::new(FxHashMap::default()),
             stats: Mutex::new(QpsStats::default()),
             sec_window: Mutex::new(VecDeque::new()),
-            ban_duration: Duration::from_secs(60), // 封禁 60 秒 // [ALLOWED-HARDCODED]
-            anomaly_threshold: 500,                // 1 秒 500 请求视为异常
+            ban_duration: DEFAULT_BAN_DURATION,
+            anomaly_threshold: 500, // 1 秒 500 请求视为异常
         }
     }
 
@@ -113,10 +118,7 @@ impl RateLimiter {
             // 清理超过 1 秒的记录
             while window
                 .front()
-                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(1))
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
+                .is_some_and(|(t, _)| now.duration_since(*t) > WINDOW_PRECISION)
             {
                 window.pop_front();
             }
@@ -147,10 +149,7 @@ impl RateLimiter {
         while state
             .recent_requests
             .front()
-            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1))
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
+            .is_some_and(|t| now.duration_since(*t) > WINDOW_PRECISION)
         {
             state.recent_requests.pop_front();
         }

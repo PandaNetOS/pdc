@@ -23,6 +23,11 @@ use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
+/// uTP 连接空闲超时（无数据则关闭）
+const UTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// uTP 连接清理截止时间（创建后超过此时长即回收）
+const UTP_CONN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 use crate::storage::PeerRepoImpl;
 use crate::types::Infohash;
 
@@ -519,10 +524,7 @@ impl UtpServer {
                     }
                 }
 
-                if conn.last_data_time.elapsed() > Duration::from_secs(60) {
-                    // [ALLOWED-HARDCODED]
-                    // [ALLOWED-HARDCODED]
-                    // [ALLOWED-HARDCODED]
+                if conn.last_data_time.elapsed() > UTP_IDLE_TIMEOUT {
                     should_close = true;
                 }
             } else {
@@ -710,7 +712,7 @@ impl UtpServer {
     /// 清理超时连接
     fn cleanup_timeout_connections(&self) {
         let mut conns = self.connections.write();
-        let timeout = Duration::from_secs(30); // [ALLOWED-HARDCODED]
+        let timeout = UTP_CONN_CLEANUP_TIMEOUT;
         let before = conns.len();
         conns.retain(|_, conn| conn.created_at.elapsed() < timeout);
         let removed = before - conns.len();

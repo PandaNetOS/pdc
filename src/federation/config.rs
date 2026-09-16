@@ -402,8 +402,8 @@ mod tests {
 enabled: true
 listen_port: 7000
 seed_nodes:
-  - "1.2.3.4:6885" # [ALLOWED-HARDCODED]
-  - "5.6.7.8:6885" # [ALLOWED-HARDCODED]
+  - "1.2.3.4:6885"
+  - "5.6.7.8:6885"
 max_connections: 64
 "#;
         let cfg: FederationConfig = serde_yaml::from_str(yaml).unwrap();
@@ -420,7 +420,7 @@ max_connections: 64
     fn test_config_serialize() {
         let cfg = FederationConfig::default();
         let yaml = serde_yaml::to_string(&cfg).unwrap();
-        assert!(yaml.contains("listen_port: 6885")); // [ALLOWED-HARDCODED]
+        assert!(yaml.contains("listen_port: 6885"));
         assert!(yaml.contains("enabled: true"));
     }
 }

@@ -50,6 +50,13 @@ use crate::federation::transport::UdpTransport;
 use crate::nat::NatManager;
 use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoImpl};
 
+/// iroh/QUIC 连接超时
+const IROH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 启动时 STUN 探测等待超时
+const STUN_PROBE_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// 关闭流程中等待消息发出的宽限时间
+const SHUTDOWN_MESSAGE_FLUSH_GRACE: Duration = Duration::from_millis(500);
+
 /// 联邦服务状态
 #[derive(Debug, Clone, Serialize)]
 pub struct FederationStatus {
@@ -357,7 +364,7 @@ impl FederationService {
                 data_dir: self.data_dir.join("iroh"),
                 derp_enabled: true,
                 derp_urls: Vec::new(),
-                connect_timeout: std::time::Duration::from_secs(10), // [ALLOWED-HARDCODED]
+                connect_timeout: IROH_CONNECT_TIMEOUT,
                 alpn: b"pdc-federation/1.0".to_vec(),
             })
         } else {
@@ -411,7 +418,7 @@ impl FederationService {
         let stun_handle = tokio::task::spawn_blocking(move || {
             nat_clone.stun_probe();
         });
-        let _ = tokio::time::timeout(Duration::from_secs(3), stun_handle).await; // [ALLOWED-HARDCODED]
+        let _ = tokio::time::timeout(STUN_PROBE_STARTUP_TIMEOUT, stun_handle).await;
 
         // 5. 设置 NAT 映射
         self.nat_integration.setup_mapping();
@@ -473,7 +480,7 @@ impl FederationService {
 
         // [ALLOWED-SLEEP] 关闭流程中一次性等待消息发出，非周期性
         // 3. 等待500ms让消息发出
-        tokio::time::sleep(Duration::from_millis(500)).await; // [ALLOWED-HARDCODED]
+        tokio::time::sleep(SHUTDOWN_MESSAGE_FLUSH_GRACE).await;
 
         // 4. 关闭所有 TCP 连接
         self.connection_manager.shutdown_all().await;
@@ -741,7 +748,7 @@ mod tests {
 
         service.clone().start().await.unwrap();
         // [ALLOWED-SLEEP] 测试代码中的一次性等待
-        tokio::time::sleep(Duration::from_millis(200)).await; // [ALLOWED-HARDCODED]
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let status = service.status();
         assert!(status.enabled);

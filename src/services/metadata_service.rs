@@ -25,6 +25,17 @@ use tracing::{debug, info};
 
 use crate::types::Infohash;
 
+/// metadata 下载 TCP 连接超时
+const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// metadata 下载读取超时
+const METADATA_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// metadata 缓存有效期（24 小时）
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(86400);
+/// metadata 下载块大小（16KB）
+const METADATA_PIECE_SIZE: usize = 16 * 1024;
+/// metadata 下载最大重试次数
+const METADATA_MAX_RETRIES: u32 = 2;
+
 /// Torrent metadata（info-dict 解析结果）
 #[derive(Debug, Clone)]
 pub struct TorrentMetadata {
@@ -103,11 +114,11 @@ impl MetadataService {
             cache: DashMap::new(),
             downloading: DashMap::new(),
             peer_id,
-            connect_timeout: Duration::from_secs(10), // [ALLOWED-HARDCODED]
-            read_timeout: Duration::from_secs(15),    // [ALLOWED-HARDCODED]
-            piece_size: 16 * 1024,                    // 16KB
-            _max_retries: 2,
-            cache_ttl: Duration::from_secs(86400), // 24小时 // [ALLOWED-HARDCODED]
+            connect_timeout: METADATA_CONNECT_TIMEOUT,
+            read_timeout: METADATA_READ_TIMEOUT,
+            piece_size: METADATA_PIECE_SIZE,
+            _max_retries: METADATA_MAX_RETRIES,
+            cache_ttl: METADATA_CACHE_TTL,
         }
     }
 
@@ -763,7 +774,7 @@ mod tests {
         info_dict.extend_from_slice(b"6:lengthi1048576ee");
 
         let infohash = [1u8; 20];
-        let peer = "127.0.0.1:6881".parse().unwrap(); // [ALLOWED-HARDCODED]
+        let peer = "127.0.0.1:6881".parse().unwrap();
 
         let meta = service.parse_info_dict(&info_dict, infohash, peer).unwrap();
         assert_eq!(meta.name, "test.bin");
@@ -788,7 +799,7 @@ mod tests {
         );
 
         let infohash = [2u8; 20];
-        let peer = "127.0.0.1:6881".parse().unwrap(); // [ALLOWED-HARDCODED]
+        let peer = "127.0.0.1:6881".parse().unwrap();
 
         // 多文件解析可能因 serde_bencode 嵌套处理问题而失败
         // 这里只测试解析不崩溃，具体值在单文件测试中验证

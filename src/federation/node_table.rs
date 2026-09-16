@@ -294,7 +294,7 @@ mod tests {
     fn make_node(id: u8, last_seen: u64) -> NodeAddress {
         NodeAddress {
             node_id: [id; 20],
-            ipv4_addr: Some(format!("127.0.0.{}:6885", id).parse().unwrap()), // [ALLOWED-HARDCODED]
+            ipv4_addr: Some(format!("127.0.0.{}:6885", id).parse().unwrap()),
             ipv6_addr: None,
             reachability: Reachability::Mapped,
             last_seen,
@@ -312,7 +312,7 @@ mod tests {
         let entry = table.get(&NodeId([1; 20])).unwrap();
         assert_eq!(
             entry.info.ipv4_addr,
-            Some("127.0.0.1:6885".parse().unwrap()) // [ALLOWED-HARDCODED]
+            Some("127.0.0.1:6885".parse().unwrap())
         );
         assert_eq!(table.len(), 1);
     }
@@ -421,7 +421,7 @@ mod tests {
         table.mark_connected(&NodeId([1; 20]), None);
 
         // timeout=0 表示所有未连接节点都视为过期
-        let removed = table.cleanup_expired(Duration::from_secs(0)); // [ALLOWED-HARDCODED]
+        let removed = table.cleanup_expired(Duration::from_secs(0));
         assert_eq!(removed, 1); // 节点2被清理
         assert!(table.get(&NodeId([1; 20])).is_some());
         assert!(table.get(&NodeId([2; 20])).is_none());

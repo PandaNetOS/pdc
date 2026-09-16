@@ -17,6 +17,9 @@ use parking_lot::RwLock;
 
 use crate::types::Infohash;
 
+/// 快照保留窗口（30 分钟）
+const SNAPSHOT_WINDOW: Duration = Duration::from_secs(1800);
+
 /// 单个时间点的快照
 #[derive(Debug, Clone)]
 struct Snapshot {
@@ -50,7 +53,7 @@ impl InfohashHistory {
             peer_count,
         });
         // 清理超过30分钟的旧快照
-        let cutoff = now - Duration::from_secs(1800); // [ALLOWED-HARDCODED]
+        let cutoff = now - SNAPSHOT_WINDOW;
         while snapshots.front().is_some_and(|s| s.timestamp < cutoff) {
             snapshots.pop_front();
         }

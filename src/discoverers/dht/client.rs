@@ -62,11 +62,11 @@ impl Default for DhtConfig {
                 .iter()
                 .map(|(host, port)| (host.to_string(), *port))
                 .collect(),
-            listen_port: 6881, // [ALLOWED-HARDCODED]
+            listen_port: 6881,
             node_id,
-            refresh_interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
-            node_ttl: Duration::from_secs(3600),        // [ALLOWED-HARDCODED]
-            request_timeout: Duration::from_secs(8),    // [ALLOWED-HARDCODED]
+            refresh_interval: Duration::from_secs(300),
+            node_ttl: Duration::from_secs(3600),
+            request_timeout: Duration::from_secs(8),
             max_concurrent_requests: 3,
             max_query_rounds: 5,
             enabled: true,

@@ -286,7 +286,7 @@ mod tests {
     fn test_peer_sync_payload_serde() {
         let payload = PeerSyncPayload {
             infohash: [1; 20],
-            addr: "127.0.0.1:6881".parse().unwrap(), // [ALLOWED-HARDCODED]
+            addr: "127.0.0.1:6881".parse().unwrap(),
             first_seen_secs: 1000,
             source: "dht".to_string(),
         };
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(decoded.infohash, [1; 20]);
         assert_eq!(
             decoded.addr,
-            "127.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap() // [ALLOWED-HARDCODED]
+            "127.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap()
         );
         assert_eq!(decoded.source, "dht");
     }
@@ -336,13 +336,13 @@ mod tests {
 
         let payload = PeerSyncPayload {
             infohash: [5; 20],
-            addr: "10.0.0.1:6881".parse().unwrap(), // [ALLOWED-HARDCODED]
+            addr: "10.0.0.1:6881".parse().unwrap(),
             first_seen_secs: 1000,
             source: "tracker".to_string(),
         };
         let ih_hex = "05".repeat(20);
         let entries = vec![SyncEntry {
-            key: format!("{}:10.0.0.1:6881", ih_hex).into_bytes(), // [ALLOWED-HARDCODED]
+            key: format!("{}:10.0.0.1:6881", ih_hex).into_bytes(),
             operation: operation::UPSERT,
             version: 1,
             payload: bincode::serialize(&payload).unwrap(),
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(
             peers[0].addr,
-            "10.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap() // [ALLOWED-HARDCODED]
+            "10.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap()
         );
     }
 }

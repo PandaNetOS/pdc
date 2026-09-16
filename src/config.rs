@@ -3,6 +3,7 @@
 //! 支持从 config.yaml 加载配置，也支持环境变量覆盖。
 //! 配置结构按模块组织：server、super_tracker、discoverers、cache、health_check、crawler。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -74,6 +75,9 @@ pub struct PdcConfig {
     /// Runtime 关闭超时（秒，默认 5）
     #[serde(default = "default_runtime_shutdown_timeout_secs")]
     pub runtime_shutdown_timeout_secs: u64,
+    /// 自适应控制器配置
+    #[serde(default)]
+    pub adaptive: AdaptiveConfig,
 }
 
 /// TaskScheduler 各分类并发度配置
@@ -91,6 +95,17 @@ pub struct TaskSchedulerConfig {
     /// 网络类并发度
     #[serde(default = "default_network_concurrency")]
     pub network_concurrency: u32,
+    /// 各任务调度间隔覆盖表。
+    ///
+    /// key 为 TaskScheduler.register 的任务名（如 `"crawler_tick"`），value 为间隔数值。
+    /// - 绝大多数任务：单位为秒（如 `crawler_active_crawl = 30`）。
+    /// - 亚秒级任务（gossip flush / propagation）：单位为毫秒
+    ///   （`fed_gossip_flush = 50`、`fed_gossip_propagation = 100`、`fed_merkle_flush = 1000`）。
+    /// - 此外可用 `<任务名>_initial_delay` / `<任务名>_jitter` 覆盖该任务的初始延迟与抖动。
+    ///
+    /// 未配置的任务一律使用代码内默认值，行为与未引入本配置前完全一致（向后兼容）。
+    #[serde(default)]
+    pub intervals: HashMap<String, u64>,
 }
 
 fn default_crawl_concurrency() -> u32 {
@@ -109,6 +124,18 @@ fn default_network_concurrency() -> u32 {
     4
 }
 
+/// 读取任务间隔数值。未在 `intervals` 中配置时返回 `default_value`，保持向后兼容。
+///
+/// 单位由调用方决定（见 [`TaskSchedulerConfig.intervals`] 文档：秒级任务用秒，
+/// 亚秒级任务用毫秒）。本函数只负责“配置覆盖或回退默认值”。
+pub fn get_interval_secs(
+    intervals: &HashMap<String, u64>,
+    task_name: &str,
+    default_value: u64,
+) -> u64 {
+    intervals.get(task_name).copied().unwrap_or(default_value)
+}
+
 impl Default for TaskSchedulerConfig {
     fn default() -> Self {
         Self {
@@ -116,6 +143,7 @@ impl Default for TaskSchedulerConfig {
             persistence_concurrency: default_persistence_concurrency(),
             monitor_concurrency: default_monitor_concurrency(),
             network_concurrency: default_network_concurrency(),
+            intervals: HashMap::new(),
         }
     }
 }
@@ -163,6 +191,9 @@ pub struct PersistenceConfig {
     /// 批量写入大小
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// WriteQueue 异步刷盘间隔（秒，攒批事务写入）
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
     /// 是否启用增量持久化（变更日志）
     #[serde(default = "default_false")]
     pub enable_incremental: bool,
@@ -192,6 +223,9 @@ fn default_wal_autocheckpoint() -> u32 {
 fn default_batch_size() -> usize {
     500
 }
+fn default_flush_interval_secs() -> u64 {
+    10
+}
 fn default_false() -> bool {
     false
 }
@@ -215,6 +249,7 @@ impl Default for PersistenceConfig {
             wal_checkpoint_interval_secs: default_checkpoint_interval(),
             wal_autocheckpoint_pages: default_wal_autocheckpoint(),
             batch_size: default_batch_size(),
+            flush_interval_secs: default_flush_interval_secs(),
             enable_incremental: default_false(),
             tier_check_interval_secs: default_tier_check_interval(),
             hot_threshold_secs: default_hot_threshold(),
@@ -332,6 +367,7 @@ impl Default for PdcConfig {
             tracker_runtime_threads: default_tracker_runtime_threads(),
             api_runtime_threads: default_api_runtime_threads(),
             runtime_shutdown_timeout_secs: default_runtime_shutdown_timeout_secs(),
+            adaptive: AdaptiveConfig::default(),
         }
     }
 }
@@ -734,6 +770,9 @@ pub struct CrawlerConfig {
     /// 消息处理并发上限（0=自动，按 CPU 核数/4 计算）
     #[serde(default = "default_max_concurrent_msg_handlers")]
     pub max_concurrent_msg_handlers: u32,
+    /// 每轮并发发送的 socket 数量（默认1，上限8）
+    #[serde(default = "default_concurrent_sockets")]
+    pub concurrent_sockets: usize,
 }
 
 /// NAT 穿透协议类型
@@ -905,6 +944,10 @@ fn default_max_concurrent_msg_handlers() -> u32 {
     0 // 0 = 自动（CPU 核数 / 4）
 }
 
+fn default_concurrent_sockets() -> usize {
+    1
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -926,6 +969,80 @@ impl Default for CrawlerConfig {
             warmup_node_count: default_warmup_node_count(),
             warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),
             max_concurrent_msg_handlers: default_max_concurrent_msg_handlers(),
+            concurrent_sockets: default_concurrent_sockets(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 自适应控制器配置（ICC 预测式自适应）
+// ---------------------------------------------------------------------------
+
+/// 自适应控制器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveConfig {
+    /// 是否启用自适应控制器
+    #[serde(default = "default_adaptive_enabled")]
+    pub enabled: bool,
+    /// 倍率下限
+    #[serde(default = "default_adaptive_min_multiplier")]
+    pub min_multiplier: f64,
+    /// 倍率上限
+    #[serde(default = "default_adaptive_max_multiplier")]
+    pub max_multiplier: f64,
+    /// 冷启动轮数（此阶段倍率固定为 1.0）
+    #[serde(default = "default_adaptive_warmup_rounds")]
+    pub warmup_rounds: u64,
+    /// 独立模式目标响应率
+    #[serde(default = "default_adaptive_target_rate_standalone")]
+    pub target_rate_standalone: f64,
+    /// 提升步长（预测达标时倍率乘数）
+    #[serde(default = "default_adaptive_rate_step_up")]
+    pub rate_step_up: f64,
+    /// 轻度下降步长（预测低于目标但高于 70% 目标时）
+    #[serde(default = "default_adaptive_rate_step_down_light")]
+    pub rate_step_down_light: f64,
+    /// 重度下降步长（预测低于 70% 目标时）
+    #[serde(default = "default_adaptive_rate_step_down_heavy")]
+    pub rate_step_down_heavy: f64,
+}
+
+fn default_adaptive_enabled() -> bool {
+    true
+}
+fn default_adaptive_min_multiplier() -> f64 {
+    0.2
+}
+fn default_adaptive_max_multiplier() -> f64 {
+    2.0
+}
+fn default_adaptive_warmup_rounds() -> u64 {
+    50
+}
+fn default_adaptive_target_rate_standalone() -> f64 {
+    0.30
+}
+fn default_adaptive_rate_step_up() -> f64 {
+    1.1
+}
+fn default_adaptive_rate_step_down_light() -> f64 {
+    0.8
+}
+fn default_adaptive_rate_step_down_heavy() -> f64 {
+    0.5
+}
+
+impl Default for AdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_adaptive_enabled(),
+            min_multiplier: default_adaptive_min_multiplier(),
+            max_multiplier: default_adaptive_max_multiplier(),
+            warmup_rounds: default_adaptive_warmup_rounds(),
+            target_rate_standalone: default_adaptive_target_rate_standalone(),
+            rate_step_up: default_adaptive_rate_step_up(),
+            rate_step_down_light: default_adaptive_rate_step_down_light(),
+            rate_step_down_heavy: default_adaptive_rate_step_down_heavy(),
         }
     }
 }
@@ -949,7 +1066,7 @@ mod tests {
     fn test_parse_yaml() {
         let yaml = r#"
 server:
-  port: 9090 # [ALLOWED-HARDCODED]
+  port: 9090
 super_tracker:
   interval: 3600
 discoverers:

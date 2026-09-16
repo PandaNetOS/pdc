@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_parse_query_params_basic() {
-        let params = parse_query_params("port=6881&uploaded=100&downloaded=0"); // [ALLOWED-HARDCODED]
+        let params = parse_query_params("port=6881&uploaded=100&downloaded=0");
         assert_eq!(params.get("port").unwrap()[0], "6881");
         assert_eq!(params.get("uploaded").unwrap()[0], "100");
         assert_eq!(params.get("downloaded").unwrap()[0], "0");
@@ -896,7 +896,7 @@ mod tests {
         let req = TrackerAnnounceRequest {
             info_hash: infohash,
             peer_id: [0u8; 20],
-            port: 6881, // [ALLOWED-HARDCODED]
+            port: 6881,
             uploaded: 0,
             downloaded: 0,
             left: 1000,
@@ -919,7 +919,7 @@ mod tests {
         let req2 = TrackerAnnounceRequest {
             info_hash: infohash,
             peer_id: [1u8; 20],
-            port: 6882, // [ALLOWED-HARDCODED]
+            port: 6882,
             uploaded: 0,
             downloaded: 0,
             left: 0, // 做种者

@@ -603,7 +603,7 @@ mod tests {
             session_id: 42,
             from_node: [1; 20],
             to_node: [2; 20],
-            from_addr: Some("1.2.3.4:6885".parse().unwrap()), // [ALLOWED-HARDCODED]
+            from_addr: Some("1.2.3.4:6885".parse().unwrap()),
             nat_type: Some("FullCone".to_string()),
             action: 0,
         };
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(decoded.session_id, 42);
         assert_eq!(decoded.from_node, [1; 20]);
         assert_eq!(decoded.action, 0);
-        assert_eq!(decoded.from_addr, Some("1.2.3.4:6885".parse().unwrap())); // [ALLOWED-HARDCODED]
+        assert_eq!(decoded.from_addr, Some("1.2.3.4:6885".parse().unwrap()));
     }
 
     #[test]
@@ -621,13 +621,13 @@ mod tests {
             repo_type: repo_type::NODE,
             entries: vec![
                 SyncEntry {
-                    key: b"127.0.0.1:6885".to_vec(), // [ALLOWED-HARDCODED]
+                    key: b"127.0.0.1:6885".to_vec(),
                     operation: operation::UPSERT,
                     version: 1,
                     payload: vec![1, 2, 3],
                 },
                 SyncEntry {
-                    key: b"10.0.0.1:6885".to_vec(), // [ALLOWED-HARDCODED]
+                    key: b"10.0.0.1:6885".to_vec(),
                     operation: operation::UPSERT,
                     version: 2,
                     payload: vec![4, 5, 6],
@@ -640,7 +640,7 @@ mod tests {
         let decoded: SyncBatchMessage = bincode::deserialize(payload).unwrap();
         assert_eq!(decoded.repo_type, 1);
         assert_eq!(decoded.entries.len(), 2);
-        assert_eq!(decoded.entries[0].key, b"127.0.0.1:6885"); // [ALLOWED-HARDCODED]
+        assert_eq!(decoded.entries[0].key, b"127.0.0.1:6885");
         assert_eq!(decoded.entries[1].version, 2);
     }
 

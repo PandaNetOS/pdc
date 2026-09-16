@@ -34,6 +34,15 @@ use crate::federation::sync::peer_sync::PeerSync;
 use crate::federation::sync::tracker_sync::TrackerSync;
 use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoImpl};
 
+/// 启动时全量重建 Merkle 树前的一次性延迟
+const MERKLE_REBUILD_STARTUP_DELAY: Duration = Duration::from_secs(5);
+/// 全量同步完成后恢复 Gossip 的一次性延迟
+const GOSSIP_RESUME_DELAY: Duration = Duration::from_secs(30);
+/// 全量同步发送流控间隔
+const FULL_SYNC_FLOW_CONTROL_INTERVAL: Duration = Duration::from_millis(10);
+/// 反熵对账前等待 Merkle 更新队列排空的上限
+const MERKLE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// 节点同步负载
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeSyncPayload {
@@ -212,7 +221,7 @@ impl SyncManager {
     pub fn spawn_merkle_rebuilder(self: Arc<Self>) {
         tokio::spawn(async move {
             // [ALLOWED-SLEEP] 启动时一次性延迟重建，非周期性
-            tokio::time::sleep(Duration::from_secs(5)).await; // [ALLOWED-HARDCODED]
+            tokio::time::sleep(MERKLE_REBUILD_STARTUP_DELAY).await;
             info!("[federation] 开始从 repo 全量重建 Merkle 树");
 
             let node_entries = self.collect_node_entries();
@@ -848,7 +857,7 @@ impl SyncManager {
             let gossip = self.gossip_engine.clone();
             tokio::spawn(async move {
                 // [ALLOWED-SLEEP] 全量完成后一次性延迟恢复 Gossip，非周期性
-                tokio::time::sleep(Duration::from_secs(30)).await; // [ALLOWED-HARDCODED]
+                tokio::time::sleep(GOSSIP_RESUME_DELAY).await;
                 gossip.set_receiving_full_sync(false);
                 info!("[federation] 所有差异全量完成，恢复 Gossip 转发");
             });
@@ -1127,7 +1136,7 @@ impl SyncManager {
             seq += 1;
             if seq.is_multiple_of(window as u64) {
                 // [ALLOWED-SLEEP] 全量同步发送流控，函数内限流等待，非周期性
-                tokio::time::sleep(Duration::from_millis(10)).await; // [ALLOWED-HARDCODED]
+                tokio::time::sleep(FULL_SYNC_FLOW_CONTROL_INTERVAL).await;
             }
         }
 
@@ -1296,7 +1305,7 @@ impl SyncManager {
                 // 这里不主动等待 Ack，由 TCP 层流控和窗口大小间接控制速率
                 if seq.is_multiple_of(window as u64) {
                     // [ALLOWED-SLEEP] 全量同步发送流控，函数内限流等待，非周期性
-                    tokio::time::sleep(Duration::from_millis(10)).await; // [ALLOWED-HARDCODED]
+                    tokio::time::sleep(FULL_SYNC_FLOW_CONTROL_INTERVAL).await;
                 }
             }
 
@@ -1566,7 +1575,7 @@ impl MerkleProvider for SyncManager {
         // 反熵对账前等待 Merkle 更新队列排空（最多 500ms），
         // 避免用尚未 flush 的旧 Merkle 值对账导致误判；超时未排空则直接用当前值对账。
         if !self.merkle_queue.is_empty() {
-            self.merkle_queue.wait_drain(Duration::from_millis(500)); // [ALLOWED-HARDCODED]
+            self.merkle_queue.wait_drain(MERKLE_DRAIN_TIMEOUT);
         }
         if let Some(merkle) = self.merkle_for_repo(repo_type) {
             merkle.digest(repo_type)
@@ -1618,14 +1627,14 @@ mod tests {
     fn test_node_sync_payload_roundtrip() {
         let payload = NodeSyncPayload {
             node_id: [0xab; 20],
-            addr: "127.0.0.1:6885".parse().unwrap(), // [ALLOWED-HARDCODED]
+            addr: "127.0.0.1:6885".parse().unwrap(),
         };
         let bytes = bincode::serialize(&payload).unwrap();
         let decoded: NodeSyncPayload = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.node_id, [0xab; 20]);
         assert_eq!(
             decoded.addr,
-            "127.0.0.1:6885".parse::<SocketAddr>().unwrap() // [ALLOWED-HARDCODED]
+            "127.0.0.1:6885".parse::<SocketAddr>().unwrap()
         );
     }
 
@@ -1668,10 +1677,10 @@ mod tests {
 
         let payload = NodeSyncPayload {
             node_id: [1; 20],
-            addr: "10.0.0.1:6885".parse().unwrap(), // [ALLOWED-HARDCODED]
+            addr: "10.0.0.1:6885".parse().unwrap(),
         };
         let entries = vec![SyncEntry {
-            key: b"10.0.0.1:6885".to_vec(), // [ALLOWED-HARDCODED]
+            key: b"10.0.0.1:6885".to_vec(),
             operation: operation::UPSERT,
             version: 100,
             payload: bincode::serialize(&payload).unwrap(),

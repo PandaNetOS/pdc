@@ -798,7 +798,7 @@ mod tests {
         let cache = discovery.peer_cache.read();
         assert_eq!(cache.nodes.len(), 1);
         assert_eq!(cache.nodes[0].success_count, 1);
-        assert_eq!(cache.nodes[0].addr, "127.0.0.1:6885"); // [ALLOWED-HARDCODED]
+        assert_eq!(cache.nodes[0].addr, "127.0.0.1:6885");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

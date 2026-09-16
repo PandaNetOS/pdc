@@ -256,7 +256,7 @@ mod tests {
 
         let infohash = [0u8; 20];
         let results = registry
-            .discover_all(&infohash, 10, 10, std::time::Duration::from_secs(5)) // [ALLOWED-HARDCODED]
+            .discover_all(&infohash, 10, 10, std::time::Duration::from_secs(5))
             .await;
         assert_eq!(results.len(), 2);
     }

@@ -22,6 +22,9 @@ use crate::data_plane::AppState;
 use crate::discoverers::tracker::PUBLIC_TRACKERS;
 use crate::types::{Infohash, PeerInfo};
 
+/// 默认 uTP 监听端口（用于状态上报）
+const DEFAULT_UTP_REPORT_PORT: u16 = 6883;
+
 // ---------------------------------------------------------------------------
 // 响应类型
 // ---------------------------------------------------------------------------
@@ -109,6 +112,11 @@ pub struct CrawlerMetrics {
     pub pending_shard_lens: Vec<usize>,
     pub udp_packet_loss_estimate: f64,
     pub node_select_avg_us: u64,
+    pub adaptive_multiplier: f64,
+    pub predicted_response_rate: Option<f64>,
+    pub model_update_count: u64,
+    pub history_len: usize,
+    pub concurrent_sockets_in_use: usize,
 }
 
 /// 任务调度器监控指标（C3 扩展）
@@ -444,6 +452,11 @@ async fn stats_handler(State(state): State<AppState>) -> Response {
                 pending_shard_lens: s.pending_shard_lens.clone(),
                 udp_packet_loss_estimate: s.udp_packet_loss_estimate,
                 node_select_avg_us: s.node_select_avg_us,
+                adaptive_multiplier: s.adaptive_multiplier,
+                predicted_response_rate: s.predicted_response_rate,
+                model_update_count: s.model_update_count,
+                history_len: s.history_len,
+                concurrent_sockets_in_use: s.concurrent_sockets_in_use,
             }
         }),
         // C3: 任务调度器指标（AppState 暂未注入 task_scheduler）
@@ -835,7 +848,7 @@ async fn utp_handler(State(state): State<AppState>) -> Response {
             let stats = server.stats();
             Json(serde_json::json!({
                 "enabled": true,
-                "port": 6883, // [ALLOWED-HARDCODED]
+                "port": DEFAULT_UTP_REPORT_PORT,
                 "syn_received": stats.syn_received,
                 "connections_established": stats.connections_established,
                 "handshakes_received": stats.handshakes_received,
@@ -850,7 +863,8 @@ async fn utp_handler(State(state): State<AppState>) -> Response {
             }))
             .into_response()
         }
-        None => Json(serde_json::json!({ "enabled": false, "port": 6883 })).into_response(), // [ALLOWED-HARDCODED]
+        None => Json(serde_json::json!({ "enabled": false, "port": DEFAULT_UTP_REPORT_PORT }))
+            .into_response(),
     }
 }
 

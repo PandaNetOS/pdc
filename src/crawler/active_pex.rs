@@ -19,6 +19,28 @@ use crate::types::Infohash;
 
 use super::pex_receiver::PexReceiver;
 
+/// BT 握手响应读取超时
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// PEX 消息分段读取超时
+const PEX_MSG_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// 单轮批量请求总超时（40 目标 × 15s/连接 ÷ 10 并发 = 60s）
+const BATCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单个连接子任务总超时（connect_timeout 5s + pex_wait 10s + 5s 余量）
+const PER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// fn new() 默认批量大小
+const DEFAULT_BATCH_SIZE: usize = 20;
+/// fn new() 默认轮询间隔
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+/// fn new() 默认连接超时
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// fn new() 默认 PEX 等待时间
+const DEFAULT_PEX_WAIT_TIME: Duration = Duration::from_secs(10);
+/// fn new() 默认最大并发连接数
+const DEFAULT_MAX_CONCURRENT: usize = 10;
+/// fn new() 默认连接间隔（毫秒）
+const DEFAULT_CONNECT_INTERVAL_MS: u64 = 100;
+
 /// 主动 PEX 请求器统计
 #[derive(Debug, Clone, Default)]
 pub struct ActivePexStats {
@@ -81,12 +103,12 @@ impl ActivePexRequester {
             node_id,
             stats: Arc::new(RwLock::new(ActivePexStats::default())),
             running: Arc::new(RwLock::new(false)),
-            batch_size: 20,
-            interval: Duration::from_secs(60), // [ALLOWED-HARDCODED]
-            connect_timeout: Duration::from_secs(5), // [ALLOWED-HARDCODED]
-            pex_wait_time: Duration::from_secs(10), // [ALLOWED-HARDCODED]
-            max_concurrent: 10,
-            connect_interval_ms: 100,
+            batch_size: DEFAULT_BATCH_SIZE,
+            interval: DEFAULT_INTERVAL,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            pex_wait_time: DEFAULT_PEX_WAIT_TIME,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            connect_interval_ms: DEFAULT_CONNECT_INTERVAL_MS,
             pause_gate: None,
         }
     }
@@ -160,28 +182,47 @@ impl ActivePexRequester {
         {
             return;
         }
-        if let Err(e) = self.run_batch().await {
-            warn!("[Active-PEX] 批量请求错误: {}", e);
-            let mut stats = self.stats.write();
-            stats.errors += 1;
+        // P0-1: 总超时保护，防止 run_batch 卡死导致调度器线程被占满
+        match timeout(BATCH_TOTAL_TIMEOUT, self.run_batch()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!("[Active-PEX] 批量请求错误: {}", e);
+                let mut stats = self.stats.write();
+                stats.errors += 1;
+            }
+            Err(_) => {
+                // 总超时：视为正常结束，不计入 errors，仅记录 warn + timeouts
+                warn!(
+                    "[Active-PEX] 批量请求总超时（{}s），强制结束本轮",
+                    BATCH_TOTAL_TIMEOUT.as_secs()
+                );
+                let mut stats = self.stats.write();
+                stats.timeouts += 1;
+            }
         }
     }
 
     /// 运行一轮批量请求
     async fn run_batch(&self) -> anyhow::Result<()> {
-        // 从 PeerRepo 获取所有 peer，按评分排序取 top
-        let mut all_peers = self.peer_repo.all_peers_sync();
+        // P0-2: all_peers_sync() 是同步阻塞操作（SQLite + 内存全量读取），
+        // 放入 spawn_blocking 避免阻塞 tokio runtime 线程
+        let peer_repo = self.peer_repo.clone();
+        let all_peers = tokio::task::spawn_blocking(move || {
+            let mut peers = peer_repo.all_peers_sync();
+            // 按评分降序排序
+            peers.sort_by(|a, b| {
+                b.priority_score
+                    .partial_cmp(&a.priority_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            peers
+        })
+        .await?;
+
         if all_peers.is_empty() {
             debug!("[Active-PEX] PeerRepo 中没有可用的 peer");
             return Ok(());
         }
-
-        // 按评分降序排序
-        all_peers.sort_by(|a, b| {
-            b.priority_score
-                .partial_cmp(&a.priority_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         // 支持 IPv4 + IPv6，取前 batch_size * 2 个
         let targets: Vec<(SocketAddr, Infohash)> = all_peers
@@ -222,25 +263,40 @@ impl ActivePexRequester {
                     tokio::time::sleep(Duration::from_millis(interval_ms)).await;
                 }
 
-                // 获取信号量许可
+                // 获取信号量许可（RAII，任务结束自动释放）
                 let _permit = match sem.acquire().await {
                     Ok(p) => p,
                     Err(_) => return,
                 };
 
-                if let Err(e) = connect_and_request_pex(
-                    addr,
-                    infohash,
-                    node_id,
-                    peer_repo,
-                    pex_receiver,
-                    connect_timeout,
-                    pex_wait_time,
-                    stats,
+                // P1-1: 单个连接总超时保护（20s = connect 5s + pex_wait 10s + 5s 余量）
+                // 超时从获取 permit 后开始计算，interval_ms 的 sleep 不计入
+                match timeout(
+                    PER_CONNECT_TIMEOUT,
+                    connect_and_request_pex(
+                        addr,
+                        infohash,
+                        node_id,
+                        peer_repo,
+                        pex_receiver,
+                        connect_timeout,
+                        pex_wait_time,
+                        stats,
+                    ),
                 )
                 .await
                 {
-                    debug!("[Active-PEX] 连接 {} 失败: {}", addr, e);
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        debug!("[Active-PEX] 连接 {} 失败: {}", addr, e);
+                    }
+                    Err(_) => {
+                        debug!(
+                            "[Active-PEX] 连接 {} 总超时（{}s）",
+                            addr,
+                            PER_CONNECT_TIMEOUT.as_secs()
+                        );
+                    }
                 }
             }));
         }
@@ -320,10 +376,7 @@ async fn connect_and_request_pex(
 
     // 3. 读取 BT 握手响应
     let mut resp_buf = [0u8; 68];
-    match timeout(Duration::from_secs(5), stream.read_exact(&mut resp_buf)).await {
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
+    match timeout(HANDSHAKE_READ_TIMEOUT, stream.read_exact(&mut resp_buf)).await {
         Ok(_) => {}
         Err(_) => {
             {
@@ -365,10 +418,7 @@ async fn connect_and_request_pex(
     while Instant::now() < deadline {
         // 读取消息长度
         let mut len_buf = [0u8; 4];
-        match timeout(Duration::from_secs(2), stream.read_exact(&mut len_buf)).await {
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
+        match timeout(PEX_MSG_READ_TIMEOUT, stream.read_exact(&mut len_buf)).await {
             Ok(_) => {}
             Err(_) => break,
         }
@@ -382,10 +432,7 @@ async fn connect_and_request_pex(
 
         // 读取消息内容
         let mut msg_buf = vec![0u8; msg_len];
-        match timeout(Duration::from_secs(2), stream.read_exact(&mut msg_buf)).await {
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
-            // [ALLOWED-HARDCODED]
+        match timeout(PEX_MSG_READ_TIMEOUT, stream.read_exact(&mut msg_buf)).await {
             Ok(_) => {}
             Err(_) => break,
         }

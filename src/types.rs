@@ -11,6 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+/// Peer 空闲过期时间（24 小时无活跃视为过期）
+const PEER_IDLE_EXPIRY: Duration = Duration::from_secs(86400);
+
 // ---------------------------------------------------------------------------
 // Peer 基础类型
 // ---------------------------------------------------------------------------
@@ -63,7 +66,7 @@ impl PeerInfo {
     pub fn is_expired(&self) -> bool {
         self.last_active
             .elapsed()
-            .map(|e| e > Duration::from_secs(86400)) // [ALLOWED-HARDCODED]
+            .map(|e| e > PEER_IDLE_EXPIRY)
             .unwrap_or(false)
     }
 }

@@ -19,6 +19,9 @@ use crate::storage::repo_traits::TrackerRepository;
 use crate::traits::{AnnounceEvent, DiscovererStats, DiscovererType, PeerDiscoverer};
 use crate::types::{Infohash, PeerInfo, PeerSource};
 
+/// 远程 Tracker 列表拉取的 HTTP 超时
+const REMOTE_TRACKER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 use super::udp::UdpTrackerClient;
 
 /// Tracker 配置
@@ -70,11 +73,11 @@ impl Default for TrackerConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            timeout: Duration::from_secs(15), // [ALLOWED-HARDCODED]
+            timeout: Duration::from_secs(15),
             max_concurrent_requests: 10,
             max_consecutive_failures: 3,
-            cooldown_duration: Duration::from_secs(300), // [ALLOWED-HARDCODED]
-            listen_port: 6881,                           // [ALLOWED-HARDCODED]
+            cooldown_duration: Duration::from_secs(300),
+            listen_port: 6881,
             uploaded: 0,
             downloaded: 0,
             left: 0,
@@ -197,7 +200,7 @@ impl TrackerDiscoverer {
     /// 从远程 URL 拉取 Tracker 列表
     pub async fn fetch_remote_trackers(url: &str) -> anyhow::Result<Vec<String>> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30)) // [ALLOWED-HARDCODED]
+            .timeout(REMOTE_TRACKER_FETCH_TIMEOUT)
             .user_agent("PDC-TrackerFetcher/1.0")
             .build()?;
         let resp = client.get(url).send().await?;
@@ -793,7 +796,7 @@ mod tests {
         let data = [127, 0, 0, 1, 0x1A, 0xE1];
         let peers = TrackerDiscoverer::parse_compact_peers(&data);
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].to_string(), "127.0.0.1:6881"); // [ALLOWED-HARDCODED]
+        assert_eq!(peers[0].to_string(), "127.0.0.1:6881");
     }
 
     #[test]

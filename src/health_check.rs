@@ -86,9 +86,9 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
-            cache_cleanup_interval: Duration::from_secs(600), // [ALLOWED-HARDCODED]
-            stats_output_interval: Duration::from_secs(300), // [ALLOWED-HARDCODED]
+            interval: Duration::from_secs(300),
+            cache_cleanup_interval: Duration::from_secs(600),
+            stats_output_interval: Duration::from_secs(300),
         }
     }
 }
@@ -320,6 +320,6 @@ mod tests {
         let storage = Arc::new(crate::storage::Storage::memory().unwrap());
         let cache = Arc::new(PeerRepoImpl::new(storage));
         let task = HealthCheckTask::with_default_config(registry, cache, None, None, None);
-        assert_eq!(task._config.interval, Duration::from_secs(300)); // [ALLOWED-HARDCODED]
+        assert_eq!(task._config.interval, Duration::from_secs(300));
     }
 }

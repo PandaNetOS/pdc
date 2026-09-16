@@ -17,6 +17,11 @@ use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::{NodeId, NodeIdentity};
 use crate::federation::protocol::*;
 
+/// 中继限流滑动窗口长度（1 秒）
+const RELAY_RATE_WINDOW: Duration = Duration::from_secs(1);
+/// 中继连接空闲超时（超过即清理）
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 中继动作
 pub mod relay_action {
     pub const REQUEST: u8 = 0;
@@ -93,10 +98,7 @@ impl BandwidthTracker {
         // 全局窗口检查
         {
             let mut window_start = self.window_start.write();
-            if now.duration_since(*window_start) >= Duration::from_secs(1) {
-                // [ALLOWED-HARDCODED]
-                // [ALLOWED-HARDCODED]
-                // [ALLOWED-HARDCODED]
+            if now.duration_since(*window_start) >= RELAY_RATE_WINDOW {
                 *window_start = now;
                 self.total_bytes.store(0, Ordering::Relaxed);
             }
@@ -111,10 +113,7 @@ impl BandwidthTracker {
         {
             let mut conn_window = self.per_conn_window.write();
             let conn_start = conn_window.entry(channel_id).or_insert(now);
-            if now.duration_since(*conn_start) >= Duration::from_secs(1) {
-                // [ALLOWED-HARDCODED]
-                // [ALLOWED-HARDCODED]
-                // [ALLOWED-HARDCODED]
+            if now.duration_since(*conn_start) >= RELAY_RATE_WINDOW {
                 *conn_start = now;
                 self.per_conn_bytes.write().insert(channel_id, 0);
             }
@@ -445,7 +444,7 @@ impl RelayManager {
             let channels = self.channels.read();
             channels
                 .iter()
-                .filter(|(_, c)| c.idle_duration() > Duration::from_secs(120)) // [ALLOWED-HARDCODED]
+                .filter(|(_, c)| c.idle_duration() > RELAY_IDLE_TIMEOUT)
                 .map(|(id, _)| *id)
                 .collect()
         };

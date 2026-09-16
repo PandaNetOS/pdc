@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn test_classify_hot() {
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(100); // [ALLOWED-HARDCODED]
+        let last_active = Instant::now() - Duration::from_secs(100);
         let tier = system.classify_node(last_active, 50.0, 10);
         assert_eq!(tier, DataTier::Hot);
     }
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_classify_warm() {
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(3600); // [ALLOWED-HARDCODED]
+        let last_active = Instant::now() - Duration::from_secs(3600);
         let tier = system.classify_node(last_active, 50.0, 10);
         assert_eq!(tier, DataTier::Warm);
     }
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn test_classify_cold() {
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(10000); // [ALLOWED-HARDCODED]
+        let last_active = Instant::now() - Duration::from_secs(10000);
         let tier = system.classify_node(last_active, 50.0, 10);
         assert_eq!(tier, DataTier::Cold);
     }
@@ -237,7 +237,7 @@ mod tests {
     fn test_high_score_floor() {
         // 高评分节点即使冷也至少温
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(10000); // [ALLOWED-HARDCODED]
+        let last_active = Instant::now() - Duration::from_secs(10000);
         let tier = system.classify_node(last_active, 85.0, 10);
         assert_eq!(tier, DataTier::Warm);
     }
@@ -246,7 +246,7 @@ mod tests {
     fn test_low_score_accelerated_demotion() {
         // 低评分节点热阈值缩短
         let system = TierSystem::new(test_config());
-        let last_active = Instant::now() - Duration::from_secs(800); // 正常是热(1800)，低评分缩短为600 // [ALLOWED-HARDCODED]
+        let last_active = Instant::now() - Duration::from_secs(800); // 正常是热(1800)，低评分缩短为600
         let tier = system.classify_node(last_active, 20.0, 10);
         assert_eq!(tier, DataTier::Warm);
     }
@@ -257,11 +257,8 @@ mod tests {
         // 热数据需要持久化
         assert!(system.should_persist(Instant::now(), 50.0, 10));
         // 冷数据不需要持久化
-        assert!(!system.should_persist(Instant::now() - Duration::from_secs(10000), 50.0, 10)); // [ALLOWED-HARDCODED]
-                                                                                                // 高评分冷数据（温）需要持久化
+        assert!(!system.should_persist(Instant::now() - Duration::from_secs(10000), 50.0, 10));
+        // 高评分冷数据（温）需要持久化
         assert!(system.should_persist(Instant::now() - Duration::from_secs(10000), 85.0, 10));
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
-        // [ALLOWED-HARDCODED]
     }
 }
