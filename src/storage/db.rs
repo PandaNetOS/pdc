@@ -127,10 +127,21 @@ impl Storage {
     }
 
     /// 手动执行 WAL checkpoint（将 WAL 合并到主数据库文件）
+    /// PASSIVE 模式：不阻塞写入，日常高频使用
     pub fn checkpoint(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        debug!("[storage] WAL checkpoint 已执行");
+        debug!("[storage] WAL checkpoint(PASSIVE) 已执行");
+        Ok(())
+    }
+
+    /// 执行 WAL checkpoint 并截断 WAL 文件
+    /// TRUNCATE 模式：会阻塞写入，但会将 WAL 文件压缩到最小
+    /// 建议低频调用（如每小时一次），避免 IO 尖峰
+    pub fn checkpoint_truncate(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        info!("[storage] WAL checkpoint(TRUNCATE) 已执行，WAL 已压缩");
         Ok(())
     }
 

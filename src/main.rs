@@ -974,6 +974,89 @@ async fn async_main(
         );
     }
 
+    // 8.5.2b2 WAL checkpoint 高频任务（每100ms，Persistence，PASSIVE模式不阻塞写入）
+    {
+        let storage_clone = storage.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "wal_checkpoint_steady",
+                "WAL checkpoint 高频稳态",
+                std::time::Duration::from_millis(get_interval_secs(
+                    intervals,
+                    "wal_checkpoint_interval_ms",
+                    100,
+                )),
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Medium,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "wal_checkpoint_steady_initial_delay",
+                5,
+            ))),
+            move || {
+                let storage = storage_clone.clone();
+                async move {
+                    // PASSIVE checkpoint 不阻塞写入，高频执行保持 WAL 小巧
+                    match storage.checkpoint() {
+                        Ok(_) => info!("[persistence] WAL checkpoint(PASSIVE) 执行成功"),
+                        Err(e) => warn!("[persistence] WAL checkpoint 失败: {}", e),
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.5.2b3 WAL TRUNCATE 压缩（每小时一次，Persistence，会短暂阻塞写入但压缩 WAL）
+    {
+        let storage_clone = storage.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "wal_checkpoint_hourly_truncate",
+                "WAL TRUNCATE 每小时压缩",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "wal_checkpoint_truncate_interval_secs",
+                    3600,
+                )),
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::High,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "wal_checkpoint_truncate_initial_delay",
+                60,
+            ))),
+            move || {
+                let storage = storage_clone.clone();
+                async move {
+                    // TRUNCATE 模式会短暂阻塞写入，但会将 WAL 文件压缩到最小
+                    // 每小时执行一次，平衡 IO 平滑与磁盘/内存占用
+                    match storage.checkpoint_truncate() {
+                        Ok(_) => info!("[persistence] WAL checkpoint(TRUNCATE) 每小时压缩完成"),
+                        Err(e) => warn!("[persistence] WAL TRUNCATE 失败: {}", e),
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
     // 8.5.2c IOScheduler 背压轮询（仅启用时注册）
     if let Some(ref sched) = io_scheduler {
         let sched_clone = sched.clone();

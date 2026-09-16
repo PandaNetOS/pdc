@@ -373,6 +373,7 @@ impl CrawlerEngine {
         }
         // socket 数量对齐
         let n = self.sockets.len().max(1);
+
         state.socket_send_pps.resize(n, 0);
         state.socket_recv_pps.resize(n, 0);
 
