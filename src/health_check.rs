@@ -19,6 +19,7 @@ use crate::intelligence::{HealthScorer, HealthScorerImpl};
 use crate::storage::repo_traits::{
     InfohashRepository, NodeRepository, PeerRepository, TrackerRepository,
 };
+use crate::storage::write_queue::WriteQueue;
 use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoImpl};
 
 /// 系统健康状态
@@ -105,6 +106,7 @@ pub struct HealthCheckTask {
     health_scorer: HealthScorerImpl,
     /// 全量同步暂停门：为 true 时跳过健康检查/缓存清理/统计输出
     pause_gate: Option<Arc<AtomicBool>>,
+    write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl HealthCheckTask {
@@ -128,6 +130,7 @@ impl HealthCheckTask {
             storage,
             health_scorer: HealthScorerImpl::new(),
             pause_gate: None,
+            write_queue: None,
         }
     }
 
@@ -153,6 +156,12 @@ impl HealthCheckTask {
     /// 设置全量同步暂停门（为 true 时暂停健康检查工作）
     pub fn with_pause_gate(mut self, gate: Option<Arc<AtomicBool>>) -> Self {
         self.pause_gate = gate;
+        self
+    }
+
+    /// 注入写入队列（builder 模式）
+    pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
+        self.write_queue = Some(wq);
         self
     }
 
@@ -295,8 +304,32 @@ impl HealthCheckTask {
             health.peer_layer_score
         );
 
-        // 记录统计快照到 SQLite
-        if let Some(storage) = &self.storage {
+        // 记录统计快照到 SQLite（通过 WriteQueue/IOScheduler 或直接写入）
+        if self.write_queue.is_some() {
+            let wq = self.write_queue.clone().unwrap();
+            let pairs: Vec<(&str, f64)> = vec![
+                ("total_requests", total_requests as f64),
+                ("success_requests", success_requests as f64),
+                ("failed_requests", failed_requests as f64),
+                ("success_rate", success_rate),
+                ("total_peers_discovered", total_peers as f64),
+                ("cached_peers", self.cache.len() as f64),
+                ("health_score", health.overall_score),
+            ];
+            for (metric, value) in pairs {
+                wq.send(move |conn| {
+                    crate::storage::db::Storage::record_stats_in_tx(conn, metric, value)
+                });
+            }
+            wq.send(move |conn| {
+                crate::storage::db::Storage::update_aggregate_in_tx(
+                    conn,
+                    "total_requests_ever",
+                    total_requests as f64,
+                )
+            });
+            debug!("[health_check] 统计快照已入队 WriteQueue");
+        } else if let Some(storage) = &self.storage {
             let _ = storage.record_stats("total_requests", total_requests as f64);
             let _ = storage.record_stats("success_requests", success_requests as f64);
             let _ = storage.record_stats("failed_requests", failed_requests as f64);

@@ -441,7 +441,7 @@ impl PeerRepoImpl {
     /// 鍏ㄩ噺淇濆瓨鍒?SQLite
     /// 娉ㄦ剰锛氬喎鐑垽瀹氱粺涓€鐢?intelligence 灞傜殑 TierSystem 璐熻矗锛岃繖閲屽叏閲忎繚瀛樻墍鏈?peer
     pub async fn save_all(&self) -> anyhow::Result<()> {
-        // 鐢ㄥ唴閮ㄤ綔鐢ㄥ煙纭繚 cache 閿佸湪 spawn_blocking 涔嬪墠閲婃斁
+        // 用内部作用域确保 cache 锁在 spawn_blocking 之前释放
         let batch = {
             let cache = self.cache.read();
             let mut batch = Vec::with_capacity(cache.global.len());
@@ -468,9 +468,21 @@ impl PeerRepoImpl {
             }
             batch
         };
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || storage.save_peers_batch(&batch)).await??;
-        Ok(())
+        if batch.is_empty() {
+            return Ok(());
+        }
+        if let Some(wq) = &self.write_queue {
+            // 异步模式：非阻塞入队 WriteQueue/IOScheduler
+            let count = batch.len();
+            wq.send(move |conn| Storage::save_peers_batch_in_tx(conn, &batch));
+            tracing::debug!("[peer_repo] 异步入队保存 {} 个 peer", count);
+            Ok(())
+        } else {
+            // 同步模式：保留原 spawn_blocking 逻辑
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || storage.save_peers_batch(&batch)).await??;
+            Ok(())
+        }
     }
 
     /// 浠?SQLite 鍔犺浇鍏ㄩ儴 peer锛堣繍琛屾椂娲昏穬 peer锛?
@@ -618,14 +630,18 @@ impl PeerRepository for PeerRepoImpl {
             score: peer.priority_score,
             discovered_at: now,
         });
-        // 缂撳啿鍖烘弧 100 鏉℃椂鑷姩 flush
+        // 缓冲区满 100 条时自动 flush
         if buffer.len() >= 100 {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            let storage = self.storage.clone();
-            tokio::spawn(async move {
-                let _ = storage.save_peer_history_batch(&batch);
-            });
+            if let Some(ref wq) = self.write_queue {
+                wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
+            } else {
+                let storage = self.storage.clone();
+                tokio::spawn(async move {
+                    let _ = storage.save_peer_history_batch(&batch);
+                });
+            }
         }
     }
 

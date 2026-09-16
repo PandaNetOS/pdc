@@ -129,8 +129,15 @@ impl Storage {
     /// 手动执行 WAL checkpoint（将 WAL 合并到主数据库文件）
     pub fn checkpoint(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         debug!("[storage] WAL checkpoint 已执行");
+        Ok(())
+    }
+
+    /// 在已有连接上执行 WAL checkpoint（供 IOScheduler 回调使用）
+    /// 使用 PASSIVE 模式，不阻塞、不全量写回，避免 IO 尖峰
+    pub fn checkpoint_in_tx(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
 
@@ -479,7 +486,45 @@ impl Storage {
         Ok(())
     }
 
-    /// 加载所有 tracker
+    /// 在已有连接上批量保存 trackers（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn save_trackers_batch_in_tx(
+        conn: &Connection,
+        trackers: &[TrackerRow],
+    ) -> anyhow::Result<()> {
+        if trackers.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut stmt = conn.prepare(
+            r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
+                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+               ON CONFLICT(url) DO UPDATE SET
+                score=excluded.score, total_requests=excluded.total_requests,
+                success_requests=excluded.success_requests,
+                failed_requests=excluded.failed_requests,
+                total_peers_discovered=excluded.total_peers_discovered,
+                total_response_time_ms=excluded.total_response_time_ms,
+                consecutive_failures=excluded.consecutive_failures,
+                disabled=excluded.disabled, last_used=excluded.last_used"#,
+        )?;
+        for t in trackers {
+            stmt.execute(params![
+                t.url.as_str(),
+                t.score,
+                t.total_requests as i64,
+                t.success_requests as i64,
+                t.failed_requests as i64,
+                t.total_peers_discovered as i64,
+                t.total_response_time_ms,
+                t.consecutive_failures as i64,
+                t.disabled as i64,
+                now,
+            ])?;
+        }
+        Ok(())
+    }
+
     pub fn load_trackers(&self) -> anyhow::Result<Vec<TrackerRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled FROM trackers")?;
@@ -533,6 +578,34 @@ impl Storage {
         Ok(())
     }
 
+    /// 在已有连接上批量保存 infohash（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn save_infohashes_batch_in_tx(
+        conn: &Connection,
+        entries: &[InfohashRow],
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut stmt = conn.prepare(
+            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score)
+               VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+               ON CONFLICT(infohash) DO UPDATE SET
+                ref_count=excluded.ref_count, last_seen=excluded.last_seen, score=excluded.score"#,
+        )?;
+        for entry in entries {
+            stmt.execute(params![
+                entry.infohash.as_slice(),
+                entry.ref_count as i64,
+                entry.first_source.as_str(),
+                now,
+                entry.score,
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// 批量保存 infohash（在已有连接上执行，供 IOScheduler 回调）
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
         let conn = self.conn.lock().unwrap();
@@ -564,6 +637,19 @@ impl Storage {
         Ok(())
     }
 
+    /// 在已有连接上更新单个 infohash 评分（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn update_infohash_score_in_tx(
+        conn: &Connection,
+        infohash: &[u8; 20],
+        score: f64,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "UPDATE infohashes SET score = ?1 WHERE infohash = ?2",
+            params![score, infohash.as_slice()],
+        )?;
+        Ok(())
+    }
+
     /// 批量更新 infohash 评分（一次事务）
     pub fn update_infohash_scores_batch(&self, scores: &[([u8; 20], f64)]) -> anyhow::Result<()> {
         if scores.is_empty() {
@@ -578,6 +664,21 @@ impl Storage {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// 在已有连接上批量更新 infohash 评分（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn update_infohash_scores_batch_in_tx(
+        conn: &Connection,
+        scores: &[([u8; 20], f64)],
+    ) -> anyhow::Result<()> {
+        if scores.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare("UPDATE infohashes SET score = ?1 WHERE infohash = ?2")?;
+        for (infohash, score) in scores {
+            stmt.execute(params![score, infohash.as_slice()])?;
+        }
         Ok(())
     }
 
@@ -687,6 +788,35 @@ impl Storage {
         Ok(())
     }
 
+    /// 在已有连接上批量保存 peers（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn save_peers_batch_in_tx(conn: &Connection, peers: &[PeerRow]) -> anyhow::Result<()> {
+        if peers.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare(
+            r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               ON CONFLICT(infohash, ip, port) DO UPDATE SET
+                source=excluded.source, score=excluded.score,
+                connection_attempts=excluded.connection_attempts,
+                connection_successes=excluded.connection_successes,
+                last_active=excluded.last_active"#,
+        )?;
+        for peer in peers {
+            stmt.execute(params![
+                peer.infohash.as_slice(),
+                peer.ip.as_str(),
+                peer.port as i64,
+                peer.source.as_str(),
+                peer.score,
+                peer.connection_attempts as i64,
+                peer.connection_successes as i64,
+                peer.last_active,
+            ])?;
+        }
+        Ok(())
+    }
+
     /// 归档冷数据：将超过指定时间无活跃的 peer 从主表迁移到归档表
     /// 返回归档的 peer 数量
     pub fn archive_cold_peers(&self, older_than_secs: i64) -> anyhow::Result<usize> {
@@ -721,6 +851,26 @@ impl Storage {
         tx.commit()?;
 
         Ok(count as usize)
+    }
+
+    /// 在已有连接上归档冷 peer（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    /// `older_than_secs` 为时间阈值（秒），last_active 早于 now - older_than_secs 的 peer 迁移到归档表
+    pub fn archive_cold_peers_in_tx(conn: &Connection, older_than_secs: i64) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let threshold = now - older_than_secs;
+        // 插入到归档表
+        conn.execute(
+            "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, archived_at)
+             SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, ?1
+             FROM peers WHERE last_active < ?2",
+            params![now, threshold],
+        )?;
+        // 从主表删除
+        conn.execute(
+            "DELETE FROM peers WHERE last_active < ?1",
+            params![threshold],
+        )?;
+        Ok(())
     }
 
     // ---- Peer History ----
@@ -829,6 +979,16 @@ impl Storage {
         Ok(())
     }
 
+    /// 在已有连接上记录统计快照（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn record_stats_in_tx(conn: &Connection, metric: &str, value: f64) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO stats_history (timestamp, metric, value) VALUES (?1, ?2, ?3)",
+            params![now, metric, value],
+        )?;
+        Ok(())
+    }
+
     /// 查询统计历史
     pub fn query_stats_history(&self, metric: &str, hours: u64) -> anyhow::Result<Vec<(i64, f64)>> {
         let conn = self.conn.lock().unwrap();
@@ -846,6 +1006,21 @@ impl Storage {
     pub fn update_aggregate(&self, metric: &str, value: f64) -> anyhow::Result<()> {
         self.record_write("stats", 1);
         let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO stats_aggregate (metric, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(metric) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![metric, value, now],
+        )?;
+        Ok(())
+    }
+
+    /// 在已有连接上更新累计统计（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
+    pub fn update_aggregate_in_tx(
+        conn: &Connection,
+        metric: &str,
+        value: f64,
+    ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO stats_aggregate (metric, value, updated_at) VALUES (?1, ?2, ?3)

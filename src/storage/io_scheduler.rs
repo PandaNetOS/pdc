@@ -115,11 +115,13 @@ impl PartialOrd for HeapEntry {
 ///
 /// 使用 AtomicUsize 的 compare_exchange 实现无锁获取。
 /// 补充在 writer_loop 内根据时间差计算，不单独 spawn interval task。
+#[allow(dead_code)]
 pub(crate) struct TokenBucket {
     tokens: AtomicUsize,
     max_tokens: usize,
 }
 
+#[allow(dead_code)]
 impl TokenBucket {
     fn new(max_tokens: usize, _refill_rate: usize) -> Self {
         Self {
@@ -221,6 +223,10 @@ pub struct SchedulerRuntimeConfig {
     pub idle_wait: Duration,
     /// 令牌不足时的重试等待时间
     pub retry_wait: Duration,
+    /// 匀速调度时间片（毫秒），每个时间片执行固定数量写入
+    pub steady_tick_ms: u64,
+    /// 每个时间片最多执行的写入条数
+    pub writes_per_tick: usize,
 }
 
 impl Default for SchedulerRuntimeConfig {
@@ -237,6 +243,8 @@ impl Default for SchedulerRuntimeConfig {
             idle_window: Duration::from_secs(60),
             idle_wait: Duration::from_millis(500),
             retry_wait: Duration::from_millis(50),
+            steady_tick_ms: 10,
+            writes_per_tick: 10,
         }
     }
 }
@@ -258,6 +266,8 @@ pub struct IoScheduler {
     config: SchedulerRuntimeConfig,
     /// 队列当前长度（原子，用于背压计算）
     queue_len: Arc<AtomicUsize>,
+    /// 背压信号（队列过长时为 true，通知 TaskScheduler 降速）
+    backpressure: Arc<AtomicBool>,
     /// 单调递增序号生成器
     seq_counter: Arc<AtomicU64>,
     /// 统计
@@ -267,6 +277,7 @@ pub struct IoScheduler {
     /// 唤醒 writer_loop 的通知器
     notify: Arc<Notify>,
     /// 上次令牌桶补充时间
+    #[allow(dead_code)]
     last_refill: ParkingMutex<Instant>,
     /// 空闲检测滑动窗口
     idle_samples: ParkingMutex<Vec<IdleSample>>,
@@ -283,6 +294,7 @@ impl IoScheduler {
             )),
             conn,
             queue_len: Arc::new(AtomicUsize::new(0)),
+            backpressure: Arc::new(AtomicBool::new(false)),
             seq_counter: Arc::new(AtomicU64::new(0)),
             config,
             stats: Arc::new(ParkingMutex::new(IoSchedulerStats::default())),
@@ -299,6 +311,11 @@ impl IoScheduler {
         });
 
         scheduler
+    }
+
+    /// 查询背压状态（队列过长时返回 true，TaskScheduler 可据此降速）
+    pub fn backpressure(&self) -> bool {
+        self.backpressure.load(AtomicOrdering::Acquire)
     }
 
     /// 提交一个 IO 请求
@@ -433,92 +450,39 @@ impl IoScheduler {
     // ─── Writer Loop ─────────────────────────────────────────────────────
 
     async fn writer_loop(self: Arc<Self>) {
+        let tick_interval = Duration::from_millis(self.config.steady_tick_ms);
+        let max_per_tick = self.config.writes_per_tick.max(1);
+
         loop {
+            let tick_start = Instant::now();
+
             // 检查关闭信号
             if self.shutdown.load(AtomicOrdering::Acquire) {
                 self.drain_remaining();
                 break;
             }
 
-            // P0: 令牌桶补充（根据时间差）
-            self.refill_tokens();
-
             // 记录空闲检测样本
             self.record_idle_sample();
 
-            // 尝试取出队首请求
-            let entry = {
-                let mut q = self.queue.lock();
-                q.pop()
-            };
-
-            let Some(mut entry) = entry else {
-                // 队列为空，等待通知或超时
-                tokio::select! {
-                    _ = self.notify.notified() => {}
-                    _ = tokio::time::sleep(self.config.idle_wait) => {}
-                }
-                continue;
-            };
-
-            self.queue_len.fetch_sub(1, AtomicOrdering::AcqRel);
-
-            // P1: Deadline 老化 — 超期的 Normal/Background 升级为 Important
-            let now = Instant::now();
-            let mut effective_priority = entry.request.priority;
-            if let Some(deadline) = entry.request.deadline {
-                if now > deadline {
-                    match effective_priority {
-                        IoPriority::Normal | IoPriority::Background => {
-                            effective_priority = IoPriority::Important;
-                            let mut stats = self.stats.lock();
-                            stats.starvation_preemptions += 1;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            entry.request.priority = effective_priority;
-
-            // P0: 令牌桶检查（Critical 不受限）
-            let is_critical = matches!(effective_priority, IoPriority::Critical);
-            let size = entry.request.size_hint.max(1);
-
-            if !is_critical && !self.token_bucket.try_acquire(size) {
-                // 令牌不足 — 重新入队（保持升级后的优先级），稍后重试
-                self.queue.lock().push(entry);
-                self.queue_len.fetch_add(1, AtomicOrdering::AcqRel);
-                // 等待下次补充
-                tokio::time::sleep(self.config.retry_wait).await;
-                continue;
-            }
-
-            // P3: 请求合并 — 继续取出同优先级请求，合并到单事务
-            let mut batch = vec![entry];
-            let batch_start = Instant::now();
-
-            while batch.len() < self.config.batch_max_size {
-                // 检查批延迟
-                if batch_start.elapsed() >= self.config.batch_max_delay {
-                    break;
-                }
-
-                let next = {
+            // 时间片匀速：每个时间片最多执行 max_per_tick 条写入
+            let mut batch = Vec::with_capacity(max_per_tick);
+            while batch.len() < max_per_tick {
+                let entry = {
                     let mut q = self.queue.lock();
                     q.pop()
                 };
 
-                let Some(mut next) = next else { break };
+                let Some(mut entry) = entry else { break };
                 self.queue_len.fetch_sub(1, AtomicOrdering::AcqRel);
 
-                // P1: 对后续请求也做 deadline 老化
-                let next_now = Instant::now();
-                let mut next_priority = next.request.priority;
-                if let Some(dl) = next.request.deadline {
-                    if next_now > dl {
-                        match next_priority {
+                // Deadline 老化 — 超期的 Normal/Background 升级为 Important
+                let now = Instant::now();
+                if let Some(deadline) = entry.request.deadline {
+                    if now > deadline {
+                        match entry.request.priority {
                             IoPriority::Normal | IoPriority::Background => {
-                                next_priority = IoPriority::Important;
+                                entry.request.priority = IoPriority::Important;
                                 let mut stats = self.stats.lock();
                                 stats.starvation_preemptions += 1;
                             }
@@ -527,33 +491,33 @@ impl IoScheduler {
                     }
                 }
 
-                // 只合并相同 effective priority 的请求
-                if next_priority != effective_priority {
-                    // 不同优先级，放回队列（不浪费）
-                    next.request.priority = next_priority;
-                    self.queue.lock().push(next);
-                    self.queue_len.fetch_add(1, AtomicOrdering::AcqRel);
-                    break;
-                }
-
-                // 令牌桶检查
-                let next_size = next.request.size_hint.max(1);
-                if !is_critical && !self.token_bucket.try_acquire(next_size) {
-                    // 令牌不足，放回队列
-                    self.queue.lock().push(next);
-                    self.queue_len.fetch_add(1, AtomicOrdering::AcqRel);
-                    break;
-                }
-
-                batch.push(next);
+                batch.push(entry);
             }
 
-            // 执行批量写入（单事务）
-            self.execute_batch(&mut batch, effective_priority);
+            // 执行小批量写入（单事务，最多 max_per_tick 条）
+            if !batch.is_empty() {
+                let priority = batch[0].request.priority;
+                self.execute_batch(&mut batch, priority);
+            }
+
+            // 更新背压信号：队列过长时通知外部降速
+            let qlen = self.queue_len.load(AtomicOrdering::Acquire);
+            if qlen > self.config.high_watermark {
+                self.backpressure.store(true, AtomicOrdering::Release);
+            } else if qlen < self.config.low_watermark {
+                self.backpressure.store(false, AtomicOrdering::Release);
+            }
+
+            // 匀速等待：到下一个时间片
+            let elapsed = tick_start.elapsed();
+            if elapsed < tick_interval {
+                tokio::time::sleep(tick_interval - elapsed).await;
+            }
         }
     }
 
     /// 根据经过时间补充令牌
+    #[allow(dead_code)]
     fn refill_tokens(&self) {
         let elapsed = {
             let mut last = self.last_refill.lock();
@@ -673,6 +637,8 @@ mod tests {
             idle_window: Duration::from_secs(5),
             idle_wait: Duration::from_millis(500),
             retry_wait: Duration::from_millis(50),
+            steady_tick_ms: 10,
+            writes_per_tick: 10,
         }
     }
 

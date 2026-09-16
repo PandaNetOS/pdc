@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::{NodeRepository, PeerRepository};
+use crate::storage::write_queue::WriteQueue;
 
 /// 数据温度层级
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +89,7 @@ pub struct PeerTierManager {
     storage: Option<Arc<Storage>>,
     config: TierConfig,
     stats: RwLock<TierStats>,
+    write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl PeerTierManager {
@@ -97,11 +99,18 @@ impl PeerTierManager {
             storage: None,
             config,
             stats: RwLock::new(TierStats::default()),
+            write_queue: None,
         }
     }
 
     pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// 注入写入队列（builder 模式）
+    pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
+        self.write_queue = Some(wq);
         self
     }
 
@@ -146,9 +155,16 @@ impl TierManageable for PeerTierManager {
 
         // 冷数据归档：超过 warm_threshold 的 peer 从主表迁移到归档表（减少主表体积）
         if cold_count > 0 {
-            if let Some(ref storage) = self.storage {
+            let threshold = self.config.warm_threshold_secs as i64;
+            if let Some(wq) = &self.write_queue {
+                // 通过 WriteQueue/IOScheduler 提交
+                wq.send(move |conn| {
+                    let _ = crate::storage::db::Storage::archive_cold_peers_in_tx(conn, threshold);
+                    Ok(())
+                });
+                debug!("[tier_manager] 冷数据归档已入队 WriteQueue");
+            } else if let Some(ref storage) = self.storage {
                 let storage = storage.clone();
-                let threshold = self.config.warm_threshold_secs as i64;
                 match tokio::task::spawn_blocking(move || storage.archive_cold_peers(threshold))
                     .await
                 {
@@ -251,6 +267,7 @@ pub struct TierManager {
     node_manager: Option<Arc<NodeTierManager>>,
     storage: Option<Arc<Storage>>,
     config: TierConfig,
+    write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl TierManager {
@@ -260,6 +277,7 @@ impl TierManager {
             node_manager: None,
             storage: None,
             config,
+            write_queue: None,
         }
     }
 
@@ -268,10 +286,19 @@ impl TierManager {
         self
     }
 
+    /// 注入写入队列（builder 模式）
+    pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
+        self.write_queue = Some(wq);
+        self
+    }
+
     pub fn with_peer_repo(mut self, peer_repo: Arc<dyn PeerRepository>) -> Self {
         let mut mgr = PeerTierManager::new(peer_repo, self.config.clone());
         if let Some(ref storage) = self.storage {
             mgr = mgr.with_storage(storage.clone());
+        }
+        if let Some(ref wq) = self.write_queue {
+            mgr = mgr.with_write_queue(wq.clone());
         }
         self.peer_manager = Some(Arc::new(mgr));
         self

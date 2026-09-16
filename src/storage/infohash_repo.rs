@@ -14,7 +14,7 @@ use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::MerkleTree;
 use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
-use crate::storage::db::Storage;
+use crate::storage::db::{InfohashRow, Storage};
 use crate::storage::repo_traits::InfohashRepository;
 use crate::storage::write_queue::WriteQueue;
 use crate::types::Infohash;
@@ -259,23 +259,46 @@ impl InfohashRepoImpl {
         // 先 flush pending 新 infohash
         self.flush_pending().await?;
 
-        let entries: Vec<(Infohash, u32, String, f64)> = self
+        let entries: Vec<InfohashRow> = self
             .cache
             .read()
             .entries
             .iter()
-            .map(|(ih, (count, src, score, _ls))| (*ih, *count, src.clone(), *score))
+            .map(|(ih, (count, src, score, _ls))| InfohashRow {
+                infohash: *ih,
+                ref_count: *count,
+                first_source: src.clone(),
+                score: *score,
+            })
             .collect();
 
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            for (infohash, ref_count, source, score) in &entries {
-                storage.save_infohash(infohash, *ref_count, source, *score)?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        Ok(())
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(wq) = &self.write_queue {
+            // 异步模式：非阻塞入队 WriteQueue
+            let count = entries.len();
+            wq.send(move |conn| Storage::save_infohashes_batch_in_tx(conn, &entries));
+            tracing::debug!("[infohash_repo] 异步入队全量保存 {} 个 infohash", count);
+            Ok(())
+        } else {
+            // 同步模式：保留原 spawn_blocking 逐条写入逻辑
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                for row in &entries {
+                    storage.save_infohash(
+                        &row.infohash,
+                        row.ref_count,
+                        &row.first_source,
+                        row.score,
+                    )?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            Ok(())
+        }
     }
 
     /// 从 SQLite 加载全部 infohash
@@ -343,11 +366,16 @@ impl InfohashRepository for InfohashRepoImpl {
             }
         }
         // 异步持久化到 SQLite
-        let storage = self.storage.clone();
-        let ih = *infohash;
-        tokio::task::spawn_blocking(move || {
-            let _ = storage.update_infohash_score(&ih, score);
-        });
+        if let Some(wq) = &self.write_queue {
+            let ih = *infohash;
+            wq.send(move |conn| Storage::update_infohash_score_in_tx(conn, &ih, score));
+        } else {
+            let storage = self.storage.clone();
+            let ih = *infohash;
+            tokio::task::spawn_blocking(move || {
+                let _ = storage.update_infohash_score(&ih, score);
+            });
+        }
     }
 
     async fn update_scores_batch(&self, scores: &[(Infohash, f64)]) {
@@ -364,11 +392,15 @@ impl InfohashRepository for InfohashRepoImpl {
             }
         }
         // 异步批量持久化到 SQLite
-        let storage = self.storage.clone();
         let scores_vec: Vec<([u8; 20], f64)> = scores.iter().map(|(ih, s)| (*ih, *s)).collect();
-        tokio::task::spawn_blocking(move || {
-            let _ = storage.update_infohash_scores_batch(&scores_vec);
-        });
+        if let Some(wq) = &self.write_queue {
+            wq.send(move |conn| Storage::update_infohash_scores_batch_in_tx(conn, &scores_vec));
+        } else {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = storage.update_infohash_scores_batch(&scores_vec);
+            });
+        }
     }
 
     async fn get_score(&self, infohash: &Infohash) -> f64 {

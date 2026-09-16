@@ -425,7 +425,7 @@ fn default_sqlite_cache_size() -> i64 {
     -262_144 // 256MB 页缓存（负数表示页数）
 }
 fn default_sqlite_wal_autocheckpoint() -> u32 {
-    1000
+    0 // 禁用SQLite自动checkpoint，完全由IOScheduler统一调度，避免IO尖峰
 }
 fn default_sqlite_temp_store() -> String {
     "MEMORY".to_string()

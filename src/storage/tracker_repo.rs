@@ -14,8 +14,9 @@ use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::MerkleTree;
 use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
-use crate::storage::db::Storage;
+use crate::storage::db::{Storage, TrackerRow};
 use crate::storage::repo_traits::{TrackerEntry, TrackerRepository};
+use crate::storage::write_queue::WriteQueue;
 
 struct TrackerCacheInner {
     /// url -> TrackerEntry
@@ -36,6 +37,8 @@ pub struct TrackerRepoImpl {
     /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
     merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
+    /// 写入队列（可选，Some 时 save_all 通过 WriteQueue/IOScheduler 提交）
+    write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl TrackerRepoImpl {
@@ -45,7 +48,14 @@ impl TrackerRepoImpl {
             storage,
             merkle: OnceLock::new(),
             gossip: OnceLock::new(),
+            write_queue: None,
         }
+    }
+
+    /// 注入写入队列（builder 模式）
+    pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
+        self.write_queue = Some(wq);
+        self
     }
 
     /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
@@ -302,25 +312,52 @@ impl TrackerRepository for TrackerRepoImpl {
 
     async fn save_all(&self) -> anyhow::Result<()> {
         let trackers = self.all_trackers_sync();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            for t in &trackers {
-                storage.save_tracker(
-                    &t.url,
-                    t.score,
-                    t.total_requests,
-                    t.success_requests,
-                    t.failed_requests,
-                    t.total_peers_discovered,
-                    t.avg_response_time_ms,
-                    t.consecutive_failures,
-                    t.disabled,
-                )?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        Ok(())
+        if trackers.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<TrackerRow> = trackers
+            .into_iter()
+            .map(|t| TrackerRow {
+                url: t.url,
+                score: t.score,
+                total_requests: t.total_requests,
+                success_requests: t.success_requests,
+                failed_requests: t.failed_requests,
+                total_peers_discovered: t.total_peers_discovered,
+                total_response_time_ms: t.avg_response_time_ms,
+                consecutive_failures: t.consecutive_failures,
+                disabled: t.disabled,
+            })
+            .collect();
+
+        if let Some(wq) = &self.write_queue {
+            // 异步模式：非阻塞入队 WriteQueue
+            let count = batch.len();
+            wq.send(move |conn| Storage::save_trackers_batch_in_tx(conn, &batch));
+            tracing::debug!("[tracker_repo] 异步入队保存 {} 个 tracker", count);
+            Ok(())
+        } else {
+            // 同步模式：保留原 spawn_blocking 逐条写入逻辑
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                for t in &batch {
+                    storage.save_tracker(
+                        &t.url,
+                        t.score,
+                        t.total_requests,
+                        t.success_requests,
+                        t.failed_requests,
+                        t.total_peers_discovered,
+                        t.total_response_time_ms,
+                        t.consecutive_failures,
+                        t.disabled,
+                    )?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            Ok(())
+        }
     }
 
     async fn load_all(&self) -> anyhow::Result<usize> {

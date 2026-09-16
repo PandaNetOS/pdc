@@ -309,6 +309,8 @@ async fn async_main(
                 idle_window: std::time::Duration::from_secs(config.io_scheduler.idle_window_secs),
                 idle_wait: std::time::Duration::from_millis(config.io_scheduler.idle_wait_ms),
                 retry_wait: std::time::Duration::from_millis(config.io_scheduler.retry_wait_ms),
+                steady_tick_ms: 10,  // 10ms 时间片，匀速写入
+                writes_per_tick: 10, // 每个时间片最多 10 条写入
             };
             let sched =
                 PeerDiscoveryCenter::storage::IoScheduler::new(storage.connection(), rt_cfg);
@@ -342,9 +344,10 @@ async fn async_main(
         PeerDiscoveryCenter::storage::InfohashRepoImpl::new(storage.clone())
             .with_write_queue(write_queue.clone()),
     );
-    let tracker_repo = Arc::new(PeerDiscoveryCenter::storage::TrackerRepoImpl::new(
-        storage.clone(),
-    ));
+    let tracker_repo = Arc::new(
+        PeerDiscoveryCenter::storage::TrackerRepoImpl::new(storage.clone())
+            .with_write_queue(write_queue.clone()),
+    );
     let node_repo = Arc::new(
         PeerDiscoveryCenter::storage::NodeRepoImpl::new(storage.clone())
             .with_write_queue(write_queue.clone()),
@@ -866,7 +869,6 @@ async fn async_main(
         let tr = tracker_repo.clone();
         let ir = infohash_repo.clone();
         let pr = peer_repo.clone();
-        let st = storage.clone();
         task_scheduler.register(
             TaskMetadata::new(
                 "periodic_persistence",
@@ -901,7 +903,6 @@ async fn async_main(
                 let tr = tr.clone();
                 let ir = ir.clone();
                 let pr = pr.clone();
-                let st = st.clone();
                 async move {
                     let mut saved = 0u64;
                     match nr.save_dirty().await {
@@ -927,9 +928,8 @@ async fn async_main(
                         Err(e) => warn!("[persistence] PeerRepo history flush 失败: {}", e),
                         _ => {}
                     }
-                    if let Err(e) = st.checkpoint() {
-                        warn!("[persistence] WAL checkpoint 失败: {}", e);
-                    }
+                    // WAL checkpoint 已移至独立高频任务（wal_checkpoint_steady，每100ms），
+                    // 此处不再执行，避免与持久化操作叠加形成 IO 尖峰
                     debug!("[persistence] 增量持久化完成（{} 项）", saved);
                     Ok(())
                 }
@@ -1323,6 +1323,7 @@ async fn async_main(
                     as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>),
         );
         let tm = tier_mgr.clone();
+        let io_sched = io_scheduler.clone();
         task_scheduler.register(
             TaskMetadata::new(
                 "tier_check",
@@ -1350,7 +1351,7 @@ async fn async_main(
             ))),
             move || {
                 let tm = tm.clone();
-                let io_sched = io_scheduler.clone();
+                let io_sched = io_sched.clone();
                 async move {
                     // P3: 仅在 IO 空闲时执行冷驱逐（避免与前台写入竞争）
                     if let Some(ref s) = io_sched {
