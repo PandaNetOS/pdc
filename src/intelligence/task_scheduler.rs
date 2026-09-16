@@ -191,6 +191,8 @@ pub struct TaskMetadata {
     pub max_retries: u32,
     /// 任务分类（用于分级并发控制）
     pub category: TaskCategory,
+    /// 是否为保活类任务（心跳/健康检查），不受资源准入限制
+    pub is_keepalive: bool,
 }
 
 /// TaskMetadata::new 的默认字段值
@@ -218,6 +220,7 @@ impl TaskMetadata {
             timeout: DEFAULT_TASK_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             category: TaskCategory::default(),
+            is_keepalive: false,
         }
     }
 
@@ -259,6 +262,12 @@ impl TaskMetadata {
 
     pub fn with_category(mut self, c: TaskCategory) -> Self {
         self.category = c;
+        self
+    }
+
+    /// 标记为保活类任务（心跳/健康检查），不受资源准入延迟影响
+    pub fn with_keepalive(mut self) -> Self {
+        self.is_keepalive = true;
         self
     }
 }
@@ -344,6 +353,8 @@ pub struct ResourceState {
     pub memory_usage: f64, // 0.0 - 1.0
     pub io_busy: bool,
     pub network_busy: bool,
+    /// IO 负载（0.0-1.0），供资源感知准入控制使用
+    pub io_usage: f64,
     pub timestamp: Instant,
 }
 
@@ -354,6 +365,7 @@ impl Default for ResourceState {
             memory_usage: 0.0,
             io_busy: false,
             network_busy: false,
+            io_usage: 0.0,
             timestamp: Instant::now(),
         }
     }
@@ -426,12 +438,226 @@ impl ResourceMonitor {
     pub fn set_network_busy(&self, busy: bool) {
         self.state.write().network_busy = busy;
     }
+
+    /// 设置 IO 负载（0.0-1.0），供准入控制判定
+    pub fn set_io_load(&self, io: f64) {
+        self.state.write().io_usage = io.clamp(0.0, 1.0);
+    }
 }
 
 impl Default for ResourceMonitor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// 调度器运行时旋钮（由 config.rs 传入，调度器内部不直接读 config）
+// ---------------------------------------------------------------------------
+
+/// 调度器运行时可调旋钮。
+///
+/// 全部带有合理默认值；所有"新功能"默认关闭，关闭后调度行为与改造前完全一致。
+#[derive(Debug, Clone)]
+pub struct SchedulerKnobs {
+    /// 资源感知准入控制总开关（默认 false）
+    pub admission_control_enabled: bool,
+    /// CPU 使用率准入阈值（0.0-1.0）
+    pub admission_cpu_threshold: f32,
+    /// IO 负载准入阈值（0.0-1.0）
+    pub admission_io_threshold: f32,
+    /// 准入延迟最大 tick 数，达到后强制执行避免饥饿
+    pub admission_max_delay_ticks: u32,
+    /// 每轮随机错峰抖动总开关（默认 false）
+    pub random_jitter_enabled: bool,
+    /// 随机抖动比例（±ratio），如 0.1 = ±10%
+    pub random_jitter_ratio: f32,
+    /// 任务画像 EWMA 平滑系数
+    pub profile_ewma_alpha: f32,
+    /// 系统负载采样间隔（秒）
+    pub load_sample_interval_secs: u64,
+}
+
+impl Default for SchedulerKnobs {
+    fn default() -> Self {
+        Self {
+            admission_control_enabled: false,
+            admission_cpu_threshold: 0.8,
+            admission_io_threshold: 0.8,
+            admission_max_delay_ticks: 5,
+            random_jitter_enabled: false,
+            random_jitter_ratio: 0.1,
+            profile_ewma_alpha: 0.2,
+            load_sample_interval_secs: 5,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 负载采样（可插拔 trait + 默认 no-op 实现）
+// ---------------------------------------------------------------------------
+
+/// 采样到的瞬时系统负载
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadSample {
+    /// CPU 使用率 0.0-1.0
+    pub cpu: f64,
+    /// IO 负载 0.0-1.0
+    pub io: f64,
+}
+
+/// 负载采样器抽象。默认实现直接复用 ResourceMonitor 的最近一次采样值；
+/// 测试时可注入 mock 采样器以驱动准入控制逻辑。
+pub trait LoadSampler: Send + Sync {
+    fn sample(&self) -> LoadSample;
+}
+
+/// 基于 ResourceMonitor 的实时采样器（生产用）
+pub struct ResourceMonitorSampler {
+    monitor: Arc<ResourceMonitor>,
+}
+
+impl ResourceMonitorSampler {
+    pub fn new(monitor: Arc<ResourceMonitor>) -> Self {
+        Self { monitor }
+    }
+}
+
+impl LoadSampler for ResourceMonitorSampler {
+    fn sample(&self) -> LoadSample {
+        let s = self.monitor.current();
+        LoadSample {
+            cpu: s.cpu_usage,
+            io: s.io_usage,
+        }
+    }
+}
+
+/// 准入控制决策结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionDecision {
+    /// 允许立即执行
+    Allow,
+    /// 当前负载超阈值且延迟预算未用尽，延迟一个 tick
+    Delay,
+    /// 延迟预算已用尽，强制执行（防饥饿）
+    Force,
+}
+
+/// 纯函数：判定单个任务在给定负载下是否应被准入延迟。
+///
+/// - 关闭总开关 / 保活任务 / Critical 任务：始终 Allow
+/// - 负载超阈值且已延迟次数 < max_delay_ticks：Delay
+/// - 达到或超过 max_delay_ticks：Force
+fn admission_decide(
+    knobs: &SchedulerKnobs,
+    meta: &TaskMetadata,
+    sample: LoadSample,
+    delayed_ticks: u32,
+) -> AdmissionDecision {
+    if !knobs.admission_control_enabled
+        || meta.is_keepalive
+        || meta.priority == TaskPriority::Critical
+    {
+        return AdmissionDecision::Allow;
+    }
+    let over_cpu = sample.cpu >= knobs.admission_cpu_threshold as f64;
+    let over_io = sample.io >= knobs.admission_io_threshold as f64;
+    if over_cpu || over_io {
+        if delayed_ticks >= knobs.admission_max_delay_ticks {
+            AdmissionDecision::Force
+        } else {
+            AdmissionDecision::Delay
+        }
+    } else {
+        AdmissionDecision::Allow
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 任务画像记录（EWMA）
+// ---------------------------------------------------------------------------
+
+/// 单个任务的耗时画像
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileEntry {
+    /// EWMA 平滑后的平均耗时（毫秒）
+    pub avg_duration_ms: f64,
+    /// 累计运行次数
+    pub run_count: u64,
+    /// 最近一次运行耗时（毫秒）
+    pub last_run_ms: u64,
+}
+
+/// 任务画像存储：记录每个任务实际耗时，EWMA 平滑。线程安全。
+pub(crate) struct TaskProfileStore {
+    entries: RwLock<HashMap<String, ProfileEntry>>,
+    /// EWMA 系数，可热更新
+    ewma_alpha: std::sync::atomic::AtomicU32,
+}
+
+impl TaskProfileStore {
+    /// alpha 以 u32 位浮点比特存储，避免 AtomicF32 跨平台问题
+    pub fn new(alpha: f32) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            ewma_alpha: std::sync::atomic::AtomicU32::new(alpha.to_bits()),
+        }
+    }
+
+    pub fn set_alpha(&self, alpha: f32) {
+        self.ewma_alpha.store(alpha.to_bits(), Ordering::Relaxed);
+    }
+
+    fn alpha(&self) -> f32 {
+        f32::from_bits(self.ewma_alpha.load(Ordering::Relaxed))
+    }
+
+    /// 记录一次执行耗时（毫秒），EWMA 平滑
+    pub fn record(&self, task_id: &str, duration_ms: f64) {
+        let alpha = self.alpha() as f64;
+        let mut entries = self.entries.write();
+        let entry = entries.entry(task_id.to_string()).or_insert(ProfileEntry {
+            avg_duration_ms: duration_ms,
+            run_count: 0,
+            last_run_ms: 0,
+        });
+        // 首次直接采用实际值，后续 EWMA 平滑
+        if entry.run_count > 0 {
+            entry.avg_duration_ms = alpha * duration_ms + (1.0 - alpha) * entry.avg_duration_ms;
+        } else {
+            entry.avg_duration_ms = duration_ms;
+        }
+        entry.run_count += 1;
+        entry.last_run_ms = duration_ms as u64;
+    }
+
+    /// 查询某任务 EWMA 平均耗时（毫秒）
+    pub fn get(&self, task_id: &str) -> Option<f64> {
+        self.entries.read().get(task_id).map(|e| e.avg_duration_ms)
+    }
+
+    /// 全量快照（供监控查询）
+    pub fn snapshot(&self) -> HashMap<String, ProfileEntry> {
+        self.entries.read().clone()
+    }
+}
+
+/// 纯函数：计算下一次执行间隔。
+///
+/// - `enabled=false`：返回原 interval（退化为固定间隔，行为与改造前一致）
+/// - `enabled=true`：在 interval 上施加 ±ratio 的随机扰动
+fn apply_interval_jitter(interval: Duration, enabled: bool, ratio: f32) -> Duration {
+    if !enabled || ratio <= 0.0 {
+        return interval;
+    }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    // uniform(-1.0, 1.0)
+    let factor = rng.gen_range(-1.0f32..=1.0f32);
+    let millis = interval.as_millis() as f64;
+    let jittered = millis * (1.0 + (ratio * factor) as f64);
+    Duration::from_millis(jittered.max(0.0) as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -500,10 +726,21 @@ pub struct TaskScheduler {
     watchdog_running: Arc<AtomicBool>,
     /// 自适应控制器（可选，None 时行为与改造前完全一致）
     adaptive_controller: Option<Arc<AdaptiveController>>,
+    /// 运行时旋钮（准入/抖动/画像系数），全部默认关闭以保持向后兼容
+    knobs: SchedulerKnobs,
+    /// 任务画像（EWMA 耗时统计）
+    profile_store: Arc<TaskProfileStore>,
+    /// 负载采样器（可注入 mock）
+    load_sampler: Arc<dyn LoadSampler>,
+    /// 每个任务当前已被准入控制延迟的 tick 数（防饥饿）
+    admission_delays: RwLock<HashMap<String, u32>>,
 }
 
 impl TaskScheduler {
     pub fn new() -> Self {
+        let resource_monitor = Arc::new(ResourceMonitor::new());
+        let load_sampler: Arc<dyn LoadSampler> =
+            Arc::new(ResourceMonitorSampler::new(resource_monitor.clone()));
         Self {
             tasks: RwLock::new(HashMap::new()),
             task_fns: RwLock::new(HashMap::new()),
@@ -518,13 +755,19 @@ impl TaskScheduler {
                 m
             }),
             max_concurrency: CategoryConcurrency::default(),
-            resource_monitor: Arc::new(ResourceMonitor::new()),
+            resource_monitor,
             seq_counter: RwLock::new(0),
             completed_dependencies: RwLock::new(HashSet::new()),
             scheduler_started: RwLock::new(false),
             last_heartbeat: Arc::new(AtomicI64::new(0)),
             watchdog_running: Arc::new(AtomicBool::new(false)),
             adaptive_controller: None,
+            knobs: SchedulerKnobs::default(),
+            profile_store: Arc::new(TaskProfileStore::new(
+                SchedulerKnobs::default().profile_ewma_alpha,
+            )),
+            load_sampler,
+            admission_delays: RwLock::new(HashMap::new()),
         }
     }
 
@@ -547,6 +790,35 @@ impl TaskScheduler {
     pub fn with_adaptive_controller(mut self, controller: Arc<AdaptiveController>) -> Self {
         self.adaptive_controller = Some(controller);
         self
+    }
+
+    /// 注入运行时旋钮（准入/随机抖动/画像 EWMA 系数）。
+    /// 所有新功能默认关闭，未注入时行为与改造前完全一致。
+    pub fn with_knobs(mut self, knobs: SchedulerKnobs) -> Self {
+        self.profile_store.set_alpha(knobs.profile_ewma_alpha);
+        self.knobs = knobs;
+        self
+    }
+
+    /// 注入自定义负载采样器（主要用于测试注入 mock）
+    pub fn with_load_sampler(mut self, sampler: Arc<dyn LoadSampler>) -> Self {
+        self.load_sampler = sampler;
+        self
+    }
+
+    /// 任务画像快照（供监控查询，符合"可查询"原则）
+    pub fn profile_snapshot(&self) -> HashMap<String, ProfileEntry> {
+        self.profile_store.snapshot()
+    }
+
+    /// 任务画像查询单个任务平均耗时（毫秒）
+    pub fn profile_avg(&self, task_id: &str) -> Option<f64> {
+        self.profile_store.get(task_id)
+    }
+
+    /// 当前系统负载快照（供监控查询）
+    pub fn load_snapshot(&self) -> LoadSample {
+        self.load_sampler.sample()
     }
 
     /// 查询指定分类当前运行任务数
@@ -826,6 +1098,53 @@ impl TaskScheduler {
                 }
             }
 
+            // 资源感知准入控制（默认关闭；关闭后 admission_decide 恒为 Allow，行为不变）
+            {
+                let sample = scheduler.load_sampler.sample();
+                let delayed = *scheduler
+                    .admission_delays
+                    .read()
+                    .get(&item.task_id)
+                    .unwrap_or(&0);
+                match admission_decide(&scheduler.knobs, &meta, sample, delayed) {
+                    AdmissionDecision::Delay => {
+                        *scheduler
+                            .admission_delays
+                            .write()
+                            .entry(item.task_id.clone())
+                            .or_insert(0) += 1;
+                        debug!(
+                            "[task_scheduler] 准入延迟: {} (CPU={:.0}% IO={:.0}%, 第 {} tick)",
+                            meta.name,
+                            sample.cpu * 100.0,
+                            sample.io * 100.0,
+                            delayed + 1
+                        );
+                        scheduler.schedule_task(
+                            &item.task_id,
+                            Instant::now() + SCHEDULER_TICK_INTERVAL,
+                            item.priority,
+                        );
+                        continue;
+                    }
+                    AdmissionDecision::Force => {
+                        warn!(
+                            "[task_scheduler] 准入延迟预算用尽，强制执行: {} (CPU={:.0}% IO={:.0}%)",
+                            meta.name,
+                            sample.cpu * 100.0,
+                            sample.io * 100.0
+                        );
+                        scheduler.admission_delays.write().remove(&item.task_id);
+                    }
+                    AdmissionDecision::Allow => {
+                        // 正常准入，清除历史延迟计数
+                        if delayed > 0 {
+                            scheduler.admission_delays.write().remove(&item.task_id);
+                        }
+                    }
+                }
+            }
+
             // 执行任务
             debug!(
                 "[task_scheduler] 执行任务: {} (优先级={:?})",
@@ -873,6 +1192,11 @@ impl TaskScheduler {
             let result = tokio::time::timeout(meta.timeout, task_fn()).await;
 
             let duration = start.elapsed();
+
+            // 任务画像：无论成功/失败/超时都记录实际耗时（EWMA 平滑）
+            scheduler
+                .profile_store
+                .record(&task_id, duration.as_secs_f64() * 1000.0);
 
             match result {
                 Ok(Ok(())) => {
@@ -956,7 +1280,7 @@ impl TaskScheduler {
                 }
             }
 
-            // 安排下一次执行（添加随机抖动）
+            // 安排下一次执行（叠加既有固定 jitter + 可选每轮比例随机抖动）
             let jitter_secs = if meta.jitter.as_secs() > 0 {
                 use rand::Rng;
                 let mut rng = rand::thread_rng();
@@ -964,9 +1288,14 @@ impl TaskScheduler {
             } else {
                 0
             };
+            let interval_with_ratio = apply_interval_jitter(
+                meta.interval,
+                scheduler.knobs.random_jitter_enabled,
+                scheduler.knobs.random_jitter_ratio,
+            );
             scheduler.schedule_task(
                 &task_id,
-                Instant::now() + meta.interval + Duration::from_secs(jitter_secs),
+                Instant::now() + interval_with_ratio + Duration::from_secs(jitter_secs),
                 meta.priority,
             );
         });
@@ -1211,5 +1540,183 @@ mod tests {
         let delays: Vec<u64> = tasks.iter().map(|t| t.initial_delay.as_secs()).collect();
         let unique_delays: HashSet<u64> = delays.iter().cloned().collect();
         assert!(unique_delays.len() > 1, "错峰应该产生不同的初始延迟");
+    }
+
+    // ---- S1-P0: TaskProfileStore EWMA ----
+
+    #[test]
+    fn test_profile_store_ewma_convergence() {
+        let store = TaskProfileStore::new(0.2);
+        // 首次直接采用实际值
+        store.record("t1", 1000.0);
+        assert!((store.get("t1").unwrap() - 1000.0).abs() < 1e-6);
+
+        // 之后持续记录 2000ms，EWMA 应单调收敛向 2000（alpha=0.2）
+        let mut prev = 1000.0;
+        for _ in 0..20 {
+            store.record("t1", 2000.0);
+            let cur = store.get("t1").unwrap();
+            assert!(cur > prev - 1e-9, "EWMA 应收敛向新值: {} -> {}", prev, cur);
+            prev = cur;
+        }
+        // 收敛后应明显大于初值且接近 2000
+        let avg = store.get("t1").unwrap();
+        assert!(avg > 1500.0, "平均耗时应收敛向 2000，实际 {}", avg);
+        assert!(
+            avg < 2000.0,
+            "alpha=0.2 未到稳态，应略小于 2000，实际 {}",
+            avg
+        );
+
+        let snap = store.snapshot();
+        let e = snap.get("t1").unwrap();
+        assert_eq!(e.run_count, 21);
+        assert_eq!(e.last_run_ms, 2000);
+    }
+
+    #[test]
+    fn test_profile_store_unknown_task() {
+        let store = TaskProfileStore::new(0.2);
+        assert!(store.get("nope").is_none());
+        assert!(store.snapshot().is_empty());
+    }
+
+    // ---- S1-P1: 每轮随机抖动 ----
+
+    #[test]
+    fn test_jitter_disabled_equals_fixed_interval() {
+        let interval = Duration::from_secs(60);
+        for _ in 0..100 {
+            let out = apply_interval_jitter(interval, false, 0.1);
+            assert_eq!(out, interval, "关闭抖动时必须等于固定间隔");
+        }
+    }
+
+    #[test]
+    fn test_jitter_enabled_produces_variation() {
+        let interval = Duration::from_secs(60);
+        let ratio = 0.1;
+        let mut seen = HashSet::new();
+        for _ in 0..200 {
+            let out = apply_interval_jitter(interval, true, ratio);
+            // 必须落在 [54s, 66s] 范围内
+            assert!(out >= Duration::from_secs(54), "抖动下界: {:?}", out);
+            assert!(out <= Duration::from_secs(66), "抖动上界: {:?}", out);
+            seen.insert(out);
+        }
+        assert!(seen.len() > 1, "开启抖动时多次结果不应全部相同");
+    }
+
+    // ---- S1-P1: 资源感知准入控制 ----
+
+    #[test]
+    fn test_admission_disabled_always_allows() {
+        let knobs = SchedulerKnobs {
+            admission_control_enabled: false,
+            admission_cpu_threshold: 0.8,
+            admission_io_threshold: 0.8,
+            admission_max_delay_ticks: 5,
+            ..Default::default()
+        };
+        let meta = TaskMetadata::new("t", "t", Duration::from_secs(60));
+        // 即使负载爆表也允许
+        let d = admission_decide(
+            &knobs,
+            &meta,
+            LoadSample {
+                cpu: 0.99,
+                io: 0.99,
+            },
+            0,
+        );
+        assert_eq!(d, AdmissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_admission_delays_when_over_threshold_then_forces() {
+        let knobs = SchedulerKnobs {
+            admission_control_enabled: true,
+            admission_cpu_threshold: 0.8,
+            admission_io_threshold: 0.8,
+            admission_max_delay_ticks: 3,
+            ..Default::default()
+        };
+        let meta = TaskMetadata::new("t", "t", Duration::from_secs(60))
+            .with_priority(TaskPriority::Normal);
+        let heavy = LoadSample { cpu: 0.95, io: 0.1 };
+
+        // 未超预算：延迟
+        assert_eq!(
+            admission_decide(&knobs, &meta, heavy, 0),
+            AdmissionDecision::Delay
+        );
+        assert_eq!(
+            admission_decide(&knobs, &meta, heavy, 2),
+            AdmissionDecision::Delay
+        );
+        // 达到预算：强制执行
+        assert_eq!(
+            admission_decide(&knobs, &meta, heavy, 3),
+            AdmissionDecision::Force
+        );
+        assert_eq!(
+            admission_decide(&knobs, &meta, heavy, 9),
+            AdmissionDecision::Force
+        );
+    }
+
+    #[test]
+    fn test_admission_keepsalive_and_critical_bypass() {
+        let knobs = SchedulerKnobs {
+            admission_control_enabled: true,
+            admission_cpu_threshold: 0.8,
+            admission_io_threshold: 0.8,
+            admission_max_delay_ticks: 1,
+            ..Default::default()
+        };
+        let heavy = LoadSample {
+            cpu: 0.99,
+            io: 0.99,
+        };
+
+        // 保活任务不受准入限制
+        let keepalive = TaskMetadata::new("hb", "hb", Duration::from_secs(5)).with_keepalive();
+        assert_eq!(
+            admission_decide(&knobs, &keepalive, heavy, 99),
+            AdmissionDecision::Allow
+        );
+
+        // Critical 任务不受准入限制
+        let critical = TaskMetadata::new("h", "h", Duration::from_secs(1))
+            .with_priority(TaskPriority::Critical);
+        assert_eq!(
+            admission_decide(&knobs, &critical, heavy, 99),
+            AdmissionDecision::Allow
+        );
+
+        // 负载不高时普通任务也允许
+        let light = LoadSample { cpu: 0.2, io: 0.2 };
+        let normal = TaskMetadata::new("n", "n", Duration::from_secs(60));
+        assert_eq!(
+            admission_decide(&knobs, &normal, light, 0),
+            AdmissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_io_threshold_triggers_admission() {
+        let knobs = SchedulerKnobs {
+            admission_control_enabled: true,
+            admission_cpu_threshold: 0.8,
+            admission_io_threshold: 0.8,
+            admission_max_delay_ticks: 2,
+            ..Default::default()
+        };
+        let meta = TaskMetadata::new("t", "t", Duration::from_secs(60));
+        // CPU 低但 IO 超阈值 -> 延迟
+        assert_eq!(
+            admission_decide(&knobs, &meta, LoadSample { cpu: 0.1, io: 0.9 }, 0),
+            AdmissionDecision::Delay
+        );
     }
 }

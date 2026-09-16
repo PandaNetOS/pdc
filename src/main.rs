@@ -1242,7 +1242,14 @@ async fn async_main(
     // 8.7 TierManager 冷热分层任务
     {
         use PeerDiscoveryCenter::intelligence::TierManager;
-        let tier_mgr = Arc::new(TierManager::new(Default::default()));
+        let tier_mgr = Arc::new(
+            TierManager::new(Default::default())
+                .with_storage(storage.clone())
+                .with_peer_repo(peer_repo.clone()
+                    as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::PeerRepository>)
+                .with_node_repo(node_repo.clone()
+                    as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>),
+        );
         let tm = tier_mgr.clone();
         task_scheduler.register(
             TaskMetadata::new(

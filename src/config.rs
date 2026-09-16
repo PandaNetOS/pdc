@@ -106,6 +106,30 @@ pub struct TaskSchedulerConfig {
     /// 未配置的任务一律使用代码内默认值，行为与未引入本配置前完全一致（向后兼容）。
     #[serde(default)]
     pub intervals: HashMap<String, u64>,
+    /// 资源感知准入控制总开关。false（默认）时调度行为与改造前完全一致。
+    #[serde(default = "default_admission_control_enabled")]
+    pub admission_control_enabled: bool,
+    /// CPU 使用率准入阈值（0.0-1.0），超过则延迟非保活任务。
+    #[serde(default = "default_admission_cpu_threshold")]
+    pub admission_cpu_threshold: f32,
+    /// IO 负载准入阈值（0.0-1.0），超过则延迟非保活任务。
+    #[serde(default = "default_admission_io_threshold")]
+    pub admission_io_threshold: f32,
+    /// 准入延迟的最大 tick 数，达到后强制执行避免饥饿。
+    #[serde(default = "default_admission_max_delay_ticks")]
+    pub admission_max_delay_ticks: u32,
+    /// 每轮执行随机错峰抖动总开关。false（默认）时退化为固定间隔。
+    #[serde(default = "default_random_jitter_enabled")]
+    pub random_jitter_enabled: bool,
+    /// 随机抖动比例（±ratio），0.1 表示间隔 ±10%。
+    #[serde(default = "default_random_jitter_ratio")]
+    pub random_jitter_ratio: f32,
+    /// 任务画像 EWMA 平滑系数 alpha（0.0-1.0）。
+    #[serde(default = "default_profile_ewma_alpha")]
+    pub profile_ewma_alpha: f32,
+    /// 系统负载采样间隔（秒）。采样任务由 main.rs 注册，本字段为参考配置。
+    #[serde(default = "default_load_sample_interval_secs")]
+    pub load_sample_interval_secs: u64,
 }
 
 fn default_crawl_concurrency() -> u32 {
@@ -122,6 +146,38 @@ fn default_monitor_concurrency() -> u32 {
 
 fn default_network_concurrency() -> u32 {
     4
+}
+
+fn default_admission_control_enabled() -> bool {
+    false
+}
+
+fn default_admission_cpu_threshold() -> f32 {
+    0.8
+}
+
+fn default_admission_io_threshold() -> f32 {
+    0.8
+}
+
+fn default_admission_max_delay_ticks() -> u32 {
+    5
+}
+
+fn default_random_jitter_enabled() -> bool {
+    false
+}
+
+fn default_random_jitter_ratio() -> f32 {
+    0.1
+}
+
+fn default_profile_ewma_alpha() -> f32 {
+    0.2
+}
+
+fn default_load_sample_interval_secs() -> u64 {
+    5
 }
 
 /// 读取任务间隔数值。未在 `intervals` 中配置时返回 `default_value`，保持向后兼容。
@@ -144,6 +200,14 @@ impl Default for TaskSchedulerConfig {
             monitor_concurrency: default_monitor_concurrency(),
             network_concurrency: default_network_concurrency(),
             intervals: HashMap::new(),
+            admission_control_enabled: default_admission_control_enabled(),
+            admission_cpu_threshold: default_admission_cpu_threshold(),
+            admission_io_threshold: default_admission_io_threshold(),
+            admission_max_delay_ticks: default_admission_max_delay_ticks(),
+            random_jitter_enabled: default_random_jitter_enabled(),
+            random_jitter_ratio: default_random_jitter_ratio(),
+            profile_ewma_alpha: default_profile_ewma_alpha(),
+            load_sample_interval_secs: default_load_sample_interval_secs(),
         }
     }
 }

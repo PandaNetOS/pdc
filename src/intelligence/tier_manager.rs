@@ -11,7 +11,7 @@
 //! - 定期检查：每 5 分钟检查一次温度
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -194,19 +194,40 @@ impl NodeTierManager {
 impl TierManageable for NodeTierManager {
     async fn check_and_migrate(&self) -> TierStats {
         let nodes = self.node_repo.all_nodes().await;
+        let now = Instant::now();
 
         let mut hot_count = 0;
         let mut warm_count = 0;
         let mut cold_count = 0;
 
         for node in &nodes {
-            let elapsed = node.last_active.elapsed();
+            // 用 now 与 last_active 比较后相减，而非 last_active.elapsed()：
+            // last_active 为未来时间时 elapsed() 会 panic；此处显式比较可安全兜底为最大值。
+            let elapsed = if now >= node.last_active {
+                now - node.last_active
+            } else {
+                Duration::from_secs(u64::MAX)
+            };
             if elapsed.as_secs() < self.config.hot_threshold_secs {
                 hot_count += 1;
             } else if elapsed.as_secs() < self.config.warm_threshold_secs {
                 warm_count += 1;
             } else {
                 cold_count += 1;
+            }
+        }
+
+        // 冷数据驱逐：超过 warm_threshold 的节点从内存移除（DB 中永久保留）
+        if cold_count > 0 {
+            let threshold = self.config.warm_threshold_secs;
+            match self.node_repo.remove_cold_nodes(threshold).await {
+                Ok(removed) => {
+                    debug!(
+                        "[tier_manager] NodeRepo 冷节点驱逐: 从内存移除 {} 个",
+                        removed
+                    );
+                }
+                Err(e) => warn!("[tier_manager] NodeRepo 冷节点驱逐失败: {}", e),
             }
         }
 

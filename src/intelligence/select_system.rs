@@ -262,6 +262,9 @@ mod tests {
         async fn load_all(&self) -> anyhow::Result<usize> {
             Ok(0)
         }
+        async fn remove_cold_nodes(&self, _older_than_secs: u64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
         async fn mark_dirty(&self, _addr: &SocketAddr) {}
         async fn dirty_nodes(&self) -> Vec<SocketAddr> {
             Vec::new()

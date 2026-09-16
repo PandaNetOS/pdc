@@ -736,4 +736,113 @@ impl NodeRepository for NodeRepoImpl {
         }
         Ok(count)
     }
+
+    async fn remove_cold_nodes(&self, older_than_secs: u64) -> anyhow::Result<usize> {
+        // 驱逐前若存在脏数据，先落库，避免丢失尚未持久化的节点更新。
+        // 失败不阻断驱逐（节点在 DB 中仍有上一份快照，不丢行）。
+        if self.dirty_count_sync() > 0 {
+            if let Err(e) = self.save_dirty().await {
+                tracing::warn!("[node_repo] 冷节点驱逐前增量持久化失败（继续驱逐）: {}", e);
+            }
+        }
+
+        // cutoff：last_active 早于该时刻的节点视为冷节点。
+        // 使用 checked_sub 避免阈值过大导致 Instant 下溢；未来时间的 last_active 天然晚于 cutoff，不会被误删。
+        let cutoff = match Instant::now().checked_sub(Duration::from_secs(older_than_secs)) {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+
+        // 第一遍：读锁内快照候选地址（避免持写锁长时间遍历）
+        let candidates: Vec<(SocketAddr, NodeId)> = {
+            let nodes = self.nodes.read();
+            nodes
+                .iter()
+                .filter(|(_, e)| e.last_active < cutoff)
+                .map(|(addr, e)| (*addr, e.id))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // 第二遍：持写锁批量移除，同步清理 /24 索引、热/冷集合与脏标记。
+        // 注意：不把被移除节点加入 dirty 集合——DB 行永久保留，删除仅作用于内存。
+        let mut nodes = self.nodes.write();
+        let mut subnet_index = self.subnet_index.write();
+        let mut hot = self.hot_addrs.write();
+        let mut cold = self.cold_addrs.write();
+        let mut dirty = self.dirty.write();
+        let mut removed = 0;
+        for (addr, id) in &candidates {
+            if nodes.remove(addr).is_some() {
+                removed += 1;
+                if let Some(subnet) = Self::subnet_key(*addr) {
+                    if let Some(bucket) = subnet_index.get_mut(&subnet) {
+                        bucket.retain(|x| x != id);
+                        if bucket.is_empty() {
+                            subnet_index.remove(&subnet);
+                        }
+                    }
+                }
+                hot.remove(addr);
+                cold.remove(addr);
+                dirty.remove(addr);
+            }
+        }
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_repo() -> NodeRepoImpl {
+        let storage = Arc::new(Storage::memory().unwrap());
+        NodeRepoImpl::new(storage)
+    }
+
+    fn addr(oct: u8, port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, oct)), port)
+    }
+
+    #[tokio::test]
+    async fn test_remove_cold_nodes_removes_only_cold() {
+        let repo = test_repo();
+        let hot = addr(1, 1001);
+        let warm = addr(2, 1002);
+        let cold = addr(3, 1003);
+
+        repo.add_node_sync([1u8; 20], hot);
+        repo.add_node_sync([2u8; 20], warm);
+        repo.add_node_sync([3u8; 20], cold);
+        assert_eq!(repo.len_sync(), 3);
+
+        // 把 warm 推到阈值内偏久、cold 推到超过 warm 阈值（7200s）
+        let warm_cutoff = Instant::now() - Duration::from_secs(3600);
+        let cold_cutoff = Instant::now() - Duration::from_secs(10_000);
+        repo.nodes.write().get_mut(&warm).unwrap().last_active = warm_cutoff;
+        repo.nodes.write().get_mut(&cold).unwrap().last_active = cold_cutoff;
+
+        // warm_threshold = 7200s：只有 cold 应被驱逐
+        let removed = repo.remove_cold_nodes(7200).await.unwrap();
+        assert_eq!(removed, 1, "应只移除 1 个冷节点");
+        assert!(repo.contains_sync(hot), "热节点必须保留");
+        assert!(repo.contains_sync(warm), "温节点必须保留");
+        assert!(!repo.contains_sync(cold), "冷节点应被移除");
+        assert_eq!(repo.len_sync(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_remove_cold_nodes_empty_when_nothing_cold() {
+        let repo = test_repo();
+        let a = addr(9, 1009);
+        repo.add_node_sync([9u8; 20], a);
+        // 新建节点 last_active = now，全部为热节点，不应移除
+        let removed = repo.remove_cold_nodes(7200).await.unwrap();
+        assert_eq!(removed, 0);
+        assert!(repo.contains_sync(a));
+    }
 }
