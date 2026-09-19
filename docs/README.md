@@ -20,7 +20,7 @@
 | [09-merkle-async-update.md](architecture/09-merkle-async-update.md) | Merkle 异步更新优化方案（待实施） | — |
 | [10-icc-upgrade-plan.md](architecture/10-icc-upgrade-plan.md) | ICC 升级方案（待确认） | Level 3 |
 | [11-billion-scale-storage.md](architecture/11-billion-scale-storage.md) | 亿级数据存储架构方案（设计阶段） | — |
-| [12-federation-sync-reconciliation.md](architecture/12-federation-sync-reconciliation.md) | 联邦同步架构重构方案（评审中） | — |
+| [12-federation-sync-reconciliation.md](architecture/12-federation-sync-reconciliation.md) | 联邦同步架构重构方案（S1–S5 已实施） | — |
 
 ### 分析报告 (`artifacts/`)
 

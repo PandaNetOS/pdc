@@ -705,8 +705,8 @@ impl SyncManager {
         let repo_elapsed = repo_start.elapsed();
 
         // 【回环修复】入站 apply 不再调用 node_merkle.update_incremental_batch。
-        // 该调用只会把这批条目所属 L2 分片标 dirty；dirty_l2 的唯一消费者是
-        // incremental_sync_tick（它会把 dirty 分片整批推回对端）。入站数据本就是对端发来的，
+        // 该调用只会把这批条目所属 L2 分片标 dirty；dirty_l2 的消费者是 Merkle 增量更新任务
+        // （merkle_incremental_*），重算后可能被反熵重新推回对端。入站数据本就是对端发来的，
         // 再标 dirty 并推回 -> A->B->A 无限回环。本地新节点的 merkle dirty 由
         // NodeRepoImpl.propagate 的 update_batch 负责，与本入站路径无关。
         let total_elapsed = total_start.elapsed();
@@ -2426,14 +2426,14 @@ impl SyncManager {
     /// 入站 ShardSyncBatch 走 handle_sync_batch -> apply_*（add_nodes_batch_internal 等），
     /// 条目已写入本地 repo 并落盘；但**不再**实时维护内存 Merkle 的 l2_hashes，也**不**把所属
     /// L2 分片标 dirty_l2（这是切断 A->B->A 回环的关键：入站数据若标 dirty，
-    /// incremental_sync_tick 会把整批再推回对端，形成无限回灌）。
+    /// 会被 Merkle 增量更新任务重算并可能经反熵再推回对端，形成无限回灌）。
     ///
     /// 内存 Merkle 根不靠这里维护，而是由周期任务 merkle_cold_rebuild_*（间隔
     /// merkle_full_rebuild_interval_secs）从 DB 全量 load_all_*_keys_hashes 后调用
     /// rebuild_cold_from_db / rebuild_all_from_db 重算 L2/L1/L0，并清空 dirty_l2，收敛到 DB 状态。
     ///
     /// 此处**不**调用 rebuild_all()：rebuild_all() 会把全部 65536 个 L2 标 dirty，
-    /// 反而触发 incremental_sync_tick 把整库回灌给对端。收敛交给周期 cold rebuild 即可。
+    /// 反而把整库经反熵回灌给对端。收敛交给周期 cold rebuild 即可。
     pub fn handle_shard_sync_complete(&self, msg: ShardSyncCompleteMessage) {
         info!(
             "[shard-sync] 收到 ShardSyncComplete（入站已落库；不实时维护内存 Merkle、不标 dirty，根由周期 cold rebuild 收敛）: repo={}, total_l2={}, total_entries={}, max_seq={}",

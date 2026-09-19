@@ -1,7 +1,11 @@
 # PDC 联邦网络架构文档
 
-> 版本：阶段 3（中继 + TrackerRepo 同步 + REST API + WebSocket + 生产增强）
-> 日期：2026-09-09
+> 版本：阶段 4（同步重构 S1–S5：oplog delta 稳态 + 分层 Merkle + Range 反熵 + bootstrap 引导）
+> 日期：2026-09-19
+>
+> 同步机制已按 [12-federation-sync-reconciliation.md](12-federation-sync-reconciliation.md) 完成重构：
+> 稳态以 **oplog delta 通道**为主（协议 v4），**Range-based 反熵**为兜底（v5），
+> **bootstrap 专用通道**负责全量引导（v6）。原「Push-Pull Gossip」与「固定 256 分片 Merkle」已移除。
 
 ## 1. 架构概述
 
@@ -22,7 +26,7 @@ PDC 联邦网络是一个去中心化的 P2P 节点发现与数据同步网络�
 
 │                   同步与业务层                        │
 
-│  Gossip引擎 │ Merkle对账 │ 4种Repo同步 │ 数据中继     │
+│  delta稳态 │ 反熵(Range/Merkle) │ bootstrap │ 中继    │
 
 ├─────────────────────────────────────────────────────┤
 
@@ -151,6 +155,31 @@ PDC 联邦网络是一个去中心化的 P2P 节点发现与数据同步网络�
 | 12 | MerkleRequest | Merkle 差异请求 | 2  |
 | 13 | SyncBatch     | 全量同步批量      | 1  |
 | 14 | Goodbye       | 优雅关闭通知      | 1  |
+| 15 | MerkleRepair  | Merkle 差异修复 | 2  |
+| 16–19 | FullSync*  | 全量同步会话（Start/Batch/Ack/Complete） | 2 |
+| 20 | GossipBatchBulk | Gossip 批量合并帧（减少往返） | 3 |
+| 21 | DiffSyncRequest | 差量同步请求（差异≥20% 触发） | 3 |
+| 22 | PeerInfo      | 握手后对端各 repo 条目数 | 3 |
+| 23–25 | ~~GossipDigest / GossipPullRequest / GossipPullResponse~~ | **已废弃**（原 Push-Pull Gossip，P1-9 移除，编号保留空位） | — |
+| 26 | PeerQueryRequest | 实时 peer 查询请求 | 3 |
+| 27 | PeerQueryResponse | 实时 peer 查询响应 | 3 |
+| 28 | DiffSyncKeyRequest | 差异分片 key 列表请求 | 3 |
+| 29 | DiffSyncKeyResponse | 差异分片 key 列表响应 | 3 |
+| 30 | MerkleLevelRequest | 分层 Merkle 层级请求（L0→L1→L2） | 3 |
+| 31 | MerkleLevelResponse | 分层 Merkle 层级响应 | 3 |
+| 32 | ShardSyncBatch | 差异 L2 分片数据批次 | 3 |
+| 33 | ShardSyncAck  | 分片同步确认 | 3 |
+| 34 | ShardSyncComplete | 分片同步完成 | 3 |
+| 35 | ShardSyncHashList | 分片内条目 (key, data\_hash) 列表 | 3 |
+| 36 | ShardSyncMissing | 请求方缺失 key 列表 | 3 |
+| 37 | OpsRequest    | **delta 增量拉取请求**（repo, since\_seq, limit） | 4 |
+| 38 | OpsBatch      | **delta 增量拉取响应**（ops, next\_seq, has\_more） | 4 |
+| 39 | RangeReconcileRequest | **Range 反熵请求**（lo, hi, digest, depth） | 4 |
+| 40 | RangeReconcileResponse | **Range 反熵响应**（digest, split\_points, entries） | 4 |
+| 41 | BootstrapManifestRequest | **bootstrap 清单请求** | 4 |
+| 42 | BootstrapManifestResponse | **bootstrap 清单响应** | 4 |
+| 43 | BootstrapChunkRequest | **bootstrap 分块请求** | 4 |
+| 44 | BootstrapChunkResponse | **bootstrap 分块响应** | 4 |
 
 ### 关键消息结构
 
@@ -240,18 +269,18 @@ MerkleDigest { repo\_type, shard\_count, roots, entry\_counts }
 
 * `random_neighbors(n)` — 随机选择 n 个已连接邻居用于 Gossip
 
-## 5. Gossip 传播协议
+## 5. 变更传播与同步通道编排
 
-### 传播流程
+### 变更即时传播（Gossip）
 
-
+本地写入后，变更经 `submit_gossip()` 进入 outbox，由 `fed_gossip_propagation` 任务周期批量传播：
 
 ```
-本地变更 → submit\_gossip() → outbox队列
+本地变更 → submit\_gossip() → outbox 队列
 
-&#x20;   ↓ (每1000ms)
+&#x20;   ↓ (每 gossip\_interval\_ms)
 
-取最多10条 → 随机选3个邻居 → 发送 GossipBatch
+取最多 N 条 → 随机选 gossip\_fanout 个邻居 → 发送 GossipBatch / GossipBatchBulk
 
 &#x20;   ↓
 
@@ -259,116 +288,129 @@ MerkleDigest { repo\_type, shard\_count, roots, entry\_counts }
 
 &#x20;   ├─ 已处理：丢弃
 
-&#x20;   └─ 未处理：加入seen\_msgs → 写入本地Repo → 加入outbox继续转发（排除来源）
+&#x20;   └─ 未处理：加入 seen\_msgs → 写入本地 Repo → 加入 outbox 继续转发（排除来源）
 ```
+
+> Gossip **只负责低延迟的变更扩散**；真正的一致性保证由 delta（§7.1）与反熵（§6 / §7.2）提供。
+> 原「Push-Pull Gossip」（`GossipDigest` / `GossipPullRequest` / `GossipPullResponse`，消息号 23–25）
+> 已随 P1-9 整体移除。
 
 ### 关键参数
 
+* `gossip_interval_ms`: 传播间隔（默认 1000ms）
 
+* `gossip_fanout`: 每批传播邻居数（默认 3）
 
-* `gossip_interval_ms`: 1000ms（传播间隔）
+* `seen_msgs`: LRU 去重缓存（默认 10000 条）
 
-* `gossip_fanout`: 3（每批传播邻居数）
+* `gossip_bulk_max_batches` / `gossip_bulk_max_bytes`: GossipBatchBulk 合并上限
 
-* `seen_msgs`: LRU 缓存（默认 10000 条）
+### 同步通道编排（三层）
 
-* 每批最多取 10 条 outbox 消息
+* **稳态**：delta 通道（每 repo 独立版本向量），成本 O(Δ)。
 
-### 反熵（Anti-Entropy）
+* **兜底**：周期反熵 —— NODE 走 Range（§7.2），其余走分层 Merkle（§6）。
 
+* **引导**：bootstrap 通道（§7.3），新节点加入或长期离线后严重落后时全量拉取。
 
+* 三者均受开关控制（默认关闭）；对端协议版本不足时逐级回退（详见 §7）。
 
-* 每 60 秒随机选 1 个邻居
+## 6. 分层 Merkle 与反熵机制
 
-* 发送 MerkleDigest 进行对账
+### 分层 Merkle 树（L0 / L1 / L2）
 
-* 差异分片通过 MerkleRequest 请求具体条目
+* **L0**：全库根，一个 blake3 哈希。
+* **L1**：固定 **256** 个一级分片，`l1 = blake3(key).first_byte`（即高 8 位）。
+* **L2**：**65536** 个二级分片，`l2 = l1 << 8 | blake3(key).second_byte`（真 16 位）。
+  自 S2 起 `node_repo` 的 `l2_shard` 列落库，可只按真 L2 取数（P1-5）。
+* 叶子哈希：分片内条目按 key 升序，`blake3(hash_fn(key) ‖ hash_fn(data))` 逐条拼接后再取 blake3。
 
-## 6. Merkle 反熵机制
+> 与旧描述的区别：**不再是「固定 256 分片」**，而是 L0→L1(256)→L2(65536) 三级定位，
+> 差异最多 3 轮收敛（`MerkleLevelRequest/Response`，协议 v3）。
 
-### 分片 Merkle 树
+### 对账流程（分层）
 
+1. A 发 `MerkleDigest { repo_type, level=0 }` 给 B（仅 L0 根）。
+2. 根相同 → 剪枝结束；不同 → B 请求 L1 层子哈希（`MerkleLevelRequest`）。
+3. 对比 L1（256 个）找出差异分片，再请求对应 L2 子哈希。
+4. 定位到差异 L2 后，走 `ShardSyncHashList`（拉取分片内 `(key, data_hash)`）→
+   `ShardSyncMissing`（回传缺失 key）→ `ShardSyncBatch`（只推真正缺失的条目）。
+   —— 把重复率从 ~97% 降到 <5%。
 
+### 反熵（Anti-Entropy）与按 repo 差异化周期
 
-* 固定 256 个分片
-
-* 分片选择：`blake3(key).first_byte % 256`
-
-* 分片根：分片内所有条目按 key 排序后，依次 `hash(key) + hash(data)` 拼接，最终 blake3
-
-### 对账流程
-
-
-
-1. A 发送 `MerkleDigest { repo_type, shard_count=256, roots, entry_counts }` 给 B
-
-2. B 对比本地 roots，找出不同的分片索引
-
-3. B 请求差异分片的所有条目（`get_shard_entries(shard)`）
-
-4. B 应用差异条目到本地 Repo
+* 反熵由 `fed_merkle_anti_entropy` 任务驱动，周期取
+  `min(anti_entropy_node_interval_secs, anti_entropy_other_interval_secs)`。
+* **按 repo 差异化（P2-5）**：NODE（churn 最高）默认 **30s**；其余 repo 默认 **300s**；
+  由 `MerkleProvider::anti_entropy_due(repo_type)` 判定本轮是否到期。
+* **NODE 由 Range 反熵接管（P1-4）**：`range_reconcile_enabled=true` 时，
+  `range_reconcile_owns(NODE)=true`，反熵主链**不再为 NODE 发 MerkleDigest**，
+  改建有序区间对账（见 §7.2）。
 
 ### 用途
 
+* NodeRepo：稳态 delta（§7.1）+ 兜底 Range 反熵（§7.2）
+* PeerRepo / InfohashRepo：变更即时 Gossip + 分层 Merkle 反熵
+* TrackerRepo：周期 Merkle 对账
 
+## 7. 同步架构（S1–S5 重构后）
 
-* NodeRepo：阶段 1 全量同步（SyncBatch）
+> 三层数据通路：**delta 稳态（主线）→ 反熵兜底（Range/Merkle）→ bootstrap 引导（首次/严重落后）**。
+> 三个通道均**默认关闭**（灰度），需显式开启：`delta_sync_enabled` / `range_reconcile_enabled`
+> / `bootstrap_enabled`。建议上线顺序：delta → range（先 `range_reconcile_diagnostic_only`）→ bootstrap。
 
-* PeerRepo/InfohashRepo：阶段 2 Gossip + Merkle 对账
+### 7.0 oplog：变更日志（delta 的数据源）
 
-* TrackerRepo：阶段 3 每小时全量对账 + 变更即时 Gossip
+* `feed_oplog(repo, seq, op, key, version, payload, ts)` 单一变更序列，`seq` 单调递增。
+* 保留窗口由 `oplog_retention_secs` 控制，`oplog_trim_interval_secs` 周期裁剪。
+* **入站 apply 不写回 oplog**（防 A→B→A 回环）；版本向量存 `delta_peer_seq(repo, peer, seq)`，
+  记录「已从该对端应用到哪个 seq」，用于续拉。
 
-## 7. 四种 Repo 同步策略
+### 7.1 delta 通道（稳态主线，协议 v4）
 
-### NodeRepo（repo\_type=1）
+* **触发**：握手的 `PeerInfo` 到达且 `delta_sync_enabled=true`、对端版本 ≥4 时，
+  对每个 repo `spawn(trigger_delta_sync)`。
+* **流程**：请求方发 `OpsRequest { repo, since_seq, limit }` →
+  数据服务器从 `feed_oplog` 取 `seq > since_seq` 的条目，回 `OpsBatch { ops, next_seq, has_more }`。
+* **成本 O(Δ)**：只传变更，不传全量；`has_more=true` 时按 `next_seq` 续拉。
+* 对端不支持（版本 <4）时该消息被丢弃，自动**回退反熵**。
 
+### 7.2 Range-based 反熵（兜底，协议 v5，默认只读诊断）
 
+* **原理**：把某 repo 的 key 空间按有序区间 `[lo, hi)` 组织，双方交换
+  `range_digest`（blake3，带长度前缀）；摘要相同则**剪枝**，不同则按 `split_points`
+  下钻，最坏 `O(d·log(N/d))`。
+* **决策**：`RangeDecision = Prune | Leaf | Descend`；
+  叶级回 `entries`（key 级差异），内部节点回 `split_points`。
+* **只接管 NODE**（churn 最高）；开启后先以
+  `range_reconcile_diagnostic_only=true` 只统计差集、不实际修复，确认无误再关诊断。
+* 参数：`range_reconcile_leaf_rows` / `_max_splits` / `_max_depth` / `_sample_ranges`。
 
-* **触发**：每 300 秒（sync\_node\_interval\_secs）
+### 7.3 bootstrap 专用通道（协议 v6，默认关闭）
 
-* **方式**：`node_repo.take_dirty_sync()` 取出脏节点 → SyncBatch 广播
+* **目标**：与在线反熵**解耦**的全量引导，用于新节点首次加入或长期离线后严重落后。
+* **六阶段**：`Idle → Manifest → Transfer → TailFollow → Verify → Done`（失败进 `Failed`）。
+* **替代物理快照**：以「W0 水位（= 发起时 `oplog_max_seq`）+ 显式区间边界逻辑分块 +
+  末块哈希校验」实现，避免快照文件的生命周期管理。
+* **流程**：`BootstrapManifestRequest` → 清单（`BootstrapManifest{chunks}`）→
+  逐块 `BootstrapChunkRequest/Response`（`TokenBucket` 按 `bootstrap_rate_bytes_per_sec` 限流，
+  批量 upsert 落地，`verify_chunk` 校验哈希）→ 校验通过后切 `trigger_delta_sync` 追尾增量。
+* **断点续传**：进度落 `bootstrap_state(repo, payload, manifest, updated_ms)`，
+  由 `fed_bootstrap_resume` 任务周期恢复。
 
-* **冲突解决**：LWW（Last Write Wins），version 大的覆盖
+### 7.4 四种 Repo 的同步方式
 
-* **数据**：SocketAddr 序列化为 SyncEntry（key=ip:port 字节，payload = 节点数据）
+| Repo | repo_type | 稳态主路径 | 反熵路径 | 备注 |
+| --- | --- | --- | --- | --- |
+| NodeRepo | 1 | delta（oplog） | **Range（接管）** | churn 最高，反熵 30s |
+| PeerRepo | 2 | delta + 变更 Gossip | 分层 Merkle | 反熵 300s |
+| InfohashRepo | 3 | delta + 变更 Gossip | 分层 Merkle | 只同步存在性 |
+| TrackerRepo | 4 | delta | 周期 Merkle 对账 | 无 remove，删除忽略 |
 
-### PeerRepo（repo\_type=2）
-
-
-
-* **触发**：EventBus `Event::PeerDiscovered` 事件驱动
-
-* **方式**：Gossip 即时传播
-
-* **同步字段**：infohash + addr + first\_seen + source（不同步评分 / 连接次数等本地计算字段）
-
-* **写入**：`peer_repo.add_peers_sync()`，source 标记为 "Federation"
-
-### InfohashRepo（repo\_type=3）
-
-
-
-* **触发**：EventBus `Event::InfohashSeen` 事件驱动
-
-* **方式**：Gossip 即时传播
-
-* **同步字段**：infohash (20 字节) + seen\_at 时间戳
-
-* **只同步存在性**，不同步元数据
-
-### TrackerRepo（repo\_type=4）
-
-
-
-* **触发**：每小时全量对账 + 变更即时 Gossip
-
-* **方式**：Merkle 对账 + Gossip 传播
-
-* **同步字段**：url + disabled 状态
-
-* **限制**：TrackerRepoImpl 无 remove 方法，删除操作忽略
-
-* **全量同步**：`all_trackers_sync()` → 更新 MerkleTree → 与随机邻居交换摘要
+* **冲突解决**：统一 LWW（Last Write Wins），version 大者胜。
+* **入站写入**：不写 oplog、不标 Merkle dirty（切断回环），由周期 cold rebuild 收敛。
+* Peer 同步字段：infohash + addr + first_seen + source（不同步评分/连接次数等本地字段）。
+* Tracker 同步字段：url + disabled 状态。
 
 ## 8. NAT 穿透与打洞信令
 
@@ -548,6 +590,20 @@ A → R（中继）→ B
 | sync\_node\_interval\_secs    | u64    | 300   | Node 全量同步间隔             |
 | sync\_infohash\_enabled       | bool   | true  | Infohash 同步开关           |
 | sync\_tracker\_enabled        | bool   | true  | Tracker 同步开关            |
+| oplog\_retention\_secs         | u64    | 86400 | oplog 保留窗口（秒）           |
+| oplog\_trim\_interval\_secs    | u64    | 3600  | oplog 裁剪周期（秒）            |
+| delta\_sync\_enabled          | bool   | false | **delta 增量通道开关（协议 v4）**   |
+| range\_reconcile\_enabled     | bool   | false | **Range 反熵开关（协议 v5）**      |
+| range\_reconcile\_diagnostic\_only | bool | true | Range 只读诊断模式（不实际修复）    |
+| range\_reconcile\_leaf\_rows   | u32    | 512   | Range 叶级行数                 |
+| range\_reconcile\_max\_splits  | u32    | 16    | Range 单次最大分裂点             |
+| range\_reconcile\_max\_depth   | u8     | 16    | Range 最大下钻深度               |
+| range\_reconcile\_sample\_ranges | u32  | 8     | Range 采样区间数                 |
+| bootstrap\_enabled           | bool   | false | **bootstrap 通道开关（协议 v6）**  |
+| bootstrap\_chunk\_rows        | u32    | 20000 | bootstrap 逻辑分块行数           |
+| bootstrap\_rate\_bytes\_per\_sec | u64  | 8388608 | bootstrap 限流（字节/秒，8 MiB/s） |
+| anti\_entropy\_node\_interval\_secs | u64 | 30  | NODE 反熵周期（秒）               |
+| anti\_entropy\_other\_interval\_secs | u64 | 300 | 其它 repo 反熵周期（秒）           |
 
 ### YAML 配置示例
 
@@ -903,7 +959,9 @@ HTTP 状态码：404
 
 ## 17. 测试覆盖
 
-阶段 3 完成后联邦模块共 **98 个单元测试**，覆盖：
+阶段 3 时联邦模块约 **98 个单元测试**；S1–S5 重构后新增 `sync/range_reconcile`
+（Range 摘要/分裂/决策）、`sync/bootstrap`（分块/manifest/令牌桶）、`sync/delta`
+（版本向量往返）、`storage/oplog` 等用例。覆盖：
 
 
 

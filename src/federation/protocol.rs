@@ -69,12 +69,10 @@ pub enum MessageType {
     /// 节点信息（握手后立即双向发送，携带本地各 repo 条目数，
     /// 供对端在数据源选择时判断哪个节点数据最完整）。
     PeerInfo = 22,
-    /// Push-Pull Gossip 摘要：携带本端最近变更的 key+version 列表
-    GossipDigest = 23,
-    /// Push-Pull Gossip 拉取请求：请求指定 key 的完整数据
-    GossipPullRequest = 24,
-    /// Push-Pull Gossip 拉取响应：返回完整条目数据
-    GossipPullResponse = 25,
+    // 编号 23 / 24 / 25：已废弃并移除。
+    // 原为 Push-Pull Gossip 的 GossipDigest / GossipPullRequest / GossipPullResponse；
+    // P1-9 移除该同步路径后不再收发（反熵改由分层 Merkle + Range 接管），
+    // 编号在此保留空位，避免与历史对端的编号语义错位。
     /// 实时 peer 查询请求（announce 时本地 peer 不足，向联邦节点查询）
     PeerQueryRequest = 26,
     /// 实时 peer 查询响应
@@ -152,9 +150,7 @@ impl MessageType {
             20 => Some(MessageType::GossipBatchBulk),
             21 => Some(MessageType::DiffSyncRequest),
             22 => Some(MessageType::PeerInfo),
-            23 => Some(MessageType::GossipDigest),
-            24 => Some(MessageType::GossipPullRequest),
-            25 => Some(MessageType::GossipPullResponse),
+            // 23 / 24 / 25：已废弃（原 Push-Pull Gossip），不再映射
             26 => Some(MessageType::PeerQueryRequest),
             27 => Some(MessageType::PeerQueryResponse),
             28 => Some(MessageType::DiffSyncKeyRequest),
@@ -781,27 +777,6 @@ pub struct BootstrapChunkResponseMessage {
 pub struct PeerInfoMessage {
     /// 发送方本地各 repo 的总条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
     pub local_entry_counts: Vec<u32>,
-}
-
-/// Push-Pull Gossip 摘要：携带本端最近变更的 key+version 列表
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GossipDigestMessage {
-    /// 最近变更的条目：(repo_type, key, version)
-    pub changes: Vec<(u8, Vec<u8>, u64)>,
-}
-
-/// Push-Pull Gossip 拉取请求：请求指定 key 的完整数据
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GossipPullRequestMessage {
-    /// 请求的条目：(repo_type, key)
-    pub keys: Vec<(u8, Vec<u8>)>,
-}
-
-/// Push-Pull Gossip 拉取响应：返回完整条目数据
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GossipPullResponseMessage {
-    /// 完整条目：(repo_type, SyncEntry)
-    pub entries: Vec<(u8, SyncEntry)>,
 }
 
 /// 实时 peer 查询请求

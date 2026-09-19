@@ -190,7 +190,7 @@ impl PeerSync {
         }
 
         // 【回环修复】入站 apply 不再 update_incremental_batch 标记 dirty（同 apply_node_sync），
-        // 否则本批条目所属 L2 被标 dirty，incremental_sync_tick 又把它整批推回对端。
+        // 否则本批条目所属 L2 被标 dirty，又被反熵整批推回对端。
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);

@@ -283,14 +283,6 @@ pub struct FederationConfig {
     /// 默认 5000，每批发送后释放内存，避免亿级数据同步时内存爆炸。
     #[serde(default = "default_sync_stream_batch_size")]
     pub sync_stream_batch_size: usize,
-    /// 是否启用增量同步优先。
-    /// 启用后优先基于 dirty 标记同步上次同步后变更的数据，增量失败时降级到 Merkle 差异同步。
-    #[serde(default = "default_true")]
-    pub incremental_sync_enabled: bool,
-    /// 增量同步间隔（秒）。
-    /// 日常增量同步周期，只同步 dirty 标记的变更数据，秒级完成。
-    #[serde(default = "default_incremental_sync_interval_secs")]
-    pub incremental_sync_interval_secs: u64,
     /// 分片同步窗口大小（发送方未确认的在途批次数）。
     #[serde(default = "default_shard_sync_window_size")]
     pub shard_sync_window_size: usize,
@@ -314,10 +306,6 @@ pub struct FederationConfig {
     /// 后台任务轮询检查引擎是否已结束，结束后从活跃列表移除。
     #[serde(default = "default_shard_sync_engine_poll_interval_secs")]
     pub shard_sync_engine_poll_interval_secs: u64,
-    /// 增量同步活跃标记清理延迟（秒）。
-    /// 触发增量同步后等待此时间再清理活跃标记，防止重复触发。
-    #[serde(default = "default_incremental_sync_active_cleanup_secs")]
-    pub incremental_sync_active_cleanup_secs: u64,
     /// 分片同步窗口流控等待时间（毫秒）。
     /// 窗口满时等待此时间后重新检查在途批次数。
     #[serde(default = "default_shard_sync_window_flow_sleep_ms")]
@@ -522,9 +510,6 @@ fn default_shard_sync_rate_limit_per_sec() -> u64 {
 fn default_sync_stream_batch_size() -> usize {
     5000
 }
-fn default_incremental_sync_interval_secs() -> u64 {
-    30
-}
 fn default_shard_sync_window_size() -> usize {
     3
 }
@@ -542,9 +527,6 @@ fn default_shard_sync_consecutive_fail_threshold() -> u32 {
 }
 fn default_shard_sync_engine_poll_interval_secs() -> u64 {
     5
-}
-fn default_incremental_sync_active_cleanup_secs() -> u64 {
-    60
 }
 fn default_shard_sync_window_flow_sleep_ms() -> u64 {
     50
@@ -632,15 +614,12 @@ impl Default for FederationConfig {
             shard_sync_batch_size: default_shard_sync_batch_size(),
             shard_sync_rate_limit_per_sec: default_shard_sync_rate_limit_per_sec(),
             sync_stream_batch_size: default_sync_stream_batch_size(),
-            incremental_sync_enabled: default_true(),
-            incremental_sync_interval_secs: default_incremental_sync_interval_secs(),
             shard_sync_window_size: default_shard_sync_window_size(),
             shard_sync_max_retries: default_shard_sync_max_retries(),
             shard_sync_base_backoff_ms: default_shard_sync_base_backoff_ms(),
             shard_sync_max_backoff_ms: default_shard_sync_max_backoff_ms(),
             shard_sync_consecutive_fail_threshold: default_shard_sync_consecutive_fail_threshold(),
             shard_sync_engine_poll_interval_secs: default_shard_sync_engine_poll_interval_secs(),
-            incremental_sync_active_cleanup_secs: default_incremental_sync_active_cleanup_secs(),
             shard_sync_window_flow_sleep_ms: default_shard_sync_window_flow_sleep_ms(),
         }
     }

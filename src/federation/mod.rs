@@ -440,7 +440,7 @@ impl FederationService {
 
         // 7.1 Merkle 反熵任务已迁移到 TaskScheduler（fed_merkle_anti_entropy）
 
-        // 7.2 Push-Pull Gossip 已迁移到 TaskScheduler（fed_push_pull_gossip）
+        // 7.2 Push-Pull Gossip 任务已随 P1-9 整体移除（稳态改由 oplog delta 通道驱动）
         // 8. 中继通道清理已迁移到 TaskScheduler（fed_relay_channel_cleanup）
 
         // 9. 引导连接种子节点
