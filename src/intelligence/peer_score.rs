@@ -26,12 +26,31 @@ impl Default for PeerScorerImpl {
 impl PeerScorer for PeerScorerImpl {
     async fn rescore_all(&self, repo: &dyn PeerRepository) {
         let peers = repo.all_peers().await;
+        let mut scores = Vec::with_capacity(peers.len());
         for peer in &peers {
-            // 计算该 peer 出现在多少个 infohash 下
             let infohash_count = self.count_infohashes_for_peer(repo, &peer.addr).await;
             let score = self.calculate(peer, infohash_count);
-            repo.update_score(&peer.addr, score).await;
+            scores.push((peer.addr, score));
         }
+        repo.update_scores_batch(&scores).await;
+    }
+
+    async fn rescore_dirty(&self, repo: &dyn PeerRepository) -> usize {
+        let dirty_addrs = repo.dirty_peers().await;
+        if dirty_addrs.is_empty() {
+            return 0;
+        }
+        let mut scores = Vec::with_capacity(dirty_addrs.len());
+        for addr in &dirty_addrs {
+            if let Some(peer) = repo.get_peer_global(addr).await {
+                let infohash_count = repo.get_peer_infohash_count(addr).await;
+                let score = self.calculate(&peer, infohash_count);
+                scores.push((*addr, score));
+            }
+        }
+        repo.update_scores_batch(&scores).await;
+        repo.clear_all_dirty().await;
+        scores.len()
     }
 
     fn calculate(&self, peer: &PeerInfo, infohash_count: u32) -> f64 {

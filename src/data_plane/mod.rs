@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod rate_limiter;
 pub mod relay;
 pub mod rest_api;
+pub mod stats_snapshot;
 pub mod udp_tracker;
 pub mod ws;
 
@@ -82,6 +83,8 @@ pub struct AppState {
     pub relay_server: Option<Arc<crate::data_plane::relay::RelayServer>>,
     /// UDP Tracker 服务端（供 TaskScheduler 调用 cleanup_expired_connections）
     pub udp_tracker: Option<Arc<UdpTrackerServer>>,
+    /// 统计快照（后台任务定期更新，API 只读）
+    pub stats_snapshot: Arc<stats_snapshot::StatsSnapshot>,
 }
 
 /// 数据面

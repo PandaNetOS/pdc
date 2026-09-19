@@ -98,9 +98,17 @@ pub struct FederationConfig {
     /// 最大缓存节点数
     #[serde(default = "default_peer_cache_max")]
     pub peer_cache_max_nodes: usize,
-    /// TCP 传输写入超时（秒），超过此时间 write_all 未完成则报错
+    /// TCP 传输写入超时（秒），超过此时间 write_all 未完成则报错（随后触发重试）
     #[serde(default = "default_transport_write_timeout")]
     pub transport_write_timeout_secs: u64,
+    /// TCP 写入超时后的最大重试次数（不含首次）。
+    /// 超时后按退避基数指数退避重试，超过此次数才判定写入失败并断开。
+    #[serde(default = "default_transport_write_max_retries")]
+    pub transport_write_max_retries: u32,
+    /// TCP 写入重试退避基数（毫秒）。
+    /// 第 n 次重试前等待 retry_base_ms * 2^(n-1)。
+    #[serde(default = "default_transport_write_retry_base_ms")]
+    pub transport_write_retry_base_ms: u64,
     /// Gossip 连续发送失败断开阈值，达到此次数则主动断开连接
     #[serde(default = "default_gossip_max_consecutive_failures")]
     pub gossip_max_consecutive_failures: u32,
@@ -156,6 +164,19 @@ pub struct FederationConfig {
     /// 队列累计达到此条数时通过 Notify 立即唤醒后台 flush，无需等待间隔。
     #[serde(default = "default_merkle_async_update_batch_size")]
     pub merkle_async_update_batch_size: usize,
+    /// Merkle 冷数据重算间隔（秒）。
+    /// 每小时从 DB 全量加载 key+hash 重算冷分片根，默认 3600 秒。
+    #[serde(default = "default_merkle_cold_rebuild_interval_secs")]
+    pub merkle_cold_rebuild_interval_secs: u64,
+    /// Merkle 增量更新间隔（秒）。
+    /// 后台任务每此间隔取出 dirty 分片，从 DB 加载对应分片数据重算分片根和全量根。
+    /// 默认 10 秒。
+    #[serde(default = "default_merkle_incremental_update_interval_secs")]
+    pub merkle_incremental_update_interval_secs: u64,
+    /// Merkle 全量重算间隔（秒）。
+    /// 兜底任务：每此间隔从 DB 全量重算所有分片根，默认 300 秒（5 分钟）。
+    #[serde(default = "default_merkle_full_rebuild_interval_secs")]
+    pub merkle_full_rebuild_interval_secs: u64,
     /// 发送端 GossipBatch 合并为 bulk 帧的最大 batch 数量。
     /// 同一连接的多个 batch 合并为一个 GossipBatchBulk 发送，减少网络往返。
     #[serde(default = "default_gossip_bulk_max_batches")]
@@ -180,6 +201,78 @@ pub struct FederationConfig {
     /// 超过此时长自动恢复正常转发（Gossip 拉取无显式完成信号，用可配置时长兜底）。
     #[serde(default = "default_full_sync_receiving_settle_ms")]
     pub full_sync_receiving_settle_ms: u64,
+    /// DiffSync key 列表交换超时（秒）。
+    /// 数据服务器发出差异分片 key 列表后，等待对端回传缺失 key 列表的最长时间。
+    /// 超时则回退到原始全量推送逻辑（对端不支持新协议或网络异常时的兜底）。
+    #[serde(default = "default_diff_key_exchange_timeout_secs")]
+    pub diff_key_exchange_timeout_secs: u64,
+    /// 是否启用分层 Merkle 对比协议（协议版本 >=3）。
+    /// 启用后使用 L0→L1→L2 三层对比定位差异，替代旧版全量 key 交换。
+    /// 对端不支持时自动回退到旧协议。
+    #[serde(default = "default_true")]
+    pub layered_merkle_enabled: bool,
+    /// 分片并行同步最大并发数（同时同步的 L2 分片数）。
+    /// 默认 4，每个分片独立超时、独立重试，单分片失败不影响其他分片。
+    #[serde(default = "default_shard_sync_max_concurrency")]
+    pub shard_sync_max_concurrency: usize,
+    /// 单个 L2 分片同步超时（秒）。
+    /// 超过此时间未收到确认则重试该分片，超过重试次数后标记失败。
+    #[serde(default = "default_shard_sync_timeout_secs")]
+    pub shard_sync_timeout_secs: u64,
+    /// 单个 L2 分片同步最大重试次数（不含首次）。
+    #[serde(default = "default_shard_sync_retry_count")]
+    pub shard_sync_retry_count: u32,
+    /// 分片同步每批条目数（ShardSyncBatch 的 entries 数量）。
+    /// 默认 5000，平衡消息大小和网络往返次数。
+    #[serde(default = "default_shard_sync_batch_size")]
+    pub shard_sync_batch_size: usize,
+    /// 分片同步速率限制（条目/秒），0 表示不限制。
+    /// 用于避免同步期间占用过多磁盘 IO 和网络带宽，影响爬虫和 Tracker 正常运行。
+    #[serde(default = "default_shard_sync_rate_limit_per_sec")]
+    pub shard_sync_rate_limit_per_sec: u64,
+    /// 流式加载每批条目数（从 DB 流式读取差异分片数据时的批次大小）。
+    /// 默认 5000，每批发送后释放内存，避免亿级数据同步时内存爆炸。
+    #[serde(default = "default_sync_stream_batch_size")]
+    pub sync_stream_batch_size: usize,
+    /// 是否启用增量同步优先。
+    /// 启用后优先基于 dirty 标记同步上次同步后变更的数据，增量失败时降级到 Merkle 差异同步。
+    #[serde(default = "default_true")]
+    pub incremental_sync_enabled: bool,
+    /// 增量同步间隔（秒）。
+    /// 日常增量同步周期，只同步 dirty 标记的变更数据，秒级完成。
+    #[serde(default = "default_incremental_sync_interval_secs")]
+    pub incremental_sync_interval_secs: u64,
+    /// 分片同步窗口大小（发送方未确认的在途批次数）。
+    #[serde(default = "default_shard_sync_window_size")]
+    pub shard_sync_window_size: usize,
+    /// 单批次最大发送重试次数（不含首次）。
+    /// 发送失败后按指数退避重试，超过此次数则丢弃该批次并记录失败统计。
+    #[serde(default = "default_shard_sync_max_retries")]
+    pub shard_sync_max_retries: u32,
+    /// 分片同步发送失败指数退避基数（毫秒）。
+    /// 第 n 次重试前等待 base_backoff_ms * 2^(send_retry_count)。
+    #[serde(default = "default_shard_sync_base_backoff_ms")]
+    pub shard_sync_base_backoff_ms: u64,
+    /// 分片同步发送失败最大退避上限（毫秒）。
+    /// 指数退避超过此值后不再增长，封顶等待。
+    #[serde(default = "default_shard_sync_max_backoff_ms")]
+    pub shard_sync_max_backoff_ms: u64,
+    /// 连续发送失败断开阈值。
+    /// 连续达到此次数发送失败则标记连接断开，停止当前同步并触发上层重连。
+    #[serde(default = "default_shard_sync_consecutive_fail_threshold")]
+    pub shard_sync_consecutive_fail_threshold: u32,
+    /// 分片同步引擎完成后轮询清理间隔（秒）。
+    /// 后台任务轮询检查引擎是否已结束，结束后从活跃列表移除。
+    #[serde(default = "default_shard_sync_engine_poll_interval_secs")]
+    pub shard_sync_engine_poll_interval_secs: u64,
+    /// 增量同步活跃标记清理延迟（秒）。
+    /// 触发增量同步后等待此时间再清理活跃标记，防止重复触发。
+    #[serde(default = "default_incremental_sync_active_cleanup_secs")]
+    pub incremental_sync_active_cleanup_secs: u64,
+    /// 分片同步窗口流控等待时间（毫秒）。
+    /// 窗口满时等待此时间后重新检查在途批次数。
+    #[serde(default = "default_shard_sync_window_flow_sleep_ms")]
+    pub shard_sync_window_flow_sleep_ms: u64,
 }
 
 fn default_listen_port() -> u16 {
@@ -233,7 +326,7 @@ fn default_gossip_interval() -> u64 {
     1000
 }
 fn default_gossip_fanout() -> usize {
-    3
+    8
 }
 fn default_gossip_seen_shards() -> usize {
     16
@@ -248,7 +341,17 @@ fn default_peer_cache_max() -> usize {
     100
 }
 fn default_transport_write_timeout() -> u64 {
-    5
+    30
+}
+/// TCP 写入超时后的最大重试次数（不含首次）。
+/// 超时后按退避基数指数退避重试，超过此次数才判定写入失败并断开。
+fn default_transport_write_max_retries() -> u32 {
+    3
+}
+/// TCP 写入重试退避基数（毫秒）。
+/// 第 n 次重试前等待 retry_base_ms * 2^(n-1)（100/200/400...）。
+fn default_transport_write_retry_base_ms() -> u64 {
+    100
 }
 fn default_gossip_max_consecutive_failures() -> u32 {
     3
@@ -278,7 +381,7 @@ fn default_gossip_flush_max_batches() -> usize {
     10
 }
 fn default_full_sync_batch_size() -> usize {
-    5000
+    2000
 }
 fn default_full_sync_window_size() -> usize {
     3
@@ -295,6 +398,15 @@ fn default_merkle_async_update_interval_ms() -> u64 {
 fn default_merkle_async_update_batch_size() -> usize {
     10000
 }
+fn default_merkle_cold_rebuild_interval_secs() -> u64 {
+    3600
+}
+fn default_merkle_incremental_update_interval_secs() -> u64 {
+    10
+}
+fn default_merkle_full_rebuild_interval_secs() -> u64 {
+    300
+}
 fn default_gossip_bulk_max_batches() -> usize {
     50
 }
@@ -309,6 +421,54 @@ fn default_full_sync_source_select_settle_ms() -> u64 {
 }
 fn default_full_sync_receiving_settle_ms() -> u64 {
     60_000
+}
+fn default_diff_key_exchange_timeout_secs() -> u64 {
+    30
+}
+fn default_shard_sync_max_concurrency() -> usize {
+    4
+}
+fn default_shard_sync_timeout_secs() -> u64 {
+    60
+}
+fn default_shard_sync_retry_count() -> u32 {
+    3
+}
+fn default_shard_sync_batch_size() -> usize {
+    5000
+}
+fn default_shard_sync_rate_limit_per_sec() -> u64 {
+    0
+}
+fn default_sync_stream_batch_size() -> usize {
+    5000
+}
+fn default_incremental_sync_interval_secs() -> u64 {
+    30
+}
+fn default_shard_sync_window_size() -> usize {
+    3
+}
+fn default_shard_sync_max_retries() -> u32 {
+    3
+}
+fn default_shard_sync_base_backoff_ms() -> u64 {
+    200
+}
+fn default_shard_sync_max_backoff_ms() -> u64 {
+    5000
+}
+fn default_shard_sync_consecutive_fail_threshold() -> u32 {
+    5
+}
+fn default_shard_sync_engine_poll_interval_secs() -> u64 {
+    5
+}
+fn default_incremental_sync_active_cleanup_secs() -> u64 {
+    60
+}
+fn default_shard_sync_window_flow_sleep_ms() -> u64 {
+    50
 }
 
 impl Default for FederationConfig {
@@ -344,6 +504,8 @@ impl Default for FederationConfig {
             peer_cache_enabled: default_true(),
             peer_cache_max_nodes: default_peer_cache_max(),
             transport_write_timeout_secs: default_transport_write_timeout(),
+            transport_write_max_retries: default_transport_write_max_retries(),
+            transport_write_retry_base_ms: default_transport_write_retry_base_ms(),
             gossip_max_consecutive_failures: default_gossip_max_consecutive_failures(),
             reconnect_cooldown_secs: default_reconnect_cooldown_secs(),
             heavy_task_max_concurrency: default_heavy_task_max_concurrency(),
@@ -360,11 +522,33 @@ impl Default for FederationConfig {
             full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
             merkle_async_update_interval_ms: default_merkle_async_update_interval_ms(),
             merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
+            merkle_cold_rebuild_interval_secs: default_merkle_cold_rebuild_interval_secs(),
+            merkle_incremental_update_interval_secs:
+                default_merkle_incremental_update_interval_secs(),
+            merkle_full_rebuild_interval_secs: default_merkle_full_rebuild_interval_secs(),
             gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
             gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
             parallel_propagation: default_parallel_propagation(),
             full_sync_source_select_settle_ms: default_full_sync_source_select_settle_ms(),
             full_sync_receiving_settle_ms: default_full_sync_receiving_settle_ms(),
+            diff_key_exchange_timeout_secs: default_diff_key_exchange_timeout_secs(),
+            layered_merkle_enabled: default_true(),
+            shard_sync_max_concurrency: default_shard_sync_max_concurrency(),
+            shard_sync_timeout_secs: default_shard_sync_timeout_secs(),
+            shard_sync_retry_count: default_shard_sync_retry_count(),
+            shard_sync_batch_size: default_shard_sync_batch_size(),
+            shard_sync_rate_limit_per_sec: default_shard_sync_rate_limit_per_sec(),
+            sync_stream_batch_size: default_sync_stream_batch_size(),
+            incremental_sync_enabled: default_true(),
+            incremental_sync_interval_secs: default_incremental_sync_interval_secs(),
+            shard_sync_window_size: default_shard_sync_window_size(),
+            shard_sync_max_retries: default_shard_sync_max_retries(),
+            shard_sync_base_backoff_ms: default_shard_sync_base_backoff_ms(),
+            shard_sync_max_backoff_ms: default_shard_sync_max_backoff_ms(),
+            shard_sync_consecutive_fail_threshold: default_shard_sync_consecutive_fail_threshold(),
+            shard_sync_engine_poll_interval_secs: default_shard_sync_engine_poll_interval_secs(),
+            incremental_sync_active_cleanup_secs: default_incremental_sync_active_cleanup_secs(),
+            shard_sync_window_flow_sleep_ms: default_shard_sync_window_flow_sleep_ms(),
         }
     }
 }
@@ -387,7 +571,7 @@ mod tests {
         assert_eq!(cfg.relay_bandwidth_limit_mbps, 10);
         assert_eq!(cfg.relay_max_connections, 5);
         assert_eq!(cfg.gossip_interval_ms, 1000);
-        assert_eq!(cfg.gossip_fanout, 3);
+        assert_eq!(cfg.gossip_fanout, 8);
         assert!(cfg.sync_node_enabled);
         assert_eq!(cfg.sync_node_interval_secs, 300);
         assert!(cfg.dht_discovery_enabled);

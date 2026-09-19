@@ -188,6 +188,33 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             })
             .count()
     };
+    // 计算各 repo 冷热分层统计（总数/热/温/冷）
+    let tier_stats = |repo_cache: (usize, usize, u64), total: u64| -> serde_json::Value {
+        let (hot, warm, _) = repo_cache;
+        serde_json::json!({
+            "total": total,
+            "hot": hot,
+            "warm": warm,
+            "cold": total.saturating_sub(hot as u64).saturating_sub(warm as u64),
+        })
+    };
+    let peer_tier = tier_stats(
+        state.peer_repo.cache_stats(),
+        state.peer_repo.total_count_sync(),
+    );
+    let infohash_tier = state
+        .infohash_repo
+        .as_ref()
+        .map(|r| tier_stats(r.cache_stats(), r.total_count_sync()));
+    let node_tier = state
+        .node_repo
+        .as_ref()
+        .map(|r| tier_stats(r.cache_stats(), r.total_count_sync()));
+    let tracker_tier = state
+        .tracker_repo
+        .as_ref()
+        .map(|r| tier_stats(r.cache_stats(), r.total_count_sync()));
+
     // 从 crawler_state 获取入站连通性评分
     let _inbound_score = state.crawler_state.as_ref().map(|cs| {
         let s = cs.read();
@@ -338,6 +365,7 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
             "infohashes": cache_stats.0,
             "peers": cache_stats.1,
             "active_peers": active_peers,
+            "tier": peer_tier,
         },
         "super_tracker": {
             "infohashes": state.super_tracker.infohash_count(),
@@ -353,6 +381,11 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
         // InfohashRepo
         "infohash_repo": {
             "count": state.infohash_repo.as_ref().map(|r| r.count_sync()).unwrap_or(0),
+            "tier": infohash_tier,
+        },
+        // TrackerRepo
+        "tracker_repo": {
+            "tier": tracker_tier,
         },
         // NodeRepo（使用 stats_sync 避免全量克隆 60000+ 节点）
         "node_repo": state.node_repo.as_ref().map(|r| {
@@ -364,6 +397,7 @@ async fn collect_status(state: &AppState) -> serde_json::Value {
                 "bad": stats.bad,
                 "questionable": stats.questionable,
                 "good": stats.good,
+                "tier": node_tier.clone(),
             })
         }).unwrap_or_else(|| serde_json::json!({"total": 0, "active": 0})),
         // NAT/UPnP

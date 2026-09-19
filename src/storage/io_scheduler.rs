@@ -284,8 +284,12 @@ pub struct IoScheduler {
 }
 
 impl IoScheduler {
-    /// 创建 IO 调度器并启动 writer_loop
-    pub fn new(conn: Arc<StdMutex<Connection>>, config: SchedulerRuntimeConfig) -> Arc<Self> {
+    /// 创建 IO 调度器并在指定 runtime 上启动 writer_loop
+    pub fn new_with_handle(
+        conn: Arc<StdMutex<Connection>>,
+        config: SchedulerRuntimeConfig,
+        handle: &tokio::runtime::Handle,
+    ) -> Arc<Self> {
         let scheduler = Arc::new(Self {
             queue: ParkingMutex::new(BinaryHeap::new()),
             token_bucket: Arc::new(TokenBucket::new(
@@ -304,13 +308,18 @@ impl IoScheduler {
             idle_samples: ParkingMutex::new(Vec::new()),
         });
 
-        // 启动 writer_loop
+        // 在指定 runtime 上启动 writer_loop
         let writer = scheduler.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             writer.writer_loop().await;
         });
 
         scheduler
+    }
+
+    /// 创建 IO 调度器并在当前 runtime 上启动 writer_loop
+    pub fn new(conn: Arc<StdMutex<Connection>>, config: SchedulerRuntimeConfig) -> Arc<Self> {
+        Self::new_with_handle(conn, config, &tokio::runtime::Handle::current())
     }
 
     /// 查询背压状态（队列过长时返回 true，TaskScheduler 可据此降速）

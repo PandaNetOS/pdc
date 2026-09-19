@@ -53,6 +53,11 @@ impl InfohashScorer for InfohashScorerImpl {
         );
     }
 
+    async fn rescore_dirty(&self, _repo: &dyn InfohashRepository) -> usize {
+        // Infohash 评分聚合由 ScoreMaintainer 协调，此处为空操作
+        0
+    }
+
     fn calculate(&self, input: &InfohashScoreInput) -> f64 {
         calculate_infohash_score_with_config(input, &self.config)
     }

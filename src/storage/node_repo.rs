@@ -1,9 +1,9 @@
-//! NodeRepository 实现
+//! NodeRepository 瀹炵幇
 //!
-//! 独立的 DHT 节点存储（无容量限制），作为爬虫候选池的唯一归口。
-//! 路由表只负责 DHT 路由响应，NodeRepo 负责爬虫候选节点的存储和评分。
-//! 内存 FxHashMap + SQLite 增量持久化。
-//! 千万级性能优化：FxHashMap 替代 std::HashMap，增量持久化只保存 dirty 节点。
+//! 鐙珛鐨?DHT 鑺傜偣瀛樺偍锛堟棤瀹归噺闄愬埗锛夛紝浣滀负鐖櫕鍊欓€夋睜鐨勫敮涓€褰掑彛銆?
+//! 璺敱琛ㄥ彧璐熻矗 DHT 璺敱鍝嶅簲锛孨odeRepo 璐熻矗鐖櫕鍊欓€夎妭鐐圭殑瀛樺偍鍜岃瘎鍒嗐€?
+//! 鍐呭瓨 FxHashMap + SQLite 澧為噺鎸佷箙鍖栥€?
+//! 鍗冧竾绾ф€ц兘浼樺寲锛欶xHashMap 鏇夸唬 std::HashMap锛屽閲忔寔涔呭寲鍙繚瀛?dirty 鑺傜偣銆?
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -20,9 +20,10 @@ use crate::federation::protocol::{operation, repo_type, SyncEntry};
 use crate::dht::kbucket::{KBucketEntry, NodeState};
 use crate::storage::db::{DhtNodeRow, Storage};
 use crate::storage::repo_traits::{NodeId, NodeRepository};
+use crate::storage::tiered_cache::TieredCacheConfig;
 use crate::storage::write_queue::WriteQueue;
 
-/// 节点统计信息（避免全量克隆）
+/// 鑺傜偣缁熻淇℃伅锛堥伩鍏嶅叏閲忓厠闅嗭級
 #[derive(Debug, Clone)]
 pub struct NodeStats {
     pub total: usize,
@@ -34,27 +35,35 @@ pub struct NodeStats {
 }
 
 pub struct NodeRepoImpl {
-    /// 独立节点存储（无容量限制，按 addr 去重）— FxHashMap 高性能
+    /// 鐙珛鑺傜偣瀛樺偍锛堟棤瀹归噺闄愬埗锛屾寜 addr 鍘婚噸锛夆€?FxHashMap 楂樻€ц兘
     nodes: RwLock<FxHashMap<SocketAddr, KBucketEntry>>,
-    /// 脏节点集合（统计数据已变化，需要重算评分 + 增量持久化）
+    /// 鑴忚妭鐐归泦鍚堬紙缁熻鏁版嵁宸插彉鍖栵紝闇€瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖栵級
     dirty: RwLock<FxHashSet<SocketAddr>>,
-    /// /24 网段索引（IPv4 前 3 字节 -> 该网段内节点 ID 列表），用于 O(1) 取网段
-    /// 仅 IPv4 节点入索引；IPv6 节点忽略。增删节点时同步维护。
+    /// /24 缃戞绱㈠紩锛圛Pv4 鍓?3 瀛楄妭 -> 璇ョ綉娈靛唴鑺傜偣 ID 鍒楄〃锛夛紝鐢ㄤ簬 O(1) 鍙栫綉娈?
+    /// 浠?IPv4 鑺傜偣鍏ョ储寮曪紱IPv6 鑺傜偣蹇界暐銆傚鍒犺妭鐐规椂鍚屾缁存姢銆?
     subnet_index: RwLock<FxHashMap<[u8; 3], Vec<NodeId>>>,
-    /// 热节点地址集合（最近 hot_threshold_secs 内被访问的节点）
+    /// 鐑妭鐐瑰湴鍧€闆嗗悎锛堟渶杩?hot_threshold_secs 鍐呰璁块棶鐨勮妭鐐癸級
     hot_addrs: RwLock<FxHashSet<SocketAddr>>,
-    /// 冷节点地址集合（超过 hot_threshold_secs 未访问，由外部定时任务迁移）
+    /// 鍐疯妭鐐瑰湴鍧€闆嗗悎锛堣秴杩?hot_threshold_secs 鏈闂紝鐢卞閮ㄥ畾鏃朵换鍔¤縼绉伙級
     cold_addrs: RwLock<FxHashSet<SocketAddr>>,
     storage: Arc<Storage>,
-    /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
+    /// 鑱旈偊寮曠敤锛圤nceLock 娉ㄥ叆锛涙湭璁剧疆鏃舵湰鍦板啓鍏ヤ笉瑙﹀彂 Merkle/Gossip锛宺epo 姝ｅ父宸ヤ綔锛?
     merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
-    /// 写入队列（可选，None 时退化为同步写入）
+    /// 鍐欏叆闃熷垪锛堝彲閫夛紝None 鏃堕€€鍖栦负鍚屾鍐欏叆锛?
     write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl NodeRepoImpl {
     pub fn new(storage: Arc<Storage>) -> Self {
+        Self::with_tier_config(storage, Default::default(), true)
+    }
+
+    pub fn with_tier_config(
+        storage: Arc<Storage>,
+        _cache_config: TieredCacheConfig,
+        _tier_enabled: bool,
+    ) -> Self {
         Self {
             nodes: RwLock::new(FxHashMap::default()),
             dirty: RwLock::new(FxHashSet::default()),
@@ -68,7 +77,7 @@ impl NodeRepoImpl {
         }
     }
 
-    /// 兼容旧接口：从 crawler 路由表创建（现在忽略路由表，独立存储）
+    /// 鍏煎鏃ф帴鍙ｏ細浠?crawler 璺敱琛ㄥ垱寤猴紙鐜板湪蹇界暐璺敱琛紝鐙珛瀛樺偍锛?
     pub fn from_crawler(
         _routing_table: Arc<parking_lot::RwLock<crate::dht::routing_table::RoutingTable>>,
         storage: Arc<Storage>,
@@ -76,23 +85,50 @@ impl NodeRepoImpl {
         Self::new(storage)
     }
 
-    /// 注入写入队列（builder 模式）
+    /// 娉ㄥ叆鍐欏叆闃熷垪锛坆uilder 妯″紡锛?
     pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
         self.write_queue = Some(wq);
         self
     }
 
-    /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
-    /// 未调用时（如单元测试），本地写入不触发传播，repo 行为完全不变。
+    /// 获取底层 Storage 引用（用于联邦同步按分片加载数据）。
+    pub fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+
+    /// 分层缓存统计（与 TrackerRepo 接口一致：(hot, warm, cold_loaded)）。
+    /// NodeRepo 全量驻内存，全部计入 hot。
+    pub fn cache_stats(&self) -> (usize, usize, u64) {
+        (self.len_sync(), 0, 0)
+    }
+
+    /// 数据库中 dht_nodes 表的总行数（同步，用于监控面板）
+    pub fn total_count_sync(&self) -> u64 {
+        self.storage.count_table("dht_nodes").unwrap_or(0)
+    }
+
+    /// 执行分层检查 + 驱逐（由 TaskScheduler 定时调用）。
+    /// 这三个 repo 全量驻内存不使用 TieredCache，为空操作。
+    pub fn tier_evict(&self) {
+        // no-op: data is fully in memory, no tiered cache to evict from
+    }
+
+    /// 紧急驱逐（内存超限时调用）。空操作。
+    pub fn emergency_evict(&self, _count: usize) {
+        // no-op: data is fully in memory
+    }
+
+    /// 娉ㄥ叆鑱旈偊 Merkle 鏍戜笌 Gossip 寮曟搸寮曠敤锛坢ain.rs 鍦?FederationService 鍒涘缓鍚庤皟鐢級銆?
+    /// 鏈皟鐢ㄦ椂锛堝鍗曞厓娴嬭瘯锛夛紝鏈湴鍐欏叆涓嶈Е鍙戜紶鎾紝repo 琛屼负瀹屽叏涓嶅彉銆?
     pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
         let _ = self.merkle.set(merkle);
         let _ = self.gossip.set(gossip);
     }
 
-    /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
-    /// merkle/gossip 未注入时直接跳过，不 panic。
+    /// 灏嗘湰鍦版柊鍐欏叆鐨勬潯鐩壒閲忔洿鏂?Merkle 骞舵彁浜?Gossip锛堝啓閿佸鎵ц锛岀函鍐呭瓨鎿嶄綔锛夈€?
+    /// merkle/gossip 鏈敞鍏ユ椂鐩存帴璺宠繃锛屼笉 panic銆?
     #[inline]
-    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>)>) {
+    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>) {
         if built.is_empty() {
             return;
         }
@@ -102,9 +138,9 @@ impl NodeRepoImpl {
         let Some(gossip) = self.gossip.get() else {
             return;
         };
-        let refs: Vec<(&[u8], &[u8])> = built
+        let refs: Vec<(&[u8], &[u8], &[u8])> = built
             .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
             .collect();
         merkle.update_batch(&refs);
         let now = std::time::SystemTime::now()
@@ -113,7 +149,7 @@ impl NodeRepoImpl {
             .as_secs();
         let entries: Vec<SyncEntry> = built
             .into_iter()
-            .map(|(key, payload)| SyncEntry {
+            .map(|(key, payload, _)| SyncEntry {
                 key,
                 operation: operation::UPSERT,
                 version: now,
@@ -123,10 +159,10 @@ impl NodeRepoImpl {
         gossip.submit_gossip(rt, entries);
     }
 
-    // ── 同步便捷方法（爬虫高频调用，避免 async 开销）──
+    // 鈹€鈹€ 鍚屾渚挎嵎鏂规硶锛堢埇铏珮棰戣皟鐢紝閬垮厤 async 寮€閿€锛夆攢鈹€
 
-    /// 提取 SocketAddr 的 IPv4 前 3 字节作为 /24 网段 key。
-    /// 仅 IPv4 返回 Some；IPv6 返回 None（不入网段索引）。
+    /// 鎻愬彇 SocketAddr 鐨?IPv4 鍓?3 瀛楄妭浣滀负 /24 缃戞 key銆?
+    /// 浠?IPv4 杩斿洖 Some锛汭Pv6 杩斿洖 None锛堜笉鍏ョ綉娈电储寮曪級銆?
     #[inline]
     fn subnet_key(addr: SocketAddr) -> Option<[u8; 3]> {
         match addr.ip() {
@@ -138,8 +174,8 @@ impl NodeRepoImpl {
         }
     }
 
-    /// 把 (node_id, subnet) 加入 /24 网段索引。
-    /// 调用方持有 self.subnet_index 写锁（在批量操作内联完成，避免额外锁竞争）。
+    /// 鎶?(node_id, subnet) 鍔犲叆 /24 缃戞绱㈠紩銆?
+    /// 璋冪敤鏂规寔鏈?self.subnet_index 鍐欓攣锛堝湪鎵归噺鎿嶄綔鍐呰仈瀹屾垚锛岄伩鍏嶉澶栭攣绔炰簤锛夈€?
     #[inline]
     fn index_subnet(
         subnet_index: &mut FxHashMap<[u8; 3], Vec<NodeId>>,
@@ -149,7 +185,7 @@ impl NodeRepoImpl {
         subnet_index.entry(subnet).or_default().push(id);
     }
 
-    /// 从 /24 网段索引中移除指定节点 id（按地址定位网段）。
+    /// 浠?/24 缃戞绱㈠紩涓Щ闄ゆ寚瀹氳妭鐐?id锛堟寜鍦板潃瀹氫綅缃戞锛夈€?
     #[inline]
     fn unindex_subnet(&self, addr: &SocketAddr, id: &NodeId) {
         let Some(subnet) = Self::subnet_key(*addr) else {
@@ -164,9 +200,9 @@ impl NodeRepoImpl {
         }
     }
 
-    /// 内部写入：批量新增节点 + 标记 dirty，不触发 Merkle/Gossip。
-    /// 返回真正新增的 (node_id, addr) 对。
-    /// 联邦同步入站（apply_node_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    /// 鍐呴儴鍐欏叆锛氭壒閲忔柊澧炶妭鐐?+ 鏍囪 dirty锛屼笉瑙﹀彂 Merkle/Gossip銆?
+    /// 杩斿洖鐪熸鏂板鐨?(node_id, addr) 瀵广€?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_node_sync锛夎皟鐢ㄦ湰鏂规硶锛岄伩鍏?Merkle 閲嶅鏇存柊涓?Gossip 鍥炵幆銆?
     pub(crate) fn add_nodes_batch_internal(
         &self,
         items: &[(NodeId, SocketAddr)],
@@ -179,7 +215,7 @@ impl NodeRepoImpl {
         let mut new_pairs: Vec<(NodeId, SocketAddr)> = Vec::new();
         for (id, addr) in items {
             if let Some(existing) = nodes.get_mut(addr) {
-                // 同地址节点 ID 更新：若 ID 变化，同步更新网段索引中的旧 ID
+                // 鍚屽湴鍧€鑺傜偣 ID 鏇存柊锛氳嫢 ID 鍙樺寲锛屽悓姝ユ洿鏂扮綉娈电储寮曚腑鐨勬棫 ID
                 if existing.id != *id {
                     if let Some(subnet) = Self::subnet_key(*addr) {
                         if let Some(bucket) = subnet_index.get_mut(&subnet) {
@@ -192,11 +228,11 @@ impl NodeRepoImpl {
                 existing.last_active = Instant::now();
             } else {
                 let mut entry = KBucketEntry::new(*id, *addr);
-                // 新节点初始评分 45.0（中性分），后续由 ScoreMaintainer 统一更新
+                // 鏂拌妭鐐瑰垵濮嬭瘎鍒?45.0锛堜腑鎬у垎锛夛紝鍚庣画鐢?ScoreMaintainer 缁熶竴鏇存柊
                 entry.score = 45.0;
                 nodes.insert(*addr, entry);
                 new_pairs.push((*id, *addr));
-                // IPv4 节点入 /24 索引
+                // IPv4 鑺傜偣鍏?/24 绱㈠紩
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     Self::index_subnet(&mut subnet_index, subnet, *id);
                 }
@@ -205,7 +241,7 @@ impl NodeRepoImpl {
         drop(nodes);
         drop(subnet_index);
 
-        // 新节点统一标记 dirty（需要增量持久化），一次写锁
+        // 鏂拌妭鐐圭粺涓€鏍囪 dirty锛堥渶瑕佸閲忔寔涔呭寲锛夛紝涓€娆″啓閿?
         if !new_pairs.is_empty() {
             let mut dirty = self.dirty.write();
             for (_, addr) in &new_pairs {
@@ -215,22 +251,22 @@ impl NodeRepoImpl {
         new_pairs
     }
 
-    /// 把新节点列表构建成 merkle/gossip 条目并传播。
+    /// 鎶婃柊鑺傜偣鍒楄〃鏋勫缓鎴?merkle/gossip 鏉＄洰骞朵紶鎾€?
     fn propagate_nodes(&self, new_pairs: Vec<(NodeId, SocketAddr)>) {
         if new_pairs.is_empty() {
             return;
         }
-        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_pairs.len());
+        let mut built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_pairs.len());
         for (id, addr) in &new_pairs {
-            if let Some((k, p)) = crate::federation::sync::build_node_sync_entry(*id, *addr) {
-                built.push((k, p));
+            if let Some((k, p, h)) = crate::federation::sync::build_node_sync_entry(*id, *addr) {
+                built.push((k, p, h));
             }
         }
         self.propagate(repo_type::NODE, built);
     }
 
-    /// 同步加入单个节点（本地爬虫路径）：写入后更新 Merkle + 提交 Gossip。
-    /// 返回 true 表示是新节点。
+    /// 鍚屾鍔犲叆鍗曚釜鑺傜偣锛堟湰鍦扮埇铏矾寰勶級锛氬啓鍏ュ悗鏇存柊 Merkle + 鎻愪氦 Gossip銆?
+    /// 杩斿洖 true 琛ㄧず鏄柊鑺傜偣銆?
     pub fn add_node_sync(&self, id: NodeId, addr: SocketAddr) -> bool {
         let new_pairs = self.add_nodes_batch_internal(&[(id, addr)]);
         let is_new = !new_pairs.is_empty();
@@ -238,9 +274,9 @@ impl NodeRepoImpl {
         is_new
     }
 
-    /// 批量加入节点（一次写锁），返回新加入数。
-    /// 本地写入路径：新节点更新 Merkle + 提交 Gossip。
-    /// 联邦同步入站（apply_node_sync）请改用 add_nodes_batch_internal，避免回环。
+    /// 鎵归噺鍔犲叆鑺傜偣锛堜竴娆″啓閿侊級锛岃繑鍥炴柊鍔犲叆鏁般€?
+    /// 鏈湴鍐欏叆璺緞锛氭柊鑺傜偣鏇存柊 Merkle + 鎻愪氦 Gossip銆?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_node_sync锛夎鏀圭敤 add_nodes_batch_internal锛岄伩鍏嶅洖鐜€?
     pub fn add_nodes_sync_batch(&self, items: &[(NodeId, SocketAddr)]) -> usize {
         let new_pairs = self.add_nodes_batch_internal(items);
         let count = new_pairs.len();
@@ -256,9 +292,9 @@ impl NodeRepoImpl {
         self.nodes.read().len()
     }
 
-    // ── /24 网段索引查询（O(1) 定位网段，供节点选择/监控使用）──
+    // 鈹€鈹€ /24 缃戞绱㈠紩鏌ヨ锛圤(1) 瀹氫綅缃戞锛屼緵鑺傜偣閫夋嫨/鐩戞帶浣跨敤锛夆攢鈹€
 
-    /// 获取指定 /24 网段的节点 ID 列表
+    /// 鑾峰彇鎸囧畾 /24 缃戞鐨勮妭鐐?ID 鍒楄〃
     pub fn nodes_by_subnet_sync(&self, subnet: [u8; 3]) -> Vec<NodeId> {
         self.subnet_index
             .read()
@@ -267,17 +303,17 @@ impl NodeRepoImpl {
             .unwrap_or_default()
     }
 
-    /// 获取所有 /24 网段列表
+    /// 鑾峰彇鎵€鏈?/24 缃戞鍒楄〃
     pub fn all_subnets_sync(&self) -> Vec<[u8; 3]> {
         self.subnet_index.read().keys().copied().collect()
     }
 
-    /// /24 网段数量
+    /// /24 缃戞鏁伴噺
     pub fn subnet_count_sync(&self) -> usize {
         self.subnet_index.read().len()
     }
 
-    /// 节点统计信息（避免全量克隆，用于健康度计算和监控）
+    /// 鑺傜偣缁熻淇℃伅锛堥伩鍏嶅叏閲忓厠闅嗭紝鐢ㄤ簬鍋ュ悍搴﹁绠楀拰鐩戞帶锛?
     pub fn stats_sync(&self) -> NodeStats {
         let nodes = self.nodes.read();
         let mut good = 0;
@@ -342,13 +378,13 @@ impl NodeRepoImpl {
                     entry.state = NodeState::Bad;
                 }
             }
-            // 标记为脏：统计数据已变化，需要重算评分 + 增量持久化
+            // 鏍囪涓鸿剰锛氱粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖?
             drop(nodes);
             self.dirty.write().insert(addr);
         }
     }
 
-    /// 记录查询成功及返回的节点数（用于节点产出维度评分）
+    /// 璁板綍鏌ヨ鎴愬姛鍙婅繑鍥炵殑鑺傜偣鏁帮紙鐢ㄤ簬鑺傜偣浜у嚭缁村害璇勫垎锛?
     pub fn record_query_with_nodes_sync(
         &self,
         addr: SocketAddr,
@@ -365,13 +401,13 @@ impl NodeRepoImpl {
             entry.last_query_time = Some(Instant::now());
             entry.state = NodeState::Good;
             entry.consecutive_failures = 0;
-            // 标记为脏
+            // 鏍囪涓鸿剰
             drop(nodes);
             self.dirty.write().insert(addr);
         }
     }
 
-    /// 刷新所有节点状态（基于最后活跃时间更新 Good/Questionable）
+    /// 鍒锋柊鎵€鏈夎妭鐐圭姸鎬侊紙鍩轰簬鏈€鍚庢椿璺冩椂闂存洿鏂?Good/Questionable锛?
     pub fn refresh_all_states_sync(&self) {
         let mut nodes = self.nodes.write();
         for entry in nodes.values_mut() {
@@ -379,9 +415,9 @@ impl NodeRepoImpl {
         }
     }
 
-    // ── 冷热分层索引（内存索引框架，不搬数据，由外部 TaskScheduler 调度迁移）──
+    // 鈹€鈹€ 鍐风儹鍒嗗眰绱㈠紩锛堝唴瀛樼储寮曟鏋讹紝涓嶆惉鏁版嵁锛岀敱澶栭儴 TaskScheduler 璋冨害杩佺Щ锛夆攢鈹€
 
-    /// 标记节点被访问（更新 last_accessed，移入 hot 集合，从 cold 移除）
+    /// 鏍囪鑺傜偣琚闂紙鏇存柊 last_accessed锛岀Щ鍏?hot 闆嗗悎锛屼粠 cold 绉婚櫎锛?
     pub fn mark_accessed_sync(&self, addr: SocketAddr) {
         let found = {
             let mut nodes = self.nodes.write();
@@ -398,7 +434,7 @@ impl NodeRepoImpl {
         }
     }
 
-    /// 返回热节点列表（hot 集合中的节点，按评分降序由调用方排序）
+    /// 杩斿洖鐑妭鐐瑰垪琛紙hot 闆嗗悎涓殑鑺傜偣锛屾寜璇勫垎闄嶅簭鐢辫皟鐢ㄦ柟鎺掑簭锛?
     pub fn hot_nodes_sync(&self) -> Vec<KBucketEntry> {
         let nodes = self.nodes.read();
         self.hot_addrs
@@ -408,8 +444,8 @@ impl NodeRepoImpl {
             .collect()
     }
 
-    /// 将超过阈值的节点从 hot 移到 cold（由外部 TaskScheduler 定时调用，模块内不自跑定时）
-    /// 返回本次迁移的节点数
+    /// 灏嗚秴杩囬槇鍊肩殑鑺傜偣浠?hot 绉诲埌 cold锛堢敱澶栭儴 TaskScheduler 瀹氭椂璋冪敤锛屾ā鍧楀唴涓嶈嚜璺戝畾鏃讹級
+    /// 杩斿洖鏈杩佺Щ鐨勮妭鐐规暟
     pub fn migrate_hot_to_cold_sync(&self, threshold_secs: u64) -> usize {
         let cutoff = Instant::now() - Duration::from_secs(threshold_secs);
         let nodes = self.nodes.read();
@@ -434,17 +470,17 @@ impl NodeRepoImpl {
         moved
     }
 
-    /// 热节点数量
+    /// 鐑妭鐐规暟閲?
     pub fn hot_count_sync(&self) -> usize {
         self.hot_addrs.read().len()
     }
 
-    /// 冷节点数量
+    /// 鍐疯妭鐐规暟閲?
     pub fn cold_count_sync(&self) -> usize {
         self.cold_addrs.read().len()
     }
 
-    // ── 脏标记同步方法（用于增量评分 + 增量持久化）──
+    // 鈹€鈹€ 鑴忔爣璁板悓姝ユ柟娉曪紙鐢ㄤ簬澧為噺璇勫垎 + 澧為噺鎸佷箙鍖栵級鈹€鈹€
 
     pub fn mark_dirty_sync(&self, addr: SocketAddr) {
         self.dirty.write().insert(addr);
@@ -462,7 +498,7 @@ impl NodeRepoImpl {
         self.dirty.write().clear();
     }
 
-    /// 取出所有 dirty 节点并清空（原子操作，用于增量持久化）
+    /// 鍙栧嚭鎵€鏈?dirty 鑺傜偣骞舵竻绌猴紙鍘熷瓙鎿嶄綔锛岀敤浜庡閲忔寔涔呭寲锛?
     pub fn take_dirty_sync(&self) -> Vec<SocketAddr> {
         let mut dirty = self.dirty.write();
         let addrs: Vec<SocketAddr> = dirty.iter().cloned().collect();
@@ -470,12 +506,12 @@ impl NodeRepoImpl {
         addrs
     }
 
-    /// dirty 节点数量
+    /// dirty 鑺傜偣鏁伴噺
     pub fn dirty_count_sync(&self) -> usize {
         self.dirty.read().len()
     }
 
-    /// WriteQueue 队列长度（如果接入了写入队列）
+    /// WriteQueue 闃熷垪闀垮害锛堝鏋滄帴鍏ヤ簡鍐欏叆闃熷垪锛?
     pub fn write_queue_len_sync(&self) -> usize {
         self.write_queue
             .as_ref()
@@ -483,7 +519,7 @@ impl NodeRepoImpl {
             .unwrap_or(0)
     }
 
-    /// 根据 dirty 地址列表构建 DhtNodeRow 批量（从内存 nodes 读取，不修改任何状态）
+    /// 鏍规嵁 dirty 鍦板潃鍒楄〃鏋勫缓 DhtNodeRow 鎵归噺锛堜粠鍐呭瓨 nodes 璇诲彇锛屼笉淇敼浠讳綍鐘舵€侊級
     fn build_dirty_batch(&self, dirty_addrs: &[SocketAddr]) -> Vec<DhtNodeRow> {
         let nodes = self.nodes.read();
         dirty_addrs
@@ -512,7 +548,7 @@ impl NodeRepoImpl {
             .collect()
     }
 
-    /// 批量更新评分（一次写锁，避免逐个更新的锁竞争）
+    /// 鎵归噺鏇存柊璇勫垎锛堜竴娆″啓閿侊紝閬垮厤閫愪釜鏇存柊鐨勯攣绔炰簤锛?
     pub fn update_scores_batch_sync(&self, scores: &[(SocketAddr, f64)]) {
         let mut nodes = self.nodes.write();
         let mut dirty = self.dirty.write();
@@ -536,7 +572,7 @@ impl NodeRepository for NodeRepoImpl {
         let Some(entry) = removed_entry else {
             return false;
         };
-        // 从 /24 网段索引中移除该节点
+        // 浠?/24 缃戞绱㈠紩涓Щ闄よ鑺傜偣
         self.unindex_subnet(addr, &entry.id);
         self.dirty.write().insert(*addr);
         true
@@ -587,7 +623,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn closest_nodes(&self, target: &NodeId, n: usize) -> Vec<KBucketEntry> {
-        // NodeRepo 不维护路由表，按 XOR 距离排序
+        // NodeRepo 涓嶇淮鎶よ矾鐢辫〃锛屾寜 XOR 璺濈鎺掑簭
         let mut all: Vec<KBucketEntry> = self.all_nodes_sync();
         all.sort_by_key(|e| crate::dht::xor_distance(&e.id, target));
         all.truncate(n);
@@ -612,7 +648,7 @@ impl NodeRepository for NodeRepoImpl {
         if let Some(entry) = self.nodes.write().get_mut(addr) {
             entry.state = state;
         }
-        // 状态变化也标记为脏
+        // 鐘舵€佸彉鍖栦篃鏍囪涓鸿剰
         self.dirty.write().insert(*addr);
     }
 
@@ -641,21 +677,21 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn bucket_count(&self) -> usize {
-        0 // NodeRepo 不维护 bucket
+        0 // NodeRepo 涓嶇淮鎶?bucket
     }
 
     async fn non_empty_bucket_targets(&self) -> Vec<NodeId> {
-        Vec::new() // NodeRepo 不维护 bucket
+        Vec::new() // NodeRepo 涓嶇淮鎶?bucket
     }
 
     async fn rescore_all(&self) {
-        // 评分由 ScoreMaintainer 统一维护，Repo 不具备算分权限
+        // 璇勫垎鐢?ScoreMaintainer 缁熶竴缁存姢锛孯epo 涓嶅叿澶囩畻鍒嗘潈闄?
     }
 
     async fn save_dirty(&self) -> anyhow::Result<()> {
-        // 【增量持久化】只保存 dirty 节点，避免全量保存千万级数据
+        // 銆愬閲忔寔涔呭寲銆戝彧淇濆瓨 dirty 鑺傜偣锛岄伩鍏嶅叏閲忎繚瀛樺崈涓囩骇鏁版嵁
         if let Some(wq) = &self.write_queue {
-            // 异步模式：原子取出并清空 dirty，非阻塞入队 WriteQueue
+            // 寮傛妯″紡锛氬師瀛愬彇鍑哄苟娓呯┖ dirty锛岄潪闃诲鍏ラ槦 WriteQueue
             let dirty_addrs = self.take_dirty_sync();
             if dirty_addrs.is_empty() {
                 return Ok(());
@@ -667,17 +703,17 @@ impl NodeRepository for NodeRepoImpl {
             let wq = wq.clone();
             let count = batch.len();
             wq.send(move |conn| Storage::save_dht_nodes_batch_in_tx(conn, &batch));
-            tracing::debug!("[node_repo] 异步入队保存 {} 个 dirty 节点", count);
+            tracing::debug!("[node_repo] 寮傛鍏ラ槦淇濆瓨 {} 涓?dirty 鑺傜偣", count);
             Ok(())
         } else {
-            // 同步模式：先查看 dirty（不清空），保存成功后再清空，失败则保留重试
+            // 鍚屾妯″紡锛氬厛鏌ョ湅 dirty锛堜笉娓呯┖锛夛紝淇濆瓨鎴愬姛鍚庡啀娓呯┖锛屽け璐ュ垯淇濈暀閲嶈瘯
             let dirty_addrs = self.dirty_nodes_sync();
             if dirty_addrs.is_empty() {
                 return Ok(());
             }
             let batch = self.build_dirty_batch(&dirty_addrs);
             if batch.is_empty() {
-                // 内存中已不存在的 dirty 节点（可能已被删除），清理标记
+                // 鍐呭瓨涓凡涓嶅瓨鍦ㄧ殑 dirty 鑺傜偣锛堝彲鑳藉凡琚垹闄わ級锛屾竻鐞嗘爣璁?
                 let mut dirty = self.dirty.write();
                 for addr in &dirty_addrs {
                     dirty.remove(addr);
@@ -686,7 +722,7 @@ impl NodeRepository for NodeRepoImpl {
             }
             let storage = self.storage.clone();
             let count = batch.len();
-            tracing::debug!("[node_repo] 增量保存 {} 个 dirty 节点", count);
+            tracing::debug!("[node_repo] 澧為噺淇濆瓨 {} 涓?dirty 鑺傜偣", count);
             let result =
                 tokio::task::spawn_blocking(move || storage.save_dht_nodes_batch(&batch)).await?;
             match result {
@@ -698,7 +734,10 @@ impl NodeRepository for NodeRepoImpl {
                     Ok(())
                 }
                 Err(e) => {
-                    tracing::warn!("[node_repo] 增量保存失败（保留 dirty 待重试）: {}", e);
+                    tracing::warn!(
+                        "[node_repo] 澧為噺淇濆瓨澶辫触锛堜繚鐣?dirty 寰呴噸璇曪級: {}",
+                        e
+                    );
                     Err(e)
                 }
             }
@@ -728,7 +767,7 @@ impl NodeRepository for NodeRepoImpl {
                 _ => NodeState::Bad,
             };
             nodes.insert(addr, entry);
-            // 重建 /24 网段索引
+            // 閲嶅缓 /24 缃戞绱㈠紩
             if let Some(subnet) = Self::subnet_key(addr) {
                 Self::index_subnet(&mut subnet_index, subnet, row.id);
             }
@@ -738,22 +777,25 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn remove_cold_nodes(&self, older_than_secs: u64) -> anyhow::Result<usize> {
-        // 驱逐前若存在脏数据，先落库，避免丢失尚未持久化的节点更新。
-        // 失败不阻断驱逐（节点在 DB 中仍有上一份快照，不丢行）。
+        // 椹遍€愬墠鑻ュ瓨鍦ㄨ剰鏁版嵁锛屽厛钀藉簱锛岄伩鍏嶄涪澶卞皻鏈寔涔呭寲鐨勮妭鐐规洿鏂般€?
+        // 澶辫触涓嶉樆鏂┍閫愶紙鑺傜偣鍦?DB 涓粛鏈変笂涓€浠藉揩鐓э紝涓嶄涪琛岋級銆?
         if self.dirty_count_sync() > 0 {
             if let Err(e) = self.save_dirty().await {
-                tracing::warn!("[node_repo] 冷节点驱逐前增量持久化失败（继续驱逐）: {}", e);
+                tracing::warn!(
+                    "[node_repo] 鍐疯妭鐐归┍閫愬墠澧為噺鎸佷箙鍖栧け璐ワ紙缁х画椹遍€愶級: {}",
+                    e
+                );
             }
         }
 
-        // cutoff：last_active 早于该时刻的节点视为冷节点。
-        // 使用 checked_sub 避免阈值过大导致 Instant 下溢；未来时间的 last_active 天然晚于 cutoff，不会被误删。
+        // cutoff锛歭ast_active 鏃╀簬璇ユ椂鍒荤殑鑺傜偣瑙嗕负鍐疯妭鐐广€?
+        // 浣跨敤 checked_sub 閬垮厤闃堝€艰繃澶у鑷?Instant 涓嬫孩锛涙湭鏉ユ椂闂寸殑 last_active 澶╃劧鏅氫簬 cutoff锛屼笉浼氳璇垹銆?
         let cutoff = match Instant::now().checked_sub(Duration::from_secs(older_than_secs)) {
             Some(c) => c,
             None => return Ok(0),
         };
 
-        // 第一遍：读锁内快照候选地址（避免持写锁长时间遍历）
+        // 绗竴閬嶏細璇婚攣鍐呭揩鐓у€欓€夊湴鍧€锛堥伩鍏嶆寔鍐欓攣闀挎椂闂撮亶鍘嗭級
         let candidates: Vec<(SocketAddr, NodeId)> = {
             let nodes = self.nodes.read();
             nodes
@@ -766,8 +808,8 @@ impl NodeRepository for NodeRepoImpl {
             return Ok(0);
         }
 
-        // 第二遍：持写锁批量移除，同步清理 /24 索引、热/冷集合与脏标记。
-        // 注意：不把被移除节点加入 dirty 集合——DB 行永久保留，删除仅作用于内存。
+        // 绗簩閬嶏細鎸佸啓閿佹壒閲忕Щ闄わ紝鍚屾娓呯悊 /24 绱㈠紩銆佺儹/鍐烽泦鍚堜笌鑴忔爣璁般€?
+        // 娉ㄦ剰锛氫笉鎶婅绉婚櫎鑺傜偣鍔犲叆 dirty 闆嗗悎鈥斺€擠B 琛屾案涔呬繚鐣欙紝鍒犻櫎浠呬綔鐢ㄤ簬鍐呭瓨銆?
         let mut nodes = self.nodes.write();
         let mut subnet_index = self.subnet_index.write();
         let mut hot = self.hot_addrs.write();
@@ -820,18 +862,18 @@ mod tests {
         repo.add_node_sync([3u8; 20], cold);
         assert_eq!(repo.len_sync(), 3);
 
-        // 把 warm 推到阈值内偏久、cold 推到超过 warm 阈值（7200s）
+        // 鎶?warm 鎺ㄥ埌闃堝€煎唴鍋忎箙銆乧old 鎺ㄥ埌瓒呰繃 warm 闃堝€硷紙7200s锛?
         let warm_cutoff = Instant::now() - Duration::from_secs(3600);
         let cold_cutoff = Instant::now() - Duration::from_secs(10_000);
         repo.nodes.write().get_mut(&warm).unwrap().last_active = warm_cutoff;
         repo.nodes.write().get_mut(&cold).unwrap().last_active = cold_cutoff;
 
-        // warm_threshold = 7200s：只有 cold 应被驱逐
+        // warm_threshold = 7200s: only cold should be evicted
         let removed = repo.remove_cold_nodes(7200).await.unwrap();
-        assert_eq!(removed, 1, "应只移除 1 个冷节点");
-        assert!(repo.contains_sync(hot), "热节点必须保留");
-        assert!(repo.contains_sync(warm), "温节点必须保留");
-        assert!(!repo.contains_sync(cold), "冷节点应被移除");
+        assert_eq!(removed, 1, "should remove exactly 1 cold node");
+        assert!(repo.contains_sync(hot), "hot node must be kept");
+        assert!(repo.contains_sync(warm), "warm node must be kept");
+        assert!(!repo.contains_sync(cold), "cold node should be removed");
         assert_eq!(repo.len_sync(), 2);
     }
 
@@ -840,7 +882,7 @@ mod tests {
         let repo = test_repo();
         let a = addr(9, 1009);
         repo.add_node_sync([9u8; 20], a);
-        // 新建节点 last_active = now，全部为热节点，不应移除
+        // new nodes have last_active = now, all hot, should not be removed
         let removed = repo.remove_cold_nodes(7200).await.unwrap();
         assert_eq!(removed, 0);
         assert!(repo.contains_sync(a));

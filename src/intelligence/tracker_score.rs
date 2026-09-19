@@ -28,6 +28,7 @@ impl Default for TrackerScorerImpl {
 impl TrackerScorer for TrackerScorerImpl {
     async fn rescore_all(&self, repo: &dyn TrackerRepository) {
         let trackers = repo.all_trackers().await;
+        let mut scores = Vec::with_capacity(trackers.len());
         for tracker in &trackers {
             let score = self.calculate(
                 tracker.total_requests,
@@ -37,8 +38,33 @@ impl TrackerScorer for TrackerScorerImpl {
                 tracker.consecutive_failures,
                 tracker.disabled,
             );
-            repo.update_score(&tracker.url, score).await;
+            scores.push((tracker.url.clone(), score));
         }
+        repo.update_scores_batch(&scores).await;
+    }
+
+    async fn rescore_dirty(&self, repo: &dyn TrackerRepository) -> usize {
+        let dirty_urls = repo.dirty_trackers().await;
+        if dirty_urls.is_empty() {
+            return 0;
+        }
+        let mut scores = Vec::with_capacity(dirty_urls.len());
+        for url in &dirty_urls {
+            if let Some(tracker) = repo.get_tracker(url).await {
+                let score = self.calculate(
+                    tracker.total_requests,
+                    tracker.success_requests,
+                    tracker.total_peers_discovered,
+                    tracker.avg_response_time_ms,
+                    tracker.consecutive_failures,
+                    tracker.disabled,
+                );
+                scores.push((url.clone(), score));
+            }
+        }
+        repo.update_scores_batch(&scores).await;
+        repo.clear_all_dirty().await;
+        scores.len()
     }
 
     fn calculate(

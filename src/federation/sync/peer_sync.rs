@@ -1,7 +1,7 @@
 //! PeerRepo 同步
 //!
 //! 订阅 EventBus 的 PeerDiscovered 事件，通过 Gossip 协议传播给联邦节点。
-//! 只同步事实数据：infohash + ip:port + first_seen + source。
+//! 只同步事实数据：infohash + addr。时间戳、来源、是否禁用等节点本地状态不同步。
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,36 +20,48 @@ use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::PeerRepoImpl;
 use crate::types::{Event, Infohash, PeerInfo, PeerSource};
 
-/// Peer 同步负载（精简版，只同步事实数据）
+/// Peer 同步负载（只同步事实数据：infohash + addr）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerSyncPayload {
     infohash: Infohash,
     addr: std::net::SocketAddr,
-    first_seen_secs: u64,
-    source: String,
 }
 
-/// 构建 Peer 同步条目的 (key, payload_bytes)。
+/// 构建 Peer 同步条目的 (key, payload_bytes, data_hash)。
 /// 主键为 infohash:addr 组合，同步 (infohash, peer) 关联。
+///
+/// data_hash 公式与 db.rs `load_all_peer_keys_hashes` 完全一致：
+/// `blake3(infohash || ip_string || port_le)`，保证冷热同构。
 pub(crate) fn build_peer_sync_entry(
     infohash: Infohash,
     addr: std::net::SocketAddr,
-    first_seen_secs: u64,
-    source: &str,
-) -> Option<(Vec<u8>, Vec<u8>)> {
-    let payload = PeerSyncPayload {
-        infohash,
-        addr,
-        first_seen_secs,
-        source: source.to_string(),
-    };
+) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let payload = PeerSyncPayload { infohash, addr };
     let payload_bytes = bincode::serialize(&payload).ok()?;
     let ih_hex = infohash
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect::<String>();
     let key = format!("{}:{}", ih_hex, addr).into_bytes();
-    Some((key, payload_bytes))
+    // data_hash = blake3(infohash || ip_string || port_le)
+    let mut buf = Vec::with_capacity(infohash.len() + 16 + 2);
+    buf.extend_from_slice(infohash.as_slice());
+    buf.extend_from_slice(addr.ip().to_string().as_bytes());
+    buf.extend_from_slice(&addr.port().to_le_bytes());
+    let data_hash = blake3::hash(&buf).as_bytes().to_vec();
+    Some((key, payload_bytes, data_hash))
+}
+
+/// 从已序列化的 PeerSyncPayload 计算 data_hash（与 build_peer_sync_entry 公式一致）。
+/// 用于 apply/重建路径，反序列化 payload 后按 db.rs 公式计算。
+#[allow(dead_code)]
+pub(crate) fn data_hash_from_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let p: PeerSyncPayload = bincode::deserialize(payload).ok()?;
+    let mut buf = Vec::with_capacity(p.infohash.len() + 16 + 2);
+    buf.extend_from_slice(p.infohash.as_slice());
+    buf.extend_from_slice(p.addr.ip().to_string().as_bytes());
+    buf.extend_from_slice(&p.addr.port().to_le_bytes());
+    Some(blake3::hash(&buf).as_bytes().to_vec())
 }
 
 /// PeerRepo 同步服务
@@ -57,6 +69,7 @@ pub struct PeerSync {
     peer_repo: Arc<PeerRepoImpl>,
     _gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
+    #[allow(dead_code)]
     merkle_queue: Arc<MerkleUpdateQueue>,
     _local_node_id: NodeId,
     metrics: Arc<FederationMetrics>,
@@ -69,7 +82,7 @@ impl PeerSync {
         peer_repo: Arc<PeerRepoImpl>,
         _gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
-        merkle_queue: Arc<MerkleUpdateQueue>,
+        #[allow(dead_code)] merkle_queue: Arc<MerkleUpdateQueue>,
         _local_node_id: NodeId,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
@@ -127,10 +140,13 @@ impl PeerSync {
     fn handle_event(self: Arc<Self>, _event: Event) {}
 
     /// 应用收到的 Peer 同步数据
+    ///
+    /// 联邦同步只传播事实（infohash + addr）：入站仅添加本地不存在的
+    /// (infohash, addr) 关联，不覆盖本地已有 peer 的 source / first_seen /
+    /// last_active 等节点状态字段。
     pub fn apply_peer_sync(&self, entries: &[SyncEntry]) {
-        // 第一遍：过滤 DELETE / 反序列化失败，构建 (infohash, PeerInfo) 列表，收集 Merkle 批量更新
+        // 第一遍：过滤 DELETE / 反序列化失败 / 本地已存在的关联，构建 (infohash, PeerInfo) 列表
         let mut items: Vec<(Infohash, PeerInfo)> = Vec::new();
-        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -141,23 +157,20 @@ impl PeerSync {
                 Err(_) => continue,
             };
 
-            let source = match payload.source.as_str() {
-                "tracker" => PeerSource::Tracker,
-                "dht" => PeerSource::Dht,
-                "pex" => PeerSource::Pex,
-                "lpd" => PeerSource::Lpd,
-                "webseed" => PeerSource::WebSeed,
-                "super_tracker" => PeerSource::SuperTracker,
-                "utp" => PeerSource::Utp,
-                _ => PeerSource::Manual,
-            };
+            // 本地已存在该 (infohash, addr) 关联则跳过，绝不覆盖本地 peer 状态
+            if self
+                .peer_repo
+                .has_peer_assoc(&payload.infohash, &payload.addr)
+            {
+                continue;
+            }
 
-            let first_seen = UNIX_EPOCH + std::time::Duration::from_secs(payload.first_seen_secs);
+            // 新关联：用默认状态构建 PeerInfo（source=Manual，时间取当前）
             let peer = PeerInfo {
                 addr: payload.addr,
                 peer_id: None,
-                source,
-                first_seen,
+                source: PeerSource::Manual,
+                first_seen: SystemTime::now(),
                 last_active: SystemTime::now(),
                 priority_score: 45.0,
                 connection_attempts: 0,
@@ -166,33 +179,18 @@ impl PeerSync {
                 metadata: Default::default(),
             };
 
-            // key = infohash:addr
-            let ih_hex = payload
-                .infohash
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>();
-            let key = format!("{}:{}", ih_hex, payload.addr).into_bytes();
-            merkle_batch.push((key, entry.payload.clone()));
-
             items.push((payload.infohash, peer));
             applied += 1;
         }
 
-        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
-        if !merkle_batch.is_empty() {
-            let items_q: Vec<_> = merkle_batch
-                .into_iter()
-                .map(|(k, v)| (repo_type::PEER, k, v))
-                .collect();
-            self.merkle_queue.push_batch(items_q);
-        }
-
         // 第二遍：一次写锁批量写入（调用 add_peers_sync_internal，维护 global + by_infohash）
-        // 注意：联邦入站不调用 propagate_peers，避免 Gossip 回环；Merkle 已通过 merkle_queue 更新
+        // 注意：联邦入站不调用 propagate_peers，避免 Gossip 回环
         if !items.is_empty() {
             self.peer_repo.add_peers_sync_internal(&items);
         }
+
+        // 【回环修复】入站 apply 不再 update_incremental_batch 标记 dirty（同 apply_node_sync），
+        // 否则本批条目所属 L2 被标 dirty，incremental_sync_tick 又把它整批推回对端。
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
@@ -226,13 +224,6 @@ impl PeerSync {
         let mut entries = Vec::new();
 
         for (peer, infohashes) in &all_with_ih {
-            let first_seen_secs = peer
-                .first_seen
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let source = peer.source.as_str().to_string();
-
             // 如果 peer 没有关联任何 infohash（理论上不应发生），跳过
             if infohashes.is_empty() {
                 continue;
@@ -242,8 +233,6 @@ impl PeerSync {
                 let payload = PeerSyncPayload {
                     infohash: *infohash,
                     addr: peer.addr,
-                    first_seen_secs,
-                    source: source.clone(),
                 };
                 let payload_bytes = match bincode::serialize(&payload) {
                     Ok(b) => b,
@@ -287,8 +276,6 @@ mod tests {
         let payload = PeerSyncPayload {
             infohash: [1; 20],
             addr: "127.0.0.1:6881".parse().unwrap(),
-            first_seen_secs: 1000,
-            source: "dht".to_string(),
         };
         let bytes = bincode::serialize(&payload).unwrap();
         let decoded: PeerSyncPayload = bincode::deserialize(&bytes).unwrap();
@@ -297,7 +284,6 @@ mod tests {
             decoded.addr,
             "127.0.0.1:6881".parse::<std::net::SocketAddr>().unwrap()
         );
-        assert_eq!(decoded.source, "dht");
     }
 
     #[test]
@@ -337,8 +323,6 @@ mod tests {
         let payload = PeerSyncPayload {
             infohash: [5; 20],
             addr: "10.0.0.1:6881".parse().unwrap(),
-            first_seen_secs: 1000,
-            source: "tracker".to_string(),
         };
         let ih_hex = "05".repeat(20);
         let entries = vec![SyncEntry {

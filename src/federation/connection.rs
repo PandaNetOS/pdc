@@ -1,4 +1,4 @@
-//! 连接管理
+﻿//! 连接管理
 //!
 //! 管理联邦网络中的所有 TCP 连接，包括监听、主动连接、握手、心跳和消息分发。
 
@@ -26,6 +26,13 @@ use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
 /// 接受连接失败后的退避等待
 const ACCEPT_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
 
+/// 本节点联邦协议版本（Hello/HelloAck 的 version 字段）。
+/// 1：旧版本（仅全量推送差异分片）。
+/// 2：支持 DiffSync key 列表交换（先交换 key 列表，只推送对方缺失条目，重复率 ~90%→<5%）。
+/// 3：支持分层 Merkle 对比 + 分片并行同步（L0→L1→L2 三层定位差异，只同步差异 L2 分片，支持并行+断点续传+流式加载）。
+/// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle。
+pub const HELLO_PROTOCOL_VERSION: u32 = 3;
+
 /// 单条连接
 pub struct Connection {
     /// TCP 传输层（内部读写分离，独立锁，可并发收发）
@@ -45,6 +52,9 @@ pub struct Connection {
     pub gossip_buffer: ParkingMutex<VecDeque<GossipBatchMessage>>,
     /// P1: flush 任务唤醒通知
     pub gossip_flush_notify: Arc<Notify>,
+    /// 对端协议版本（握手 Hello/HelloAck 中的 version 字段）。
+    /// 默认 1（旧版本）；>= HELLO_PROTOCOL_VERSION 表示对端支持 DiffSync key 列表交换。
+    pub peer_protocol_version: AtomicU32,
 }
 
 impl Connection {
@@ -59,7 +69,23 @@ impl Connection {
             pending: AtomicU32::new(0),
             gossip_buffer: ParkingMutex::new(VecDeque::new()),
             gossip_flush_notify: Arc::new(Notify::new()),
+            peer_protocol_version: AtomicU32::new(1),
         }
+    }
+
+    /// 设置对端协议版本（握手后由 ConnectionManager 调用）
+    pub fn set_peer_protocol_version(&self, v: u32) {
+        self.peer_protocol_version.store(v, Ordering::Relaxed);
+    }
+
+    /// 对端是否支持 DiffSync key 列表交换（协议版本 >= 2）
+    pub fn supports_diff_keys(&self) -> bool {
+        self.peer_protocol_version.load(Ordering::Relaxed) >= 2
+    }
+
+    /// 对端是否支持分层 Merkle 对比 + 分片并行同步（协议版本 >= 3）
+    pub fn supports_layered_merkle(&self) -> bool {
+        self.peer_protocol_version.load(Ordering::Relaxed) >= 3
     }
 
     /// 发送消息
@@ -296,10 +322,14 @@ impl ConnectionManager {
         let transport_write_timeout = Duration::from_secs(self.config.transport_write_timeout_secs);
         let transport = TcpTransport::new(stream)
             .with_metrics(self.metrics.clone())
-            .with_write_timeout(transport_write_timeout);
+            .with_write_timeout(transport_write_timeout)
+            .with_retry_config(
+                self.config.transport_write_max_retries,
+                self.config.transport_write_retry_base_ms,
+            );
 
         // 入站握手
-        let (node_id, _hello) = self.handshake_inbound(&transport).await?;
+        let (node_id, hello) = self.handshake_inbound(&transport).await?;
 
         // per-node 连接锁：与出站方向串行化，消除双向同时握手的重复连接竞态
         let connection = {
@@ -319,6 +349,8 @@ impl ConnectionManager {
             }
 
             let connection = Arc::new(Connection::new(transport, node_id, addr));
+            // 记录对端协议版本（决定是否启用 DiffSync key 交换新协议）
+            connection.set_peer_protocol_version(hello.version);
             self.register_connection(connection.clone());
             connection
         };
@@ -388,66 +420,75 @@ impl ConnectionManager {
         self.node_table.mark_connecting(&node_id);
 
         // 建立 TCP 连接：优先使用 NetAgent（直连→打洞→中继），回退到原始连接
-        let transport =
-            if let Some(agent) = self.net_agent.get() {
-                let net_node_id = pnos_net::types::NodeId(node_id.0);
-                let (reachability, nat_type) = self
-                    .node_table
-                    .get(&node_id)
-                    .map(|e| {
-                        let r = match e.info.reachability {
-                            crate::federation::node_id::Reachability::PublicIpv6 => {
-                                pnos_net::types::Reachability::PublicIpv6
-                            }
-                            crate::federation::node_id::Reachability::Mapped => {
-                                pnos_net::types::Reachability::Mapped
-                            }
-                            crate::federation::node_id::Reachability::HolePunchable => {
-                                pnos_net::types::Reachability::HolePunchable
-                            }
-                            crate::federation::node_id::Reachability::OutboundOnly => {
-                                pnos_net::types::Reachability::OutboundOnly
-                            }
-                            crate::federation::node_id::Reachability::Unknown => {
-                                pnos_net::types::Reachability::Unknown
-                            }
-                        };
-                        (r, e.info.nat_type.clone())
-                    })
-                    .unwrap_or((pnos_net::types::Reachability::Unknown, None));
+        let transport = if let Some(agent) = self.net_agent.get() {
+            let net_node_id = pnos_net::types::NodeId(node_id.0);
+            let (reachability, nat_type) = self
+                .node_table
+                .get(&node_id)
+                .map(|e| {
+                    let r = match e.info.reachability {
+                        crate::federation::node_id::Reachability::PublicIpv6 => {
+                            pnos_net::types::Reachability::PublicIpv6
+                        }
+                        crate::federation::node_id::Reachability::Mapped => {
+                            pnos_net::types::Reachability::Mapped
+                        }
+                        crate::federation::node_id::Reachability::HolePunchable => {
+                            pnos_net::types::Reachability::HolePunchable
+                        }
+                        crate::federation::node_id::Reachability::OutboundOnly => {
+                            pnos_net::types::Reachability::OutboundOnly
+                        }
+                        crate::federation::node_id::Reachability::Unknown => {
+                            pnos_net::types::Reachability::Unknown
+                        }
+                    };
+                    (r, e.info.nat_type.clone())
+                })
+                .unwrap_or((pnos_net::types::Reachability::Unknown, None));
 
-                match agent
-                    .connect_to(net_node_id, &[addr], reachability, nat_type)
-                    .await
-                {
-                    Ok(result) => TcpTransport::new(result.connection)
-                        .with_metrics(self.metrics.clone())
-                        .with_write_timeout(Duration::from_secs(
-                            self.config.transport_write_timeout_secs,
-                        )),
-                    Err(e) => {
-                        self.connecting.write().remove(&addr);
-                        self.node_table.mark_failed(&node_id);
-                        return Err(e);
-                    }
-                }
-            } else {
-                match TcpTransport::connect(addr).await {
-                    Ok(t) => t.with_metrics(self.metrics.clone()).with_write_timeout(
-                        Duration::from_secs(self.config.transport_write_timeout_secs),
+            match agent
+                .connect_to(net_node_id, &[addr], reachability, nat_type)
+                .await
+            {
+                Ok(result) => TcpTransport::new(result.connection)
+                    .with_metrics(self.metrics.clone())
+                    .with_write_timeout(Duration::from_secs(
+                        self.config.transport_write_timeout_secs,
+                    ))
+                    .with_retry_config(
+                        self.config.transport_write_max_retries,
+                        self.config.transport_write_retry_base_ms,
                     ),
-                    Err(e) => {
-                        self.connecting.write().remove(&addr);
-                        self.node_table.mark_failed(&node_id);
-                        return Err(e);
-                    }
+                Err(e) => {
+                    self.connecting.write().remove(&addr);
+                    self.node_table.mark_failed(&node_id);
+                    return Err(e);
                 }
-            };
+            }
+        } else {
+            match TcpTransport::connect(addr).await {
+                Ok(t) => t
+                    .with_metrics(self.metrics.clone())
+                    .with_write_timeout(Duration::from_secs(
+                        self.config.transport_write_timeout_secs,
+                    ))
+                    .with_retry_config(
+                        self.config.transport_write_max_retries,
+                        self.config.transport_write_retry_base_ms,
+                    ),
+                Err(e) => {
+                    self.connecting.write().remove(&addr);
+                    self.node_table.mark_failed(&node_id);
+                    return Err(e);
+                }
+            }
+        };
 
         // 出站握手
         let transport = transport;
-        let peer_id = match self.handshake_outbound(&transport, node_id).await {
-            Ok(id) => id,
+        let (peer_id, peer_version) = match self.handshake_outbound(&transport, node_id).await {
+            Ok(v) => v,
             Err(e) => {
                 self.connecting.write().remove(&addr);
                 return Err(e);
@@ -462,6 +503,7 @@ impl ConnectionManager {
         }
 
         let connection = Arc::new(Connection::new(transport, peer_id, addr));
+        connection.set_peer_protocol_version(peer_version);
         self.register_connection(connection.clone());
 
         self.node_table.mark_connected(&peer_id, None);
@@ -505,15 +547,17 @@ impl ConnectionManager {
     }
 
     /// 出站握手：发 Hello -> 收 HelloAck（阶段2：Ed25519 签名验证）
+    ///
+    /// 返回 `(对端 NodeId, 对端协议版本)`。
     async fn handshake_outbound(
         &self,
         transport: &TcpTransport,
         _expected_node_id: NodeId,
-    ) -> anyhow::Result<NodeId> {
+    ) -> anyhow::Result<(NodeId, u32)> {
         let hello = HelloMessage::sign_and_build(
             &self.identity,
             self.identity.addresses_snapshot(),
-            1,
+            HELLO_PROTOCOL_VERSION,
             false,
         );
         transport.send_message(MessageType::Hello, &hello).await?;
@@ -532,6 +576,7 @@ impl ConnectionManager {
         }
 
         let peer_id = NodeId(ack.node_id);
+        let peer_version = ack.version;
         // 自连接过滤：不允许连接自己（通过 PEX/DHT 发现到自身地址后误连）
         if peer_id == self.identity.node_id {
             warn!(
@@ -541,10 +586,10 @@ impl ConnectionManager {
             anyhow::bail!("拒绝自连接: {}", peer_id);
         }
         debug!(
-            "[federation] 握手成功: 本地 {} <-> 远端 {}",
-            self.identity.node_id, peer_id
+            "[federation] 握手成功: 本地 {} <-> 远端 {} (proto={})",
+            self.identity.node_id, peer_id, peer_version
         );
-        Ok(peer_id)
+        Ok((peer_id, peer_version))
     }
 
     /// 入站握手：收 Hello -> 发 HelloAck（阶段2：Ed25519 签名验证）
@@ -576,11 +621,11 @@ impl ConnectionManager {
             anyhow::bail!("拒绝自连接: {}", peer_id);
         }
 
-        // 回复 HelloAck（签名）
+        // 回复 HelloAck（签名），携带本节点协议版本
         let ack = HelloMessage::sign_and_build(
             &self.identity,
             self.identity.addresses_snapshot(),
-            1,
+            HELLO_PROTOCOL_VERSION,
             false,
         );
         transport.send_message(MessageType::HelloAck, &ack).await?;
@@ -943,6 +988,30 @@ impl ConnectionManager {
                 }
                 false
             }
+            MessageType::DiffSyncKeyRequest => {
+                // P0-2: 数据服务器发来差异分片 key 列表分片，对比本地后回传缺失 key。
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    if let Ok(msg) = bincode::deserialize::<DiffSyncKeyRequestMessage>(&payload) {
+                        tokio::spawn(async move {
+                            sync_mgr.handle_diff_sync_key_request(&conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::DiffSyncKeyResponse => {
+                // P0-2: 请求方回传缺失 key 列表分片，唤醒等待中的数据服务器推送任务。
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<DiffSyncKeyResponseMessage>(&payload) {
+                        sync_mgr.handle_diff_sync_key_response(&connection, msg);
+                    }
+                }
+                false
+            }
             MessageType::PeerInfo => {
                 // 握手后对端发来的节点信息（本地各 repo 条目数），记录到 peer_digests
                 // 供全量同步数据源选择时判断数据完整度。
@@ -1075,6 +1144,94 @@ impl ConnectionManager {
                             .entry(resp.infohash)
                             .or_default()
                             .extend(resp.peers);
+                    }
+                }
+                false
+            }
+            MessageType::MerkleLevelRequest => {
+                // 分层 Merkle 层级请求：返回指定层级的子哈希列表
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    if let Ok(req) = bincode::deserialize::<MerkleLevelRequestMessage>(&payload) {
+                        tokio::spawn(async move {
+                            sync_mgr.handle_merkle_level_request(conn, req).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::MerkleLevelResponse => {
+                // 分层 Merkle 层级响应：继续逐层对比流程
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    let sync_mgr = sync_mgr.clone();
+                    let conn = connection.clone();
+                    if let Ok(resp) = bincode::deserialize::<MerkleLevelResponseMessage>(&payload) {
+                        tokio::spawn(async move {
+                            sync_mgr.handle_merkle_level_response(conn, resp).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::ShardSyncBatch => {
+                // 分片同步批次：接收并应用条目，回复 Ack
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<ShardSyncBatchMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        sync_mgr.handle_shard_sync_batch(conn, msg);
+                    }
+                }
+                false
+            }
+            MessageType::ShardSyncAck => {
+                // 分片同步确认：唤醒发送端等待的 oneshot
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<ShardSyncAckMessage>(&payload) {
+                        sync_mgr.handle_shard_sync_ack(msg);
+                    }
+                }
+                false
+            }
+            MessageType::ShardSyncComplete => {
+                // 分片同步完成：标记同步结束，触发 Merkle 重建
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<ShardSyncCompleteMessage>(&payload) {
+                        info!(
+                            "[federation] 收到 ShardSyncComplete: repo_type={}, from={}",
+                            msg.repo_type, connection.node_id
+                        );
+                        sync_mgr.handle_shard_sync_complete(msg);
+                    }
+                }
+                false
+            }
+            MessageType::ShardSyncHashList => {
+                // 分片同步 hash 列表：对比本地 DB，回复缺失 key 列表（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<ShardSyncHashListMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_shard_sync_hash_list(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::ShardSyncMissing => {
+                // 分片同步缺失 key 列表：唤醒发送端等待的 oneshot
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<ShardSyncMissingMessage>(&payload) {
+                        sync_mgr.handle_shard_sync_missing(msg);
                     }
                 }
                 false
@@ -1550,7 +1707,8 @@ mod tests {
             .handshake_outbound(&transport, identity2.node_id)
             .await
             .unwrap();
-        assert_eq!(peer_id, identity2.node_id);
+        assert_eq!(peer_id.0, identity2.node_id);
+        assert!(peer_id.1 >= 2);
 
         server.await.unwrap();
     }

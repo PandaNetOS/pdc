@@ -70,6 +70,30 @@ pub enum MessageType {
     PeerQueryRequest = 26,
     /// 实时 peer 查询响应
     PeerQueryResponse = 27,
+    /// DiffSync key 列表请求（数据服务器 → 请求方）：携带差异分片的 key 列表分片。
+    /// 仅协议版本 >=2 的对端使用；旧版本对端走原始全量推送。
+    DiffSyncKeyRequest = 28,
+    /// DiffSync key 列表响应（请求方 → 数据服务器）：返回请求方缺失的 key 列表分片。
+    DiffSyncKeyResponse = 29,
+    /// 分层 Merkle 层级请求：请求某层某分片的子哈希列表（协议版本 >=3）。
+    /// 对比流程：L0根 → L1一级分片(256) → L2二级分片(65536)，最多3轮定位差异。
+    MerkleLevelRequest = 30,
+    /// 分层 Merkle 层级响应：返回请求层级的子哈希列表（协议版本 >=3）。
+    MerkleLevelResponse = 31,
+    /// 分片同步批次：携带差异 L2 二级分片的数据条目（协议版本 >=3）。
+    /// 替代旧版全量 key 交换，只同步差异 L2 分片，支持并行+断点续传。
+    ShardSyncBatch = 32,
+    /// 分片同步确认：接收方确认收到指定批次（协议版本 >=3）。
+    ShardSyncAck = 33,
+    /// 分片同步完成：发送方通知所有差异 L2 分片已同步完毕（协议版本 >=3）。
+    ShardSyncComplete = 34,
+    /// 分片同步 hash 列表（数据服务器 → 请求方）：携带某 L2 分片内所有条目的
+    /// (key, data_hash) 列表。请求方对比本地 DB 后回传缺失 key（ShardSyncMissing），
+    /// 数据服务器只推送真正缺失的条目，把重复率从 ~97% 降到 <5%。
+    ShardSyncHashList = 35,
+    /// 分片同步缺失 key 列表（请求方 → 数据服务器）：请求方对比本地 DB 后，
+    /// 回传本地缺失的 key 列表，数据服务器只推送这些 key 的完整数据。
+    ShardSyncMissing = 36,
 }
 
 impl MessageType {
@@ -104,6 +128,15 @@ impl MessageType {
             25 => Some(MessageType::GossipPullResponse),
             26 => Some(MessageType::PeerQueryRequest),
             27 => Some(MessageType::PeerQueryResponse),
+            28 => Some(MessageType::DiffSyncKeyRequest),
+            29 => Some(MessageType::DiffSyncKeyResponse),
+            30 => Some(MessageType::MerkleLevelRequest),
+            31 => Some(MessageType::MerkleLevelResponse),
+            32 => Some(MessageType::ShardSyncBatch),
+            33 => Some(MessageType::ShardSyncAck),
+            34 => Some(MessageType::ShardSyncComplete),
+            35 => Some(MessageType::ShardSyncHashList),
+            36 => Some(MessageType::ShardSyncMissing),
             _ => None,
         }
     }
@@ -316,10 +349,14 @@ pub struct MerkleDigestMessage {
     pub repo_type: u8,
     /// 分片数
     pub shard_count: u16,
-    /// 各分片 Merkle 根
+    /// 各分片 Merkle 根（热+冷合并根 combined_roots）
     pub roots: Vec<[u8; 32]>,
-    /// 各分片条目数
+    /// 各分片条目数（热+冷合计）
     pub entry_counts: Vec<u32>,
+    /// L0 全量根（热+冷全量数据的根哈希）。
+    /// Option 用于向后兼容：旧版本节点不发送此字段，接收方为 None 时跳过 full_root 快速比较。
+    #[serde(default)]
+    pub full_root: Option<[u8; 32]>,
 }
 
 /// Merkle 分片请求（对账发现差异后，请求指定分片的全量条目）
@@ -385,6 +422,167 @@ pub struct FullSyncCompleteMessage {
 pub struct DiffSyncRequestMessage {
     /// 发起方本地单个 repo 的 Merkle 摘要
     pub digest: MerkleDigestMessage,
+}
+
+/// DiffSync key 列表请求（数据服务器 → 请求方，协议版本 >=2）。
+///
+/// 数据服务器发现差异分片后，不直接推送全部条目（重复率 ~90%），而是先把差异分片的
+/// key 列表分片发给请求方。请求方对比本地 key 后回传缺失 key（DiffSyncKeyResponse），
+/// 数据服务器只推送缺失条目，重复率降至 <5%。
+///
+/// 为避免单条消息过大，key 列表按 `DIFF_SYNC_KEY_CHUNK_SIZE` 分片发送，
+/// 接收方累计直到 `is_last == true`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiffSyncKeyRequestMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 差异分片索引列表（请求方据此从本地 DB 加载同分片 key 做对比）
+    pub shards: Vec<u16>,
+    /// 本片 key 列表（每个 key 为 SyncEntry.key 的原始字节）
+    pub keys: Vec<Vec<u8>>,
+    /// 是否为最后一片 key（请求方收到最后一片后才对比并回复）
+    pub is_last: bool,
+}
+
+/// DiffSync key 列表响应（请求方 → 数据服务器，协议版本 >=2）。
+///
+/// 请求方对比本地 key 后，把缺失的 key 列表分片回传。同样按分片发送，
+/// 数据服务器累计直到 `is_last == true`，再只加载/推送这些缺失 key 的完整条目。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiffSyncKeyResponseMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 请求方缺失的 key 列表（本片）
+    pub missing_keys: Vec<Vec<u8>>,
+    /// 是否为最后一片缺失 key（数据服务器收到最后一片后开始推送）
+    pub is_last: bool,
+}
+
+/// DiffSync key 列表单条消息最大 key 数（约 200KB，避免超大帧）。
+pub const DIFF_SYNC_KEY_CHUNK_SIZE: usize = 10000;
+
+// ============================================================================
+// 分层 Merkle 对比协议（协议版本 >=3，亿级数据架构升级）
+// ============================================================================
+
+/// 分层 Merkle 层级请求（协议版本 >=3）。
+///
+/// 请求对端返回指定层级的子哈希列表，用于逐层定位差异分片：
+/// - level=0: 请求 L0 根哈希（parent_shard 忽略，返回 1 个哈希）
+/// - level=1: 请求 L1 一级分片哈希（parent_shard 忽略，返回 256 个哈希）
+/// - level=2: 请求指定 L1 下的 L2 二级分片哈希（parent_shard 指定 L1，返回 256 个哈希）
+///
+/// 对比流程最多 3 轮：交换根 → 不一致则交换 L1 → 对差异 L1 交换 L2 → 只同步差异 L2。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MerkleLevelRequestMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 请求层级（0=L0根, 1=L1一级分片, 2=L2二级分片）
+    pub level: u8,
+    /// 父分片索引（level=2 时为 L1 分片索引；level=0/1 时忽略）
+    pub parent_shard: u16,
+}
+
+/// 分层 Merkle 层级响应（协议版本 >=3）。
+///
+/// 返回请求层级的子哈希列表和对应条目数。
+/// - level=0: hashes 含 1 个根哈希
+/// - level=1: hashes 含 256 个 L1 哈希
+/// - level=2: hashes 含 256 个 L2 哈希（指定 L1 下）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MerkleLevelResponseMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 响应层级（0=L0根, 1=L1一级分片, 2=L2二级分片）
+    pub level: u8,
+    /// 父分片索引（与请求对应）
+    pub parent_shard: u16,
+    /// 子哈希列表（数量取决于层级：1/256/256）
+    pub hashes: Vec<[u8; 32]>,
+    /// 各子分片条目数（与 hashes 一一对应）
+    pub entry_counts: Vec<u32>,
+}
+
+// ============================================================================
+// 分片同步协议（协议版本 >=3，替代旧版全量 key 交换）
+// ============================================================================
+
+/// 分片同步批次（协议版本 >=3）。
+///
+/// 携带差异 L2 二级分片的数据条目。发送方按 L2 分片分组，
+/// 每批可覆盖一个或多个 L2 分片，接收方独立应用并确认。
+/// 支持并行同步（多个 L2 分片同时传输）、独立超时重试、断点续传。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardSyncBatchMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 本批次覆盖的 L2 二级分片索引列表
+    pub l2_shards: Vec<u32>,
+    /// 同步条目
+    pub entries: Vec<SyncEntry>,
+    /// 批次序号（用于确认和去重）
+    pub seq: u64,
+    /// 是否为最后一批（发送方通知同步完成）
+    pub is_last: bool,
+}
+
+/// 分片同步确认（协议版本 >=3）。
+///
+/// 接收方确认收到并应用指定批次，发送方据此推进窗口和记录进度。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardSyncAckMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 已确认的批次序号
+    pub seq: u64,
+    /// 本批次应用的条目数
+    pub applied_count: u32,
+}
+
+/// 分片同步完成（协议版本 >=3）。
+///
+/// 发送方通知所有差异 L2 分片已同步完毕，携带统计信息供监控和对账。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardSyncCompleteMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 同步的 L2 分片总数
+    pub total_l2_shards: u32,
+    /// 同步的条目总数
+    pub total_entries: u64,
+    /// 总批次序号上限（接收方据此判断是否有遗漏）
+    pub max_seq: u64,
+}
+
+/// 分片同步 hash 列表（数据服务器 → 请求方）。
+///
+/// 携带某 L2 分片内所有条目的 (key, data_hash)，用于对端对比找出缺失条目。
+/// 若分片内条目数超过单条消息上限，按片发送，接收方累计直到 `is_last == true`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardSyncHashListMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 对应的 L2 二级分片索引（接收方据此定位本地 L1 分片做对比）
+    pub l2_shard: u32,
+    /// (key, data_hash) 列表
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 是否为最后一片
+    pub is_last: bool,
+}
+
+/// 分片同步缺失 key 列表（请求方 → 数据服务器）。
+///
+/// 请求方对比本地 DB 后，把缺失的 key 列表回传，数据服务器只推送这些 key 的完整数据。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardSyncMissingMessage {
+    /// 仓库类型
+    pub repo_type: u8,
+    /// 对应的 L2 二级分片索引
+    pub l2_shard: u32,
+    /// 请求方缺失的 key 列表
+    pub missing_keys: Vec<Vec<u8>>,
+    /// 是否为最后一片
+    pub is_last: bool,
 }
 
 /// 节点信息消息（握手后立即双向发送）

@@ -1,14 +1,14 @@
-//! InfohashRepository 实现
+//! InfohashRepository 瀹炵幇
 //!
-//! 合并 seen_infohashes + 引用计数，自动清理零引用。
-//! 内存 FxHashMap + SQLite 增量持久化。
-//! 千万级性能优化：FxHashMap 替代 std::HashMap，新 infohash 批量写入。
+//! 鍚堝苟 seen_infohashes + 寮曠敤璁℃暟锛岃嚜鍔ㄦ竻鐞嗛浂寮曠敤銆?
+//! 鍐呭瓨 FxHashMap + SQLite 澧為噺鎸佷箙鍖栥€?
+//! 鍗冧竾绾ф€ц兘浼樺寲锛欶xHashMap 鏇夸唬 std::HashMap锛屾柊 infohash 鎵归噺鍐欏叆銆?
 
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::MerkleTree;
@@ -16,11 +16,12 @@ use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::{InfohashRow, Storage};
 use crate::storage::repo_traits::InfohashRepository;
+use crate::storage::tiered_cache::TieredCacheConfig;
 use crate::storage::write_queue::WriteQueue;
 use crate::types::Infohash;
 
 struct InfohashCacheInner {
-    /// infohash -> (引用计数, 首次发现来源, 热门度评分)
+    /// infohash -> (寮曠敤璁℃暟, 棣栨鍙戠幇鏉ユ簮, 鐑棬搴﹁瘎鍒?
     entries: FxHashMap<Infohash, (u32, String, f64, u64)>,
 }
 
@@ -35,44 +36,96 @@ impl InfohashCacheInner {
 pub struct InfohashRepoImpl {
     cache: RwLock<InfohashCacheInner>,
     storage: Arc<Storage>,
-    /// 待持久化的新 infohash 缓冲区（批量写入，避免频繁 SQLite IO）
+    /// 寰呮寔涔呭寲鐨勬柊 infohash 缂撳啿鍖猴紙鎵归噺鍐欏叆锛岄伩鍏嶉绻?SQLite IO锛?
     pending: RwLock<Vec<(Infohash, String)>>,
-    /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
+    /// 鑴?infohash 闆嗗悎锛堢粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒嗭級
+    dirty: RwLock<FxHashSet<Infohash>>,
+    /// 鑱旈偊寮曠敤锛圤nceLock 娉ㄥ叆锛涙湭璁剧疆鏃舵湰鍦板啓鍏ヤ笉瑙﹀彂 Merkle/Gossip锛宺epo 姝ｅ父宸ヤ綔锛?
     merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
-    /// 写入队列（可选，Some 时 flush_pending 通过 WriteQueue/IOScheduler 提交）
+    /// 鍐欏叆闃熷垪锛堝彲閫夛紝Some 鏃?flush_pending 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛?
     write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl InfohashRepoImpl {
     pub fn new(storage: Arc<Storage>) -> Self {
+        Self::with_tier_config(storage, Default::default(), true)
+    }
+
+    pub fn with_tier_config(
+        storage: Arc<Storage>,
+        _cache_config: TieredCacheConfig,
+        _tier_enabled: bool,
+    ) -> Self {
         Self {
             cache: RwLock::new(InfohashCacheInner::new()),
             storage,
             pending: RwLock::new(Vec::new()),
+            dirty: RwLock::new(FxHashSet::default()),
             merkle: OnceLock::new(),
             gossip: OnceLock::new(),
             write_queue: None,
         }
     }
 
-    /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
-    /// 未调用时（如单元测试），本地写入不触发传播，repo 行为完全不变。
+    /// 娉ㄥ叆鑱旈偊 Merkle 鏍戜笌 Gossip 寮曟搸寮曠敤锛坢ain.rs 鍦?FederationService 鍒涘缓鍚庤皟鐢級銆?
+    /// 鏈皟鐢ㄦ椂锛堝鍗曞厓娴嬭瘯锛夛紝鏈湴鍐欏叆涓嶈Е鍙戜紶鎾紝repo 琛屼负瀹屽叏涓嶅彉銆?
     pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
         let _ = self.merkle.set(merkle);
         let _ = self.gossip.set(gossip);
     }
 
-    /// 注入写入队列（builder 模式）
+    /// 娉ㄥ叆鍐欏叆闃熷垪锛坆uilder 妯″紡锛?
     pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
         self.write_queue = Some(wq);
         self
     }
 
-    /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
-    /// merkle/gossip 未注入时直接跳过，不 panic。
+    /// 鑾峰彇搴曞眰 Storage 寮曠敤锛堢敤浜庤仈閭﹀悓姝ユ寜鍒嗙墖鍔犺浇鏁版嵁锛夈€?
+    pub fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+
+    /// 鍒嗗眰缂撳瓨缁熻锛堜笌 TrackerRepo 鎺ュ彛涓€鑷达細(hot, warm, cold_loaded)锛夈€?
+    /// InfohashRepo 鍏ㄩ噺椹诲唴瀛橈紝鍏ㄩ儴璁″叆 hot銆?
+    pub fn cache_stats(&self) -> (usize, usize, u64) {
+        (self.count_sync(), 0, 0)
+    }
+
+    /// 鏁版嵁搴撲腑 infohashes 琛ㄧ殑鎬昏鏁帮紙鍚屾锛岀敤浜庣洃鎺ч潰鏉匡級
+    pub fn total_count_sync(&self) -> u64 {
+        self.storage.count_table("infohashes").unwrap_or(0)
+    }
+
+    /// 执行分层检查 + 驱逐（由 TaskScheduler 定时调用）。
+    /// 全量驻内存不使用 TieredCache，为空操作。
+    pub fn tier_evict(&self) {
+        // no-op: data is fully in memory, no tiered cache to evict from
+    }
+
+    /// 紧急驱逐（内存超限时调用）。空操作。
+    pub fn emergency_evict(&self, _count: usize) {
+        // no-op: data is fully in memory
+    }
+
+    // 鈹€鈹€ 鑴忔爣璁板悓姝ユ柟娉曪紙鐢ㄤ簬澧為噺璇勫垎锛夆攢鈹€
+
+    pub fn mark_dirty_sync(&self, infohash: &Infohash) {
+        self.dirty.write().insert(*infohash);
+    }
+
+    pub fn dirty_infohashes_sync(&self) -> Vec<Infohash> {
+        self.dirty.read().iter().copied().collect()
+    }
+
+    pub fn clear_all_dirty_sync(&self) {
+        self.dirty.write().clear();
+    }
+
+    /// 灏嗘湰鍦版柊鍐欏叆鐨勬潯鐩壒閲忔洿鏂?Merkle 骞舵彁浜?Gossip锛堝啓閿佸鎵ц锛岀函鍐呭瓨鎿嶄綔锛夈€?
+    /// merkle/gossip 鏈敞鍏ユ椂鐩存帴璺宠繃锛屼笉 panic銆?
     #[inline]
-    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>)>) {
+    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>) {
         if built.is_empty() {
             return;
         }
@@ -82,9 +135,9 @@ impl InfohashRepoImpl {
         let Some(gossip) = self.gossip.get() else {
             return;
         };
-        let refs: Vec<(&[u8], &[u8])> = built
+        let refs: Vec<(&[u8], &[u8], &[u8])> = built
             .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
             .collect();
         merkle.update_batch(&refs);
         let now = std::time::SystemTime::now()
@@ -93,7 +146,7 @@ impl InfohashRepoImpl {
             .as_secs();
         let entries: Vec<SyncEntry> = built
             .into_iter()
-            .map(|(key, payload)| SyncEntry {
+            .map(|(key, payload, _)| SyncEntry {
                 key,
                 operation: operation::UPSERT,
                 version: now,
@@ -103,12 +156,12 @@ impl InfohashRepoImpl {
         gossip.submit_gossip(rt, entries);
     }
 
-    /// 同步获取 infohash 数量
+    /// 鍚屾鑾峰彇 infohash 鏁伴噺
     pub fn count_sync(&self) -> usize {
         self.cache.read().entries.len()
     }
 
-    /// 同步获取所有 infohash
+    /// 鍚屾鑾峰彇鎵€鏈?infohash
     pub fn all_sync(&self) -> Vec<(Infohash, u64)> {
         self.cache
             .read()
@@ -118,9 +171,9 @@ impl InfohashRepoImpl {
             .collect()
     }
 
-    /// 内部批量注册：更新引用计数 + 新 infohash 入 pending 缓冲区，不触发 Merkle/Gossip。
-    /// 返回真正新增的 (infohash, source)（引用计数 0→1）。
-    /// 联邦同步入站（apply_infohash_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    /// 鍐呴儴鎵归噺娉ㄥ唽锛氭洿鏂板紩鐢ㄨ鏁?+ 鏂?infohash 鍏?pending 缂撳啿鍖猴紝涓嶈Е鍙?Merkle/Gossip銆?
+    /// 杩斿洖鐪熸鏂板鐨?(infohash, source)锛堝紩鐢ㄨ鏁?0鈫?锛夈€?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_infohash_sync锛夎皟鐢ㄦ湰鏂规硶锛岄伩鍏?Merkle 閲嶅鏇存柊涓?Gossip 鍥炵幆銆?
     pub(crate) fn register_batch_internal(
         &self,
         items: &[(Infohash, String, u64)],
@@ -131,7 +184,7 @@ impl InfohashRepoImpl {
         let mut cache = self.cache.write();
         let mut new_items: Vec<(Infohash, String)> = Vec::new();
         for (infohash, source, last_seen) in items {
-            // LWW: 如果本地已有且对端 last_seen 较旧，则跳过
+            // LWW: 濡傛灉鏈湴宸叉湁涓斿绔?last_seen 杈冩棫锛屽垯璺宠繃
             if let Some(existing) = cache.entries.get(infohash) {
                 if *last_seen < existing.3 {
                     continue;
@@ -143,7 +196,7 @@ impl InfohashRepoImpl {
                     .entry(*infohash)
                     .or_insert((0, source.clone(), 0.0, *last_seen));
             entry.0 += 1;
-            // 更新 last_seen（取较大值）
+            // 鏇存柊 last_seen锛堝彇杈冨ぇ鍊硷級
             if *last_seen > entry.3 {
                 entry.3 = *last_seen;
             }
@@ -153,7 +206,7 @@ impl InfohashRepoImpl {
         }
         drop(cache);
 
-        // 新 infohash 批量写入 pending 缓冲区，由 flush_pending 批量写入 SQLite
+        // 鏂?infohash 鎵归噺鍐欏叆 pending 缂撳啿鍖猴紝鐢?flush_pending 鎵归噺鍐欏叆 SQLite
         if !new_items.is_empty() {
             let mut pending = self.pending.write();
             for item in &new_items {
@@ -163,8 +216,8 @@ impl InfohashRepoImpl {
         new_items
     }
 
-    /// 同步注册 infohash（引用计数+1），新 infohash 写入 pending 缓冲区批量持久化。
-    /// 本地写入路径：新 infohash 更新 Merkle + 提交 Gossip。
+    /// 鍚屾娉ㄥ唽 infohash锛堝紩鐢ㄨ鏁?1锛夛紝鏂?infohash 鍐欏叆 pending 缂撳啿鍖烘壒閲忔寔涔呭寲銆?
+    /// 鏈湴鍐欏叆璺緞锛氭柊 infohash 鏇存柊 Merkle + 鎻愪氦 Gossip銆?
     pub fn register_sync(&self, infohash: Infohash, source: &str) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -175,9 +228,9 @@ impl InfohashRepoImpl {
         self.propagate_infohash(new_items);
     }
 
-    /// 批量注册 infohash（一次 cache 写锁 + 一次 pending 写锁），返回新注册数。
-    /// 本地写入路径：新 infohash 更新 Merkle + 提交 Gossip。
-    /// 联邦同步入站（apply_infohash_sync）请改用 register_batch_internal，避免回环。
+    /// 鎵归噺娉ㄥ唽 infohash锛堜竴娆?cache 鍐欓攣 + 涓€娆?pending 鍐欓攣锛夛紝杩斿洖鏂版敞鍐屾暟銆?
+    /// 鏈湴鍐欏叆璺緞锛氭柊 infohash 鏇存柊 Merkle + 鎻愪氦 Gossip銆?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_infohash_sync锛夎鏀圭敤 register_batch_internal锛岄伩鍏嶅洖鐜€?
     pub fn register_batch_sync(&self, items: &[(Infohash, String)]) -> usize {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -193,21 +246,17 @@ impl InfohashRepoImpl {
         count
     }
 
-    /// 把新 infohash 列表构建成 merkle/gossip 条目并传播。
+    /// 鎶婃柊 infohash 鍒楄〃鏋勫缓鎴?merkle/gossip 鏉＄洰骞朵紶鎾€?
     fn propagate_infohash(&self, new_items: Vec<(Infohash, String)>) {
         if new_items.is_empty() {
             return;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_items.len());
-        for (infohash, source) in &new_items {
-            if let Some((k, p)) = crate::federation::sync::infohash_sync::build_infohash_sync_entry(
-                *infohash, now, source,
-            ) {
-                built.push((k, p));
+        let mut built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_items.len());
+        for (infohash, _source) in &new_items {
+            if let Some((k, p, h)) =
+                crate::federation::sync::infohash_sync::build_infohash_sync_entry(*infohash)
+            {
+                built.push((k, p, h));
             }
         }
         self.propagate(repo_type::INFOHASH, built);
@@ -224,7 +273,7 @@ impl InfohashRepoImpl {
 
         let count = pending.len();
         if let Some(ref wq) = self.write_queue {
-            // 通过 WriteQueue/IOScheduler 提交（Normal 优先级）
+            // 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛圢ormal 浼樺厛绾э級
             wq.send(move |conn| {
                 for (infohash, source) in &pending {
                     Storage::save_infohash_in_tx(conn, infohash, 1, source, 0.0)?;
@@ -243,20 +292,20 @@ impl InfohashRepoImpl {
         }
 
         tracing::debug!(
-            "[infohash_repo] flush_pending 批量写入 {} 个新 infohash",
+            "[infohash_repo] flush_pending 鎵归噺鍐欏叆 {} 涓柊 infohash",
             count
         );
         Ok(count)
     }
 
-    /// pending 缓冲区大小
+    /// pending 缂撳啿鍖哄ぇ灏?
     pub fn pending_count(&self) -> usize {
         self.pending.read().len()
     }
 
-    /// 全量保存到 SQLite（先 flush pending，再全量更新引用计数）
+    /// 鍏ㄩ噺淇濆瓨鍒?SQLite锛堝厛 flush pending锛屽啀鍏ㄩ噺鏇存柊寮曠敤璁℃暟锛?
     pub async fn save_all(&self) -> anyhow::Result<()> {
-        // 先 flush pending 新 infohash
+        // 鍏?flush pending 鏂?infohash
         self.flush_pending().await?;
 
         let entries: Vec<InfohashRow> = self
@@ -277,13 +326,16 @@ impl InfohashRepoImpl {
         }
 
         if let Some(wq) = &self.write_queue {
-            // 异步模式：非阻塞入队 WriteQueue
+            // 寮傛妯″紡锛氶潪闃诲鍏ラ槦 WriteQueue
             let count = entries.len();
             wq.send(move |conn| Storage::save_infohashes_batch_in_tx(conn, &entries));
-            tracing::debug!("[infohash_repo] 异步入队全量保存 {} 个 infohash", count);
+            tracing::debug!(
+                "[infohash_repo] 寮傛鍏ラ槦鍏ㄩ噺淇濆瓨 {} 涓?infohash",
+                count
+            );
             Ok(())
         } else {
-            // 同步模式：保留原 spawn_blocking 逐条写入逻辑
+            // 鍚屾妯″紡锛氫繚鐣欏師 spawn_blocking 閫愭潯鍐欏叆閫昏緫
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || {
                 for row in &entries {
@@ -301,8 +353,8 @@ impl InfohashRepoImpl {
         }
     }
 
-    /// 从 SQLite 加载全部 infohash
-    /// 增量持久化（全量保存模式：所有数据均视为 dirty，直接全量保存）
+    /// 浠?SQLite 鍔犺浇鍏ㄩ儴 infohash
+    /// 澧為噺鎸佷箙鍖栵紙鍏ㄩ噺淇濆瓨妯″紡锛氭墍鏈夋暟鎹潎瑙嗕负 dirty锛岀洿鎺ュ叏閲忎繚瀛橈級
     pub async fn save_dirty(&self) -> anyhow::Result<()> {
         self.save_all().await
     }
@@ -353,19 +405,19 @@ impl InfohashRepository for InfohashRepoImpl {
     }
 
     async fn cleanup_zero_ref(&self) -> usize {
-        // 永久资产模式：infohash 永久保留，不删除零引用条目
+        // 姘镐箙璧勪骇妯″紡锛歩nfohash 姘镐箙淇濈暀锛屼笉鍒犻櫎闆跺紩鐢ㄦ潯鐩?
         0
     }
 
     async fn update_score(&self, infohash: &Infohash, score: f64) {
-        // 更新内存缓存
+        // 鏇存柊鍐呭瓨缂撳瓨
         {
             let mut cache = self.cache.write();
             if let Some((_, _, s, _)) = cache.entries.get_mut(infohash) {
                 *s = score;
             }
         }
-        // 异步持久化到 SQLite
+        // 寮傛鎸佷箙鍖栧埌 SQLite
         if let Some(wq) = &self.write_queue {
             let ih = *infohash;
             wq.send(move |conn| Storage::update_infohash_score_in_tx(conn, &ih, score));
@@ -382,7 +434,7 @@ impl InfohashRepository for InfohashRepoImpl {
         if scores.is_empty() {
             return;
         }
-        // 更新内存缓存
+        // 鏇存柊鍐呭瓨缂撳瓨
         {
             let mut cache = self.cache.write();
             for (infohash, score) in scores {
@@ -391,7 +443,7 @@ impl InfohashRepository for InfohashRepoImpl {
                 }
             }
         }
-        // 异步批量持久化到 SQLite
+        // 寮傛鎵归噺鎸佷箙鍖栧埌 SQLite
         let scores_vec: Vec<([u8; 20], f64)> = scores.iter().map(|(ih, s)| (*ih, *s)).collect();
         if let Some(wq) = &self.write_queue {
             wq.send(move |conn| Storage::update_infohash_scores_batch_in_tx(conn, &scores_vec));
@@ -423,6 +475,18 @@ impl InfohashRepository for InfohashRepoImpl {
         entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         entries.truncate(n);
         entries
+    }
+
+    async fn mark_dirty(&self, infohash: &Infohash) {
+        self.mark_dirty_sync(infohash);
+    }
+
+    async fn dirty_infohashes(&self) -> Vec<Infohash> {
+        self.dirty_infohashes_sync()
+    }
+
+    async fn clear_all_dirty(&self) {
+        self.clear_all_dirty_sync();
     }
 }
 

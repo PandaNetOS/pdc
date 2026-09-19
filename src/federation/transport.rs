@@ -22,6 +22,10 @@ use crate::federation::protocol::{
 
 /// 传输层默认写入超时
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 写入超时后的默认最大重试次数（不含首次）
+const DEFAULT_WRITE_MAX_RETRIES: u32 = 3;
+/// 写入重试退避基数（毫秒）
+const DEFAULT_WRITE_RETRY_BASE_MS: u64 = 100;
 /// 主动 TCP 连接超时
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 传输层事件轮询间隔
@@ -51,6 +55,10 @@ pub struct TcpTransport {
     metrics: Option<Arc<FederationMetrics>>,
     /// 写入超时（防止对端接收慢导致永久阻塞）
     write_timeout: Duration,
+    /// 写入超时后的最大重试次数（不含首次）
+    max_retries: u32,
+    /// 写入重试退避基数（毫秒），第 n 次重试前等待 base_ms * 2^(n-1)
+    retry_base_ms: u64,
 }
 
 impl TcpTransport {
@@ -69,6 +77,8 @@ impl TcpTransport {
             local,
             metrics: None,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            max_retries: DEFAULT_WRITE_MAX_RETRIES,
+            retry_base_ms: DEFAULT_WRITE_RETRY_BASE_MS,
         }
     }
 
@@ -82,6 +92,55 @@ impl TcpTransport {
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
         self
+    }
+
+    /// 配置写入重试参数（链式调用，由 ConnectionManager 根据配置注入）
+    pub fn with_retry_config(mut self, max_retries: u32, retry_base_ms: u64) -> Self {
+        self.max_retries = max_retries;
+        self.retry_base_ms = retry_base_ms;
+        self
+    }
+
+    /// 带重试的帧写入（持写锁）。
+    ///
+    /// 单次 `write_all` 受 `write_timeout` 限制；超时后按指数退避重试最多 `max_retries` 次，
+    /// 退避间隔为 `retry_base_ms * 2^attempt`（100/200/400...）。
+    /// 非超时的硬 IO 错误（如连接重置）不重试，立即返回。
+    async fn write_frame_with_retry(
+        &self,
+        writer: &mut WriteHalf<Box<dyn TransportStream>>,
+        frame: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut attempt: u32 = 0;
+        loop {
+            match tokio::time::timeout(self.write_timeout, writer.write_all(frame)).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => {
+                    // 硬 IO 错误：不重试，直接上抛
+                    return Err(anyhow::anyhow!("写入失败: {}", e));
+                }
+                Err(_elapsed) => {
+                    // 超时：可重试的瞬时错误
+                    if attempt >= self.max_retries {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("write timeout (重试 {} 次后仍超时)", self.max_retries),
+                        )
+                        .into());
+                    }
+                    // 指数退避：base * 2^attempt
+                    let backoff_ms = self.retry_base_ms.saturating_mul(1u64 << attempt);
+                    tracing::debug!(
+                        "[federation] write 超时，第 {}/{} 次重试（等待 {}ms）",
+                        attempt + 1,
+                        self.max_retries,
+                        backoff_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// 主动连接到远端
@@ -115,10 +174,8 @@ impl TcpTransport {
         let frame = encode_message(msg_type, msg)?;
         let frame_len = frame.len();
         let mut writer = self.writer.lock().await;
-        tokio::time::timeout(self.write_timeout, writer.writer.write_all(&frame))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))?
-            .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
+        self.write_frame_with_retry(&mut writer.writer, &frame)
+            .await?;
         // 累加序列化后的完整帧字节数（含帧头）
         if let Some(metrics) = &self.metrics {
             metrics.record_bytes_sent(frame_len as u64);
@@ -129,10 +186,8 @@ impl TcpTransport {
     /// 发送原始帧字节
     pub async fn send_raw(&self, frame: &[u8]) -> anyhow::Result<()> {
         let mut writer = self.writer.lock().await;
-        tokio::time::timeout(self.write_timeout, writer.writer.write_all(frame))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))?
-            .map_err(|e| anyhow::anyhow!("写入失败: {}", e))?;
+        self.write_frame_with_retry(&mut writer.writer, frame)
+            .await?;
         Ok(())
     }
 

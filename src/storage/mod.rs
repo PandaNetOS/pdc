@@ -10,6 +10,7 @@ pub mod node_repo;
 pub mod peer_repo;
 pub mod repo_traits;
 pub mod sharded_map;
+pub mod tiered_cache;
 pub mod tracker_repo;
 pub mod write_queue;
 
@@ -20,5 +21,6 @@ pub use node_repo::NodeRepoImpl;
 pub use peer_repo::PeerRepoImpl;
 pub use repo_traits::*;
 pub use sharded_map::{DirtyShardedHashMap, ShardedHashMap};
+pub use tiered_cache::{TieredCache, TieredCacheConfig};
 pub use tracker_repo::TrackerRepoImpl;
 pub use write_queue::{WriteQueue, WriteStats};

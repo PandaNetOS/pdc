@@ -228,16 +228,13 @@ impl DiscoveryService {
                         let new_nodes: Vec<crate::federation::node_id::NodeAddress> = node
                             .addresses
                             .iter()
-                            .map(|addr| {
-                                let temp_id = crate::federation::node_id::NodeId::random();
-                                crate::federation::node_id::NodeAddress {
-                                    node_id: temp_id.0,
-                                    ipv4_addr: if addr.is_ipv4() { Some(*addr) } else { None },
-                                    ipv6_addr: if addr.is_ipv6() { Some(*addr) } else { None },
-                                    reachability: crate::federation::node_id::Reachability::Unknown,
-                                    last_seen: now,
-                                    nat_type: None,
-                                }
+                            .map(|addr| crate::federation::node_id::NodeAddress {
+                                node_id: node.node_id.0,
+                                ipv4_addr: if addr.is_ipv4() { Some(*addr) } else { None },
+                                ipv6_addr: if addr.is_ipv6() { Some(*addr) } else { None },
+                                reachability: crate::federation::node_id::Reachability::Unknown,
+                                last_seen: now,
+                                nat_type: None,
                             })
                             .collect();
                         self_clone.process_new_nodes(new_nodes);

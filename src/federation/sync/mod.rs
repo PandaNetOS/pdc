@@ -3,9 +3,12 @@
 //! 阶段2扩展：集成 Gossip 引擎、PeerRepo 同步、InfohashRepo 同步。
 //! 阶段1的 NodeRepo 同步保留。
 
+#![allow(clippy::type_complexity)]
+
 pub mod infohash_sync;
 pub mod merkle_updater;
 pub mod peer_sync;
+pub mod shard_sync_engine;
 pub mod tracker_sync;
 
 use std::collections::{HashSet, VecDeque};
@@ -14,9 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::event_bus::EventBus;
@@ -31,6 +34,7 @@ use crate::federation::relay::RelayManager;
 use crate::federation::sync::infohash_sync::InfohashSync;
 use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::federation::sync::peer_sync::PeerSync;
+use crate::federation::sync::shard_sync_engine::{LayeredCompareSession, ShardSyncEngine};
 use crate::federation::sync::tracker_sync::TrackerSync;
 use crate::storage::{InfohashRepoImpl, NodeRepoImpl, PeerRepoImpl, TrackerRepoImpl};
 
@@ -50,16 +54,25 @@ struct NodeSyncPayload {
     addr: SocketAddr,
 }
 
-/// 构建 Node 同步条目的 (key, payload_bytes)。
+/// 构建 Node 同步条目的 (key, payload_bytes, data_hash)。
 /// 格式与 collect_node_entries 一致，供 NodeRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
+///
+/// data_hash 公式与 db.rs `load_all_node_keys_hashes` 完全一致：
+/// `blake3(node_id || ip.as_bytes() || port_le)`，保证冷热同构。
 pub(crate) fn build_node_sync_entry(
     node_id: [u8; 20],
     addr: SocketAddr,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let payload = NodeSyncPayload { node_id, addr };
     let payload_bytes = bincode::serialize(&payload).ok()?;
     let key = addr.to_string().into_bytes();
-    Some((key, payload_bytes))
+    // data_hash = blake3(node_id || ip || port_le)
+    let mut buf = Vec::with_capacity(node_id.len() + 16 + 2);
+    buf.extend_from_slice(node_id.as_slice());
+    buf.extend_from_slice(addr.ip().to_string().as_bytes());
+    buf.extend_from_slice(&addr.port().to_le_bytes());
+    let data_hash = blake3::hash(&buf).as_bytes().to_vec();
+    Some((key, payload_bytes, data_hash))
 }
 
 /// 同步管理器
@@ -94,6 +107,38 @@ pub struct SyncManager {
     /// 已见过的对端 Merkle 摘要（对端 node_id -> 各 repo 条目数），
     /// 供数据源选择时按「数据最完整（与本地差异最大）」排序。
     peer_digests: RwLock<FxHashMap<NodeId, Vec<u32>>>,
+    /// DiffSync key 列表请求累计缓冲（请求方侧）：key=(对端, repo_type)。
+    /// 数据服务器分片发送 key 列表，请求方收齐到 is_last 后才对比本地并回传缺失 key。
+    diff_key_req_buffer: RwLock<FxHashMap<(NodeId, u8), DiffKeyReqBuffer>>,
+    /// DiffSync key 列表响应待收集（数据服务器侧）：key=(对端, repo_type)。
+    /// 数据服务器发出 key 列表后在此挂起 oneshot，等待请求方回传的缺失 key 分片收齐。
+    pending_diff_key_resp: RwLock<FxHashMap<(NodeId, u8), PendingKeyResp>>,
+    /// 活跃的分片同步引擎：key=(peer, repo_type)。
+    /// 每个 peer+repo 同时只允许一个分片同步引擎运行（互斥）。
+    active_shard_engines: RwLock<FxHashMap<(NodeId, u8), Arc<ShardSyncEngine>>>,
+    /// 分片同步 hash 列表累计缓冲（接收方侧）：key=(对端, repo_type, l2_shard)。
+    /// 数据服务器分片发送 (key, data_hash) 列表，接收方收齐到 is_last 后才对比本地并回复缺失 key。
+    shard_hash_list_buffer: RwLock<FxHashMap<(NodeId, u8, u32), Vec<(Vec<u8>, Vec<u8>)>>>,
+    /// 分层 Merkle 对比会话：key=(peer, repo_type)。
+    /// 追踪正在进行的 L0→L1→L2 分层对比流程。
+    layered_compare_sessions: RwLock<FxHashMap<(NodeId, u8), LayeredCompareSession>>,
+    /// 增量同步互斥标记：每个 repo 同时只进行一次增量同步。
+    incremental_sync_active: RwLock<FxHashSet<u8>>,
+}
+
+/// DiffSync key 列表请求累计缓冲（请求方侧）
+#[derive(Default)]
+struct DiffKeyReqBuffer {
+    shards: Vec<u16>,
+    keys: Vec<Vec<u8>>,
+}
+
+/// DiffSync key 列表响应待收集（数据服务器侧）
+struct PendingKeyResp {
+    ///  oneshot 发送端（收到最后一片缺失 key 后触发，唤醒等待中的推送任务）
+    tx: Option<oneshot::Sender<Vec<Vec<u8>>>>,
+    /// 已累计的缺失 key 分片
+    buf: Vec<Vec<u8>>,
 }
 
 impl SyncManager {
@@ -206,6 +251,12 @@ impl SyncManager {
             diff_sync_states: RwLock::new(FxHashMap::default()),
             recent_changes: RwLock::new(VecDeque::with_capacity(500)),
             peer_digests: RwLock::new(FxHashMap::default()),
+            diff_key_req_buffer: RwLock::new(FxHashMap::default()),
+            pending_diff_key_resp: RwLock::new(FxHashMap::default()),
+            active_shard_engines: RwLock::new(FxHashMap::default()),
+            shard_hash_list_buffer: RwLock::new(FxHashMap::default()),
+            layered_compare_sessions: RwLock::new(FxHashMap::default()),
+            incremental_sync_active: RwLock::new(FxHashSet::default()),
         }
     }
 
@@ -217,56 +268,83 @@ impl SyncManager {
         // 已迁移：Node 同步周期任务由 TaskScheduler 调度 do_node_sync()
     }
 
-    /// 启动时从各 repo 全量重建 Merkle 树（延迟5秒）。
+    /// 启动时从数据库全量重建 Merkle 树（延迟5秒）。
+    ///
+    /// 纯 DB 驱动：直接从存储层加载 (key, data_hash) 后调用
+    /// `rebuild_cold_from_db`，不从内存喂 Merkle（内存只有热+温数据，不完整）。
     pub fn spawn_merkle_rebuilder(self: Arc<Self>) {
         tokio::spawn(async move {
             // [ALLOWED-SLEEP] 启动时一次性延迟重建，非周期性
             tokio::time::sleep(MERKLE_REBUILD_STARTUP_DELAY).await;
-            info!("[federation] 开始从 repo 全量重建 Merkle 树");
+            info!("[federation] 开始从数据库全量重建 Merkle 树");
 
-            let node_entries = self.collect_node_entries();
-            if !node_entries.is_empty() {
-                let batch: Vec<(&[u8], &[u8])> = node_entries
-                    .iter()
-                    .map(|e| (e.key.as_slice(), e.payload.as_slice()))
-                    .collect();
-                self.node_merkle.update_batch(&batch);
-                info!("[federation] Node Merkle 重建: {} 条", node_entries.len());
-            }
-            if let Some(ps) = &self.peer_sync {
-                let entries = ps.collect_all_entries();
-                if !entries.is_empty() {
-                    let batch: Vec<(&[u8], &[u8])> = entries
-                        .iter()
-                        .map(|e| (e.key.as_slice(), e.payload.as_slice()))
-                        .collect();
-                    ps.merkle().update_batch(&batch);
-                    info!("[federation] Peer Merkle 重建: {} 条", entries.len());
+            // Node：从 DB 加载 (key, data_hash) 后冷重算
+            {
+                let storage = self.node_repo.storage();
+                match storage.load_all_node_keys_hashes() {
+                    Ok(keys_hashes) => {
+                        self.node_merkle().rebuild_cold_from_db(&keys_hashes);
+                        info!(
+                            "[federation] Node Merkle 从 DB 重建: {} 条",
+                            keys_hashes.len()
+                        );
+                    }
+                    Err(e) => warn!("[federation] Node Merkle 从 DB 重建失败: {}", e),
                 }
             }
-            if let Some(ihs) = &self.infohash_sync {
-                let entries = ihs.collect_all_entries();
-                if !entries.is_empty() {
-                    let batch: Vec<(&[u8], &[u8])> = entries
-                        .iter()
-                        .map(|e| (e.key.as_slice(), e.payload.as_slice()))
-                        .collect();
-                    ihs.merkle().update_batch(&batch);
-                    info!("[federation] Infohash Merkle 重建: {} 条", entries.len());
+            // Peer：从 DB 加载
+            if let Some(pr) = &self.peer_repo {
+                let storage = pr.storage();
+                match storage.load_all_peer_keys_hashes() {
+                    Ok(keys_hashes) => {
+                        if let Some(m) = self.peer_merkle() {
+                            m.rebuild_cold_from_db(&keys_hashes);
+                            info!(
+                                "[federation] Peer Merkle 从 DB 重建: {} 条",
+                                keys_hashes.len()
+                            );
+                        }
+                    }
+                    Err(e) => warn!("[federation] Peer Merkle 从 DB 重建失败: {}", e),
                 }
             }
-            if let Some(ts) = &self.tracker_sync {
-                let entries = ts.collect_all_entries();
-                if !entries.is_empty() {
-                    let batch: Vec<(&[u8], &[u8])> = entries
-                        .iter()
-                        .map(|e| (e.key.as_slice(), e.payload.as_slice()))
-                        .collect();
-                    ts.merkle().update_batch(&batch);
-                    info!("[federation] Tracker Merkle 重建: {} 条", entries.len());
+            // Infohash：从 DB 加载
+            if let Some(ir) = &self.infohash_repo {
+                let storage = ir.storage();
+                match storage.load_all_infohash_keys_hashes() {
+                    Ok(keys_hashes) => {
+                        if let Some(m) = self.infohash_merkle() {
+                            m.rebuild_cold_from_db(&keys_hashes);
+                            info!(
+                                "[federation] Infohash Merkle 从 DB 重建: {} 条",
+                                keys_hashes.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[federation] Infohash Merkle 从 DB 重建失败: {}", e)
+                    }
                 }
             }
-            info!("[federation] 所有 Merkle 树从 repo 重建完成");
+            // Tracker：从 DB 加载
+            if let Some(tr) = &self.tracker_repo {
+                let storage = tr.storage();
+                match storage.load_all_tracker_keys_hashes() {
+                    Ok(keys_hashes) => {
+                        if let Some(m) = self.tracker_merkle() {
+                            m.rebuild_cold_from_db(&keys_hashes);
+                            info!(
+                                "[federation] Tracker Merkle 从 DB 重建: {} 条",
+                                keys_hashes.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[federation] Tracker Merkle 从 DB 重建失败: {}", e)
+                    }
+                }
+            }
+            info!("[federation] 所有 Merkle 树从数据库重建完成");
         });
     }
 
@@ -318,18 +396,18 @@ impl SyncManager {
             return;
         }
 
-        // 按 repo_type 分组
-        let mut node_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut peer_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut infohash_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut tracker_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // 按 repo_type 分组（item 为 (key, payload, data_hash) 三元组）
+        let mut node_batch: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut peer_batch: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut infohash_batch: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut tracker_batch: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
 
-        for (repo_type, key, payload) in items {
+        for (repo_type, key, payload, data_hash) in items {
             match repo_type {
-                repo_type::NODE => node_batch.push((key, payload)),
-                repo_type::PEER => peer_batch.push((key, payload)),
-                repo_type::INFOHASH => infohash_batch.push((key, payload)),
-                repo_type::TRACKER => tracker_batch.push((key, payload)),
+                repo_type::NODE => node_batch.push((key, payload, data_hash)),
+                repo_type::PEER => peer_batch.push((key, payload, data_hash)),
+                repo_type::INFOHASH => infohash_batch.push((key, payload, data_hash)),
+                repo_type::TRACKER => tracker_batch.push((key, payload, data_hash)),
                 other => {
                     warn!("[federation] Merkle flush: 未知 repo_type={}, 丢弃", other);
                 }
@@ -338,35 +416,35 @@ impl SyncManager {
 
         // 逐 repo 调用 update_batch（一次写锁批量插入，只重算受影响分片）
         if !node_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = node_batch
+            let refs: Vec<(&[u8], &[u8], &[u8])> = node_batch
                 .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
                 .collect();
             self.node_merkle.update_batch(&refs);
         }
         if !peer_batch.is_empty() {
             if let Some(ps) = &self.peer_sync {
-                let refs: Vec<(&[u8], &[u8])> = peer_batch
+                let refs: Vec<(&[u8], &[u8], &[u8])> = peer_batch
                     .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
                     .collect();
                 ps.merkle().update_batch(&refs);
             }
         }
         if !infohash_batch.is_empty() {
             if let Some(ihs) = &self.infohash_sync {
-                let refs: Vec<(&[u8], &[u8])> = infohash_batch
+                let refs: Vec<(&[u8], &[u8], &[u8])> = infohash_batch
                     .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
                     .collect();
                 ihs.merkle().update_batch(&refs);
             }
         }
         if !tracker_batch.is_empty() {
             if let Some(ts) = &self.tracker_sync {
-                let refs: Vec<(&[u8], &[u8])> = tracker_batch
+                let refs: Vec<(&[u8], &[u8], &[u8])> = tracker_batch
                     .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
                     .collect();
                 ts.merkle().update_batch(&refs);
             }
@@ -388,16 +466,11 @@ impl SyncManager {
 
     /// 处理收到的同步批量消息（阶段1 SyncBatch 协议）
     pub fn handle_sync_batch(&self, repo_type: u8, entries: &[SyncEntry]) {
-        // 记录到最近变更缓冲区（Push-Pull Gossip 用）
-        {
-            let mut changes = self.recent_changes.write();
-            for entry in entries {
-                changes.push_back((repo_type, entry.key.clone(), entry.version));
-                if changes.len() > 500 {
-                    changes.pop_front();
-                }
-            }
-        }
+        // 【回环修复】此处不再把入站条目登记进 recent_changes。
+        // recent_changes 是「本地最近变更广告位」，只应装本地产生的变更（本地新节点走
+        // propagate->submit_gossip 直接传播）。若把对端发来的条目登记进去，push_pull_tick /
+        // incremental_sync_tick 会把它当作本地变更再用 GossipDigest 广告回对端，对端 pull
+        // 回来又登记、再广告 -> A->B->A 无限拉取回环。
         match repo_type {
             repo_type::NODE => self.apply_node_sync(entries),
             repo_type::PEER => {
@@ -463,11 +536,10 @@ impl SyncManager {
         }
         let total_start = Instant::now();
 
-        // 第一遍：过滤 DELETE / 反序列化失败的条目，收集有效 payload，
-        // 并批量收集 Merkle 更新（循环结束后一次 update_batch）。
+        // 第一遍：过滤 DELETE / 反序列化失败的条目，收集有效 payload。
+        // （历史上这里还收集 (key, data_hash) 去标记 Merkle dirty，已移除——见下方说明。）
         let deserialize_start = Instant::now();
         let mut items: Vec<([u8; 20], SocketAddr)> = Vec::new();
-        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -477,22 +549,16 @@ impl SyncManager {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            // LWW 检查：本地已存在该节点且 entry 版本未知（==0，旧版/未知）时跳过，
+            // 避免版本缺失的旧数据覆盖本地较新数据。version>0 的条目走 upsert 语义
+            // （真正的时间戳对比需 DB 存 version 字段，当前不修改 schema）。
+            if self.node_repo.contains_sync(payload.addr) && entry.version == 0 {
+                continue;
+            }
             items.push((payload.node_id, payload.addr));
-            merkle_batch.push((entry.key.clone(), entry.payload.clone()));
             applied += 1;
         }
         let deserialize_elapsed = deserialize_start.elapsed();
-
-        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
-        let merkle_start = Instant::now();
-        if !merkle_batch.is_empty() {
-            let items: Vec<_> = merkle_batch
-                .into_iter()
-                .map(|(k, v)| (repo_type::NODE, k, v))
-                .collect();
-            self.merkle_queue.push_batch(items);
-        }
-        let merkle_elapsed = merkle_start.elapsed();
 
         // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
         let repo_start = Instant::now();
@@ -501,13 +567,17 @@ impl SyncManager {
         }
         let repo_elapsed = repo_start.elapsed();
 
+        // 【回环修复】入站 apply 不再调用 node_merkle.update_incremental_batch。
+        // 该调用只会把这批条目所属 L2 分片标 dirty；dirty_l2 的唯一消费者是
+        // incremental_sync_tick（它会把 dirty 分片整批推回对端）。入站数据本就是对端发来的，
+        // 再标 dirty 并推回 -> A->B->A 无限回环。本地新节点的 merkle dirty 由
+        // NodeRepoImpl.propagate 的 update_batch 负责，与本入站路径无关。
         let total_elapsed = total_start.elapsed();
 
         warn!(
-            "[federation][perf] apply_node_sync: count={} deserialize={}ms merkle={}ms repo_write={}ms total={}ms",
+            "[federation][perf] apply_node_sync: count={} deserialize={}ms repo_write={}ms total={}ms",
             entries.len(),
             deserialize_elapsed.as_millis(),
-            merkle_elapsed.as_millis(),
             repo_elapsed.as_millis(),
             total_elapsed.as_millis()
         );
@@ -962,15 +1032,26 @@ impl SyncManager {
 
     /// 处理收到的 GossipDigest：对比本地，找出对端有而本地没有的 key，发送 PullRequest
     pub async fn handle_gossip_digest(&self, conn: &Connection, digest: GossipDigestMessage) {
-        // 收集本地缺失的 key（对端 version > 本地，或本地没有）
+        // 收集本地缺失的 key（对端有而本地没有）。
+        // 【回环修复】不能用 merkle.contains_key 判断本地是否持有：当前 Merkle 是 DB 驱动的，
+        // contains_key() 恒返回 false（merkle.rs 无 per-key 内存索引），会把本地已持有的 key
+        // 全部误判为「缺失」-> 对每个 key 都发 PullRequest -> 对端回传 -> 又登记 -> 再广告，
+        // 形成 A<->B 无限拉取回环。NODE repo 直接查存储层按 addr 判断存在性。
         let mut missing: Vec<(u8, Vec<u8>)> = Vec::new();
         for (repo_type, key, _version) in &digest.changes {
-            // 简化判断：如果本地 Merkle 树中没有这个 key，说明缺失
-            // （实际应该对比 version，但当前 Merkle 只存 payload，不存 version）
-            if let Some(merkle) = self.merkle_for_repo(*repo_type) {
-                if !merkle.contains_key(key) {
-                    missing.push((*repo_type, key.clone()));
-                }
+            let already_here: bool = match *repo_type {
+                repo_type::NODE => std::str::from_utf8(key)
+                    .ok()
+                    .and_then(|s| s.parse::<SocketAddr>().ok())
+                    .map(|addr| self.node_repo.contains_sync(addr))
+                    .unwrap_or(false),
+                _ => self
+                    .merkle_for_repo(*repo_type)
+                    .map(|m| m.contains_key(key))
+                    .unwrap_or(false),
+            };
+            if !already_here {
+                missing.push((*repo_type, key.clone()));
             }
         }
 
@@ -1003,18 +1084,8 @@ impl SyncManager {
     ) {
         let mut entries: Vec<(u8, SyncEntry)> = Vec::new();
         for (repo_type, key) in &req.keys {
-            if let Some(merkle) = self.merkle_for_repo(*repo_type) {
-                if let Some(payload) = merkle.get(key) {
-                    entries.push((
-                        *repo_type,
-                        SyncEntry {
-                            key: key.clone(),
-                            operation: operation::UPSERT,
-                            version: 0,
-                            payload,
-                        },
-                    ));
-                }
+            if let Some(entry) = self.load_entry_by_key(*repo_type, key) {
+                entries.push((*repo_type, entry));
             }
         }
 
@@ -1080,23 +1151,50 @@ impl SyncManager {
             return;
         }
 
-        let raw_entries = merkle.entries_for_shards(&diff_shards);
-        if raw_entries.is_empty() {
+        // DB 驱动推送：从数据库按差异分片加载完整 SyncEntry
+        let entries = self.load_entries_by_shards(digest.repo_type, &diff_shards);
+
+        if entries.is_empty() {
             self.gossip_engine.set_sending_full_sync(false);
             return;
         }
 
-        let entries: Vec<SyncEntry> = raw_entries
-            .into_iter()
-            .map(|(key, payload)| SyncEntry {
-                key,
-                operation: operation::UPSERT,
-                version: 0,
-                payload,
-            })
-            .collect();
+        // P0-2: 若对端支持 key 列表交换，先交换 key 列表，只推送对方缺失的条目
+        // （重复率 ~90% -> <5%）。对端为旧版本或交换失败时回退到原始全量推送。
+        let final_entries: Vec<SyncEntry> = if conn.supports_diff_keys() {
+            match self
+                .clone()
+                .run_diff_key_exchange(
+                    &conn,
+                    from_node_id,
+                    digest.repo_type,
+                    &diff_shards,
+                    &entries,
+                )
+                .await
+            {
+                Ok(filtered) => {
+                    info!(
+                        "[federation] DiffSync key 交换完成: repo={}, 本地候选={}, 仅推送对方缺失={}",
+                        digest.repo_type,
+                        entries.len(),
+                        filtered.len()
+                    );
+                    filtered
+                }
+                Err(e) => {
+                    warn!(
+                        "[federation] DiffSync key 交换失败，回退全量推送: repo={}, err={}",
+                        digest.repo_type, e
+                    );
+                    entries
+                }
+            }
+        } else {
+            entries
+        };
 
-        let total = entries.len();
+        let total = final_entries.len();
         info!(
             "[federation] DiffSync 推送: repo_type={}, 差异分片={}, 条目={}, to={}",
             digest.repo_type,
@@ -1120,7 +1218,7 @@ impl SyncManager {
         }
 
         let mut seq: u64 = 0;
-        for chunk in entries.chunks(batch_size) {
+        for chunk in final_entries.chunks(batch_size) {
             let batch_msg = FullSyncBatchMessage {
                 repo_type: digest.repo_type,
                 entries: chunk.to_vec(),
@@ -1152,6 +1250,208 @@ impl SyncManager {
             "[federation] DiffSync 完成: to={}, 总推送条目={}",
             from_node_id, _total_pushed
         );
+    }
+
+    /// P0-2: DiffSync key 列表交换（数据服务器侧）。
+    ///
+    /// 把本地差异分片的 key 列表分片发给请求方，等待请求方回传其缺失的 key 列表，
+    /// 然后只从 `entries` 中筛出对方缺失的条目返回。
+    /// 超时或发送失败时返回 Err，调用方回退到全量推送。
+    async fn run_diff_key_exchange(
+        self: Arc<Self>,
+        conn: &Connection,
+        peer: NodeId,
+        repo_type: u8,
+        diff_shards: &[u16],
+        entries: &[SyncEntry],
+    ) -> anyhow::Result<Vec<SyncEntry>> {
+        // 1. 本地差异分片的全部 key
+        let all_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.key.clone()).collect();
+
+        // 2. 注册 oneshot，等待请求方回传缺失 key
+        let (tx, rx) = oneshot::channel::<Vec<Vec<u8>>>();
+        let key = (peer, repo_type);
+        self.pending_diff_key_resp.write().insert(
+            key,
+            PendingKeyResp {
+                tx: Some(tx),
+                buf: Vec::new(),
+            },
+        );
+
+        // 确保无论成功/失败/超时都清理待收集项，避免泄漏
+        struct Guard<'a> {
+            mgr: &'a SyncManager,
+            key: (NodeId, u8),
+        }
+        impl<'a> Drop for Guard<'a> {
+            fn drop(&mut self) {
+                self.mgr.pending_diff_key_resp.write().remove(&self.key);
+            }
+        }
+        let _guard = Guard {
+            mgr: self.as_ref(),
+            key,
+        };
+
+        // 3. 分片发送 key 列表（每片 <= DIFF_SYNC_KEY_CHUNK_SIZE 个 key）
+        let chunk_size = DIFF_SYNC_KEY_CHUNK_SIZE;
+        let total_chunks = all_keys.len().div_ceil(chunk_size).max(1);
+        for (i, chunk) in all_keys.chunks(chunk_size).enumerate() {
+            let is_last = i + 1 == total_chunks;
+            let msg = DiffSyncKeyRequestMessage {
+                repo_type,
+                shards: diff_shards.to_vec(),
+                keys: chunk.to_vec(),
+                is_last,
+            };
+            if let Err(e) = conn
+                .send_message(MessageType::DiffSyncKeyRequest, &msg)
+                .await
+            {
+                anyhow::bail!("发送 DiffSyncKeyRequest 失败: {}", e);
+            }
+        }
+        self.metrics.record_message_sent();
+        debug!(
+            "[federation] DiffSyncKeyRequest 已发送: repo={}, keys={}, chunks={}, to={}",
+            repo_type,
+            all_keys.len(),
+            total_chunks,
+            peer
+        );
+
+        // 4. 等待请求方回传缺失 key（带超时，超时回退全量）
+        let timeout = Duration::from_secs(self.config.diff_key_exchange_timeout_secs);
+        let missing = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(_)) => {
+                anyhow::bail!("对端未回传 DiffSyncKeyResponse（通道关闭）");
+            }
+            Err(_) => {
+                anyhow::bail!("等待 DiffSyncKeyResponse 超时 {}s", timeout.as_secs());
+            }
+        };
+
+        // 5. 只保留对方缺失的条目
+        let missing_set: FxHashSet<&[u8]> = missing.iter().map(|k| k.as_slice()).collect();
+        let filtered: Vec<SyncEntry> = entries
+            .iter()
+            .filter(|e| missing_set.contains(e.key.as_slice()))
+            .cloned()
+            .collect();
+        Ok(filtered)
+    }
+
+    /// P0-2: 处理收到的 DiffSyncKeyRequest（请求方侧）。
+    ///
+    /// 累计数据服务器分片发来的 key 列表，收齐到 is_last 后，从本地 DB 加载同分片 key，
+    /// 对比出对方有而本地缺失的 key，分片回传 DiffSyncKeyResponse。
+    pub async fn handle_diff_sync_key_request(
+        self: Arc<Self>,
+        conn: &Connection,
+        msg: DiffSyncKeyRequestMessage,
+    ) {
+        let repo_type = msg.repo_type;
+        let peer = conn.node_id;
+        let key = (peer, repo_type);
+
+        // 累计本片 key
+        {
+            let mut buf_map = self.diff_key_req_buffer.write();
+            let buf = buf_map.entry(key).or_default();
+            if !msg.shards.is_empty() {
+                buf.shards = msg.shards;
+            }
+            buf.keys.extend(msg.keys);
+        }
+
+        if !msg.is_last {
+            // 还有更多分片，等待下一片
+            return;
+        }
+
+        // 收齐：取出累计缓冲
+        let (shards, server_keys) = {
+            let mut buf_map = self.diff_key_req_buffer.write();
+            buf_map
+                .remove(&key)
+                .map(|b| (b.shards, b.keys))
+                .unwrap_or_default()
+        };
+
+        // 从本地 DB 加载同分片 key，构建本地 key 集合
+        let local_entries = self.load_entries_by_shards(repo_type, &shards);
+        let local_set: FxHashSet<&[u8]> = local_entries.iter().map(|e| e.key.as_slice()).collect();
+
+        // 对方有而本地缺失的 key
+        let missing: Vec<Vec<u8>> = server_keys
+            .iter()
+            .filter(|k| !local_set.contains(k.as_slice()))
+            .cloned()
+            .collect();
+
+        debug!(
+            "[federation] DiffSyncKeyRequest 对比: repo={}, 对方keys={}, 本地keys={}, 缺失={}, from={}",
+            repo_type,
+            server_keys.len(),
+            local_set.len(),
+            missing.len(),
+            peer
+        );
+
+        // 分片回传缺失 key
+        let chunk_size = DIFF_SYNC_KEY_CHUNK_SIZE;
+        let total_chunks = missing.len().div_ceil(chunk_size).max(1);
+        for (i, chunk) in missing.chunks(chunk_size).enumerate() {
+            let is_last = i + 1 == total_chunks;
+            let resp = DiffSyncKeyResponseMessage {
+                repo_type,
+                missing_keys: chunk.to_vec(),
+                is_last,
+            };
+            if let Err(e) = conn
+                .send_message(MessageType::DiffSyncKeyResponse, &resp)
+                .await
+            {
+                debug!("[federation] DiffSyncKeyResponse 发送失败: {}", e);
+                return;
+            }
+        }
+        self.metrics.record_message_sent();
+    }
+
+    /// P0-2: 处理收到的 DiffSyncKeyResponse（数据服务器侧）。
+    ///
+    /// 累计请求方回传的缺失 key 分片，收齐到 is_last 后唤醒等待中的推送任务。
+    pub fn handle_diff_sync_key_response(
+        &self,
+        conn: &Connection,
+        msg: DiffSyncKeyResponseMessage,
+    ) {
+        let repo_type = msg.repo_type;
+        let key = (conn.node_id, repo_type);
+
+        let pending = {
+            let mut map = self.pending_diff_key_resp.write();
+            if let Some(p) = map.get_mut(&key) {
+                p.buf.extend(msg.missing_keys);
+                if msg.is_last {
+                    map.remove(&key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // is_last 时 pending 已被移除，取出 tx 唤醒等待方
+        if let Some(p) = pending {
+            if let Some(tx) = p.tx {
+                let _ = tx.send(p.buf);
+            }
+        }
     }
 
     /// 统计本节点各 repo 的当前条目数（顺序与 repo_type::NODE/PEER/INFOHASH/TRACKER 一致）。
@@ -1362,6 +1662,142 @@ impl SyncManager {
         entries
     }
 
+    /// 从数据库按分片加载完整 SyncEntry 数据（DB 驱动推送路径）。
+    ///
+    /// Merkle 根和推送数据都基于数据库，不再从内存 Merkle entries 取热数据。
+    /// 此方法调用 DB 的 load_*_rows_by_shards（走 shard 索引），返回完整条目。
+    pub fn load_entries_by_shards(&self, repo_type: u8, shards: &[u16]) -> Vec<SyncEntry> {
+        match repo_type {
+            rt if rt == repo_type::NODE => {
+                let storage = self.node_repo.storage();
+                let rows = match storage.load_node_rows_by_shards(shards) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("[federation] load_node_rows_by_shards 失败: {}", e);
+                        return Vec::new();
+                    }
+                };
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                rows.into_iter()
+                    .filter_map(|(id, ip, port)| {
+                        let mut node_id = [0u8; 20];
+                        if id.len() == 20 {
+                            node_id.copy_from_slice(&id);
+                        }
+                        let addr: SocketAddr = format!("{}:{}", ip, port).parse().ok()?;
+                        let (_key, payload, _hash) = build_node_sync_entry(node_id, addr)?;
+                        Some(SyncEntry {
+                            key: _key,
+                            operation: operation::UPSERT,
+                            version: now,
+                            payload,
+                        })
+                    })
+                    .collect()
+            }
+            rt if rt == repo_type::PEER => {
+                let storage = match &self.peer_repo {
+                    Some(r) => r.storage(),
+                    None => return Vec::new(),
+                };
+                let rows = match storage.load_peer_rows_by_shards(shards) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("[federation] load_peer_rows_by_shards 失败: {}", e);
+                        return Vec::new();
+                    }
+                };
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                rows.into_iter()
+                    .filter_map(|(infohash, ip, port, _source, _last_active)| {
+                        let mut ih = [0u8; 20];
+                        if infohash.len() == 20 {
+                            ih.copy_from_slice(&infohash);
+                        }
+                        let addr: SocketAddr = format!("{}:{}", ip, port).parse().ok()?;
+                        let (_key, payload, _hash) = peer_sync::build_peer_sync_entry(ih, addr)?;
+                        Some(SyncEntry {
+                            key: _key,
+                            operation: operation::UPSERT,
+                            version: now,
+                            payload,
+                        })
+                    })
+                    .collect()
+            }
+            rt if rt == repo_type::INFOHASH => {
+                let storage = match &self.infohash_repo {
+                    Some(r) => r.storage(),
+                    None => return Vec::new(),
+                };
+                let rows = match storage.load_infohash_rows_by_shards(shards) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("[federation] load_infohash_rows_by_shards 失败: {}", e);
+                        return Vec::new();
+                    }
+                };
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                rows.into_iter()
+                    .filter_map(|(infohash, _last_seen, _first_source)| {
+                        let mut ih = [0u8; 20];
+                        if infohash.len() == 20 {
+                            ih.copy_from_slice(&infohash);
+                        }
+                        let (_key, payload, _hash) = infohash_sync::build_infohash_sync_entry(ih)?;
+                        Some(SyncEntry {
+                            key: _key,
+                            operation: operation::UPSERT,
+                            version: now,
+                            payload,
+                        })
+                    })
+                    .collect()
+            }
+            rt if rt == repo_type::TRACKER => {
+                let storage = match &self.tracker_repo {
+                    Some(r) => r.storage(),
+                    None => return Vec::new(),
+                };
+                let rows = match storage.load_tracker_rows_by_shards(shards) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("[federation] load_tracker_rows_by_shards 失败: {}", e);
+                        return Vec::new();
+                    }
+                };
+                rows.into_iter()
+                    .filter_map(|(url, _disabled, last_used)| {
+                        let ts = last_used.unwrap_or(0) as u64;
+                        let (_key, payload, _hash) = tracker_sync::build_tracker_sync_entry(&url)?;
+                        Some(SyncEntry {
+                            key: _key,
+                            operation: operation::UPSERT,
+                            version: ts,
+                            payload,
+                        })
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// 从数据库按 key 加载单个 SyncEntry（用于 Gossip Pull）。
+    pub fn load_entry_by_key(&self, repo_type: u8, key: &[u8]) -> Option<SyncEntry> {
+        let shard = self.merkle_for_repo(repo_type)?.shard_for_key(key);
+        let entries = self.load_entries_by_shards(repo_type, &[shard]);
+        entries.into_iter().find(|e| e.key == key)
+    }
     /// 获取同步统计（各 repo 同步计数 + Gossip 传播次数）
     pub fn sync_stats(&self) -> crate::federation::SyncStats {
         let snap = self.metrics.snapshot();
@@ -1426,13 +1862,22 @@ impl SyncManager {
             conn.node_id
         );
 
-        // 大差异（≥20%分片）：触发差异全量同步
+        // 大差异（≥20%分片）：优先走分层 Merkle + 分片并行同步（version>=3）
         if diffs.len() * 5 >= 256 {
-            info!(
-                "[federation] 差异≥20%，触发差异全量同步（repo_type={}, from={}）",
-                digest.repo_type, conn.node_id
-            );
-            self.trigger_diff_sync(conn.node_id, digest.repo_type).await;
+            if conn.supports_layered_merkle() && self.config.layered_merkle_enabled {
+                info!(
+                    "[federation] 差异≥20%，触发分层Merkle+分片同步（repo_type={}, from={}）",
+                    digest.repo_type, conn.node_id
+                );
+                self.trigger_layered_sync(conn.node_id, digest.repo_type)
+                    .await;
+            } else {
+                info!(
+                    "[federation] 差异≥20%，对端不支持分层Merkle，触发旧版DiffSync（repo_type={}, from={}）",
+                    digest.repo_type, conn.node_id
+                );
+                self.trigger_diff_sync(conn.node_id, digest.repo_type).await;
+            }
             return;
         }
 
@@ -1457,23 +1902,13 @@ impl SyncManager {
     /// 收到对端的分片请求后，从本地 Merkle 树收集指定分片的所有条目，
     /// 打包成 MerkleRepair 消息发送回对端。
     pub async fn handle_merkle_request(&self, conn: &Connection, request: MerkleRequestMessage) {
-        let merkle = match self.merkle_for_repo(request.repo_type) {
+        let _merkle = match self.merkle_for_repo(request.repo_type) {
             Some(m) => m,
             None => return,
         };
 
-        let mut entries = Vec::new();
-        for shard in &request.shards {
-            let shard_entries = merkle.get_shard_entries(*shard);
-            for (key, payload) in shard_entries {
-                entries.push(SyncEntry {
-                    key,
-                    operation: operation::UPSERT,
-                    version: 0,
-                    payload,
-                });
-            }
-        }
+        // DB 驱动推送：从数据库按请求分片加载完整 SyncEntry
+        let entries = self.load_entries_by_shards(request.repo_type, &request.shards);
 
         if entries.is_empty() {
             return;
@@ -1497,8 +1932,6 @@ impl SyncManager {
         }
     }
 
-    /// 处理收到的 MerkleRepair：应用修复数据到本地 repo
-    ///
     /// 收到对端返回的差异分片数据后，通过 handle_sync_batch 应用到本地，
     /// 并记录 merkle_repairs 计数。
     pub fn handle_merkle_repair(&self, repair: MerkleRepairMessage) {
@@ -1567,6 +2000,814 @@ impl SyncManager {
             .collect();
         repo.add_peers_sync(&ih, &peer_infos);
     }
+
+    // ========================================================================
+    // 分层 Merkle 对比 + 分片并行同步（协议版本 >=3，亿级数据架构升级）
+    // ========================================================================
+
+    /// 处理收到的 MerkleLevelRequest：返回指定层级的子哈希列表
+    ///
+    /// 由对端请求某层某分片的子哈希，用于逐层定位差异 L2。
+    /// - level=0: 返回 L0 根哈希（1个）
+    /// - level=1: 返回所有 L1 一级分片哈希（256个）
+    /// - level=2: 返回指定 L1 下的 L2 二级分片哈希（256个）
+    pub async fn handle_merkle_level_request(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        req: MerkleLevelRequestMessage,
+    ) {
+        let merkle = match self.merkle_for_repo(req.repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let (hashes, entry_counts) = match req.level {
+            0 => {
+                // L0 根
+                let root = merkle.root_hash();
+                (vec![root], vec![merkle.total_entries() as u32])
+            }
+            1 => {
+                // L1 一级分片
+                let l1_hashes = merkle.level1_hashes();
+                let counts: Vec<u32> = (0..merkle.shard_count())
+                    .map(|i| merkle.l1_entry_count(i))
+                    .collect();
+                (l1_hashes, counts)
+            }
+            2 => {
+                // L2 二级分片（指定 L1 下）
+                let l2_hashes = merkle.level2_hashes(req.parent_shard);
+                let l2_start =
+                    req.parent_shard as u32 * crate::federation::merkle::L2_PER_L1 as u32;
+                let counts: Vec<u32> = (0..l2_hashes.len() as u32)
+                    .map(|i| merkle.l2_entry_count(l2_start + i))
+                    .collect();
+                (l2_hashes, counts)
+            }
+            _ => {
+                debug!("[shard-sync] 未知 MerkleLevelRequest level={}", req.level);
+                return;
+            }
+        };
+
+        let resp = MerkleLevelResponseMessage {
+            repo_type: req.repo_type,
+            level: req.level,
+            parent_shard: req.parent_shard,
+            hashes,
+            entry_counts,
+        };
+
+        if let Err(e) = conn
+            .send_message(MessageType::MerkleLevelResponse, &resp)
+            .await
+        {
+            debug!("[shard-sync] 发送 MerkleLevelResponse 失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+            debug!(
+                "[shard-sync] MerkleLevelResponse: repo={}, level={}, parent={}, hashes={}",
+                req.repo_type,
+                req.level,
+                req.parent_shard,
+                resp.hashes.len()
+            );
+        }
+    }
+
+    /// 处理收到的 MerkleLevelResponse：继续分层对比流程
+    ///
+    /// 收到对端返回的层级哈希后，与本地对比：
+    /// - level=1: 对比 L1，找出差异 L1，然后请求差异 L1 的 L2
+    /// - level=2: 对比 L2，收集差异 L2，全部收齐后启动分片同步
+    pub async fn handle_merkle_level_response(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        resp: MerkleLevelResponseMessage,
+    ) {
+        let merkle = match self.merkle_for_repo(resp.repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let key = (conn.node_id, resp.repo_type);
+
+        match resp.level {
+            1 => {
+                // 对比 L1，找出差异 L1 分片
+                let diff_l1 = merkle.diff_level1(&resp.hashes);
+                debug!(
+                    "[shard-sync] L1 对比完成: repo={}, 差异L1数={}",
+                    resp.repo_type,
+                    diff_l1.len()
+                );
+
+                if diff_l1.is_empty() {
+                    self.layered_compare_sessions.write().remove(&key);
+                    return;
+                }
+
+                // 为每个差异 L1 请求 L2 哈希
+                let pending_count = diff_l1.len();
+                self.layered_compare_sessions.write().insert(
+                    key,
+                    LayeredCompareSession {
+                        peer: conn.node_id,
+                        repo_type: resp.repo_type,
+                        started_at: std::time::Instant::now(),
+                        phase: crate::federation::sync::shard_sync_engine::LayeredComparePhase::AwaitingL2 {
+                            compared_l1: Vec::new(),
+                            diff_l2: FxHashSet::default(),
+                            pending_l1_count: pending_count,
+                        },
+                    },
+                );
+
+                for &l1 in &diff_l1 {
+                    let req = MerkleLevelRequestMessage {
+                        repo_type: resp.repo_type,
+                        level: 2,
+                        parent_shard: l1,
+                    };
+                    if let Err(e) = conn
+                        .send_message(MessageType::MerkleLevelRequest, &req)
+                        .await
+                    {
+                        warn!("[shard-sync] 发送 L2 请求失败: {}", e);
+                        break;
+                    }
+                }
+                self.metrics.record_message_sent();
+            }
+            2 => {
+                // 对比指定 L1 下的 L2，收集差异 L2
+                let diff_l2_offsets = merkle.diff_level2(resp.parent_shard, &resp.hashes);
+                let l1_base =
+                    resp.parent_shard as u32 * crate::federation::merkle::L2_PER_L1 as u32;
+                let absolute_diff_l2: Vec<u32> = diff_l2_offsets
+                    .iter()
+                    .map(|&off| l1_base + off as u32)
+                    .collect();
+
+                debug!(
+                    "[shard-sync] L2 对比: repo={}, L1={}, 差异L2数={}",
+                    resp.repo_type,
+                    resp.parent_shard,
+                    absolute_diff_l2.len()
+                );
+
+                // 更新会话状态
+                let mut sessions = self.layered_compare_sessions.write();
+                if let Some(session) = sessions.get_mut(&key) {
+                    if let crate::federation::sync::shard_sync_engine::LayeredComparePhase::AwaitingL2 {
+                        compared_l1,
+                        diff_l2,
+                        pending_l1_count,
+                    } = &mut session.phase
+                    {
+                        compared_l1.push(resp.parent_shard);
+                        for &l2 in &absolute_diff_l2 {
+                            diff_l2.insert(l2);
+                        }
+                        *pending_l1_count -= 1;
+
+                        // 所有 L1 都收齐了，启动分片同步
+                        if *pending_l1_count == 0 {
+                            let diff_l2_list: Vec<u32> =
+                                std::mem::take(diff_l2).into_iter().collect();
+                            drop(sessions);
+
+                            info!(
+                                "[shard-sync] 分层对比完成: repo={}, peer={}, 差异L2总数={}",
+                                resp.repo_type,
+                                conn.node_id,
+                                diff_l2_list.len()
+                            );
+
+                            // 启动分片同步引擎
+                            self.start_shard_sync(conn.clone(), resp.repo_type, diff_l2_list);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 处理收到的 ShardSyncBatch：应用条目并回复 Ack
+    ///
+    /// 接收方将批次中的条目应用到本地 repo，然后回复 ShardSyncAck。
+    pub fn handle_shard_sync_batch(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        msg: ShardSyncBatchMessage,
+    ) {
+        debug!(
+            "[shard-sync] 收到 ShardSyncBatch: repo={}, seq={}, l2_shards={:?}, entries={}, is_last={}",
+            msg.repo_type,
+            msg.seq,
+            msg.l2_shards,
+            msg.entries.len(),
+            msg.is_last
+        );
+
+        // 应用条目到本地
+        self.handle_sync_batch(msg.repo_type, &msg.entries);
+
+        // 回复 Ack
+        let ack = ShardSyncAckMessage {
+            repo_type: msg.repo_type,
+            seq: msg.seq,
+            applied_count: msg.entries.len() as u32,
+        };
+
+        let conn_clone = conn.clone();
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = conn_clone
+                .send_message(MessageType::ShardSyncAck, &ack)
+                .await
+            {
+                debug!("[shard-sync] 发送 ShardSyncAck 失败: {}", e);
+            } else {
+                self_clone.metrics.record_message_sent();
+            }
+        });
+    }
+
+    /// 处理收到的 ShardSyncAck：唤醒发送端等待的 oneshot
+    ///
+    /// 在活跃的分片同步引擎中查找匹配 seq 的等待者并唤醒。
+    pub fn handle_shard_sync_ack(&self, ack: ShardSyncAckMessage) {
+        let engines = self.active_shard_engines.read();
+
+        // 遍历该 repo 的所有活跃引擎，找到匹配的
+        for ((peer, rt), engine) in engines.iter() {
+            if *rt == ack.repo_type {
+                engine.handle_ack(&ack);
+                debug!(
+                    "[shard-sync] Ack 路由到引擎: peer={}, repo={}, seq={}, applied={}",
+                    peer, ack.repo_type, ack.seq, ack.applied_count
+                );
+            }
+        }
+    }
+
+    /// 处理收到的 ShardSyncHashList：对比本地 DB，回复缺失的 key（异步）
+    ///
+    /// 接收方把对端发来的 (key, data_hash) 列表分片累计，收齐后对比本地该 L1 分片的 key，
+    /// 回传本地缺失的 key 列表，数据服务器只推送这些 key 的完整数据。
+    pub async fn handle_shard_sync_hash_list(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        msg: ShardSyncHashListMessage,
+    ) {
+        let key = (conn.node_id, msg.repo_type, msg.l2_shard);
+        // 累计分片
+        {
+            let mut buf = self.shard_hash_list_buffer.write();
+            let entry = buf.entry(key).or_default();
+            entry.extend(msg.entries);
+        }
+        if !msg.is_last {
+            return; // 继续等待后续分片
+        }
+        // 收齐，取出累计列表
+        let entries = self
+            .shard_hash_list_buffer
+            .write()
+            .remove(&key)
+            .unwrap_or_default();
+
+        // NODE repo：查本地该 L1 分片的 key 集合（走 shard 索引），计算缺失
+        let missing: Vec<Vec<u8>> = if msg.repo_type == repo_type::NODE {
+            let l1 = MerkleTree::l1_for_l2(msg.l2_shard);
+            let storage = self.node_repo.storage();
+            match storage.load_node_rows_by_shards(&[l1]) {
+                Ok(rows) => {
+                    let local_keys: FxHashSet<Vec<u8>> = rows
+                        .into_iter()
+                        .map(|(_id, ip, port)| format!("{}:{}", ip, port).into_bytes())
+                        .collect();
+                    entries
+                        .iter()
+                        .filter(|(k, _h)| !local_keys.contains(k))
+                        .map(|(k, _h)| k.clone())
+                        .collect()
+                }
+                Err(e) => {
+                    warn!(
+                        "[shard-sync] 加载本地节点 key 失败: {}, 回传全部 key 作为缺失",
+                        e
+                    );
+                    entries.iter().map(|(k, _)| k.clone()).collect()
+                }
+            }
+        } else {
+            // 其他 repo 暂不支持 hash 对比，回传全部 key 作为缺失（对端全量发送）
+            entries.iter().map(|(k, _)| k.clone()).collect()
+        };
+
+        debug!(
+            "[shard-sync] ShardSyncHashList: repo={}, l2={}, 对端条目={}, 本地缺失={}",
+            msg.repo_type,
+            msg.l2_shard,
+            entries.len(),
+            missing.len()
+        );
+
+        // 回复缺失 key 列表
+        let reply = ShardSyncMissingMessage {
+            repo_type: msg.repo_type,
+            l2_shard: msg.l2_shard,
+            missing_keys: missing,
+            is_last: true,
+        };
+        if let Err(e) = conn
+            .send_message(MessageType::ShardSyncMissing, &reply)
+            .await
+        {
+            warn!("[shard-sync] 发送 ShardSyncMissing 失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// 处理收到的 ShardSyncMissing：唤醒发送端等待的 oneshot
+    ///
+    /// 在活跃的分片同步引擎中查找匹配 repo_type 的引擎并唤醒其等待。
+    pub fn handle_shard_sync_missing(&self, msg: ShardSyncMissingMessage) {
+        let engines = self.active_shard_engines.read();
+        for ((_peer, rt), engine) in engines.iter() {
+            if *rt == msg.repo_type {
+                engine.handle_shard_sync_missing(msg.l2_shard, msg.missing_keys.clone());
+            }
+        }
+    }
+
+    /// 处理收到的 ShardSyncComplete：分层分片同步完成。
+    ///
+    /// 入站 ShardSyncBatch 走 handle_sync_batch -> apply_*（add_nodes_batch_internal 等），
+    /// 条目已写入本地 repo 并落盘；但**不再**实时维护内存 Merkle 的 l2_hashes，也**不**把所属
+    /// L2 分片标 dirty_l2（这是切断 A->B->A 回环的关键：入站数据若标 dirty，
+    /// incremental_sync_tick 会把整批再推回对端，形成无限回灌）。
+    ///
+    /// 内存 Merkle 根不靠这里维护，而是由周期任务 merkle_cold_rebuild_*（间隔
+    /// merkle_full_rebuild_interval_secs）从 DB 全量 load_all_*_keys_hashes 后调用
+    /// rebuild_cold_from_db / rebuild_all_from_db 重算 L2/L1/L0，并清空 dirty_l2，收敛到 DB 状态。
+    ///
+    /// 此处**不**调用 rebuild_all()：rebuild_all() 会把全部 65536 个 L2 标 dirty，
+    /// 反而触发 incremental_sync_tick 把整库回灌给对端。收敛交给周期 cold rebuild 即可。
+    pub fn handle_shard_sync_complete(&self, msg: ShardSyncCompleteMessage) {
+        info!(
+            "[shard-sync] 收到 ShardSyncComplete（入站已落库；不实时维护内存 Merkle、不标 dirty，根由周期 cold rebuild 收敛）: repo={}, total_l2={}, total_entries={}, max_seq={}",
+            msg.repo_type, msg.total_l2_shards, msg.total_entries, msg.max_seq
+        );
+    }
+
+    /// 启动分层 Merkle 对比 + 分片同步流程
+    ///
+    /// 由 handle_merkle_digest 在检测到大差异且对端支持分层 Merkle 时调用。
+    /// 流程：
+    /// 1. 对比 L1（已从 MerkleDigest 获得），找出差异 L1
+    /// 2. 对每个差异 L1 请求 L2 哈希
+    /// 3. 对比 L2，收集差异 L2
+    /// 4. 启动 ShardSyncEngine 推送差异 L2
+    pub async fn trigger_layered_sync(self: Arc<Self>, peer: NodeId, repo_type: u8) {
+        let conn = match self.connection_manager.get_connection(&peer) {
+            Some(c) => c,
+            None => {
+                warn!("[shard-sync] trigger_layered_sync: 无连接 peer={}", peer);
+                return;
+            }
+        };
+
+        if !conn.supports_layered_merkle() {
+            warn!(
+                "[shard-sync] 对端不支持分层 Merkle (version={}), 回退 DiffSync",
+                conn.peer_protocol_version
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            self.trigger_diff_sync(peer, repo_type).await;
+            return;
+        }
+
+        let _merkle = match self.merkle_for_repo(repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        info!(
+            "[shard-sync] 启动分层 Merkle 对比: repo={}, peer={}",
+            repo_type, peer
+        );
+
+        // 步骤1：请求对端的 L1 哈希（虽然 MerkleDigest 已有 L1，但为了流程统一，
+        // 这里直接用已有的 digest 对比 L1，然后请求差异 L1 的 L2）
+        // 实际上 handle_merkle_digest 已经做了 L1 对比，这里直接请求 L2
+
+        // 发送 L2 请求给对端，获取差异 L1 的 L2 哈希
+        // 注意：差异 L1 列表需要从 handle_merkle_digest 传入，这里简化为
+        // 先请求所有 L1 的 L2（开销大但实现简单，后续优化为只请求差异 L1）
+        // 为优化性能，我们直接用已有 digest 对比 L1，然后只请求差异 L1 的 L2
+
+        // 这里需要从对端重新获取最新的 L1 哈希做对比
+        let req = MerkleLevelRequestMessage {
+            repo_type,
+            level: 1,
+            parent_shard: 0, // 忽略
+        };
+
+        if let Err(e) = conn
+            .send_message(MessageType::MerkleLevelRequest, &req)
+            .await
+        {
+            warn!("[shard-sync] 发送 MerkleLevelRequest(level=1) 失败: {}", e);
+            // 回退到旧版 DiffSync
+            self.trigger_diff_sync(peer, repo_type).await;
+            return;
+        }
+        self.metrics.record_message_sent();
+    }
+
+    /// 启动分片同步引擎（数据服务器侧，推送差异 L2 分片数据到请求方）
+    ///
+    /// # 参数
+    /// - conn: 到请求方的连接
+    /// - repo_type: 仓库类型
+    /// - diff_l2_shards: 差异 L2 分片列表
+    pub fn start_shard_sync(
+        self: &Arc<Self>,
+        conn: Arc<Connection>,
+        repo_type: u8,
+        diff_l2_shards: Vec<u32>,
+    ) {
+        let peer_id = conn.node_id;
+        let key = (peer_id, repo_type);
+
+        // 互斥检查：同一 peer+repo 同时只允许一个引擎
+        {
+            let engines = self.active_shard_engines.read();
+            if engines.contains_key(&key) {
+                debug!(
+                    "[shard-sync] 分片同步已在进行中: peer={}, repo={}",
+                    peer_id, repo_type
+                );
+                return;
+            }
+        }
+
+        let merkle = match self.merkle_for_repo(repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        info!(
+            "[shard-sync] 创建分片同步引擎: peer={}, repo={}, 差异L2数={}",
+            peer_id,
+            repo_type,
+            diff_l2_shards.len()
+        );
+
+        // 创建数据加载回调：按L2分片号加载数据（支持4种repo类型）
+        let load_fn: Arc<dyn Fn(u32) -> Vec<SyncEntry> + Send + Sync> = {
+            let node_repo = self.node_repo.clone();
+            let peer_repo = self.peer_repo.clone();
+            let infohash_repo = self.infohash_repo.clone();
+            let tracker_repo = self.tracker_repo.clone();
+            let repo_type_clone = repo_type;
+            Arc::new(move |l2: u32| -> Vec<SyncEntry> {
+                // l2 是 0..65535 的绝对 L2 索引，DB 的 shard 列存的是 L1 分片 0..255（= L2 / 256）
+                let shard = MerkleTree::l1_for_l2(l2);
+                let shards = [shard];
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                match repo_type_clone {
+                    rt if rt == repo_type::NODE => {
+                        let storage = node_repo.storage();
+                        match storage.load_node_rows_by_shards(&shards) {
+                            Ok(rows) => rows
+                                .into_iter()
+                                .filter_map(|(id, ip, port)| {
+                                    let mut node_id = [0u8; 20];
+                                    if id.len() == 20 {
+                                        node_id.copy_from_slice(&id);
+                                    }
+                                    let addr: std::net::SocketAddr =
+                                        format!("{}:{}", ip, port).parse().ok()?;
+                                    let (key, payload, _hash) =
+                                        build_node_sync_entry(node_id, addr)?;
+                                    Some(SyncEntry {
+                                        key,
+                                        operation: operation::UPSERT,
+                                        version: now,
+                                        payload,
+                                    })
+                                })
+                                .collect(),
+                            Err(e) => {
+                                warn!("[shard-sync] load_node_rows_by_shards 失败: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    }
+                    rt if rt == repo_type::PEER => {
+                        let storage = match &peer_repo {
+                            Some(r) => r.storage(),
+                            None => return Vec::new(),
+                        };
+                        match storage.load_peer_rows_by_shards(&shards) {
+                            Ok(rows) => rows
+                                .into_iter()
+                                .filter_map(|(infohash, ip, port, _source, _last_active)| {
+                                    let mut ih = [0u8; 20];
+                                    if infohash.len() == 20 {
+                                        ih.copy_from_slice(&infohash);
+                                    }
+                                    let addr: std::net::SocketAddr =
+                                        format!("{}:{}", ip, port).parse().ok()?;
+                                    let (key, payload, _hash) =
+                                        crate::federation::sync::peer_sync::build_peer_sync_entry(
+                                            ih, addr,
+                                        )?;
+                                    Some(SyncEntry {
+                                        key,
+                                        operation: operation::UPSERT,
+                                        version: now,
+                                        payload,
+                                    })
+                                })
+                                .collect(),
+                            Err(e) => {
+                                warn!("[shard-sync] load_peer_rows_by_shards 失败: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    }
+                    rt if rt == repo_type::INFOHASH => {
+                        let storage = match &infohash_repo {
+                            Some(r) => r.storage(),
+                            None => return Vec::new(),
+                        };
+                        match storage.load_infohash_rows_by_shards(&shards) {
+                            Ok(rows) => {
+                                rows.into_iter()
+                                    .filter_map(|(infohash, _last_seen, _first_source)| {
+                                        let mut ih = [0u8; 20];
+                                        if infohash.len() == 20 {
+                                            ih.copy_from_slice(&infohash);
+                                        }
+                                        let (key, payload, _hash) =
+                                            crate::federation::sync::infohash_sync::build_infohash_sync_entry(ih)?;
+                                        Some(SyncEntry {
+                                            key,
+                                            operation: operation::UPSERT,
+                                            version: now,
+                                            payload,
+                                        })
+                                    })
+                                    .collect()
+                            }
+                            Err(e) => {
+                                warn!("[shard-sync] load_infohash_rows_by_shards 失败: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    }
+                    rt if rt == repo_type::TRACKER => {
+                        let storage = match &tracker_repo {
+                            Some(r) => r.storage(),
+                            None => return Vec::new(),
+                        };
+                        match storage.load_tracker_rows_by_shards(&shards) {
+                            Ok(rows) => {
+                                rows.into_iter()
+                                    .filter_map(|(url, _disabled, last_used)| {
+                                        let ts = last_used.unwrap_or(0) as u64;
+                                        let (key, payload, _hash) =
+                                            crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url)?;
+                                        Some(SyncEntry {
+                                            key,
+                                            operation: operation::UPSERT,
+                                            version: ts,
+                                            payload,
+                                        })
+                                    })
+                                    .collect()
+                            }
+                            Err(e) => {
+                                warn!("[shard-sync] load_tracker_rows_by_shards 失败: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!("[shard-sync] 未知repo_type={}", repo_type_clone);
+                        Vec::new()
+                    }
+                }
+            })
+        };
+
+        // 节点级 hash 去重：NODE repo 注入 (key, data_hash) 加载回调；其他 repo 暂为 None（回退全量）
+        let hash_list_fn: Option<Arc<dyn Fn(u32) -> Vec<(Vec<u8>, Vec<u8>)> + Send + Sync>> =
+            if repo_type == repo_type::NODE {
+                let node_repo_hl = self.node_repo.clone();
+                Some(Arc::new(move |l2: u32| -> Vec<(Vec<u8>, Vec<u8>)> {
+                    let l1 = MerkleTree::l1_for_l2(l2);
+                    let storage = node_repo_hl.storage();
+                    match storage.load_node_rows_by_shards(&[l1]) {
+                        Ok(rows) => rows
+                            .into_iter()
+                            .map(|(id, ip, port)| {
+                                let key = format!("{}:{}", ip, port).into_bytes();
+                                let mut buf = Vec::with_capacity(id.len() + ip.len() + 2);
+                                buf.extend_from_slice(&id);
+                                buf.extend_from_slice(ip.as_bytes());
+                                buf.extend_from_slice(&port.to_le_bytes());
+                                let data_hash = blake3::hash(&buf).as_bytes().to_vec();
+                                (key, data_hash)
+                            })
+                            .collect(),
+                        Err(e) => {
+                            warn!(
+                                "[shard-sync] hash_list: load_node_rows_by_shards 失败: {}",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
+
+        let engine = Arc::new(ShardSyncEngine::new(
+            conn.clone(),
+            peer_id,
+            repo_type,
+            merkle,
+            self.config.clone(),
+            Some(load_fn),
+            hash_list_fn,
+        ));
+
+        // 注册引擎到活跃列表
+        self.active_shard_engines
+            .write()
+            .insert(key, engine.clone());
+
+        // 清理函数：引擎完成后从活跃列表移除
+        let self_clone = self.clone();
+        let key_clone = key;
+        let engine_clone = engine.clone();
+
+        // 启动引擎
+        engine.start(diff_l2_shards);
+
+        // 后台等待引擎完成并清理
+        tokio::spawn(async move {
+            // 简单等待：轮询检查引擎是否还在运行
+            // [ALLOWED-SLEEP] 分片同步引擎完成后轮询清理，一次性后台任务（非周期性）
+            loop {
+                tokio::time::sleep(Duration::from_secs(
+                    self_clone.config.shard_sync_engine_poll_interval_secs,
+                ))
+                .await;
+                if !engine_clone.is_running() {
+                    break;
+                }
+            }
+            self_clone.active_shard_engines.write().remove(&key_clone);
+            debug!(
+                "[shard-sync] 引擎已移除: peer={}, repo={}",
+                key_clone.0, key_clone.1
+            );
+        });
+    }
+
+    /// 增量同步 tick：基于 dirty L2 标记同步变更数据
+    ///
+    /// 由 TaskScheduler 周期性调用。对每个 repo：
+    /// 1. 取出 dirty L2 分片
+    /// 2. 如果有 dirty 分片且对端支持分层 Merkle，触发增量分片同步
+    /// 3. 增量失败时降级到分层 Merkle 差异同步
+    pub async fn incremental_sync_tick(self: Arc<Self>) {
+        if !self.config.incremental_sync_enabled {
+            return;
+        }
+
+        let repos = [
+            repo_type::NODE,
+            repo_type::PEER,
+            repo_type::INFOHASH,
+            repo_type::TRACKER,
+        ];
+
+        for &repo_type in &repos {
+            let merkle = match self.merkle_for_repo(repo_type) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // 检查是否已有增量同步在进行
+            {
+                let active = self.incremental_sync_active.read();
+                if active.contains(&repo_type) {
+                    continue;
+                }
+            }
+
+            // 取出 dirty L2 分片
+            let dirty_l2 = merkle.take_dirty_l2_shards();
+            if dirty_l2.is_empty() {
+                continue;
+            }
+
+            debug!(
+                "[shard-sync] 增量同步 tick: repo={}, dirty_l2数={}",
+                repo_type,
+                dirty_l2.len()
+            );
+
+            // 标记为活跃
+            self.incremental_sync_active.write().insert(repo_type);
+
+            // 找支持分层 Merkle 的活跃连接
+            let connections = self.connection_manager.all_connections();
+            let layered_peers: Vec<_> = connections
+                .iter()
+                .filter(|c| c.supports_layered_merkle())
+                .cloned()
+                .collect();
+
+            if layered_peers.is_empty() {
+                debug!(
+                    "[shard-sync] 增量同步: 无支持分层Merkle的连接, repo={}",
+                    repo_type
+                );
+                self.incremental_sync_active.write().remove(&repo_type);
+                continue;
+            }
+
+            // 先发送最近变更的增量摘要（Push-Pull 优化）：把本 repo 的近期变更
+            // 推给所有支持分层 Merkle 的邻居（不仅随机1个），对端对比后拉取缺失 key。
+            let recent: Vec<(u8, Vec<u8>, u64)> = self
+                .recent_changes
+                .read()
+                .iter()
+                .filter(|(rt, _, _)| *rt == repo_type)
+                .cloned()
+                .collect();
+            if !recent.is_empty() {
+                for conn in &layered_peers {
+                    let digest = GossipDigestMessage {
+                        changes: recent.clone(),
+                    };
+                    if let Err(e) = conn.send_message(MessageType::GossipDigest, &digest).await {
+                        debug!(
+                            "[shard-sync] 增量 GossipDigest 发送失败 to={}: {}",
+                            conn.node_id, e
+                        );
+                    } else {
+                        self.metrics.record_message_sent();
+                    }
+                }
+            }
+
+            // 选择第一个分层 Merkle 节点作为同步目标
+            let target = &layered_peers[0];
+            let dirty_list: Vec<u32> = dirty_l2.into_iter().collect();
+
+            info!(
+                "[shard-sync] 触发增量分片同步: repo={}, peer={}, dirty_l2数={}",
+                repo_type,
+                target.node_id,
+                dirty_list.len()
+            );
+
+            // 启动分片同步引擎推送 dirty L2
+            self.start_shard_sync(target.clone(), repo_type, dirty_list);
+
+            // 异步清理活跃标记
+            let self_clone = self.clone();
+            tokio::spawn(async move {
+                // 等待一段时间后清理
+                tokio::time::sleep(Duration::from_secs(
+                    self_clone.config.incremental_sync_active_cleanup_secs,
+                ))
+                .await;
+                self_clone
+                    .incremental_sync_active
+                    .write()
+                    .remove(&repo_type);
+            });
+        }
+    }
 }
 
 /// MerkleProvider 实现：为 GossipEngine 反熵任务提供各 repo 的 Merkle 摘要和分片数据
@@ -1585,6 +2826,7 @@ impl MerkleProvider for SyncManager {
                 shard_count: 0,
                 roots: Vec::new(),
                 entry_counts: Vec::new(),
+                full_root: None,
             }
         }
     }

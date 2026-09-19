@@ -11,8 +11,8 @@ use tokio::sync::Notify;
 /// wait_drain 轮询粒度
 const WAIT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// 单条待更新条目：(repo_type, key, payload)
-pub type MerkleUpdateEntry = (u8, Vec<u8>, Vec<u8>);
+/// 单条待更新条目：(repo_type, key, payload, data_hash)
+pub type MerkleUpdateEntry = (u8, Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Merkle 树异步批量更新队列
 pub struct MerkleUpdateQueue {
@@ -30,8 +30,10 @@ impl MerkleUpdateQueue {
 
     /// 入队一条更新，唤醒后台 flush 任务。
     /// 多次 push 在后台任务未消费时会被 Notify 合并为一次唤醒，不会造成惊群。
-    pub fn push(&self, repo_type: u8, key: Vec<u8>, payload: Vec<u8>) {
-        self.pending.lock().push((repo_type, key, payload));
+    pub fn push(&self, repo_type: u8, key: Vec<u8>, payload: Vec<u8>, data_hash: Vec<u8>) {
+        self.pending
+            .lock()
+            .push((repo_type, key, payload, data_hash));
         self.notify.notify_one();
     }
 

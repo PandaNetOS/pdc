@@ -19,7 +19,6 @@ use tower_http::cors::CorsLayer;
 use tracing::debug;
 
 use crate::data_plane::AppState;
-use crate::discoverers::tracker::PUBLIC_TRACKERS;
 use crate::types::{Infohash, PeerInfo};
 
 /// 默认 uTP 监听端口（用于状态上报）
@@ -44,7 +43,7 @@ pub struct HealthResponse {
 }
 
 /// 统计响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct TrackerScoreInfo {
     pub url: String,
     pub score: f64,
@@ -66,9 +65,15 @@ pub struct StatsResponse {
     pub task_scheduler_metrics: Option<TaskSchedulerMetrics>,
     #[serde(default)]
     pub node_repo_metrics: Option<NodeRepoMetrics>,
+    #[serde(default)]
+    pub peer_repo_metrics: Option<PeerRepoMetrics>,
+    #[serde(default)]
+    pub infohash_repo_metrics: Option<InfohashRepoMetrics>,
+    #[serde(default)]
+    pub tracker_repo_metrics: Option<TrackerRepoMetrics>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct FetcherStats {
     pub total_rounds: u64,
     pub last_round_peers: u64,
@@ -76,7 +81,7 @@ pub struct FetcherStats {
     pub infohash_repo_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct DiscovererStat {
     pub name: String,
     pub discoverer_type: String,
@@ -91,20 +96,20 @@ pub struct DiscovererStat {
     pub tracker_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct CacheStats {
     pub total_infohashes: usize,
     pub total_peers: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct SuperTrackerStats {
     pub total_infohashes: usize,
     pub total_peers: usize,
 }
 
 /// 爬虫深度监控指标（C3 扩展）
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct CrawlerMetrics {
     pub socket_send_pps: Vec<u64>,
     pub socket_recv_pps: Vec<u64>,
@@ -120,19 +125,55 @@ pub struct CrawlerMetrics {
 }
 
 /// 任务调度器监控指标（C3 扩展）
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct TaskSchedulerMetrics {
     pub running_by_category: std::collections::HashMap<String, u32>,
     pub queue_len: usize,
     pub task_recent_avg_durations: std::collections::HashMap<String, u64>,
 }
 
+/// Repo 冷热分层统计（监控面板用：总数/热/温/冷）
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct RepoTierStats {
+    /// 数据库总数
+    pub total: u64,
+    /// 热缓存数量
+    pub hot: usize,
+    /// 温缓存数量
+    pub warm: usize,
+    /// 冷数据 = total - hot - warm
+    pub cold: u64,
+}
+
 /// NodeRepo 监控指标（C3 扩展）
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct NodeRepoMetrics {
     pub dirty_count: usize,
     pub write_queue_len: usize,
     pub subnet_count: usize,
+    #[serde(default)]
+    pub tier: RepoTierStats,
+}
+
+/// PeerRepo 监控指标
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct PeerRepoMetrics {
+    #[serde(default)]
+    pub tier: RepoTierStats,
+}
+
+/// InfohashRepo 监控指标
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct InfohashRepoMetrics {
+    #[serde(default)]
+    pub tier: RepoTierStats,
+}
+
+/// TrackerRepo 监控指标
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct TrackerRepoMetrics {
+    #[serde(default)]
+    pub tier: RepoTierStats,
 }
 
 /// 发现请求
@@ -370,103 +411,24 @@ async fn health_handler(State(state): State<AppState>) -> Response {
 }
 
 /// 统计信息
+///
+/// 只读后台快照（stats_snapshot），不直接访问 Repo 层，
+/// 避免在 API 线程上执行 DB COUNT 查询导致阻塞。
 async fn stats_handler(State(state): State<AppState>) -> Response {
-    let registry = state.control_plane.registry();
-    let config = state.config.read();
-    let custom_trackers = &config.discoverers.custom_trackers;
-    let total_tracker_count = if custom_trackers.is_empty() {
-        PUBLIC_TRACKERS.len()
-    } else {
-        custom_trackers.len()
-    };
-
-    let discoverer_stats: Vec<DiscovererStat> = registry
-        .all()
-        .iter()
-        .map(|d| {
-            let stats = d.stats();
-            let is_tracker = d.name() == "tracker";
-            DiscovererStat {
-                name: d.name().to_string(),
-                discoverer_type: d.discoverer_type().as_str().to_string(),
-                enabled: d.is_enabled(),
-                total_requests: stats.total_requests,
-                success_requests: stats.success_requests,
-                failed_requests: stats.failed_requests,
-                total_peers_discovered: stats.total_peers_discovered,
-                success_rate: stats.success_rate(),
-                avg_response_time_ms: stats.avg_response_time_ms,
-                tracker_count: if is_tracker { total_tracker_count } else { 0 },
-            }
-        })
-        .collect();
-
-    let cache_stats_raw = state.peer_repo.stats();
-
-    // 收集 tracker 评分
-    let tracker_scores: Vec<TrackerScoreInfo> = registry
-        .all()
-        .iter()
-        .find(|d| d.name() == "tracker")
-        .and_then(|d| d.tracker_scores())
-        .map(|scores| {
-            scores
-                .into_iter()
-                .map(|(url, score, disabled)| TrackerScoreInfo {
-                    url,
-                    score,
-                    disabled,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let s = state.stats_snapshot.get();
 
     let resp = StatsResponse {
-        discoverer_stats,
-        cache_stats: CacheStats {
-            total_infohashes: cache_stats_raw.0,
-            total_peers: cache_stats_raw.1,
-        },
-        super_tracker_stats: SuperTrackerStats {
-            total_infohashes: state.super_tracker.infohash_count(),
-            total_peers: state.super_tracker.peer_count(),
-        },
-        tracker_scores,
-        fetcher_stats: state.fetcher.as_ref().map(|f| FetcherStats {
-            total_rounds: f.total_rounds.load(std::sync::atomic::Ordering::Relaxed),
-            last_round_peers: f
-                .last_round_peers
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_peers_fetched: f
-                .total_peers_fetched
-                .load(std::sync::atomic::Ordering::Relaxed),
-            infohash_repo_count: f.infohash_count(),
-        }),
-        // C3: 爬虫深度指标
-        crawler_metrics: state.crawler_state.as_ref().map(|cs| {
-            let s = cs.read();
-            CrawlerMetrics {
-                socket_send_pps: s.socket_send_pps.clone(),
-                socket_recv_pps: s.socket_recv_pps.clone(),
-                socket_response_rates: s.socket_response_rates.clone(),
-                pending_shard_lens: s.pending_shard_lens.clone(),
-                udp_packet_loss_estimate: s.udp_packet_loss_estimate,
-                node_select_avg_us: s.node_select_avg_us,
-                adaptive_multiplier: s.adaptive_multiplier,
-                predicted_response_rate: s.predicted_response_rate,
-                model_update_count: s.model_update_count,
-                history_len: s.history_len,
-                concurrent_sockets_in_use: s.concurrent_sockets_in_use,
-            }
-        }),
-        // C3: 任务调度器指标（AppState 暂未注入 task_scheduler）
+        discoverer_stats: s.discoverer_stats,
+        cache_stats: s.cache_stats,
+        super_tracker_stats: s.super_tracker_stats,
+        tracker_scores: s.tracker_scores,
+        fetcher_stats: s.fetcher_stats,
+        crawler_metrics: s.crawler_metrics,
         task_scheduler_metrics: None,
-        // C3: NodeRepo 深度指标
-        node_repo_metrics: state.node_repo.as_ref().map(|nr| NodeRepoMetrics {
-            dirty_count: nr.dirty_count_sync(),
-            write_queue_len: nr.write_queue_len_sync(),
-            subnet_count: nr.subnet_count_sync(),
-        }),
+        node_repo_metrics: s.node_repo_metrics,
+        peer_repo_metrics: s.peer_repo_metrics,
+        infohash_repo_metrics: s.infohash_repo_metrics,
+        tracker_repo_metrics: s.tracker_repo_metrics,
     };
 
     Json(resp).into_response()

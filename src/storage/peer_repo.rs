@@ -1,8 +1,8 @@
-//! PeerRepository 瀹炵幇
+//! PeerRepository 鐎圭偟骞?
 //!
-//! 鍚堝苟 PeerCache + PEX姹?+ Probe闃熷垪 + SuperTracker peers锛屼綔涓?BT Peer 鐨勫敮涓€褰掑彛銆?
-//! 鍐呭瓨缂撳瓨 + SQLite 鍘嗗彶鍙屽啓銆?
-//! 浣跨敤 parking_lot::RwLock锛堝悓姝ワ級锛屼笌 NodeRepo 涓€鑷达紝渚夸簬鏇挎崲鍘?PeerCache銆?
+//! 閸氬牆鑻?PeerCache + PEX濮?+ Probe闂冪喎鍨?+ SuperTracker peers閿涘奔缍旀稉?BT Peer 閻ㄥ嫬鏁稉鈧ぐ鎺戝經閵?
+//! 閸愬懎鐡ㄧ紓鎾崇摠 + SQLite 閸樺棗褰堕崣灞藉晸閵?
+//! 娴ｈ法鏁?parking_lot::RwLock閿涘牆鎮撳銉礆閿涘奔绗?NodeRepo 娑撯偓閼疯揪绱濇笟澶哥艾閺囨寧宕查崢?PeerCache閵?
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -20,16 +20,17 @@ use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::Storage;
 use crate::storage::repo_traits::PeerRepository;
+use crate::storage::tiered_cache::TieredCacheConfig;
 use crate::storage::write_queue::WriteQueue;
 use crate::types::{Infohash, PeerInfo, PeerSource};
 
-/// 鍐呭瓨涓殑 peer 缂撳瓨锛堟寜 infohash 鍒嗙粍锛?
+/// 閸愬懎鐡ㄦ稉顓犳畱 peer 缂傛挸鐡ㄩ敍鍫熷瘻 infohash 閸掑棛绮嶉敍?
 struct PeerMemoryStore {
-    /// infohash -> peer addr 闆嗗悎
+    /// infohash -> peer addr 闂嗗棗鎮?
     by_infohash: HashMap<Infohash, HashSet<SocketAddr>>,
-    /// 鍏ㄥ眬 peer addr -> PeerInfo锛堣法 infohash 鍘婚噸锛?
+    /// 閸忋劌鐪?peer addr -> PeerInfo閿涘牐娉?infohash 閸樺鍣搁敍?
     global: HashMap<SocketAddr, PeerInfo>,
-    /// peer addr -> 鍑虹幇鍦ㄥ摢浜?infohash 涓?
+    /// peer addr -> 閸戣櫣骞囬崷銊ユ憿娴?infohash 娑?
     infohash_refs: HashMap<SocketAddr, HashSet<Infohash>>,
 }
 
@@ -46,46 +47,108 @@ impl PeerMemoryStore {
 pub struct PeerRepoImpl {
     cache: RwLock<PeerMemoryStore>,
     storage: Arc<Storage>,
-    /// peer_history 鍐欏叆缂撳啿鍖猴紙鏀掓壒鍐欏叆锛屽噺灏?fsync锛?
+    /// peer_history 閸愭瑥鍙嗙紓鎾冲暱閸栫尨绱欓弨鎺撳閸愭瑥鍙嗛敍灞藉櫤鐏?fsync閿?
     history_buffer: RwLock<Vec<crate::storage::db::PeerHistoryEntry>>,
-    /// 联邦引用（OnceLock 注入；未设置时本地写入不触发 Merkle/Gossip，repo 正常工作）
+    /// 鑴?peer 闆嗗悎锛堢粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖栵級
+    dirty: RwLock<FxHashSet<SocketAddr>>,
+    /// 鑱旈偊寮曠敤锛圤nceLock 娉ㄥ叆锛涙湭璁剧疆鏃舵湰鍦板啓鍏ヤ笉瑙﹀彂 Merkle/Gossip锛宺epo 姝ｅ父宸ヤ綔锛?
     merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
-    /// 写入队列（可选，Some 时 history flush 通过 WriteQueue/IOScheduler 提交）
+    /// 鍐欏叆闃熷垪锛堝彲閫夛紝Some 鏃?history flush 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛?
     write_queue: Option<Arc<WriteQueue>>,
 }
 
 impl PeerRepoImpl {
     pub fn new(storage: Arc<Storage>) -> Self {
+        Self::with_tier_config(storage, Default::default(), true)
+    }
+
+    pub fn with_tier_config(
+        storage: Arc<Storage>,
+        _cache_config: TieredCacheConfig,
+        _tier_enabled: bool,
+    ) -> Self {
         Self {
             cache: RwLock::new(PeerMemoryStore::new()),
             storage,
             history_buffer: RwLock::new(Vec::new()),
+            dirty: RwLock::new(FxHashSet::default()),
             merkle: OnceLock::new(),
             gossip: OnceLock::new(),
             write_queue: None,
         }
     }
 
-    // 鈹€鈹€ 鍚屾渚挎嵎鏂规硶锛坃sync 鍚庣紑锛屼笌 async trait 鏂规硶鍖哄垎锛夆攢鈹€
+    // 閳光偓閳光偓 閸氬本顒炴笟鎸庡祹閺傝纭堕敍鍧僺ync 閸氬海绱戦敍灞肩瑢 async trait 閺傝纭堕崠鍝勫瀻閿涘鏀㈤埞鈧?
 
-    /// 注入联邦 Merkle 树与 Gossip 引擎引用（main.rs 在 FederationService 创建后调用）。
-    /// 未调用时（如单元测试），本地写入不触发传播，repo 行为完全不变。
+    /// 娉ㄥ叆鑱旈偊 Merkle 鏍戜笌 Gossip 寮曟搸寮曠敤锛坢ain.rs 鍦?FederationService 鍒涘缓鍚庤皟鐢級銆?
+    /// 鏈皟鐢ㄦ椂锛堝鍗曞厓娴嬭瘯锛夛紝鏈湴鍐欏叆涓嶈Е鍙戜紶鎾紝repo 琛屼负瀹屽叏涓嶅彉銆?
     pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
         let _ = self.merkle.set(merkle);
         let _ = self.gossip.set(gossip);
     }
 
-    /// 注入写入队列（builder 模式）
+    /// 娉ㄥ叆鍐欏叆闃熷垪锛坆uilder 妯″紡锛?
     pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
         self.write_queue = Some(wq);
         self
     }
 
-    /// 将本地新写入的条目批量更新 Merkle 并提交 Gossip（写锁外执行，纯内存操作）。
-    /// merkle/gossip 未注入时直接跳过，不 panic。
+    /// 鑾峰彇搴曞眰 Storage 寮曠敤锛堢敤浜庤仈閭﹀悓姝ユ寜鍒嗙墖鍔犺浇鏁版嵁锛夈€?
+    pub fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+
+    /// 鍒嗗眰缂撳瓨缁熻锛堜笌 TrackerRepo 鎺ュ彛涓€鑷达細(hot, warm, cold_loaded)锛夈€?
+    /// PeerRepo 鍏ㄩ噺椹诲唴瀛橈紝鍏ㄩ儴璁″叆 hot銆?
+    pub fn cache_stats(&self) -> (usize, usize, u64) {
+        (self.len(), 0, 0)
+    }
+
+    /// 鏁版嵁搴撲腑 peers 琛ㄧ殑鎬昏鏁帮紙鍚屾锛岀敤浜庣洃鎺ч潰鏉匡級
+    pub fn total_count_sync(&self) -> u64 {
+        self.storage.count_table("peers").unwrap_or(0)
+    }
+
+    /// 执行分层检查 + 驱逐（由 TaskScheduler 定时调用）。
+    /// 全量驻内存不使用 TieredCache，为空操作。
+    pub fn tier_evict(&self) {
+        // no-op: data is fully in memory, no tiered cache to evict from
+    }
+
+    /// 紧急驱逐（内存超限时调用）。空操作。
+    pub fn emergency_evict(&self, _count: usize) {
+        // no-op: data is fully in memory
+    }
+
+    /// 妫€鏌?(infohash, addr) 鍏宠仈鏄惁宸插瓨鍦紙鑱旈偊鍚屾鍘婚噸鐢級
+    pub fn has_peer_assoc(&self, infohash: &Infohash, addr: &SocketAddr) -> bool {
+        self.cache
+            .read()
+            .by_infohash
+            .get(infohash)
+            .map(|set| set.contains(addr))
+            .unwrap_or(false)
+    }
+
+    // 鈹€鈹€ 鑴忔爣璁板悓姝ユ柟娉曪紙鐢ㄤ簬澧為噺璇勫垎 + 澧為噺鎸佷箙鍖栵級鈹€鈹€
+
+    pub fn mark_dirty_sync(&self, addr: &SocketAddr) {
+        self.dirty.write().insert(*addr);
+    }
+
+    pub fn dirty_peers_sync(&self) -> Vec<SocketAddr> {
+        self.dirty.read().iter().cloned().collect()
+    }
+
+    pub fn clear_all_dirty_sync(&self) {
+        self.dirty.write().clear();
+    }
+
+    /// 灏嗘湰鍦版柊鍐欏叆鐨勬潯鐩壒閲忔洿鏂?Merkle 骞舵彁浜?Gossip锛堝啓閿佸鎵ц锛岀函鍐呭瓨鎿嶄綔锛夈€?
+    /// merkle/gossip 鏈敞鍏ユ椂鐩存帴璺宠繃锛屼笉 panic銆?
     #[inline]
-    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>)>) {
+    fn propagate(&self, rt: u8, built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>) {
         if built.is_empty() {
             return;
         }
@@ -95,9 +158,9 @@ impl PeerRepoImpl {
         let Some(gossip) = self.gossip.get() else {
             return;
         };
-        let refs: Vec<(&[u8], &[u8])> = built
+        let refs: Vec<(&[u8], &[u8], &[u8])> = built
             .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
             .collect();
         merkle.update_batch(&refs);
         let now = SystemTime::now()
@@ -106,7 +169,7 @@ impl PeerRepoImpl {
             .as_secs();
         let entries: Vec<SyncEntry> = built
             .into_iter()
-            .map(|(key, payload)| SyncEntry {
+            .map(|(key, payload, _)| SyncEntry {
                 key,
                 operation: operation::UPSERT,
                 version: now,
@@ -116,10 +179,10 @@ impl PeerRepoImpl {
         gossip.submit_gossip(rt, entries);
     }
 
-    /// 确保数据已加载（如果 cache 为空，从 SQLite 同步加载）
+    /// 纭繚鏁版嵁宸插姞杞斤紙濡傛灉 cache 涓虹┖锛屼粠 SQLite 鍚屾鍔犺浇锛?
     pub fn ensure_loaded(&self) {
         if self.cache.read().global.is_empty() {
-            info!("[federation] PeerRepo cache 为空，重新从 SQLite 加载...");
+            info!("[federation] PeerRepo cache 涓虹┖锛岄噸鏂颁粠 SQLite 鍔犺浇...");
             match self.storage.load_peers() {
                 Ok(rows) => {
                     let mut cache = self.cache.write();
@@ -161,19 +224,22 @@ impl PeerRepoImpl {
                             .insert(row.infohash);
                         count += 1;
                     }
-                    info!("[federation] PeerRepo 重新加载完成: {} 个 peer", count);
+                    info!(
+                        "[federation] PeerRepo 閲嶆柊鍔犺浇瀹屾垚: {} 涓?peer",
+                        count
+                    );
                 }
                 Err(e) => {
-                    warn!("[federation] PeerRepo 重新加载失败: {}", e);
+                    warn!("[federation] PeerRepo 閲嶆柊鍔犺浇澶辫触: {}", e);
                 }
             }
         }
     }
 
-    /// 内部写入：批量更新内存缓存 + history 缓冲区，不触发 Merkle/Gossip。
-    /// 内部写入：批量新增 peer + 关联，不触发 Merkle/Gossip。
-    /// 返回真正新增的 peer (addr, first_seen_secs, source)（按 addr 去重）。
-    /// 联邦同步入站（apply_peer_sync）请改用 add_peers_only_internal，避免回环。
+    /// 鍐呴儴鍐欏叆锛氭壒閲忔洿鏂板唴瀛樼紦瀛?+ history 缂撳啿鍖猴紝涓嶈Е鍙?Merkle/Gossip銆?
+    /// 鍐呴儴鍐欏叆锛氭壒閲忔柊澧?peer + 鍏宠仈锛屼笉瑙﹀彂 Merkle/Gossip銆?
+    /// 杩斿洖鐪熸鏂板鐨?peer (addr, first_seen_secs, source)锛堟寜 addr 鍘婚噸锛夈€?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_peer_sync锛夎鏀圭敤 add_peers_only_internal锛岄伩鍏嶅洖鐜€?
     pub(crate) fn add_peers_sync_internal(
         &self,
         items: &[(Infohash, PeerInfo)],
@@ -196,7 +262,7 @@ impl PeerRepoImpl {
             } else {
                 cache.global.insert(addr, peer.clone());
             }
-            // 维护 (infohash, addr) 关联
+            // 缁存姢 (infohash, addr) 鍏宠仈
             let is_new_assoc = cache.by_infohash.entry(*infohash).or_default().insert(addr);
             cache
                 .infohash_refs
@@ -219,7 +285,7 @@ impl PeerRepoImpl {
         }
         drop(cache);
 
-        // 写入 peer_history 缓冲区（批量节流，减少 fsync）
+        // 鍐欏叆 peer_history 缂撳啿鍖猴紙鎵归噺鑺傛祦锛屽噺灏?fsync锛?
         let now = chrono::Utc::now().timestamp();
         let mut buffer = self.history_buffer.write();
         for (infohash, p) in items {
@@ -232,12 +298,12 @@ impl PeerRepoImpl {
                 discovered_at: now,
             });
         }
-        // 缓冲区满 100 条时自动 flush（与原行为一致）
+        // 缂撳啿鍖烘弧 100 鏉℃椂鑷姩 flush锛堜笌鍘熻涓轰竴鑷达級
         if buffer.len() >= 100 {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
             if let Some(ref wq) = self.write_queue {
-                // 通过 WriteQueue/IOScheduler 提交（Normal 优先级）
+                // 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛圢ormal 浼樺厛绾э級
                 wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
             } else {
                 let storage = self.storage.clone();
@@ -249,8 +315,8 @@ impl PeerRepoImpl {
         new_entries
     }
 
-    /// 内部写入：仅批量新增 peer（不维护 infohash 关联），不触发 Merkle/Gossip。
-    /// 联邦同步入站（apply_peer_sync）调用本方法，避免 Merkle 重复更新与 Gossip 回环。
+    /// 鍐呴儴鍐欏叆锛氫粎鎵归噺鏂板 peer锛堜笉缁存姢 infohash 鍏宠仈锛夛紝涓嶈Е鍙?Merkle/Gossip銆?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_peer_sync锛夎皟鐢ㄦ湰鏂规硶锛岄伩鍏?Merkle 閲嶅鏇存柊涓?Gossip 鍥炵幆銆?
     #[allow(dead_code)]
     pub(crate) fn add_peers_only_internal(&self, peers: &[PeerInfo]) {
         if peers.is_empty() {
@@ -271,26 +337,23 @@ impl PeerRepoImpl {
         }
     }
 
-    /// 把新 peer 列表构建成 merkle/gossip 条目并传播（与 Node/Infohash/Tracker 一致）。
+    /// 鎶婃柊 peer 鍒楄〃鏋勫缓鎴?merkle/gossip 鏉＄洰骞朵紶鎾紙涓?Node/Infohash/Tracker 涓€鑷达級銆?
     fn propagate_peers(&self, new_entries: Vec<(Infohash, SocketAddr, u64, String)>) {
         if new_entries.is_empty() {
             return;
         }
-        let mut built: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_entries.len());
-        for (infohash, addr, first_seen_secs, source) in &new_entries {
-            if let Some((k, p)) = crate::federation::sync::peer_sync::build_peer_sync_entry(
-                *infohash,
-                *addr,
-                *first_seen_secs,
-                source,
-            ) {
-                built.push((k, p));
+        let mut built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_entries.len());
+        for (infohash, addr, _first_seen_secs, _source) in &new_entries {
+            if let Some((k, p, h)) =
+                crate::federation::sync::peer_sync::build_peer_sync_entry(*infohash, *addr)
+            {
+                built.push((k, p, h));
             }
         }
         self.propagate(repo_type::PEER, built);
     }
 
-    /// 同步批量加入 peer（本地发现路径）：写入后统一更新 Merkle + 提交 Gossip。
+    /// 鍚屾鎵归噺鍔犲叆 peer锛堟湰鍦板彂鐜拌矾寰勶級锛氬啓鍏ュ悗缁熶竴鏇存柊 Merkle + 鎻愪氦 Gossip銆?
     pub fn add_peers_sync(&self, infohash: &Infohash, new_peers: &[PeerInfo]) {
         let items: Vec<(Infohash, PeerInfo)> =
             new_peers.iter().map(|p| (*infohash, p.clone())).collect();
@@ -298,9 +361,9 @@ impl PeerRepoImpl {
         self.propagate_peers(new_peers);
     }
 
-    /// 批量写入 peer（一次 cache 写锁 + 一次 history_buffer 写锁），返回处理条数。
-    /// 本地写入路径：新 peer 更新 Merkle + 提交 Gossip。
-    /// 联邦同步入站（apply_peer_sync）请改用 add_peers_only_internal，避免回环。
+    /// 鎵归噺鍐欏叆 peer锛堜竴娆?cache 鍐欓攣 + 涓€娆?history_buffer 鍐欓攣锛夛紝杩斿洖澶勭悊鏉℃暟銆?
+    /// 鏈湴鍐欏叆璺緞锛氭柊 peer 鏇存柊 Merkle + 鎻愪氦 Gossip銆?
+    /// 鑱旈偊鍚屾鍏ョ珯锛坅pply_peer_sync锛夎鏀圭敤 add_peers_only_internal锛岄伩鍏嶅洖鐜€?
     pub fn add_peers_sync_batch(&self, items: &[(Infohash, PeerInfo)]) -> usize {
         if items.is_empty() {
             return 0;
@@ -346,10 +409,10 @@ impl PeerRepoImpl {
         result
     }
 
-    /// 从 peer_history 表同步查询历史 peer（冷数据补充）。
+    /// 浠?peer_history 琛ㄥ悓姝ユ煡璇㈠巻鍙?peer锛堝喎鏁版嵁琛ュ厖锛夈€?
     ///
-    /// 用于超级 Tracker 在内存 peer 不足时补充落盘的冷数据。
-    /// 返回解析出的 SocketAddr 列表（按 discovered_at 倒序，由 SQL 决定）。
+    /// 鐢ㄤ簬瓒呯骇 Tracker 鍦ㄥ唴瀛?peer 涓嶈冻鏃惰ˉ鍏呰惤鐩樼殑鍐锋暟鎹€?
+    /// 杩斿洖瑙ｆ瀽鍑虹殑 SocketAddr 鍒楄〃锛堟寜 discovered_at 鍊掑簭锛岀敱 SQL 鍐冲畾锛夈€?
     pub fn get_peers_from_history(&self, infohash: &Infohash, limit: usize) -> Vec<SocketAddr> {
         match self.storage.query_peer_history(infohash, limit) {
             Ok(rows) => rows
@@ -367,7 +430,7 @@ impl PeerRepoImpl {
             peer.connection_successes += 1;
             peer.last_active = SystemTime::now();
         }
-        let _ = infohash; // 鍏煎鎺ュ彛
+        let _ = infohash; // 閸忕厧顔愰幒銉ュ經
     }
 
     pub fn mark_connection_failure_sync(&self, infohash: &Infohash, addr: &SocketAddr) {
@@ -379,7 +442,7 @@ impl PeerRepoImpl {
     }
 
     pub fn cleanup_expired_sync(&self) {
-        // 永久资产模式：不删除任何 peer
+        // 姘镐箙璧勪骇妯″紡锛氫笉鍒犻櫎浠讳綍 peer
     }
 
     pub fn len(&self) -> usize {
@@ -423,7 +486,7 @@ impl PeerRepoImpl {
         self.cache.read().global.values().cloned().collect()
     }
 
-    /// 高效获取所有 peer 及其关联的 infohashes（一次读锁）
+    /// 楂樻晥鑾峰彇鎵€鏈?peer 鍙婂叾鍏宠仈鐨?infohashes锛堜竴娆¤閿侊級
     pub fn all_peers_with_infohashes_sync(&self) -> Vec<(PeerInfo, Vec<Infohash>)> {
         let cache = self.cache.read();
         let mut result = Vec::with_capacity(cache.global.len());
@@ -438,10 +501,10 @@ impl PeerRepoImpl {
         result
     }
 
-    /// 鍏ㄩ噺淇濆瓨鍒?SQLite
-    /// 娉ㄦ剰锛氬喎鐑垽瀹氱粺涓€鐢?intelligence 灞傜殑 TierSystem 璐熻矗锛岃繖閲屽叏閲忎繚瀛樻墍鏈?peer
+    /// 閸忋劑鍣烘穱婵嗙摠閸?SQLite
+    /// 濞夈劍鍓伴敍姘枎閻戭厼鍨界€规氨绮烘稉鈧悽?intelligence 鐏炲倻娈?TierSystem 鐠愮喕鐭楅敍宀冪箹闁插苯鍙忛柌蹇庣箽鐎涙ɑ澧嶉張?peer
     pub async fn save_all(&self) -> anyhow::Result<()> {
-        // 用内部作用域确保 cache 锁在 spawn_blocking 之前释放
+        // 鐢ㄥ唴閮ㄤ綔鐢ㄥ煙纭繚 cache 閿佸湪 spawn_blocking 涔嬪墠閲婃斁
         let batch = {
             let cache = self.cache.read();
             let mut batch = Vec::with_capacity(cache.global.len());
@@ -472,21 +535,21 @@ impl PeerRepoImpl {
             return Ok(());
         }
         if let Some(wq) = &self.write_queue {
-            // 异步模式：非阻塞入队 WriteQueue/IOScheduler
+            // 寮傛妯″紡锛氶潪闃诲鍏ラ槦 WriteQueue/IOScheduler
             let count = batch.len();
             wq.send(move |conn| Storage::save_peers_batch_in_tx(conn, &batch));
-            tracing::debug!("[peer_repo] 异步入队保存 {} 个 peer", count);
+            tracing::debug!("[peer_repo] 寮傛鍏ラ槦淇濆瓨 {} 涓?peer", count);
             Ok(())
         } else {
-            // 同步模式：保留原 spawn_blocking 逻辑
+            // 鍚屾妯″紡锛氫繚鐣欏師 spawn_blocking 閫昏緫
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || storage.save_peers_batch(&batch)).await??;
             Ok(())
         }
     }
 
-    /// 浠?SQLite 鍔犺浇鍏ㄩ儴 peer锛堣繍琛屾椂娲昏穬 peer锛?
-    /// 增量持久化（全量保存模式：所有数据均视为 dirty，直接全量保存）
+    /// 娴?SQLite 閸旂姾娴囬崗銊╁劥 peer閿涘牐绻嶇悰灞炬濞叉槒绌?peer閿?
+    /// 澧為噺鎸佷箙鍖栵紙鍏ㄩ噺淇濆瓨妯″紡锛氭墍鏈夋暟鎹潎瑙嗕负 dirty锛岀洿鎺ュ叏閲忎繚瀛橈級
     pub async fn save_dirty(&self) -> anyhow::Result<()> {
         self.save_all().await
     }
@@ -583,6 +646,29 @@ impl PeerRepository for PeerRepoImpl {
         }
     }
 
+    async fn update_scores_batch(&self, scores: &[(SocketAddr, f64)]) {
+        let mut cache = self.cache.write();
+        let mut dirty = self.dirty.write();
+        for (addr, score) in scores {
+            if let Some(peer) = cache.global.get_mut(addr) {
+                peer.priority_score = *score;
+                dirty.insert(*addr);
+            }
+        }
+    }
+
+    async fn mark_dirty(&self, addr: &SocketAddr) {
+        self.mark_dirty_sync(addr);
+    }
+
+    async fn dirty_peers(&self) -> Vec<SocketAddr> {
+        self.dirty_peers_sync()
+    }
+
+    async fn clear_all_dirty(&self) {
+        self.clear_all_dirty_sync();
+    }
+
     async fn update_probe_stats(&self, addr: &SocketAddr, tcp_ok: bool, _supports_dht: bool) {
         let mut cache = self.cache.write();
         if let Some(peer) = cache.global.get_mut(addr) {
@@ -608,7 +694,7 @@ impl PeerRepository for PeerRepoImpl {
     }
 
     async fn cleanup_expired(&self, _ttl_secs: u64) {
-        // 永久资产模式：不删除任何 peer
+        // 姘镐箙璧勪骇妯″紡锛氫笉鍒犻櫎浠讳綍 peer
     }
 
     async fn save_all(&self) -> anyhow::Result<()> {
@@ -630,7 +716,7 @@ impl PeerRepository for PeerRepoImpl {
             score: peer.priority_score,
             discovered_at: now,
         });
-        // 缓冲区满 100 条时自动 flush
+        // 缂撳啿鍖烘弧 100 鏉℃椂鑷姩 flush
         if buffer.len() >= 100 {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);

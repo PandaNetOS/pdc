@@ -15,6 +15,10 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+// 全局使用mimalloc高性能内存分配器，减少Heap碎片
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use parking_lot::RwLock;
 use rand::Rng;
 use tracing::{debug, info, warn};
@@ -27,6 +31,7 @@ use PeerDiscoveryCenter::crawler::Crawler;
 use PeerDiscoveryCenter::crawler::CrawlerEngine;
 use PeerDiscoveryCenter::data_plane::http_tracker::SuperTrackerState;
 use PeerDiscoveryCenter::data_plane::relay::RelayServer;
+use PeerDiscoveryCenter::data_plane::stats_snapshot;
 use PeerDiscoveryCenter::data_plane::udp_tracker::UdpTrackerServer;
 use PeerDiscoveryCenter::data_plane::{AppState, DataPlane};
 use PeerDiscoveryCenter::discoverers::DiscovererRegistry;
@@ -43,7 +48,9 @@ use PeerDiscoveryCenter::nat::NatManager;
 use PeerDiscoveryCenter::net::socket_opts::create_udp_socket;
 use PeerDiscoveryCenter::port_allocator::PortAllocator;
 use PeerDiscoveryCenter::services::{MetadataService, ScrapeService};
-use PeerDiscoveryCenter::storage::{InfohashRepository, NodeRepository, TrackerRepository};
+use PeerDiscoveryCenter::storage::{
+    InfohashRepository, NodeRepository, TieredCacheConfig, TrackerRepository,
+};
 
 /// 工作目录管理（pnos-spec 未提供 workdir 模块，pdc 自实现）
 /// 目录结构：<root>/config/config.yaml, <root>/data/*.db, <root>/logs/
@@ -160,10 +167,7 @@ fn main() -> anyhow::Result<()> {
     config.storage.path = work_dir.db_file("pdc").to_string_lossy().to_string();
     info!("[main] 数据路径: {}", config.storage.path);
 
-    // 构建三个独立 Tokio runtime，彻底隔离爬虫 / Tracker / API，避免互相抢占线程
-    // crawler_runtime: 爬虫、联邦、任务调度等核心业务（worker 可配置）
-    // tracker_runtime: 超级 Tracker HTTP + UDP（固定 4 线程）
-    // api_runtime: API/监控/WebSocket（固定 4 线程）
+    // 构建六个独立 Tokio runtime，彻底隔离爬虫 / 联邦 / Tracker / API / 调度器 / 持久化
     let worker_threads = if config.runtime_worker_threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -174,14 +178,29 @@ fn main() -> anyhow::Result<()> {
     let worker_threads = worker_threads.max(4);
     let tracker_threads = config.tracker_runtime_threads.max(2);
     let api_threads = config.api_runtime_threads.max(2);
+    let federation_threads = if config.federation_runtime_threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    } else {
+        config.federation_runtime_threads
+    };
+    let federation_threads = federation_threads.max(4);
+    let scheduler_threads = config.scheduler_runtime_threads.max(2);
+    let persistence_threads = config.persistence_runtime_threads.max(2);
     info!(
-        "[main] 三 runtime 隔离: crawler={}, tracker={}, api={}",
-        worker_threads, tracker_threads, api_threads
+        "[main] 六 runtime 隔离: crawler={}, federation={}, tracker={}, api={}, scheduler={}, persistence={}",
+        worker_threads, federation_threads, tracker_threads, api_threads, scheduler_threads, persistence_threads
     );
 
     let crawler_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .thread_name("pdc-crawler")
+        .enable_all()
+        .build()?;
+    let federation_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(federation_threads)
+        .thread_name("pdc-federation")
         .enable_all()
         .build()?;
     let tracker_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -194,9 +213,23 @@ fn main() -> anyhow::Result<()> {
         .thread_name("pdc-api")
         .enable_all()
         .build()?;
+    let scheduler_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(scheduler_threads)
+        .thread_name("pdc-scheduler")
+        .enable_all()
+        .build()?;
+    let persistence_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(persistence_threads)
+        .thread_name("pdc-persistence")
+        .enable_all()
+        .build()?;
 
+    let crawler_handle = crawler_runtime.handle().clone();
     let tracker_handle = tracker_runtime.handle().clone();
     let api_handle = api_runtime.handle().clone();
+    let federation_handle = federation_runtime.handle().clone();
+    let scheduler_handle = scheduler_runtime.handle().clone();
+    let persistence_handle = persistence_runtime.handle().clone();
     let shutdown_timeout = std::time::Duration::from_secs(config.runtime_shutdown_timeout_secs);
 
     let result = crawler_runtime.block_on(async_main(
@@ -205,25 +238,40 @@ fn main() -> anyhow::Result<()> {
         config,
         tracker_handle,
         api_handle,
+        crawler_handle,
+        federation_handle,
+        scheduler_handle,
+        persistence_handle,
     ));
 
-    // 关闭 tracker 和 api runtime（crawler_runtime 随 block_on 返回自然结束）
+    // 关闭 tracker/api/federation/scheduler/persistence runtime（crawler_runtime 随 block_on 返回自然结束）
     info!("[main] 关闭 tracker_runtime...");
     tracker_runtime.shutdown_timeout(shutdown_timeout);
     info!("[main] 关闭 api_runtime...");
     api_runtime.shutdown_timeout(shutdown_timeout);
+    info!("[main] 关闭 federation_runtime...");
+    federation_runtime.shutdown_timeout(shutdown_timeout);
+    info!("[main] 关闭 scheduler_runtime...");
+    scheduler_runtime.shutdown_timeout(shutdown_timeout);
+    info!("[main] 关闭 persistence_runtime...");
+    persistence_runtime.shutdown_timeout(shutdown_timeout);
     info!("[main] 所有 runtime 已关闭");
 
     result
 }
 
 /// 异步主逻辑：所有 .await 操作在此运行（由 main 中的手动 runtime 驱动）
+#[allow(clippy::too_many_arguments)]
 async fn async_main(
     work_dir: WorkDir,
     config_path: Option<String>,
     mut config: PdcConfig,
     tracker_handle: tokio::runtime::Handle,
     api_handle: tokio::runtime::Handle,
+    crawler_handle: tokio::runtime::Handle,
+    federation_handle: tokio::runtime::Handle,
+    scheduler_handle: tokio::runtime::Handle,
+    persistence_handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     // 2.2 加载或生成 PEX/uTP 节点身份（持久化到 work_dir.node_id_file()）
     let pex_node_id = load_or_generate_node_id(&work_dir.node_id_file());
@@ -290,6 +338,11 @@ async fn async_main(
         Arc::new(PeerDiscoveryCenter::storage::Storage::memory().expect("无法创建内存数据库"))
     };
 
+    // 3.5b shard 列一次性回填（旧库历史数据 shard=0 需修正为正确的 blake3(key)%256）
+    if let Err(e) = storage.backfill_shards() {
+        warn!("[main] shard 列回填失败（不影响启动）: {}", e);
+    }
+
     // 3.6 创建所有数据层 Repo（统一数据归口）
     // P2: 先创建 WriteQueue/IOScheduler，再注入到各 Repo
     let io_scheduler: Option<Arc<PeerDiscoveryCenter::storage::IoScheduler>> =
@@ -312,8 +365,11 @@ async fn async_main(
                 steady_tick_ms: 10,  // 10ms 时间片，匀速写入
                 writes_per_tick: 10, // 每个时间片最多 10 条写入
             };
-            let sched =
-                PeerDiscoveryCenter::storage::IoScheduler::new(storage.connection(), rt_cfg);
+            let sched = PeerDiscoveryCenter::storage::IoScheduler::new_with_handle(
+                storage.connection(),
+                rt_cfg,
+                &persistence_handle,
+            );
             info!(
                 "[main] IOScheduler 已启用（令牌桶 {} 行/秒，队列上限 {}）",
                 config.io_scheduler.token_bucket_rate, config.io_scheduler.max_queue_size
@@ -336,23 +392,57 @@ async fn async_main(
         ))
     };
 
+    // 3.6 冷热分层缓存配置（从 config.tier 读取，所有 Repo 共享同一配置）
+    let tier_cache_config = TieredCacheConfig {
+        hot_max_count: config.tier.hot_max_count,
+        warm_max_count: config.tier.warm_max_count,
+        hot_threshold_secs: config.tier.hot_threshold_secs,
+        warm_threshold_secs: config.tier.warm_threshold_secs,
+    };
+    let tier_enabled = config.tier.enabled;
+    info!(
+        "[main] 冷热分层缓存: enabled={}, hot_max={}, warm_max={}",
+        tier_enabled, config.tier.hot_max_count, config.tier.warm_max_count
+    );
+
+    // Peer 条目较大，单独下调 Warm 上限（tier.peer_warm_max_count，默认 5 万），其余 repo 用全局值
+    let peer_tier_config = TieredCacheConfig {
+        warm_max_count: config.tier.peer_warm_max_count,
+        ..tier_cache_config.clone()
+    };
     let peer_repo = Arc::new(
-        PeerDiscoveryCenter::storage::PeerRepoImpl::new(storage.clone())
-            .with_write_queue(write_queue.clone()),
+        PeerDiscoveryCenter::storage::PeerRepoImpl::with_tier_config(
+            storage.clone(),
+            peer_tier_config,
+            tier_enabled,
+        )
+        .with_write_queue(write_queue.clone()),
     );
     let infohash_repo = Arc::new(
-        PeerDiscoveryCenter::storage::InfohashRepoImpl::new(storage.clone())
-            .with_write_queue(write_queue.clone()),
+        PeerDiscoveryCenter::storage::InfohashRepoImpl::with_tier_config(
+            storage.clone(),
+            tier_cache_config.clone(),
+            tier_enabled,
+        )
+        .with_write_queue(write_queue.clone()),
     );
     let tracker_repo = Arc::new(
-        PeerDiscoveryCenter::storage::TrackerRepoImpl::new(storage.clone())
-            .with_write_queue(write_queue.clone()),
+        PeerDiscoveryCenter::storage::TrackerRepoImpl::with_tier_config(
+            storage.clone(),
+            tier_cache_config.clone(),
+            tier_enabled,
+        )
+        .with_write_queue(write_queue.clone()),
     );
     let node_repo = Arc::new(
-        PeerDiscoveryCenter::storage::NodeRepoImpl::new(storage.clone())
-            .with_write_queue(write_queue.clone()),
+        PeerDiscoveryCenter::storage::NodeRepoImpl::with_tier_config(
+            storage.clone(),
+            tier_cache_config.clone(),
+            tier_enabled,
+        )
+        .with_write_queue(write_queue.clone()),
     );
-    info!("[main] 数据层 Repo 已初始化（Node/Peer/Infohash/Tracker，WriteQueue 已接入）");
+    info!("[main] 数据层 Repo 已初始化（冷热分层已启用）");
 
     // 3.7 从 SQLite 加载持久化数据
     match tracker_repo.load_all().await {
@@ -556,14 +646,14 @@ async fn async_main(
 
         // 启动爬虫
         let crawler_clone = crawler.clone();
-        tokio::spawn(async move {
+        crawler_handle.spawn(async move {
             if let Err(e) = crawler_clone.start().await {
                 warn!("[main] 爬虫引擎启动失败: {}", e);
             }
         });
         // 启动预热（不阻塞，预热完成前主动爬行会跳过）
         let crawler_warmup = crawler.clone();
-        tokio::spawn(async move {
+        crawler_handle.spawn(async move {
             crawler_warmup.warmup().await;
         });
         info!("[main] 爬虫引擎已启动（主动模式）");
@@ -663,7 +753,7 @@ async fn async_main(
                     .with_pex_receiver(pex_receiver.clone());
             let server = Arc::new(server);
             let s = server.clone();
-            tokio::spawn(async move {
+            crawler_handle.spawn(async move {
                 s.run().await;
             });
             info!("[main] uTP 服务端已启动（UDP {}）", utp_port);
@@ -684,7 +774,7 @@ async fn async_main(
                 .with_pex_receiver(pex_receiver.clone());
         let server = Arc::new(server);
         let s = server.clone();
-        tokio::spawn(async move {
+        crawler_handle.spawn(async move {
             if let Err(e) = s.run().await {
                 warn!("[main] TCP-PEX 服务端运行错误: {}", e);
             }
@@ -716,7 +806,7 @@ async fn async_main(
     // 6.9 启动联邦网络服务（如果启用）
     if let Some(ref fed_svc) = federation_service {
         let fed_clone = fed_svc.clone();
-        tokio::spawn(async move {
+        federation_handle.spawn(async move {
             if let Err(e) = fed_clone.start().await {
                 warn!("[main] 联邦网络服务启动失败: {}", e);
             }
@@ -730,7 +820,7 @@ async fn async_main(
         let addr = format!("0.0.0.0:{}", relay_port).parse().unwrap();
         let server = Arc::new(RelayServer::new(addr));
         let server_clone = server.clone();
-        tokio::spawn(async move {
+        crawler_handle.spawn(async move {
             if let Err(e) = server_clone.start().await {
                 warn!("[main] 中继服务器启动失败: {}", e);
             }
@@ -763,6 +853,9 @@ async fn async_main(
         None
     };
 
+    // 统计快照（后台任务定期更新，API 只读）
+    let stats_snapshot = Arc::new(stats_snapshot::StatsSnapshot::new());
+
     let app_state = AppState {
         control_plane: control_plane.clone(),
         super_tracker: super_tracker.clone(),
@@ -790,6 +883,7 @@ async fn async_main(
         federation: federation_service.clone(),
         relay_server,
         udp_tracker: udp_tracker_instance,
+        stats_snapshot: stats_snapshot.clone(),
     };
     // 保留引用用于 TaskScheduler 注册（已被 move 到 AppState）
     let dht_probe_clone = app_state.dht_probe.clone();
@@ -818,7 +912,8 @@ async fn async_main(
         .with_pause_gate(full_sync_gate.clone()),
     );
 
-    // 8.5 创建统一 TaskScheduler（所有后台任务纳管，按分类分级并发）
+    // 8.5 创建统一 TaskScheduler（所有后台任务纳管，按分类分级并发 + 六 runtime 隔离）
+    use PeerDiscoveryCenter::intelligence::task_scheduler::RuntimeHandles;
     let task_scheduler = Arc::new(
         TaskScheduler::new()
             .with_category_concurrency(CategoryConcurrency {
@@ -826,6 +921,16 @@ async fn async_main(
                 persistence: config.task_scheduler.persistence_concurrency,
                 monitor: config.task_scheduler.monitor_concurrency,
                 network: config.task_scheduler.network_concurrency,
+                federation: 4,
+                tracker: 2,
+            })
+            .with_runtime_handles(RuntimeHandles {
+                crawler: crawler_handle.clone(),
+                federation: federation_handle.clone(),
+                tracker: tracker_handle.clone(),
+                api: api_handle.clone(),
+                scheduler: scheduler_handle.clone(),
+                persistence: persistence_handle.clone(),
             })
             .with_adaptive_controller(adaptive_controller.clone()),
     );
@@ -863,7 +968,7 @@ async fn async_main(
         );
     }
 
-    // 8.5.2 定期增量持久化任务（每60秒，Background）
+    // 8.5.2 定期增量持久化任务（每10秒，Background）
     {
         let nr = node_repo.clone();
         let tr = tracker_repo.clone();
@@ -876,7 +981,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "periodic_persistence",
-                    60,
+                    10,
                 )),
             )
             .with_category(TaskCategory::Persistence)
@@ -1449,6 +1554,186 @@ async fn async_main(
             },
         );
     }
+    // 8.7.1 冷热分层驱逐任务（每60秒执行 tier_check + evict_if_needed）
+    {
+        let nr = node_repo.clone();
+        let pr = peer_repo.clone();
+        let ir = infohash_repo.clone();
+        let tr = tracker_repo.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "tier_evict",
+                "冷热分层驱逐",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "tier_evict",
+                    config.tier.evict_interval_secs,
+                )),
+            )
+            .with_category(TaskCategory::Monitor)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
+            .with_initial_delay(std::time::Duration::from_secs(60)),
+            move || {
+                let nr = nr.clone();
+                let pr = pr.clone();
+                let ir = ir.clone();
+                let tr = tr.clone();
+                async move {
+                    nr.tier_evict();
+                    pr.tier_evict();
+                    ir.tier_evict();
+                    tr.tier_evict();
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.7.2 全局内存监控任务（每30秒采样，超阈值触发紧急驱逐）
+    {
+        let nr = node_repo.clone();
+        let pr = peer_repo.clone();
+        let ir = infohash_repo.clone();
+        let tr = tracker_repo.clone();
+        let st = storage.clone();
+        let memory_limit_mb = config.tier.memory_limit_mb;
+        let emergency_threshold = config.tier.emergency_threshold;
+        task_scheduler.register(
+            TaskMetadata::new(
+                "memory_monitor",
+                "全局内存监控",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "memory_monitor",
+                    config.tier.memory_monitor_interval_secs,
+                )),
+            )
+            .with_category(TaskCategory::Monitor)
+            .with_priority(TaskPriority::Important)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+                        // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
+            .with_initial_delay(std::time::Duration::from_secs(30)),
+            move || {
+                let nr = nr.clone();
+                let pr = pr.clone();
+                let ir = ir.clone();
+                let tr = tr.clone();
+                let st = st.clone();
+                async move {
+                    use sysinfo::System;
+                    // 使用 new_all 确保在 SYSTEM 账户下也能获取进程信息
+                    let sys = System::new_all();
+                    let pid = sysinfo::get_current_pid().unwrap();
+                    if let Some(proc) = sys.process(pid) {
+                        // sysinfo memory() 在 Windows 返回字节，转换为 MB
+                        let memory_mb = proc.memory() / (1024 * 1024);
+                        let threshold_mb = (memory_limit_mb as f64 * emergency_threshold) as u64;
+                        tracing::info!(
+                            "[memory_monitor] 内存检测: {}MB / 阈值 {}MB",
+                            memory_mb,
+                            threshold_mb
+                        );
+                        if memory_mb > threshold_mb {
+                            tracing::warn!(
+                                "[memory_monitor] 内存 {}MB 超过阈值 {}MB，触发渐进式驱逐",
+                                memory_mb,
+                                threshold_mb
+                            );
+                            // 渐进式驱逐：每次驱逐10%，循环直到内存达标或达到上限（最多5轮=50%）
+                            // 数量小于10万的repo不驱散，避免小repo被误驱逐
+                            let min_evict_threshold = 100_000usize;
+                            let max_rounds = 5usize;
+                            let mut total_evicted_1 = 0usize;
+                            let mut total_evicted_2 = 0usize;
+                            let mut _total_evicted_3 = 0usize;
+                            let mut _total_evicted_4 = 0usize;
+                            let (h1_start, w1_start, _) = nr.cache_stats();
+                            let (h2_start, w2_start, _) = pr.cache_stats();
+
+                            for round in 0..max_rounds {
+                                let (h1, w1, _) = nr.cache_stats();
+                                let (h2, w2, _) = pr.cache_stats();
+                                let (h3, w3, _) = ir.cache_stats();
+                                let (h4, w4, _) = tr.cache_stats();
+                                let evict_1 = if h1 + w1 >= min_evict_threshold { (h1 + w1) / 10 } else { 0 };
+                                let evict_2 = if h2 + w2 >= min_evict_threshold { (h2 + w2) / 10 } else { 0 };
+                                let evict_3 = if h3 + w3 >= min_evict_threshold { (h3 + w3) / 10 } else { 0 };
+                                let evict_4 = if h4 + w4 >= min_evict_threshold { (h4 + w4) / 10 } else { 0 };
+
+                                if evict_1 + evict_2 + evict_3 + evict_4 == 0 {
+                                    tracing::info!("[memory_monitor] 第{}轮：所有repo均低于驱逐阈值，停止", round + 1);
+                                    break;
+                                }
+
+                                let nr_clone = nr.clone();
+                                let pr_clone = pr.clone();
+                                let ir_clone = ir.clone();
+                                let tr_clone = tr.clone();
+                                let st_clone = st.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if evict_1 > 0 { nr_clone.emergency_evict(evict_1); }
+                                    if evict_2 > 0 { pr_clone.emergency_evict(evict_2); }
+                                    if evict_3 > 0 { ir_clone.emergency_evict(evict_3); }
+                                    if evict_4 > 0 { tr_clone.emergency_evict(evict_4); }
+                                    st_clone.shrink_memory();
+                                })
+                                .await
+                                .ok();
+
+                                total_evicted_1 += evict_1;
+                                total_evicted_2 += evict_2;
+                                _total_evicted_3 += evict_3;
+                                _total_evicted_4 += evict_4;
+
+                                // 重新检测内存
+                                let sys = System::new_all();
+                                let pid = sysinfo::get_current_pid().unwrap();
+                                let current_mb = if let Some(proc) = sys.process(pid) {
+                                    proc.memory() / (1024 * 1024)
+                                } else {
+                                    memory_mb
+                                };
+                                tracing::info!(
+                                    "[memory_monitor] 第{}轮驱逐完成: node驱逐{}，内存{}MB",
+                                    round + 1, evict_1, current_mb
+                                );
+
+                                if current_mb <= threshold_mb {
+                                    tracing::info!("[memory_monitor] 内存已降到阈值以下，停止驱逐");
+                                    break;
+                                }
+                            }
+
+                            let (h1a, w1a, _) = nr.cache_stats();
+                            let (h2a, w2a, _) = pr.cache_stats();
+                            tracing::warn!(
+                                "[memory_monitor] 渐进驱逐完成: node {}/{}->{}/{} (共驱逐{}), peer {}/{}->{}/{} (共驱逐{})",
+                                h1_start, w1_start, h1a, w1a, total_evicted_1,
+                                h2_start, w2_start, h2a, w2a, total_evicted_2
+                            );
+                        }
+                    } else {
+                        tracing::warn!("[memory_monitor] 无法获取当前进程信息 (pid={:?})", pid);
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
 
     // 8.8 联邦任务注册（4个：心跳/节点同步/DHT发现/Merkle反熵）
     if let Some(ref fed) = federation_service {
@@ -2009,6 +2294,400 @@ async fn async_main(
                 }
             },
         );
+
+        // 8.8.4 Merkle 全量重算任务（4 个 repo 独立，Persistence 分类并发=1 串行执行，避免 DB 竞争）
+        // DB 驱动后：冷重算 = 全量重算（从 DB 全量加载重算所有分片根），默认 300s（5 分钟）
+        let cold_rebuild_interval = config.federation.merkle_full_rebuild_interval_secs;
+        let incremental_interval = config.federation.merkle_incremental_update_interval_secs;
+        info!(
+            "[main] 注册 Merkle 全量重算任务（4 repo，间隔 {}s）+ 增量更新任务（{}s）",
+            cold_rebuild_interval, incremental_interval
+        );
+
+        // === Merkle 增量更新任务（10s，取出 dirty 分片从 DB 重算） ===
+
+        // Node 增量更新
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_incremental_node",
+                    "Merkle增量更新-Node",
+                    std::time::Duration::from_secs(incremental_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
+                .with_initial_delay(std::time::Duration::from_secs(15)),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        let merkle = sm.node_merkle();
+                        let dirty = merkle.take_dirty_shards();
+                        if dirty.is_empty() {
+                            return Ok(());
+                        }
+                        let shards: Vec<u16> = dirty.into_iter().collect();
+                        match st.load_node_keys_hashes_by_shards(&shards) {
+                            Ok(keys_hashes) => {
+                                for &shard in &shards {
+                                    let shard_data: Vec<_> = keys_hashes
+                                        .iter()
+                                        .filter(|(k, _)| merkle.shard_for_key(k) == shard)
+                                        .cloned()
+                                        .collect();
+                                    merkle.recompute_shard_from_db(shard, &shard_data);
+                                }
+                            }
+                            Err(e) => warn!("[merkle_incremental] Node 失败: {}", e),
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Peer 增量更新
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_incremental_peer",
+                    "Merkle增量更新-Peer",
+                    std::time::Duration::from_secs(incremental_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
+                .with_initial_delay(std::time::Duration::from_secs(20)),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        if let Some(merkle) = sm.peer_merkle() {
+                            let dirty = merkle.take_dirty_shards();
+                            if dirty.is_empty() {
+                                return Ok(());
+                            }
+                            let shards: Vec<u16> = dirty.into_iter().collect();
+                            match st.load_peer_keys_hashes_by_shards(&shards) {
+                                Ok(keys_hashes) => {
+                                    for &shard in &shards {
+                                        let shard_data: Vec<_> = keys_hashes
+                                            .iter()
+                                            .filter(|(k, _)| merkle.shard_for_key(k) == shard)
+                                            .cloned()
+                                            .collect();
+                                        merkle.recompute_shard_from_db(shard, &shard_data);
+                                    }
+                                }
+                                Err(e) => warn!("[merkle_incremental] Peer 失败: {}", e),
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Infohash 增量更新
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_incremental_infohash",
+                    "Merkle增量更新-Infohash",
+                    std::time::Duration::from_secs(incremental_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
+                .with_initial_delay(std::time::Duration::from_secs(25)),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        if let Some(merkle) = sm.infohash_merkle() {
+                            let dirty = merkle.take_dirty_shards();
+                            if dirty.is_empty() {
+                                return Ok(());
+                            }
+                            let shards: Vec<u16> = dirty.into_iter().collect();
+                            match st.load_infohash_keys_hashes_by_shards(&shards) {
+                                Ok(keys_hashes) => {
+                                    for &shard in &shards {
+                                        let shard_data: Vec<_> = keys_hashes
+                                            .iter()
+                                            .filter(|(k, _)| merkle.shard_for_key(k) == shard)
+                                            .cloned()
+                                            .collect();
+                                        merkle.recompute_shard_from_db(shard, &shard_data);
+                                    }
+                                }
+                                Err(e) => warn!("[merkle_incremental] Infohash 失败: {}", e),
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Tracker 增量更新
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_incremental_tracker",
+                    "Merkle增量更新-Tracker",
+                    std::time::Duration::from_secs(incremental_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
+                .with_initial_delay(std::time::Duration::from_secs(30)),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        if let Some(merkle) = sm.tracker_merkle() {
+                            let dirty = merkle.take_dirty_shards();
+                            if dirty.is_empty() {
+                                return Ok(());
+                            }
+                            let shards: Vec<u16> = dirty.into_iter().collect();
+                            match st.load_tracker_keys_hashes_by_shards(&shards) {
+                                Ok(keys_hashes) => {
+                                    for &shard in &shards {
+                                        let shard_data: Vec<_> = keys_hashes
+                                            .iter()
+                                            .filter(|(k, _)| merkle.shard_for_key(k) == shard)
+                                            .cloned()
+                                            .collect();
+                                        merkle.recompute_shard_from_db(shard, &shard_data);
+                                    }
+                                }
+                                Err(e) => warn!("[merkle_incremental] Tracker 失败: {}", e),
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Node 冷重算
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_cold_rebuild_node",
+                    "Merkle冷数据重算-Node",
+                    std::time::Duration::from_secs(cold_rebuild_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Medium,
+                    io: ResourceLevel::High,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "merkle_cold_rebuild_node_initial_delay",
+                    60,
+                ))),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        match st.load_all_node_keys_hashes() {
+                            Ok(keys_hashes) => {
+                                let count = keys_hashes.len();
+                                sm.node_merkle().rebuild_cold_from_db(&keys_hashes);
+                                info!("[merkle_cold_rebuild] Node: {} 条，冷根已重算", count);
+                            }
+                            Err(e) => warn!("[merkle_cold_rebuild] Node 失败: {}", e),
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Peer 冷重算
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_cold_rebuild_peer",
+                    "Merkle冷数据重算-Peer",
+                    std::time::Duration::from_secs(cold_rebuild_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Medium,
+                    io: ResourceLevel::High,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "merkle_cold_rebuild_peer_initial_delay",
+                    75,
+                ))),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        if let Some(merkle) = sm.peer_merkle() {
+                            match st.load_all_peer_keys_hashes() {
+                                Ok(keys_hashes) => {
+                                    let count = keys_hashes.len();
+                                    merkle.rebuild_cold_from_db(&keys_hashes);
+                                    info!("[merkle_cold_rebuild] Peer: {} 条，冷根已重算", count);
+                                }
+                                Err(e) => warn!("[merkle_cold_rebuild] Peer 失败: {}", e),
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Infohash 冷重算
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_cold_rebuild_infohash",
+                    "Merkle冷数据重算-Infohash",
+                    std::time::Duration::from_secs(cold_rebuild_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Medium,
+                    memory: ResourceLevel::Medium,
+                    io: ResourceLevel::High,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "merkle_cold_rebuild_infohash_initial_delay",
+                    90,
+                ))),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        if let Some(merkle) = sm.infohash_merkle() {
+                            match st.load_all_infohash_keys_hashes() {
+                                Ok(keys_hashes) => {
+                                    let count = keys_hashes.len();
+                                    merkle.rebuild_cold_from_db(&keys_hashes);
+                                    info!(
+                                        "[merkle_cold_rebuild] Infohash: {} 条，冷根已重算",
+                                        count
+                                    );
+                                }
+                                Err(e) => warn!("[merkle_cold_rebuild] Infohash 失败: {}", e),
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // Tracker 冷重算
+        {
+            let st = storage.clone();
+            let sm = fed.sync_manager.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "merkle_cold_rebuild_tracker",
+                    "Merkle冷数据重算-Tracker",
+                    std::time::Duration::from_secs(cold_rebuild_interval),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Medium,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "merkle_cold_rebuild_tracker_initial_delay",
+                    105,
+                ))),
+                move || {
+                    let st = st.clone();
+                    let sm = sm.clone();
+                    async move {
+                        if let Some(merkle) = sm.tracker_merkle() {
+                            match st.load_all_tracker_keys_hashes() {
+                                Ok(keys_hashes) => {
+                                    let count = keys_hashes.len();
+                                    merkle.rebuild_cold_from_db(&keys_hashes);
+                                    info!(
+                                        "[merkle_cold_rebuild] Tracker: {} 条，冷根已重算",
+                                        count
+                                    );
+                                }
+                                Err(e) => warn!("[merkle_cold_rebuild] Tracker 失败: {}", e),
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
     }
 
     // 8.9 远程 Tracker 列表定期刷新任务
@@ -2675,6 +3354,12 @@ async fn async_main(
     task_scheduler.start();
     info!("[main] TaskScheduler 已启动（统一调度所有后台任务，14个任务已注册）");
 
+    // 启动统计快照后台更新任务（API stats 只读快照，不阻塞 API 线程）
+    let stats_shutdown = stats_snapshot::spawn_snapshot_updater(
+        app_state.clone(),
+        config.stats_snapshot_interval_secs,
+    );
+
     // 9. 启动 UDP Tracker 服务（BEP 15）—— 在 tracker_runtime 上运行，与爬虫隔离
     if config.super_tracker.enabled {
         let udp_state = app_state.clone();
@@ -2746,6 +3431,9 @@ async fn async_main(
     // 优雅关闭：等待 Ctrl+C
     tokio::signal::ctrl_c().await.ok();
     info!("[main] 收到关闭信号，开始优雅关闭...");
+
+    // 通知统计快照后台任务退出
+    stats_shutdown.notify_waiters();
 
     info!("[main] 正在保存数据...");
 

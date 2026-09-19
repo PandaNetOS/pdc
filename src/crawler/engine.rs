@@ -1,4 +1,4 @@
-//! 爬虫引擎实现
+﻿//! 爬虫引擎实现
 //!
 //! 主动 + 被动混合 DHT 爬虫：
 //! 1. 加入 DHT 网络（通过 bootstrap 节点发 find_node 获取初始路由）
@@ -1767,6 +1767,11 @@ impl CrawlerEngine {
                     for ih in &resp.samples {
                         let is_new = {
                             let mut seen = self.seen_infohashes.write();
+                            // 内存上限：超过 crawler.max_infohashes 时清空旧去重集合，
+                            // 防止无界 HashSet 持续膨胀（权威去重由 InfohashRepo 负责）
+                            if seen.len() >= self.config.max_infohashes {
+                                seen.clear();
+                            }
                             seen.insert(*ih)
                         };
                         if is_new {
@@ -1860,9 +1865,16 @@ impl CrawlerEngine {
             }
         }
 
-        // 入站来源节点统计（被动打洞效果分析）
+        // 入站来源节点统计（被动打洞效果分析）— 有界集合，超上限时清空防止内存泄漏
         {
             let mut sources = self.inbound_sources.write();
+            if sources.len() >= self.config.inbound_sources_max {
+                sources.clear();
+                tracing::debug!(
+                    "[crawler] inbound_sources 达到上限 {}，已清空",
+                    self.config.inbound_sources_max
+                );
+            }
             sources.insert(from);
             let mut state = self.state.write();
             state.inbound_unique_sources = sources.len();
@@ -2174,6 +2186,10 @@ impl CrawlerEngine {
                                         if let Some(infohash) = q.discovered_infohash {
                                             let is_new = {
                                                 let mut seen = self.seen_infohashes.write();
+                                                // 内存上限：超过 crawler.max_infohashes 时清空旧去重集合
+                                                if seen.len() >= self.config.max_infohashes {
+                                                    seen.clear();
+                                                }
                                                 seen.insert(infohash)
                                             };
 

@@ -18,28 +18,34 @@ use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::TrackerRepoImpl;
 
 /// Tracker 同步负载
+///
+/// 联邦同步只传播 url 字段；disabled / last_seen 属于各节点本地状态，
+/// 不同步（避免时间戳差异导致 Merkle 哈希永远对不上）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrackerSyncPayload {
     url: String,
-    disabled: bool,
-    last_seen: u64,
 }
 
-/// 构建 Tracker 同步条目的 (key, payload_bytes)。
+/// 构建 Tracker 同步条目的 (key, payload_bytes, data_hash)。
 /// 格式与 collect_all_entries 一致，供 TrackerRepoImpl 本地写入后更新 Merkle / 提交 Gossip。
-pub(crate) fn build_tracker_sync_entry(
-    url: &str,
-    disabled: bool,
-    last_seen: u64,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+///
+/// data_hash 公式与 db.rs `load_all_tracker_keys_hashes` 完全一致：
+/// `blake3(url)`，保证冷热同构。
+pub(crate) fn build_tracker_sync_entry(url: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let payload = TrackerSyncPayload {
         url: url.to_string(),
-        disabled,
-        last_seen,
     };
     let payload_bytes = bincode::serialize(&payload).ok()?;
     let key = url.as_bytes().to_vec();
-    Some((key, payload_bytes))
+    // data_hash = blake3(url)
+    let data_hash = blake3::hash(url.as_bytes()).as_bytes().to_vec();
+    Some((key, payload_bytes, data_hash))
+}
+
+/// 从已序列化的 TrackerSyncPayload 计算 data_hash（与 build_tracker_sync_entry 公式一致）。
+pub(crate) fn data_hash_from_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let p: TrackerSyncPayload = bincode::deserialize(payload).ok()?;
+    Some(blake3::hash(p.url.as_bytes()).as_bytes().to_vec())
 }
 
 /// TrackerRepo 同步服务
@@ -47,6 +53,7 @@ pub struct TrackerSync {
     tracker_repo: Arc<TrackerRepoImpl>,
     gossip_engine: Arc<GossipEngine>,
     merkle: Arc<MerkleTree>,
+    #[allow(dead_code)]
     merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
     last_full_sync: parking_lot::RwLock<Instant>,
@@ -59,7 +66,7 @@ impl TrackerSync {
         tracker_repo: Arc<TrackerRepoImpl>,
         gossip_engine: Arc<GossipEngine>,
         merkle: Arc<MerkleTree>,
-        merkle_queue: Arc<MerkleUpdateQueue>,
+        #[allow(dead_code)] merkle_queue: Arc<MerkleUpdateQueue>,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
@@ -95,20 +102,11 @@ impl TrackerSync {
             .as_secs();
 
         let mut entries = Vec::with_capacity(trackers.len());
-        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(trackers.len());
         for tracker in &trackers {
-            let ts = tracker.last_used.unwrap_or(now);
-            let payload = TrackerSyncPayload {
-                url: tracker.url.clone(),
-                disabled: tracker.disabled,
-                last_seen: ts,
+            let (key, payload_bytes, _data_hash) = match build_tracker_sync_entry(&tracker.url) {
+                Some(v) => v,
+                None => continue,
             };
-            let payload_bytes = match bincode::serialize(&payload) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let key = tracker.url.as_bytes().to_vec();
-            merkle_batch.push((key.clone(), payload_bytes.clone()));
             entries.push(SyncEntry {
                 key,
                 operation: operation::UPSERT,
@@ -117,14 +115,7 @@ impl TrackerSync {
             });
         }
 
-        // 批量更新 Merkle
-        if !merkle_batch.is_empty() {
-            let refs: Vec<(&[u8], &[u8])> = merkle_batch
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                .collect();
-            self.merkle.update_batch(&refs);
-        }
+        // Merkle 哈希不再从内存喂入：由周期冷重算任务从 DB 重算（见 main.rs 冷重算）。
 
         *self.last_full_sync.write() = Instant::now();
 
@@ -147,27 +138,20 @@ impl TrackerSync {
 
         let key = url.as_bytes().to_vec();
         let payload = if operation == operation::UPSERT {
-            let tracker = self.tracker_repo.get_tracker_sync(url);
-            let (disabled, last_used) = tracker
-                .map(|t| (t.disabled, t.last_used))
-                .unwrap_or((false, None));
-            let p = TrackerSyncPayload {
-                url: url.to_string(),
-                disabled,
-                last_seen: last_used.unwrap_or(now),
-            };
-            match bincode::serialize(&p) {
-                Ok(b) => b,
-                Err(_) => return,
+            match build_tracker_sync_entry(url) {
+                Some((_key, payload_bytes, _hash)) => payload_bytes,
+                None => return,
             }
         } else {
             Vec::new()
         };
 
         if operation == operation::DELETE {
-            self.merkle.remove(&key);
+            // 真正删除：标记墓碑（下次冷重算排除），不从热数据物理删除
+            self.merkle.mark_tombstone(&key);
         } else {
-            self.merkle.update(&key, &payload);
+            let data_hash = data_hash_from_payload(&payload).unwrap_or_default();
+            self.merkle.update(&key, &payload, &data_hash);
         }
 
         let entry = SyncEntry {
@@ -186,10 +170,14 @@ impl TrackerSync {
     }
 
     /// 应用收到的 Tracker 同步数据
+    ///
+    /// 联邦同步只传播 url：入站仅新增本地不存在的 tracker，
+    /// 不覆盖本地的 disabled 状态与 last_seen 时间戳。
     pub fn apply_tracker_sync(&self, entries: &[SyncEntry]) {
         // 第一遍：过滤 DELETE / 反序列化失败，收集 url 并批量更新 Merkle
+        // 时间戳传 0：仅用于"新增"，update 闭包里 0 不会大于本地真实时间，
+        // 因此不会覆盖本地已存在 tracker 的 last_seen；disabled 字段本地自行维护。
         let mut items: Vec<(String, u64)> = Vec::new();
-        let mut merkle_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
@@ -201,24 +189,16 @@ impl TrackerSync {
                 Err(_) => continue,
             };
 
-            merkle_batch.push((entry.key.clone(), entry.payload.clone()));
-            items.push((payload.url, payload.last_seen));
+            items.push((payload.url, 0));
             applied += 1;
-        }
-
-        // 异步批量入队 Merkle 更新（后台任务定期 flush），不再同步调用 update_batch
-        if !merkle_batch.is_empty() {
-            let items: Vec<_> = merkle_batch
-                .into_iter()
-                .map(|(k, v)| (repo_type::TRACKER, k, v))
-                .collect();
-            self.merkle_queue.push_batch(items);
         }
 
         // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
         if !items.is_empty() {
             self.tracker_repo.add_trackers_batch_internal(&items);
         }
+
+        // 【回环修复】入站 apply 不再 update_incremental_batch 标记 dirty（避免整批推回对端）。
 
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
@@ -245,21 +225,14 @@ impl TrackerSync {
 
         let mut entries = Vec::with_capacity(trackers.len());
         for tracker in &trackers {
-            let ts = tracker.last_used.unwrap_or(now);
-            let payload = TrackerSyncPayload {
-                url: tracker.url.clone(),
-                disabled: tracker.disabled,
-                last_seen: ts,
+            let (key, payload_bytes, _hash) = match build_tracker_sync_entry(&tracker.url) {
+                Some(v) => v,
+                None => continue,
             };
-            let payload_bytes = match bincode::serialize(&payload) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let key = tracker.url.as_bytes().to_vec();
             entries.push(SyncEntry {
                 key,
                 operation: operation::UPSERT,
-                version: ts,
+                version: now,
                 payload: payload_bytes,
             });
         }
@@ -288,15 +261,9 @@ impl TrackerSync {
 
         let mut entries = Vec::new();
         for tracker in &trackers {
-            let ts = tracker.last_used.unwrap_or(now);
-            let payload = TrackerSyncPayload {
-                url: tracker.url.clone(),
-                disabled: tracker.disabled,
-                last_seen: ts,
-            };
-            if let Ok(payload_bytes) = bincode::serialize(&payload) {
+            if let Some((key, payload_bytes, _hash)) = build_tracker_sync_entry(&tracker.url) {
                 entries.push(SyncEntry {
-                    key: tracker.url.as_bytes().to_vec(),
+                    key,
                     operation: operation::UPSERT,
                     version: now,
                     payload: payload_bytes,
@@ -354,13 +321,10 @@ mod tests {
     fn test_tracker_sync_payload_serde() {
         let payload = TrackerSyncPayload {
             url: "http://tracker.example.com:6969/announce".to_string(),
-            disabled: false,
-            last_seen: 1000,
         };
         let bytes = bincode::serialize(&payload).unwrap();
         let decoded: TrackerSyncPayload = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.url, "http://tracker.example.com:6969/announce");
-        assert!(!decoded.disabled);
     }
 
     #[test]
@@ -378,8 +342,6 @@ mod tests {
 
         let payload = TrackerSyncPayload {
             url: "http://test.tracker:6969/announce".to_string(),
-            disabled: false,
-            last_seen: 1000,
         };
         let entries = vec![SyncEntry {
             key: b"http://test.tracker:6969/announce".to_vec(),

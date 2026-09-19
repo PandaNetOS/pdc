@@ -30,6 +30,11 @@ pub trait NodeScorer: Send + Sync {
 #[async_trait]
 pub trait TrackerScorer: Send + Sync {
     async fn rescore_all(&self, repo: &dyn TrackerRepository);
+    /// 增量重算脏 tracker 评分（只重算统计数据有变化的 tracker），返回重算数量
+    async fn rescore_dirty(&self, repo: &dyn TrackerRepository) -> usize {
+        self.rescore_all(repo).await;
+        0
+    }
     fn calculate(
         &self,
         total_requests: u64,
@@ -48,6 +53,11 @@ pub trait TrackerScorer: Send + Sync {
 #[async_trait]
 pub trait PeerScorer: Send + Sync {
     async fn rescore_all(&self, repo: &dyn PeerRepository);
+    /// 增量重算脏 peer 评分（只重算统计数据有变化的 peer），返回重算数量
+    async fn rescore_dirty(&self, repo: &dyn PeerRepository) -> usize {
+        self.rescore_all(repo).await;
+        0
+    }
     fn calculate(&self, peer: &PeerInfo, infohash_count: u32) -> f64;
 }
 
@@ -182,6 +192,11 @@ impl InfohashScoreInput {
 pub trait InfohashScorer: Send + Sync {
     /// 全量重算所有 infohash 评分（兜底用）
     async fn rescore_all(&self, repo: &dyn InfohashRepository);
+    /// 增量重算脏 infohash 评分（只重算统计数据有变化的 infohash），返回重算数量
+    async fn rescore_dirty(&self, repo: &dyn InfohashRepository) -> usize {
+        self.rescore_all(repo).await;
+        0
+    }
     /// 计算单个 infohash 的热门度评分（0-100）
     fn calculate(&self, input: &InfohashScoreInput) -> f64;
 }

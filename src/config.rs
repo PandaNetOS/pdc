@@ -1,4 +1,4 @@
-//! 配置管理
+﻿//! 配置管理
 //!
 //! 支持从 config.yaml 加载配置，也支持环境变量覆盖。
 //! 配置结构按模块组织：server、super_tracker、discoverers、cache、health_check、crawler。
@@ -75,12 +75,27 @@ pub struct PdcConfig {
     /// API runtime 线程数（默认 4）
     #[serde(default = "default_api_runtime_threads")]
     pub api_runtime_threads: usize,
+    /// 联邦 runtime 线程数（0=自动按 CPU 核数）
+    #[serde(default = "default_federation_runtime_threads")]
+    pub federation_runtime_threads: usize,
+    /// 调度器 runtime 线程数（默认 2）
+    #[serde(default = "default_scheduler_runtime_threads")]
+    pub scheduler_runtime_threads: usize,
+    /// 持久化 runtime 线程数（默认 4）
+    #[serde(default = "default_persistence_runtime_threads")]
+    pub persistence_runtime_threads: usize,
+    /// 统计快照更新间隔（秒，默认 1）
+    #[serde(default = "default_stats_snapshot_interval_secs")]
+    pub stats_snapshot_interval_secs: u64,
     /// Runtime 关闭超时（秒，默认 5）
     #[serde(default = "default_runtime_shutdown_timeout_secs")]
     pub runtime_shutdown_timeout_secs: u64,
     /// 自适应控制器配置
     #[serde(default)]
     pub adaptive: AdaptiveConfig,
+    /// 冷热分层缓存配置
+    #[serde(default)]
+    pub tier: TierConfig,
 }
 
 /// TaskScheduler 各分类并发度配置
@@ -265,7 +280,11 @@ impl Default for TaskSchedulerConfig {
             persistence_concurrency: default_persistence_concurrency(),
             monitor_concurrency: default_monitor_concurrency(),
             network_concurrency: default_network_concurrency(),
-            intervals: HashMap::new(),
+            intervals: {
+                let mut m = HashMap::new();
+                m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 300u64); // 5分钟（原3600秒/1小时，缩短后WAL更频繁压缩）
+                m
+            },
             admission_control_enabled: default_admission_control_enabled(),
             admission_cpu_threshold: default_admission_cpu_threshold(),
             admission_io_threshold: default_admission_io_threshold(),
@@ -419,13 +438,13 @@ pub struct SqliteConfig {
 }
 
 fn default_sqlite_mmap_size() -> i64 {
-    2_147_483_648 // 2GB
+    134_217_728 // 128MB（原256MB过大，配合64MB cache控制内存）
 }
 fn default_sqlite_cache_size() -> i64 {
-    -262_144 // 256MB 页缓存（负数表示页数）
+    -65_536 // 64MB 页缓存（负数表示页数，原256MB过大导致内存占用高）
 }
 fn default_sqlite_wal_autocheckpoint() -> u32 {
-    0 // 禁用SQLite自动checkpoint，完全由IOScheduler统一调度，避免IO尖峰
+    1000 // 恢复SQLite自动checkpoint兜底（1000页），IOScheduler仍为主调度
 }
 fn default_sqlite_temp_store() -> String {
     "MEMORY".to_string()
@@ -583,8 +602,124 @@ fn default_api_runtime_threads() -> usize {
     4
 }
 
+fn default_federation_runtime_threads() -> usize {
+    0
+}
+
+fn default_scheduler_runtime_threads() -> usize {
+    2
+}
+
+fn default_persistence_runtime_threads() -> usize {
+    4
+}
+
+fn default_stats_snapshot_interval_secs() -> u64 {
+    1
+}
+
 fn default_runtime_shutdown_timeout_secs() -> u64 {
     5
+}
+
+/// 冷热分层缓存配置
+///
+/// 所有 Repo 数据永久保存在 SQLite，内存只保留 Hot+Warm。
+/// 冷数据自动从内存卸载，需要时按需加载。全局内存硬限制由 memory_limit_mb 控制。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierConfig {
+    /// 是否启用冷热分层（默认 true；false 时退化为全量加载）
+    #[serde(default = "default_tier_enabled")]
+    pub enabled: bool,
+    /// 全局内存硬限制（MB，默认 500）
+    #[serde(default = "default_tier_memory_limit_mb")]
+    pub memory_limit_mb: usize,
+    /// Repo 数据缓存预算（MB，默认 250；其余为程序基础+爬虫+联邦）
+    #[serde(default = "default_tier_repo_cache_mb")]
+    pub repo_cache_mb: usize,
+    /// Hot LRU 最大条目数（默认 500,000）
+    #[serde(default = "default_tier_hot_max_count")]
+    pub hot_max_count: usize,
+    /// Warm LRU 最大条目数（默认 100,000）
+    #[serde(default = "default_tier_warm_max_count")]
+    pub warm_max_count: usize,
+    /// PeerRepo 专属 Warm LRU 上限（默认 50,000；peer 条目较大，单独下调以省内存）
+    #[serde(default = "default_tier_peer_warm_max_count")]
+    pub peer_warm_max_count: usize,
+    /// Hot→Warm 降级阈值（秒，默认 1800=30分钟）
+    #[serde(default = "default_tier_hot_threshold_secs")]
+    pub hot_threshold_secs: u64,
+    /// Warm→Cold 卸载阈值（秒，默认 7200=2小时）
+    #[serde(default = "default_tier_warm_threshold_secs")]
+    pub warm_threshold_secs: u64,
+    /// 分层驱逐任务间隔（秒，默认 60）
+    #[serde(default = "default_tier_evict_interval_secs")]
+    pub evict_interval_secs: u64,
+    /// 启动时预热 Top-N 高评分节点（默认 100,000）
+    #[serde(default = "default_tier_preload_top_n")]
+    pub preload_top_n: usize,
+    /// 全局内存监控采样间隔（秒，默认 30）
+    #[serde(default = "default_tier_memory_monitor_interval_secs")]
+    pub memory_monitor_interval_secs: u64,
+    /// 紧急驱逐触发阈值（内存占比，默认 0.90=90%）
+    #[serde(default = "default_tier_emergency_threshold")]
+    pub emergency_threshold: f64,
+}
+
+impl Default for TierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tier_enabled(),
+            memory_limit_mb: default_tier_memory_limit_mb(),
+            repo_cache_mb: default_tier_repo_cache_mb(),
+            hot_max_count: default_tier_hot_max_count(),
+            warm_max_count: default_tier_warm_max_count(),
+            peer_warm_max_count: default_tier_peer_warm_max_count(),
+            hot_threshold_secs: default_tier_hot_threshold_secs(),
+            warm_threshold_secs: default_tier_warm_threshold_secs(),
+            evict_interval_secs: default_tier_evict_interval_secs(),
+            preload_top_n: default_tier_preload_top_n(),
+            memory_monitor_interval_secs: default_tier_memory_monitor_interval_secs(),
+            emergency_threshold: default_tier_emergency_threshold(),
+        }
+    }
+}
+
+fn default_tier_enabled() -> bool {
+    true
+}
+fn default_tier_memory_limit_mb() -> usize {
+    500
+}
+fn default_tier_repo_cache_mb() -> usize {
+    250
+}
+fn default_tier_hot_max_count() -> usize {
+    200_000
+}
+fn default_tier_warm_max_count() -> usize {
+    100_000
+}
+fn default_tier_peer_warm_max_count() -> usize {
+    50_000
+}
+fn default_tier_hot_threshold_secs() -> u64 {
+    1800
+}
+fn default_tier_warm_threshold_secs() -> u64 {
+    7200
+}
+fn default_tier_evict_interval_secs() -> u64 {
+    60
+}
+fn default_tier_preload_top_n() -> usize {
+    100_000
+}
+fn default_tier_memory_monitor_interval_secs() -> u64 {
+    30
+}
+fn default_tier_emergency_threshold() -> f64 {
+    0.90
 }
 
 impl Default for PdcConfig {
@@ -611,8 +746,13 @@ impl Default for PdcConfig {
             runtime_worker_threads: default_runtime_worker_threads(),
             tracker_runtime_threads: default_tracker_runtime_threads(),
             api_runtime_threads: default_api_runtime_threads(),
+            federation_runtime_threads: default_federation_runtime_threads(),
+            scheduler_runtime_threads: default_scheduler_runtime_threads(),
+            persistence_runtime_threads: default_persistence_runtime_threads(),
+            stats_snapshot_interval_secs: default_stats_snapshot_interval_secs(),
             runtime_shutdown_timeout_secs: default_runtime_shutdown_timeout_secs(),
             adaptive: AdaptiveConfig::default(),
+            tier: TierConfig::default(),
         }
     }
 }
@@ -1018,6 +1158,9 @@ pub struct CrawlerConfig {
     /// 每轮并发发送的 socket 数量（默认1，上限8）
     #[serde(default = "default_concurrent_sockets")]
     pub concurrent_sockets: usize,
+    /// 入站来源节点集合上限（超过时清空，防止无界增长）
+    #[serde(default = "default_inbound_sources_max")]
+    pub inbound_sources_max: usize,
 }
 
 /// NAT 穿透协议类型
@@ -1193,6 +1336,10 @@ fn default_concurrent_sockets() -> usize {
     1
 }
 
+fn default_inbound_sources_max() -> usize {
+    100_000
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -1215,6 +1362,7 @@ impl Default for CrawlerConfig {
             warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),
             max_concurrent_msg_handlers: default_max_concurrent_msg_handlers(),
             concurrent_sockets: default_concurrent_sockets(),
+            inbound_sources_max: default_inbound_sources_max(),
         }
     }
 }

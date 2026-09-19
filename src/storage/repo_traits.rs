@@ -110,10 +110,20 @@ pub trait PeerRepository: Send + Sync {
 
     // 评分与探测统计（由 ProbeService 和 PeerScorer 写入）
     async fn update_score(&self, addr: &SocketAddr, score: f64);
+    /// 批量更新评分（一次事务，避免逐个更新的锁竞争）
+    async fn update_scores_batch(&self, scores: &[(SocketAddr, f64)]);
     async fn update_probe_stats(&self, addr: &SocketAddr, tcp_ok: bool, supports_dht: bool);
     async fn get_peer_global(&self, addr: &SocketAddr) -> Option<PeerInfo>;
     /// 获取该 peer 出现在多少个 infohash 下（多 infohash 共享维度）
     async fn get_peer_infohash_count(&self, addr: &SocketAddr) -> u32;
+
+    // 脏标记（用于增量评分：统计数据变化时标记，评分系统只重算脏 peer）
+    /// 标记 peer 为脏（统计数据已变化，需要重算评分）
+    async fn mark_dirty(&self, addr: &SocketAddr);
+    /// 获取所有脏 peer 地址
+    async fn dirty_peers(&self) -> Vec<SocketAddr>;
+    /// 清除所有脏标记
+    async fn clear_all_dirty(&self);
 
     // TTL 清理
     async fn cleanup_expired(&self, ttl_secs: u64);
@@ -147,6 +157,14 @@ pub trait InfohashRepository: Send + Sync {
     async fn get_score(&self, infohash: &Infohash) -> f64;
     /// 获取热门 infohash 排行榜（按评分降序）
     async fn top_infohashes(&self, n: usize) -> Vec<(Infohash, f64)>;
+
+    // 脏标记（用于增量评分）
+    /// 标记 infohash 为脏（统计数据已变化，需要重算评分）
+    async fn mark_dirty(&self, infohash: &Infohash);
+    /// 获取所有脏 infohash
+    async fn dirty_infohashes(&self) -> Vec<Infohash>;
+    /// 清除所有脏标记
+    async fn clear_all_dirty(&self);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,8 +199,18 @@ pub trait TrackerRepository: Send + Sync {
 
     // 评分与统计
     async fn update_score(&self, url: &str, score: f64);
+    /// 批量更新评分（一次事务，避免逐个更新的锁竞争）
+    async fn update_scores_batch(&self, scores: &[(String, f64)]);
     async fn record_request(&self, url: &str, success: bool, peers: u64, latency_ms: u64);
     async fn set_disabled(&self, url: &str, disabled: bool);
+
+    // 脏标记（用于增量评分）
+    /// 标记 tracker 为脏（统计数据已变化，需要重算评分）
+    async fn mark_dirty(&self, url: &str);
+    /// 获取所有脏 tracker URL
+    async fn dirty_trackers(&self) -> Vec<String>;
+    /// 清除所有脏标记
+    async fn clear_all_dirty(&self);
 
     // 持久化
     async fn save_all(&self) -> anyhow::Result<()>;

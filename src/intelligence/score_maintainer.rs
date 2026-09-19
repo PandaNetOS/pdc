@@ -169,20 +169,27 @@ impl ScoreMaintainer {
         }
 
         if let Some(repo) = &self.peer_repo {
-            self.peer_scorer.rescore_all(repo.as_ref()).await;
-            debug!("[score_maintainer] PeerRepo 增量重算完成（全量）");
+            let count = self.peer_scorer.rescore_dirty(repo.as_ref()).await;
+            total_rescored += count;
+            debug!("[score_maintainer] PeerRepo 增量重算: {} 个脏 peer", count);
         }
 
         if let Some(repo) = &self.tracker_repo {
-            self.tracker_scorer.rescore_all(repo.as_ref()).await;
-            debug!("[score_maintainer] TrackerRepo 增量重算完成（全量）");
+            let count = self.tracker_scorer.rescore_dirty(repo.as_ref()).await;
+            total_rescored += count;
+            debug!(
+                "[score_maintainer] TrackerRepo 增量重算: {} 个脏 tracker",
+                count
+            );
         }
 
         if let Some(repo) = &self.infohash_repo {
-            // Infohash 评分：自动聚合多源数据
-            let count = self.rescore_infohashes(repo.as_ref()).await;
+            let count = self.rescore_dirty_infohashes(repo.as_ref()).await;
             total_rescored += count;
-            debug!("[score_maintainer] InfohashRepo 增量重算完成: {} 个", count);
+            debug!(
+                "[score_maintainer] InfohashRepo 增量重算完成: {} 个脏",
+                count
+            );
         }
 
         total_rescored
@@ -233,6 +240,34 @@ impl ScoreMaintainer {
         if !scores.is_empty() {
             repo.update_scores_batch(&scores).await;
         }
+
+        scores.len()
+    }
+
+    /// 增量重算脏 infohash 评分：只遍历脏 infohash，从多源聚合数据，计算评分，批量写回
+    async fn rescore_dirty_infohashes(&self, repo: &dyn InfohashRepository) -> usize {
+        let dirty_infohashes = repo.dirty_infohashes().await;
+        if dirty_infohashes.is_empty() {
+            return 0;
+        }
+
+        debug!(
+            "[score_maintainer] 增量聚合 {} 个脏 infohash 的评分",
+            dirty_infohashes.len()
+        );
+
+        let mut scores: Vec<(Infohash, f64)> = Vec::with_capacity(dirty_infohashes.len());
+
+        for infohash in &dirty_infohashes {
+            let input = self.aggregate_score_input(infohash).await;
+            let score = self.infohash_scorer.calculate(&input);
+            scores.push((*infohash, score));
+        }
+
+        if !scores.is_empty() {
+            repo.update_scores_batch(&scores).await;
+        }
+        repo.clear_all_dirty().await;
 
         scores.len()
     }

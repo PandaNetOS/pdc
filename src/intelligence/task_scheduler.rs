@@ -84,8 +84,12 @@ pub enum TaskCategory {
     /// 监控类（资源监控、状态采集、健康检查等）
     #[default]
     Monitor,
-    /// 网络类（发现器、联邦同步、NAT 等）
+    /// 网络类（发现器、NAT 等）
     Network,
+    /// 联邦类（联邦同步、shard-sync、merkle 计算）
+    Federation,
+    /// Tracker 类（超级 Tracker 后台任务）
+    Tracker,
 }
 
 /// 各分类并发度配置
@@ -95,6 +99,8 @@ pub struct CategoryConcurrency {
     pub persistence: u32,
     pub monitor: u32,
     pub network: u32,
+    pub federation: u32,
+    pub tracker: u32,
 }
 
 impl Default for CategoryConcurrency {
@@ -104,6 +110,8 @@ impl Default for CategoryConcurrency {
             persistence: 1,
             monitor: 2,
             network: 4,
+            federation: 4,
+            tracker: 2,
         }
     }
 }
@@ -116,6 +124,8 @@ impl CategoryConcurrency {
             TaskCategory::Persistence => self.persistence,
             TaskCategory::Monitor => self.monitor,
             TaskCategory::Network => self.network,
+            TaskCategory::Federation => self.federation,
+            TaskCategory::Tracker => self.tracker,
         }
     }
 }
@@ -883,6 +893,17 @@ impl Eq for ScheduledItem {}
 type TaskFn =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
+/// 六个 runtime 的 Handle 集合，用于跨 runtime 调度任务
+#[derive(Clone)]
+pub struct RuntimeHandles {
+    pub crawler: tokio::runtime::Handle,
+    pub federation: tokio::runtime::Handle,
+    pub tracker: tokio::runtime::Handle,
+    pub api: tokio::runtime::Handle,
+    pub scheduler: tokio::runtime::Handle,
+    pub persistence: tokio::runtime::Handle,
+}
+
 /// 智能任务调度器
 pub struct TaskScheduler {
     tasks: RwLock<HashMap<String, TaskMetadata>>,
@@ -921,6 +942,8 @@ pub struct TaskScheduler {
     external_io_backpressure: Arc<ParkingMutex<f32>>,
     /// S1-P3: 外部注入的 dirty 积压量（闭环反馈信号之一）
     dirty_backlog: Arc<AtomicI64>,
+    /// 六个 runtime 的 Handle（None 时退化为当前 runtime，保持向后兼容）
+    runtime_handles: Option<RuntimeHandles>,
 }
 
 impl TaskScheduler {
@@ -939,6 +962,8 @@ impl TaskScheduler {
                 m.insert(TaskCategory::Persistence, 0);
                 m.insert(TaskCategory::Monitor, 0);
                 m.insert(TaskCategory::Network, 0);
+                m.insert(TaskCategory::Federation, 0);
+                m.insert(TaskCategory::Tracker, 0);
                 m
             }),
             max_concurrency: CategoryConcurrency::default(),
@@ -963,6 +988,7 @@ impl TaskScheduler {
             predicted_defer_total: Arc::new(AtomicU64::new(0)),
             external_io_backpressure: Arc::new(ParkingMutex::new(0.0)),
             dirty_backlog: Arc::new(AtomicI64::new(0)),
+            runtime_handles: None,
         }
     }
 
@@ -978,6 +1004,12 @@ impl TaskScheduler {
     /// 设置各分类并发度
     pub fn with_category_concurrency(mut self, config: CategoryConcurrency) -> Self {
         self.max_concurrency = config;
+        self
+    }
+
+    /// 注入六个 runtime 的 Handle，启用跨 runtime 调度
+    pub fn with_runtime_handles(mut self, handles: RuntimeHandles) -> Self {
+        self.runtime_handles = Some(handles);
         self
     }
 
@@ -1140,9 +1172,15 @@ impl TaskScheduler {
         *self.scheduler_started.write() = true;
 
         let scheduler = self.clone();
-        tokio::spawn(async move {
-            scheduler.run().await;
-        });
+        if let Some(ref handles) = self.runtime_handles {
+            handles.scheduler.spawn(async move {
+                scheduler.run().await;
+            });
+        } else {
+            tokio::spawn(async move {
+                scheduler.run().await;
+            });
+        }
 
         // P1-3: 启动独立 OS 线程 watchdog，不依赖 tokio runtime
         // 即使 runtime 线程被全部占满，watchdog 仍能检测到心跳停止
@@ -1178,11 +1216,13 @@ impl TaskScheduler {
             .expect("failed to spawn watchdog thread");
 
         info!(
-            "[task_scheduler] 智能任务调度中心已启动（分级并发: crawl={}, persistence={}, monitor={}, network={}）",
+            "[task_scheduler] 智能任务调度中心已启动（分级并发: crawl={}, persistence={}, monitor={}, network={}, federation={}, tracker={}）",
             self.max_concurrency.crawl,
             self.max_concurrency.persistence,
             self.max_concurrency.monitor,
-            self.max_concurrency.network
+            self.max_concurrency.network,
+            self.max_concurrency.federation,
+            self.max_concurrency.tracker
         );
     }
 
@@ -1536,7 +1576,15 @@ impl TaskScheduler {
 
         let task_id = item.task_id.clone();
 
-        tokio::spawn(async move {
+        let runtime_handle = scheduler.runtime_handles.as_ref().map(|h| match category {
+            TaskCategory::Crawl | TaskCategory::Network => h.crawler.clone(),
+            TaskCategory::Federation => h.federation.clone(),
+            TaskCategory::Tracker => h.tracker.clone(),
+            TaskCategory::Persistence => h.persistence.clone(),
+            TaskCategory::Monitor => h.api.clone(),
+        });
+
+        let fut = async move {
             let start = Instant::now();
             let result = tokio::time::timeout(meta.timeout, task_fn()).await;
 
@@ -1660,7 +1708,12 @@ impl TaskScheduler {
                 Instant::now() + interval_with_ratio + Duration::from_secs(jitter_secs),
                 meta.priority,
             );
-        });
+        };
+
+        match runtime_handle {
+            Some(h) => h.spawn(fut),
+            None => tokio::spawn(fut),
+        };
     }
 
     /// 获取任务统计
@@ -1729,6 +1782,8 @@ impl TaskScheduler {
                     TaskCategory::Persistence => "persistence",
                     TaskCategory::Monitor => "monitor",
                     TaskCategory::Network => "network",
+                    TaskCategory::Federation => "federation",
+                    TaskCategory::Tracker => "tracker",
                 };
                 (name.to_string(), *n)
             })
