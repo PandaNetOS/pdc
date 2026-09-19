@@ -73,7 +73,7 @@ where
     V: Clone,
 {
     inner: RwLock<TieredCacheInner<K, V>>,
-    config: TieredCacheConfig,
+    config: RwLock<TieredCacheConfig>,
 }
 
 impl<K, V> TieredCache<K, V>
@@ -93,7 +93,7 @@ where
                 warm: LruCache::with_hasher(warm_cap, FxBuildHasher::default()),
                 cold_loaded_count: 0,
             }),
-            config,
+            config: RwLock::new(config),
         }
     }
 
@@ -296,12 +296,9 @@ where
     /// 返回 (demoted_to_warm, evicted_to_cold)
     pub fn tier_check(&self) -> (usize, usize) {
         let now = Instant::now();
-        let hot_cutoff = now.checked_sub(std::time::Duration::from_secs(
-            self.config.hot_threshold_secs,
-        ));
-        let warm_cutoff = now.checked_sub(std::time::Duration::from_secs(
-            self.config.warm_threshold_secs,
-        ));
+        let cfg = self.config.read().clone();
+        let hot_cutoff = now.checked_sub(std::time::Duration::from_secs(cfg.hot_threshold_secs));
+        let warm_cutoff = now.checked_sub(std::time::Duration::from_secs(cfg.warm_threshold_secs));
 
         let mut inner = self.inner.write();
 
@@ -349,12 +346,9 @@ where
     /// 返回 (demoted_to_warm, evicted_keys)
     pub fn tier_check_with_evicted(&self) -> (usize, Vec<K>) {
         let now = Instant::now();
-        let hot_cutoff = now.checked_sub(std::time::Duration::from_secs(
-            self.config.hot_threshold_secs,
-        ));
-        let warm_cutoff = now.checked_sub(std::time::Duration::from_secs(
-            self.config.warm_threshold_secs,
-        ));
+        let cfg = self.config.read().clone();
+        let hot_cutoff = now.checked_sub(std::time::Duration::from_secs(cfg.hot_threshold_secs));
+        let warm_cutoff = now.checked_sub(std::time::Duration::from_secs(cfg.warm_threshold_secs));
 
         let mut inner = self.inner.write();
 
@@ -398,11 +392,12 @@ where
     /// 容量驱逐：超过上限时按 LRU 驱逐（先驱逐 Warm 的 LRU，再驱逐 Hot 的 LRU）
     /// 返回实际驱逐数
     pub fn evict_if_needed(&self) -> usize {
+        let cfg = self.config.read().clone();
         let mut inner = self.inner.write();
         let mut evicted = 0;
 
         // Warm 超限：驱逐 LRU
-        while inner.warm.len() > self.config.warm_max_count {
+        while inner.warm.len() > cfg.warm_max_count {
             if inner.warm.pop_lru().is_some() {
                 evicted += 1;
             } else {
@@ -411,7 +406,7 @@ where
         }
 
         // Hot 超限：驱逐 LRU
-        while inner.hot.len() > self.config.hot_max_count {
+        while inner.hot.len() > cfg.hot_max_count {
             if inner.hot.pop_lru().is_some() {
                 evicted += 1;
             } else {
@@ -449,30 +444,23 @@ where
         evicted_keys
     }
 
-    /// 更新配置（运行时热更新）
+    /// 更新配置（运行时热更新）：同时更新 LRU 容量与阈值
     pub fn update_config(&self, config: TieredCacheConfig) {
         let mut inner = self.inner.write();
-        // 调整 LRU 容量
         let hot_cap =
             NonZeroUsize::new(config.hot_max_count.max(1)).expect("hot_max_count must be > 0");
         let warm_cap =
             NonZeroUsize::new(config.warm_max_count.max(1)).expect("warm_max_count must be > 0");
         inner.hot.resize(hot_cap);
         inner.warm.resize(warm_cap);
-        // 注意：config 存在 self.config（不可变字段），通过重新创建或外部存储
-        // 这里只调整容量，阈值通过 tier_check 的参数传入
         drop(inner);
-        // 更新阈值（需要 unsafe 或内部可变性，这里用一个简单的方式：
-        // 阈值在 tier_check 时从 self.config 读取，而 self.config 是不可变的。
-        // 为了支持热更新，我们把阈值也存在 inner 中）
-        // 实际上，resize 已经处理了容量，阈值热更新可以通过重新创建 TieredCache 实现。
-        // 对于当前需求，配置在启动时确定，运行时不频繁变更。
-        let _ = config; // 阈值热更新暂不支持，保留接口
+        // 同步更新阈值配置，否则 tier_check/evict_if_needed 仍按旧阈值判断
+        *self.config.write() = config;
     }
 
     /// 获取当前配置的克隆
     pub fn config(&self) -> TieredCacheConfig {
-        self.config.clone()
+        self.config.read().clone()
     }
 }
 

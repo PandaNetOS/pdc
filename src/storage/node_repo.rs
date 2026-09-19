@@ -252,6 +252,56 @@ impl NodeRepoImpl {
     }
 
     /// 鎶婃柊鑺傜偣鍒楄〃鏋勫缓鎴?merkle/gossip 鏉＄洰骞朵紶鎾€?
+    /// 联邦同步入站（apply_node_sync）专用：批量删除节点，**不触发 Merkle/Gossip**，
+    /// 避免入站删除又被标 dirty 推回形成回环。返回实际删除的条目数。
+    pub(crate) fn remove_nodes_batch_internal(&self, addrs: &[SocketAddr]) -> usize {
+        if addrs.is_empty() {
+            return 0;
+        }
+        let mut nodes = self.nodes.write();
+        let mut subnet_index = self.subnet_index.write();
+        let mut removed = 0usize;
+        for addr in addrs {
+            if let Some(entry) = nodes.remove(addr) {
+                if let Some(subnet) = Self::subnet_key(*addr) {
+                    if let Some(bucket) = subnet_index.get_mut(&subnet) {
+                        bucket.retain(|x| x != &entry.id);
+                        if bucket.is_empty() {
+                            subnet_index.remove(&subnet);
+                        }
+                    }
+                }
+                removed += 1;
+            }
+        }
+        drop(nodes);
+        drop(subnet_index);
+
+        // 与 remove_node 保持一致的加锁顺序：hot -> cold -> dirty
+        if removed > 0 {
+            {
+                let mut hot = self.hot_addrs.write();
+                for addr in addrs {
+                    hot.remove(addr);
+                }
+            }
+            {
+                let mut cold = self.cold_addrs.write();
+                for addr in addrs {
+                    cold.remove(addr);
+                }
+            }
+            {
+                let mut dirty = self.dirty.write();
+                for addr in addrs {
+                    dirty.remove(addr);
+                }
+            }
+        }
+        removed
+    }
+
+    /// 把新节点列表构建成 merkle/gossip 条目并传播。
     fn propagate_nodes(&self, new_pairs: Vec<(NodeId, SocketAddr)>) {
         if new_pairs.is_empty() {
             return;
@@ -447,7 +497,7 @@ impl NodeRepoImpl {
     /// 灏嗚秴杩囬槇鍊肩殑鑺傜偣浠?hot 绉诲埌 cold锛堢敱澶栭儴 TaskScheduler 瀹氭椂璋冪敤锛屾ā鍧楀唴涓嶈嚜璺戝畾鏃讹級
     /// 杩斿洖鏈杩佺Щ鐨勮妭鐐规暟
     pub fn migrate_hot_to_cold_sync(&self, threshold_secs: u64) -> usize {
-        let cutoff = Instant::now() - Duration::from_secs(threshold_secs);
+        let cutoff = crate::utils::cutoff_before(Duration::from_secs(threshold_secs));
         let nodes = self.nodes.read();
         let mut hot = self.hot_addrs.write();
         let mut cold = self.cold_addrs.write();
@@ -492,6 +542,17 @@ impl NodeRepoImpl {
 
     pub fn clear_dirty_sync(&self, addr: &SocketAddr) {
         self.dirty.write().remove(addr);
+    }
+
+    /// 只清除指定节点的脏标记（避免全量清除误伤并发新增的脏标记）
+    pub fn clear_dirty_batch_sync(&self, addrs: &[SocketAddr]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let mut dirty = self.dirty.write();
+        for addr in addrs {
+            dirty.remove(addr);
+        }
     }
 
     pub fn clear_all_dirty_sync(&self) {
@@ -574,7 +635,32 @@ impl NodeRepository for NodeRepoImpl {
         };
         // 浠?/24 缃戞绱㈠紩涓Щ闄よ鑺傜偣
         self.unindex_subnet(addr, &entry.id);
-        self.dirty.write().insert(*addr);
+        // 同步清理分层集合，避免 hot/cold 无界残留导致计数虚高与内存泄漏
+        self.hot_addrs.write().remove(addr);
+        self.cold_addrs.write().remove(addr);
+        // 节点已删除，不再是待评分脏节点
+        self.dirty.write().remove(addr);
+        // 联动 Merkle：标记该 key 所在分片为 dirty（墓碑）
+        let key = addr.to_string().into_bytes();
+        if let Some(merkle) = self.merkle.get() {
+            merkle.mark_tombstone(&key);
+        }
+        // 联邦删除传播：提交 DELETE 条目，避免对端 upsert-only 合并导致"删除复活"
+        if let Some(gossip) = self.gossip.get() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            gossip.submit_gossip(
+                repo_type::NODE,
+                vec![SyncEntry {
+                    key,
+                    operation: operation::DELETE,
+                    version: now,
+                    payload: Vec::new(),
+                }],
+            );
+        }
         true
     }
 
@@ -672,6 +758,10 @@ impl NodeRepository for NodeRepoImpl {
         self.clear_dirty_sync(addr);
     }
 
+    async fn clear_dirty_batch(&self, addrs: &[SocketAddr]) {
+        self.clear_dirty_batch_sync(addrs);
+    }
+
     async fn clear_all_dirty(&self) {
         self.clear_all_dirty_sync();
     }
@@ -760,7 +850,7 @@ impl NodeRepository for NodeRepoImpl {
             entry.nodes_returned = row.nodes_returned;
             entry.last_query_time = row
                 .last_query_time
-                .map(|secs| Instant::now() - Duration::from_secs(secs.max(0) as u64));
+                .map(|secs| crate::utils::cutoff_before(Duration::from_secs(secs.max(0) as u64)));
             entry.state = match row.state.as_str() {
                 "Good" => NodeState::Good,
                 "Questionable" => NodeState::Questionable,
@@ -863,8 +953,8 @@ mod tests {
         assert_eq!(repo.len_sync(), 3);
 
         // 鎶?warm 鎺ㄥ埌闃堝€煎唴鍋忎箙銆乧old 鎺ㄥ埌瓒呰繃 warm 闃堝€硷紙7200s锛?
-        let warm_cutoff = Instant::now() - Duration::from_secs(3600);
-        let cold_cutoff = Instant::now() - Duration::from_secs(10_000);
+        let warm_cutoff = crate::utils::cutoff_before(Duration::from_secs(3600));
+        let cold_cutoff = crate::utils::cutoff_before(Duration::from_secs(10_000));
         repo.nodes.write().get_mut(&warm).unwrap().last_active = warm_cutoff;
         repo.nodes.write().get_mut(&cold).unwrap().last_active = cold_cutoff;
 

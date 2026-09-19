@@ -195,10 +195,12 @@ impl TcpTransport {
     ///
     /// 循环读取直到获得完整帧，返回 `(消息类型, payload 字节)`。
     pub async fn recv_message(&self) -> anyhow::Result<(MessageType, Vec<u8>)> {
+        /// 接收缓冲上限：对端若持续发送无法组帧的数据即断开，避免内存无界增长
+        const MAX_READ_BUF: usize = 2 * 1024 * 1024; // 2 MiB
         let mut reader = self.reader.lock().await;
         loop {
-            // 检查缓冲区中是否已有完整帧
-            if let Some(frame_len) = frame_size_in_buffer(&reader.read_buf) {
+            // 检查缓冲区中是否已有完整帧；非法长度直接报错断开（此前被当作"未收全"→缓冲无限增长）
+            if let Some(frame_len) = frame_size_in_buffer(&reader.read_buf)? {
                 let frame = reader.read_buf.split_to(frame_len);
                 let (msg_type, payload) = decode_frame(&frame)?;
                 // 累加接收的完整帧字节数（含帧头）
@@ -206,6 +208,10 @@ impl TcpTransport {
                     metrics.record_bytes_recv(frame_len as u64);
                 }
                 return Ok((msg_type, payload.to_vec()));
+            }
+
+            if reader.read_buf.len() > MAX_READ_BUF {
+                anyhow::bail!("接收缓冲区超限（{}B），断开连接", reader.read_buf.len());
             }
 
             // 缓冲区不足，读取更多数据

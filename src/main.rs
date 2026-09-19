@@ -1042,6 +1042,44 @@ async fn async_main(
         );
     }
 
+    // 8.5.2a 分片列定期回填（每 300s，Persistence）
+    // 运行时 INSERT 不写 l2_shard（默认 0），若只在启动回填一次，
+    // 启动后新写入的行会一直停留在 shard 0，导致联邦分片同步按 shard
+    // 过滤时漏掉新数据（shard!=0 的请求取到空集）。此处周期性修正。
+    {
+        let st = storage.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "shard_backfill",
+                "分片列定期回填",
+                std::time::Duration::from_secs(get_interval_secs(intervals, "shard_backfill", 300)),
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Medium,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "shard_backfill_initial_delay",
+                120,
+            ))),
+            move || {
+                let st = st.clone();
+                async move {
+                    if let Err(e) = st.backfill_shards() {
+                        warn!("[shard_backfill] 分片列回填失败: {}", e);
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
     // 8.5.2b WriteQueue 定时 flush（每5秒，Persistence）
     {
         let wq = write_queue.clone();

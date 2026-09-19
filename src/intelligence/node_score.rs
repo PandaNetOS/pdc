@@ -65,8 +65,8 @@ impl NodeScorer for NodeScorerImpl {
         }
         // 批量更新评分（一次事务）
         repo.update_scores_batch(&scores).await;
-        // 清除脏标记
-        repo.clear_all_dirty().await;
+        // 只清除本次处理的脏标记，避免误清并发新增的标记导致漏算
+        repo.clear_dirty_batch(&dirty_addrs).await;
         scores.len()
     }
 

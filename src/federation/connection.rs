@@ -1,4 +1,4 @@
-﻿//! 连接管理
+//! 连接管理
 //!
 //! 管理联邦网络中的所有 TCP 连接，包括监听、主动连接、握手、心跳和消息分发。
 
@@ -25,6 +25,9 @@ use pnos_net::transport::{TcpTransportStream, TransportKind, TransportStream};
 
 /// 接受连接失败后的退避等待
 const ACCEPT_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// 握手超时（入站/出站共用）：未完成签名的连接不得长期占用资源，防慢速连接 DoS
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 本节点联邦协议版本（Hello/HelloAck 的 version 字段）。
 /// 1：旧版本（仅全量推送差异分片）。
@@ -170,6 +173,8 @@ pub struct ConnectionManager {
     /// query_peers 发起时清空对应 key，dispatch 收到 PeerQueryResponse 时 push，
     /// 超时后由 query_peers 取走结果并删除 key。
     peer_query_responses: Arc<DashMap<[u8; 20], Vec<PeerQueryEntry>>>,
+    /// 已见过的 Hello nonce（防重放）：nonce -> 首次见到时刻
+    seen_hello_nonces: RwLock<FxHashMap<[u8; 16], Instant>>,
 }
 
 impl ConnectionManager {
@@ -202,7 +207,24 @@ impl ConnectionManager {
             seed_node_ids: RwLock::new(FxHashMap::default()),
             last_reconnect_attempt: AtomicU64::new(0),
             peer_query_responses: Arc::new(DashMap::new()),
+            seen_hello_nonces: RwLock::new(FxHashMap::default()),
         }
+    }
+
+    /// 记录并校验 Hello nonce 是否为重放；重复返回 true。
+    fn is_replayed_nonce(&self, nonce: [u8; 16]) -> bool {
+        let now = Instant::now();
+        let ttl = Duration::from_millis(HelloMessage::REPLAY_WINDOW_MS * 2);
+        let mut map = self.seen_hello_nonces.write();
+        // 有界清理：超过阈值时回收已过窗口的 nonce，防止无界增长
+        if map.len() > 4096 {
+            map.retain(|_, t| now.duration_since(*t) < ttl);
+        }
+        if map.contains_key(&nonce) {
+            return true;
+        }
+        map.insert(nonce, now);
+        false
     }
 
     /// 获取指定 node_id 的连接锁（不存在则创建），用于串行化同节点的双向握手
@@ -210,6 +232,8 @@ impl ConnectionManager {
         if let Some(lock) = self.connecting_locks.read().get(&node_id) {
             return lock.clone();
         }
+        // 兜底清理：临时 NodeId（发现阶段随机生成）不会走 remove_connection
+        self.prune_connecting_locks();
         self.connecting_locks
             .write()
             .entry(node_id)
@@ -328,8 +352,11 @@ impl ConnectionManager {
                 self.config.transport_write_retry_base_ms,
             );
 
-        // 入站握手
-        let (node_id, hello) = self.handshake_inbound(&transport).await?;
+        // 入站握手（限时：未通过签名握手的连接不得长期占用，防慢速连接 DoS）
+        let (node_id, hello) =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, self.handshake_inbound(&transport))
+                .await
+                .map_err(|_| anyhow::anyhow!("入站握手超时（peer={}）", addr))??;
 
         // per-node 连接锁：与出站方向串行化，消除双向同时握手的重复连接竞态
         let connection = {
@@ -411,6 +438,22 @@ impl ConnectionManager {
             anyhow::bail!("地址 {} 正在连接中，跳过重复连接", addr);
         }
 
+        // RAII：无论成功/失败/任务被取消，退出时都移除 connecting 标记，
+        // 避免 future 被 drop 后地址永久停留在"正在连接中"而无法重连。
+        struct ConnectingGuard {
+            mgr: Arc<ConnectionManager>,
+            addr: SocketAddr,
+        }
+        impl Drop for ConnectingGuard {
+            fn drop(&mut self) {
+                self.mgr.connecting.write().remove(&self.addr);
+            }
+        }
+        let _connecting_guard = ConnectingGuard {
+            mgr: self.clone(),
+            addr,
+        };
+
         // 检查连接数上限
         if self.connection_count() >= self.config.max_connections {
             self.connecting.write().remove(&addr);
@@ -487,11 +530,21 @@ impl ConnectionManager {
 
         // 出站握手
         let transport = transport;
-        let (peer_id, peer_version) = match self.handshake_outbound(&transport, node_id).await {
-            Ok(v) => v,
-            Err(e) => {
+        // 出站握手（限时，避免对端不回 HelloAck 时任务长期挂起）
+        let handshake_result = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            self.handshake_outbound(&transport, node_id),
+        )
+        .await;
+        let (peer_id, peer_version) = match handshake_result {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 self.connecting.write().remove(&addr);
                 return Err(e);
+            }
+            Err(_) => {
+                self.connecting.write().remove(&addr);
+                anyhow::bail!("出站握手超时（peer={}）", addr);
             }
         };
 
@@ -575,6 +628,15 @@ impl ConnectionManager {
             anyhow::bail!("HelloAck 签名验证失败，节点 {}", NodeId(ack.node_id));
         }
 
+        // 身份绑定 + 时间戳新鲜度
+        if !ack.verify_identity_binding() {
+            self.metrics.record_signature_failure();
+            anyhow::bail!("HelloAck 身份绑定校验失败：node_id 与公钥不匹配");
+        }
+        if !ack.is_fresh() {
+            anyhow::bail!("HelloAck 时间戳超出重放窗口（{} ms）", ack.timestamp_ms);
+        }
+
         let peer_id = NodeId(ack.node_id);
         let peer_version = ack.version;
         // 自连接过滤：不允许连接自己（通过 PEX/DHT 发现到自身地址后误连）
@@ -610,6 +672,22 @@ impl ConnectionManager {
             anyhow::bail!("Hello 签名验证失败，节点 {}", NodeId(hello.node_id));
         }
 
+        // 身份绑定：node_id 必须由 public_key 派生，防止用自建密钥冒充任意 node_id
+        if !hello.verify_identity_binding() {
+            self.metrics.record_signature_failure();
+            anyhow::bail!("Hello 身份绑定校验失败：node_id 与公钥不匹配");
+        }
+
+        // 时间戳新鲜度：超出重放窗口的 Hello 一律拒绝
+        if !hello.is_fresh() {
+            anyhow::bail!("Hello 时间戳超出重放窗口（{} ms）", hello.timestamp_ms);
+        }
+
+        // nonce 去重：窗口内重复的 nonce 视为重放
+        if self.is_replayed_nonce(hello.nonce) {
+            anyhow::bail!("Hello nonce 重放，已拒绝");
+        }
+
         let peer_id = NodeId(hello.node_id);
 
         // 自连接过滤：不允许连接自己（入站方向）
@@ -630,9 +708,26 @@ impl ConnectionManager {
         );
         transport.send_message(MessageType::HelloAck, &ack).await?;
 
-        // 将对端地址信息加入节点表
-        for addr_info in &hello.addresses {
-            self.node_table.add_or_update(addr_info.clone());
+        // 将对端地址信息加入节点表（限制单次 Hello 携带的地址数量，防止节点表投毒）
+        const MAX_HELLO_ADDRESSES: usize = 64;
+        let total_addrs = hello.addresses.len();
+        let mut adopted = 0usize;
+        for addr_info in hello.addresses.iter().take(MAX_HELLO_ADDRESSES) {
+            // 过滤无效地址（无可用地址或端口为 0）
+            let valid = addr_info
+                .preferred_addr()
+                .map(|a| a.port() != 0)
+                .unwrap_or(false);
+            if valid {
+                self.node_table.add_or_update(addr_info.clone());
+                adopted += 1;
+            }
+        }
+        if total_addrs > MAX_HELLO_ADDRESSES {
+            warn!(
+                "[federation] Hello 携带地址过多（{}），仅采纳前 {} 条",
+                total_addrs, adopted
+            );
         }
 
         Ok((peer_id, hello))
@@ -672,6 +767,11 @@ impl ConnectionManager {
             .write()
             .insert(*node_id, Instant::now() + cooldown);
 
+        // 清理该节点的连接锁，防止 connecting_locks 无界增长
+        self.connecting_locks.write().remove(node_id);
+        // 顺带清理已过期的冷却项
+        self.prune_cooldowns();
+
         let conn = self.connections.write().remove(node_id);
         if let Some(conn) = conn {
             self.metrics.record_connection_closed();
@@ -683,6 +783,21 @@ impl ConnectionManager {
             });
         }
         self.node_table.mark_disconnected(node_id);
+    }
+
+    /// 清理已过期的重连冷却项
+    fn prune_cooldowns(&self) {
+        let now = Instant::now();
+        self.cooldown_until.write().retain(|_, until| now < *until);
+    }
+
+    /// 清理未被持有的连接锁（仅 map 持有强引用者），防止 connecting_locks 无界增长。
+    /// 临时 NodeId（发现阶段随机生成）不会走 remove_connection，故需兜底清理。
+    fn prune_connecting_locks(&self) {
+        let mut locks = self.connecting_locks.write();
+        if locks.len() > 4096 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
     }
 
     /// 启动心跳后台任务（已迁移到 TaskScheduler，此方法保留兼容但不再被调用）

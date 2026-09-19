@@ -100,6 +100,10 @@ impl ExtendedMessage {
     where
         R: tokio::io::AsyncReadExt + Unpin,
     {
+        /// 单条 BT 扩展消息的最大长度（1 MiB）。
+        /// 对端声明超长时直接报错，避免按 4GB 分配导致进程 abort。
+        const MAX_BT_MESSAGE_SIZE: usize = 1 << 20;
+
         // 读取 4 字节长度
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
@@ -108,6 +112,16 @@ impl ExtendedMessage {
         if length == 0 {
             // keep-alive
             return Ok((255, vec![]));
+        }
+
+        if length > MAX_BT_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "BT 消息长度 {} 超过上限 {}，拒绝读取",
+                    length, MAX_BT_MESSAGE_SIZE
+                ),
+            ));
         }
 
         // 读取消息体
@@ -137,16 +151,21 @@ impl ExtensionHandshake {
     /// 构建扩展握手请求
     pub fn build_request(our_peer_id: &[u8; 20], listen_port: u16) -> Vec<u8> {
         // 手动构造 bencode
-        // d1:md11:ut_pex1e1:pi20:<peer_id>4:porti<port>e1:v17:PeerDiscoveryCentere
+        // d1:md6:ut_pexi1ee1:p20:<peer_id>4:porti<port>e1:v23:PeerDiscoveryCenter/0.2e
+        let version = b"PeerDiscoveryCenter/0.2";
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"d1:md11:ut_pex");
-        buf.extend_from_slice(b"1"); // 我们分配给 ut_pex 的扩展 ID = 1
-        buf.extend_from_slice(b"e");
-        buf.extend_from_slice(b"1:pi20:");
+        buf.extend_from_slice(b"d1:md6:ut_pex");
+        buf.extend_from_slice(b"i1e"); // 我们分配给 ut_pex 的扩展 ID = 1
+        buf.extend_from_slice(b"e"); // 关闭 m 子字典
+        buf.extend_from_slice(b"1:p20:");
         buf.extend_from_slice(our_peer_id);
         buf.extend_from_slice(b"4:porti");
         buf.extend_from_slice(listen_port.to_string().as_bytes());
-        buf.extend_from_slice(b"e1:v21:PeerDiscoveryCenter/0.2e");
+        buf.extend_from_slice(b"e");
+        buf.extend_from_slice(b"1:v");
+        buf.extend_from_slice(format!("{}:", version.len()).as_bytes());
+        buf.extend_from_slice(version);
+        buf.extend_from_slice(b"e"); // 关闭外层字典
         buf
     }
 
@@ -392,6 +411,11 @@ mod tests {
         let s = String::from_utf8_lossy(&msg);
         assert!(s.contains("ut_pex"));
         assert!(s.contains("6881"));
+        // 关键回归：自产握手必须能被本模块解析，且 ut_pex 扩展 ID 为 1
+        let parsed =
+            ExtensionHandshake::parse(&msg).expect("built handshake must be valid bencode");
+        assert_eq!(parsed.ut_pex_id(), Some(1));
+        assert_eq!(parsed.port, Some(6881));
     }
 
     #[test]

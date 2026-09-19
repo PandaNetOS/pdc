@@ -25,8 +25,14 @@ use tracing::{debug, info};
 
 /// uTP 连接空闲超时（无数据则关闭）
 const UTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// uTP 连接清理截止时间（创建后超过此时长即回收）
-const UTP_CONN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// uTP 连接清理截止时间（空闲超过此时长即回收）
+const UTP_CONN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// BitTorrent 握手长度（pstrlen(1)+pstr(19)+reserved(8)+infohash(20)+peer_id(20)）
+const BT_HANDSHAKE_LEN: usize = 68;
+/// 单个 uTP 连接接收缓冲上限（超限即断开，防止非法长度前缀导致无界增长）
+const MAX_UTP_RECV_BUFFER: usize = 1 << 20; // 1 MiB
+/// 单条 BT 协议消息长度上限
+const MAX_BT_MSG_LEN: usize = 1 << 20; // 1 MiB
 
 use crate::storage::PeerRepoImpl;
 use crate::types::Infohash;
@@ -122,8 +128,6 @@ struct UtpConnection {
     our_seq: u16,
     /// 对端的下一个期望序列号
     peer_seq_expected: u16,
-    /// 连接创建时间
-    created_at: Instant,
     /// 接收到的不完整数据（用于重组 BT 消息）
     recv_buffer: Vec<u8>,
     /// 是否已收到 BT 握手
@@ -367,7 +371,6 @@ impl UtpServer {
             our_conn_id,
             our_seq: 1,
             peer_seq_expected: header.seq_nr.wrapping_add(1),
-            created_at: Instant::now(),
             recv_buffer: Vec::new(),
             got_handshake: false,
             infohash: None,
@@ -435,6 +438,15 @@ impl UtpServer {
             let mut conns = self.connections.write();
             if let Some(conn) = conns.get_mut(&key) {
                 conn.recv_buffer.extend_from_slice(payload);
+                // 缓冲上限：防止对端发送非法长度前缀（永不满足）导致无界增长
+                if conn.recv_buffer.len() > MAX_UTP_RECV_BUFFER {
+                    debug!(
+                        "[uTP] 连接 {} 接收缓冲超限({}B)，断开",
+                        from,
+                        conn.recv_buffer.len()
+                    );
+                    should_close = true;
+                }
                 conn.peer_seq_expected = header.seq_nr.wrapping_add(1);
                 conn.last_data_time = Instant::now();
                 our_conn_id_for_resp = conn.our_conn_id;
@@ -445,6 +457,8 @@ impl UtpServer {
                     if let Some((peer_id, infohash)) = parse_bittorrent_handshake(&conn.recv_buffer)
                     {
                         conn.got_handshake = true;
+                        // 消费掉 68 字节 BT 握手，否则后续会把 0x13 当作消息长度导致解析永久错位
+                        conn.recv_buffer.drain(0..BT_HANDSHAKE_LEN);
                         conn.peer_id = Some(peer_id);
                         conn.infohash = Some(infohash);
                         infohash_for_resp = Some(infohash);
@@ -493,6 +507,11 @@ impl UtpServer {
                         if msg_len == 0 {
                             conn.recv_buffer.drain(0..4);
                             continue;
+                        }
+                        if msg_len > MAX_BT_MSG_LEN {
+                            debug!("[uTP] 连接 {} BT 消息长度异常({})，断开", from, msg_len);
+                            should_close = true;
+                            break;
                         }
                         if conn.recv_buffer.len() < 4 + msg_len {
                             break;
@@ -714,7 +733,8 @@ impl UtpServer {
         let mut conns = self.connections.write();
         let timeout = UTP_CONN_CLEANUP_TIMEOUT;
         let before = conns.len();
-        conns.retain(|_, conn| conn.created_at.elapsed() < timeout);
+        // 用 last_data_time（空闲时长）而非 created_at（创建时长）判断，避免掐断活跃会话
+        conns.retain(|_, conn| conn.last_data_time.elapsed() < timeout);
         let removed = before - conns.len();
         if removed > 0 {
             debug!("[uTP] 清理 {} 个超时连接", removed);
@@ -781,14 +801,14 @@ fn build_bittorrent_handshake(peer_id: &[u8; 20], infohash: &Infohash) -> Vec<u8
 /// - e: 支持的扩展标志
 fn build_extension_handshake(listen_port: u16) -> Vec<u8> {
     // 手动构造 bencode 字典
-    // d1:md5:ut_pexi1ee1:pi6883e1:v13:PDC uTP Server1:ei0ee
+    // d1:md6:ut_pexi1ee1:pi6883e1:v13:PDC uTP Server1:ei0ee
     let mut buf = Vec::new();
     buf.extend_from_slice(b"d"); // 字典开始
 
     // m: 扩展消息映射
     buf.extend_from_slice(b"1:m");
     buf.extend_from_slice(b"d"); // 子字典开始
-    buf.extend_from_slice(b"5:ut_pex"); // key: ut_pex
+    buf.extend_from_slice(b"6:ut_pex"); // key: ut_pex（"ut_pex" 长度为 6）
     buf.extend_from_slice(b"i1e"); // value: 1 (ut_pex 的消息 ID)
     buf.extend_from_slice(b"e"); // 子字典结束
 

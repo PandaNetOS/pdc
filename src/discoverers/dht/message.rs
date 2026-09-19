@@ -206,7 +206,8 @@ impl DhtMessage {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"d1:ad2:id20:");
         buf.extend_from_slice(node_id);
-        buf.extend_from_slice(b"e1:q19:sample_infohashes1:t2:");
+        // "sample_infohashes" 长度为 17（此前误写为 19，导致请求 bencode 非法、对端解析失败）
+        buf.extend_from_slice(b"e1:q17:sample_infohashes1:t2:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
         buf
@@ -244,9 +245,11 @@ impl DhtMessage {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"d1:rd2:id20:");
         buf.extend_from_slice(node_id);
-        buf.extend_from_slice(b"5:num");
+        // bencode 整型必须写作 i<digits>e；此前把 'i' 错放在 "7:samples" 前缀，
+        // 生成 `5:num<digits>i7:samples` —— 整型缺 i/e，响应非法。
+        buf.extend_from_slice(b"5:numi");
         buf.extend_from_slice(total_count.to_string().as_bytes());
-        buf.extend_from_slice(b"i7:samples");
+        buf.extend_from_slice(b"e7:samples");
         buf.extend_from_slice((samples.len() * 20).to_string().as_bytes());
         buf.extend_from_slice(b":");
         for ih in samples {
@@ -313,6 +316,8 @@ impl DhtMessage {
             b"find_node" => QueryMethod::FindNode,
             b"get_peers" => QueryMethod::GetPeers,
             b"announce_peer" => QueryMethod::AnnouncePeer,
+            // BEP 51：此前遗漏，导致对端发来的 sample_infohashes 查询被直接丢弃
+            b"sample_infohashes" => QueryMethod::SampleInfohashes,
             _ => return None,
         };
 

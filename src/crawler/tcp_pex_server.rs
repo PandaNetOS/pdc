@@ -296,7 +296,7 @@ fn build_extension_handshake(listen_port: u16) -> Vec<u8> {
     buf.extend_from_slice(b"d");
     buf.extend_from_slice(b"1:m");
     buf.extend_from_slice(b"d");
-    buf.extend_from_slice(b"5:ut_pex");
+    buf.extend_from_slice(b"6:ut_pex");
     buf.extend_from_slice(b"i1e");
     buf.extend_from_slice(b"e");
     buf.extend_from_slice(b"1:p");

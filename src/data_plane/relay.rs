@@ -45,6 +45,10 @@ pub const DEFAULT_RELAY_PORT: u16 = 6881;
 /// UDP 接收缓冲区大小
 const UDP_BUFFER_SIZE: usize = 65536;
 
+/// 单次 UDP 转发的最大扇出。
+/// UDP 源地址可伪造，若无上限则一个小报文可被放大转发给大量客户端（反射放大）。
+const MAX_RELAY_FANOUT: usize = 32;
+
 /// TCP 连接超时
 /// 中继连接空闲超时（超过即回收）
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -273,19 +277,28 @@ impl RelayServer {
             }
         }
 
+        // 空 payload 无需转发
+        if payload.is_empty() {
+            return;
+        }
+
         // 查找目标 peer（简化：广播给所有其他客户端）
-        // 实际应用中应该根据 payload 中的目标 peer_id 转发
+        // 实际应用中应该根据 payload 中的目标 peer_id 转发。
+        // 限制扇出：UDP 源可伪造，无上限会导致反射放大攻击。
         let targets: Vec<SocketAddr> = {
             let clients = clients.read();
-            clients
+            let mut addrs: Vec<SocketAddr> = clients
                 .values()
-                .filter(|c| c.peer_id != peer_id)
+                .filter(|c| c.peer_id != peer_id && c.addr != src)
                 .map(|c| c.addr)
-                .collect()
+                .collect();
+            addrs.truncate(MAX_RELAY_FANOUT);
+            addrs
         };
 
         // 转发给所有其他客户端
         let mut forwarded = 0u64;
+        let mut failures = 0u64;
         for target in &targets {
             match socket.send_to(payload, target).await {
                 Ok(_) => {
@@ -293,16 +306,17 @@ impl RelayServer {
                 }
                 Err(e) => {
                     debug!("[relay] 转发到 {} 失败: {}", target, e);
-                    stats.write().forward_failures += 1;
+                    failures += 1;
                 }
             }
         }
 
-        // 更新统计
+        // 更新统计（一次性写入，避免多次取锁）
         {
             let mut stats = stats.write();
             stats.udp_packets_forwarded += 1;
             stats.udp_bytes_forwarded += payload.len() as u64 * forwarded;
+            stats.forward_failures += failures;
         }
     }
 

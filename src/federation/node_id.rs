@@ -50,6 +50,22 @@ impl NodeId {
     pub fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
+
+    /// 由 Ed25519 公钥派生节点 ID：blake3(pubkey) 的前 20 字节。
+    ///
+    /// 将 node_id 与身份密钥绑定，对端可据此校验"自称的 node_id 是否由该公钥派生"，
+    /// 防止攻击者用自建密钥冒充任意 node_id。
+    pub fn from_public_key(public_key: &[u8; 32]) -> Self {
+        let hash = blake3::hash(public_key);
+        let mut id = [0u8; 20];
+        id.copy_from_slice(&hash.as_bytes()[..20]);
+        Self(id)
+    }
+
+    /// 校验对端自称的 node_id 是否与其公钥一致
+    pub fn matches_public_key(node_id: &NodeId, public_key: &[u8; 32]) -> bool {
+        &NodeId::from_public_key(public_key) == node_id
+    }
 }
 
 impl fmt::Debug for NodeId {
@@ -150,9 +166,10 @@ pub struct NodeIdentity {
 impl NodeIdentity {
     /// 生成新的随机身份（Ed25519 密钥对）
     pub fn generate() -> Self {
-        let node_id = NodeId::random();
         let mut rng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut rng);
+        // node_id 由公钥派生（blake3(pubkey)），与身份密钥绑定，防止冒充
+        let node_id = NodeId::from_public_key(&signing_key.verifying_key().to_bytes());
         Self {
             node_id,
             signing_key,
@@ -202,12 +219,18 @@ impl NodeIdentity {
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&data[20..52]);
                 let signing_key = SigningKey::from_bytes(&seed);
-                tracing::info!(
-                    "[federation] 已加载节点身份: {}",
-                    NodeId(node_id_bytes).to_hex()
-                );
+                let stored = NodeId(node_id_bytes);
+                let derived = NodeId::from_public_key(&signing_key.verifying_key().to_bytes());
+                if derived != stored {
+                    tracing::warn!(
+                        "[federation] 身份 node_id({}) 与公钥派生值({}) 不一致（旧格式），保持已有 node_id 以兼容",
+                        stored.to_hex(),
+                        derived.to_hex()
+                    );
+                }
+                tracing::info!("[federation] 已加载节点身份: {}", stored.to_hex());
                 return Ok(Self {
-                    node_id: NodeId(node_id_bytes),
+                    node_id: stored,
                     signing_key,
                     addresses: RwLock::new(Vec::new()),
                 });

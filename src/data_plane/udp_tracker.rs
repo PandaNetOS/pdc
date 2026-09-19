@@ -31,6 +31,9 @@ const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 /// BEP 15 建议连接 ID 有效期：2 分钟
 const CONNECTION_TTL: Duration = Duration::from_secs(120);
+/// 接收出错后的退避等待：避免错误时忙循环
+/// （Windows 下对端不可达时 `recv_from` 会持续返回错误）
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(5);
 
 /// connection_id 条目
 struct ConnectionEntry {
@@ -126,20 +129,33 @@ impl UdpTrackerServer {
         let interval = config.interval.max(0) as u32;
 
         let mut buf = vec![0u8; 4096]; // P2优化：超级Tracker接收缓冲区翻倍
+                                       // 并发处理上限：UDP 洪泛时避免 task 数量爆炸
+        let handler_sem = Arc::new(tokio::sync::Semaphore::new(256));
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, from)) => {
+                    // 限流：被封禁/令牌耗尽直接丢弃。
+                    // 此前返回值被 `let _ =` 忽略，导致 IP 封禁与令牌桶完全不生效。
+                    if !rate_limiter.check_and_record(from.ip(), RequestType::Announce) {
+                        continue;
+                    }
+                    let permit = match handler_sem.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            debug!("[udp_tracker] 并发已达上限，丢弃来自 {} 的包", from);
+                            continue;
+                        }
+                    };
+
                     let data = buf[..n].to_vec();
                     let socket = socket.clone();
                     let super_tracker = super_tracker.clone();
                     let cache = cache.clone();
                     let infohash_repo = infohash_repo.clone();
                     let connections = connections.clone();
-                    let rate_limiter = rate_limiter.clone();
 
                     tokio::spawn(async move {
-                        // P2优化：限流检查（默认允许，异常IP会被封禁）
-                        let _ = rate_limiter.check_and_record(from.ip(), RequestType::Announce);
+                        let _permit = permit; // 持有至处理完成
                         if let Some(response) = Self::handle_packet(
                             &data,
                             from,
@@ -159,6 +175,8 @@ impl UdpTrackerServer {
                 }
                 Err(e) => {
                     warn!("[udp_tracker] 接收失败: {}", e);
+                    // 避免错误时忙循环（Windows 下 ICMP 不可达会持续返回错误）
+                    tokio::time::sleep(RECV_ERROR_BACKOFF).await;
                 }
             }
         }

@@ -73,7 +73,7 @@ struct TrackerRateLimit {
 impl TrackerRateLimit {
     fn new() -> Self {
         Self {
-            last_request: RwLock::new(Instant::now() - RATE_LIMIT_INITIAL_BACKDATE),
+            last_request: RwLock::new(crate::utils::cutoff_before(RATE_LIMIT_INITIAL_BACKDATE)),
             consecutive_failures: RwLock::new(0),
             disabled_until: RwLock::new(None),
         }
@@ -283,7 +283,8 @@ impl ScrapeService {
 
     /// 清理过期缓存
     pub fn cleanup_expired_cache(&self) -> usize {
-        let cutoff = Instant::now() - Duration::from_secs(self.cache_ttl_secs * 2);
+        let cutoff =
+            crate::utils::cutoff_before(Duration::from_secs(self.cache_ttl_secs.saturating_mul(2)));
         let mut removed = 0;
         self.cache.retain(|_, v| {
             if v.last_updated < cutoff {

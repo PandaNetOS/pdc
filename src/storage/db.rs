@@ -59,12 +59,13 @@ impl Storage {
 
         let conn = Connection::open(path_ref)?;
         let pragma_sql = format!(
-            "PRAGMA journal_mode=WAL;              PRAGMA synchronous={};              PRAGMA mmap_size={};              PRAGMA cache_size={};              PRAGMA temp_store={};              PRAGMA wal_autocheckpoint={};",
+            "PRAGMA journal_mode=WAL;              PRAGMA synchronous={};              PRAGMA mmap_size={};              PRAGMA cache_size={};              PRAGMA temp_store={};              PRAGMA wal_autocheckpoint={};              PRAGMA busy_timeout={};",
             config.synchronous,
             config.mmap_size,
             config.cache_size,
             config.temp_store,
             config.wal_autocheckpoint,
+            config.busy_timeout_ms,
         );
         conn.execute_batch(&pragma_sql)?;
 
@@ -90,7 +91,10 @@ impl Storage {
 
     /// 获取写入统计
     pub fn write_stats(&self) -> WriteStats {
-        self.write_stats.lock().unwrap().clone()
+        self.write_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 获取底层连接的 Arc<Mutex<Connection>>（用于 WriteQueue）
@@ -100,7 +104,7 @@ impl Storage {
 
     /// 记录写入统计
     fn record_write(&self, table: &str, rows: u64) {
-        let mut stats = self.write_stats.lock().unwrap();
+        let mut stats = self.write_stats.lock().unwrap_or_else(|e| e.into_inner());
         stats.total_writes += 1;
         match table {
             "dht_nodes" => {
@@ -133,7 +137,7 @@ impl Storage {
     /// 手动执行 WAL checkpoint（将 WAL 合并到主数据库文件）
     /// PASSIVE 模式：不阻塞写入，日常高频使用
     pub fn checkpoint(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         debug!("[storage] WAL checkpoint(PASSIVE) 已执行");
         Ok(())
@@ -143,7 +147,7 @@ impl Storage {
     /// TRUNCATE 模式：会阻塞写入，但会将 WAL 文件压缩到最小
     /// 建议低频调用（如每小时一次），避免 IO 尖峰
     pub fn checkpoint_truncate(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         info!("[storage] WAL checkpoint(TRUNCATE) 已执行，WAL 已压缩");
         Ok(())
@@ -158,7 +162,7 @@ impl Storage {
 
     /// 执行 VACUUM（清理碎片，压缩数据库）
     pub fn vacuum(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("VACUUM;")?;
         info!("[storage] VACUUM 已完成");
         Ok(())
@@ -166,7 +170,7 @@ impl Storage {
 
     /// 初始化表结构
     fn init_tables(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS dht_nodes (
@@ -335,7 +339,7 @@ impl Storage {
         nodes_returned: u64,
         last_query_time: Option<i64>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
@@ -370,7 +374,7 @@ impl Storage {
 
     /// 加载所有 DHT 节点
     pub fn load_dht_nodes(&self) -> anyhow::Result<Vec<DhtNodeRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time FROM dht_nodes")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
@@ -397,7 +401,7 @@ impl Storage {
 
     /// 清空 DHT 节点表
     pub fn clear_dht_nodes(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM dht_nodes", [])?;
         Ok(())
     }
@@ -408,7 +412,7 @@ impl Storage {
             return Ok(());
         }
         self.record_write("dht_nodes", nodes.len() as u64);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         Self::save_dht_nodes_batch_conn(&conn, nodes)
     }
 
@@ -512,7 +516,7 @@ impl Storage {
         disabled: bool,
     ) -> anyhow::Result<()> {
         self.record_write("trackers", 1);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
@@ -533,6 +537,13 @@ impl Storage {
                 disabled as i64, now
             ],
         )?;
+        Ok(())
+    }
+
+    /// 删除指定 tracker（同步，autocommit）。用于 remove_tracker，避免删除后回源"复活"。
+    pub fn delete_tracker_by_url(&self, url: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute("DELETE FROM trackers WHERE url = ?1", params![url])?;
         Ok(())
     }
 
@@ -576,7 +587,7 @@ impl Storage {
     }
 
     pub fn load_trackers(&self) -> anyhow::Result<Vec<TrackerRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled FROM trackers")?;
         let rows = stmt.query_map([], |row| {
             Ok(TrackerRow {
@@ -605,7 +616,7 @@ impl Storage {
         score: f64,
     ) -> anyhow::Result<()> {
         self.record_write("infohashes", 1);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         Self::save_infohash_in_tx(&conn, infohash, ref_count, first_source, score)
     }
 
@@ -658,7 +669,7 @@ impl Storage {
     /// 批量保存 infohash（在已有连接上执行，供 IOScheduler 回调）
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt =
             conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes")?;
         let rows = stmt.query_map([], |row| {
@@ -679,7 +690,7 @@ impl Storage {
 
     /// 更新 infohash 评分
     pub fn update_infohash_score(&self, infohash: &[u8; 20], score: f64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE infohashes SET score = ?1 WHERE infohash = ?2",
             params![score, infohash.as_slice()],
@@ -705,7 +716,7 @@ impl Storage {
         if scores.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare("UPDATE infohashes SET score = ?1 WHERE infohash = ?2")?;
@@ -734,7 +745,7 @@ impl Storage {
 
     /// 清空 infohash 表
     pub fn clear_infohashes(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM infohashes", [])?;
         Ok(())
     }
@@ -754,7 +765,7 @@ impl Storage {
         connection_successes: u32,
         last_active: i64,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -774,7 +785,7 @@ impl Storage {
 
     /// 加载所有 peer
     pub fn load_peers(&self) -> anyhow::Result<Vec<PeerRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active FROM peers")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -798,7 +809,7 @@ impl Storage {
 
     /// 清空 peers 表
     pub fn clear_peers(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM peers", [])?;
         Ok(())
     }
@@ -809,7 +820,7 @@ impl Storage {
             return Ok(());
         }
         self.record_write("peers", peers.len() as u64);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -870,7 +881,7 @@ impl Storage {
     /// 归档冷数据：将超过指定时间无活跃的 peer 从主表迁移到归档表
     /// 返回归档的 peer 数量
     pub fn archive_cold_peers(&self, older_than_secs: i64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         let threshold = now - older_than_secs;
 
@@ -934,7 +945,7 @@ impl Storage {
         source: &str,
         score: f64,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO peer_history (infohash, ip, port, source, score, discovered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -949,11 +960,17 @@ impl Storage {
             return Ok(());
         }
         self.record_write("peer_history", entries.len() as u64);
-        let conn = self.conn.lock().unwrap();
-        Self::save_peer_history_batch_in_tx(&conn, entries)
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // 单独调用时自行开启事务（批量原子性）；WriteQueue/IOScheduler 路径使用 _in_tx 变体
+        let tx = conn.unchecked_transaction()?;
+        Self::save_peer_history_batch_in_tx(&tx, entries)?;
+        tx.commit()?;
+        Ok(())
     }
 
-    /// 在已有连接上批量写入 peer_history（供 WriteQueue/IOScheduler 闭包使用）
+    /// 在已有连接/事务上批量写入 peer_history（供 WriteQueue/IOScheduler 闭包使用）
+    ///
+    /// 注意：调用方需自行保证外层事务已开启；本函数不再开启事务。
     pub fn save_peer_history_batch_in_tx(
         conn: &Connection,
         entries: &[PeerHistoryEntry],
@@ -961,23 +978,19 @@ impl Storage {
         if entries.is_empty() {
             return Ok(());
         }
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO peer_history (infohash, ip, port, source, score, discovered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-            )?;
-            for entry in entries {
-                stmt.execute(params![
-                    entry.infohash.as_slice(),
-                    entry.ip.as_str(),
-                    entry.port as i64,
-                    entry.source.as_str(),
-                    entry.score,
-                    entry.discovered_at,
-                ])?;
-            }
+        let mut stmt = conn.prepare(
+            "INSERT INTO peer_history (infohash, ip, port, source, score, discovered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        )?;
+        for entry in entries {
+            stmt.execute(params![
+                entry.infohash.as_slice(),
+                entry.ip.as_str(),
+                entry.port as i64,
+                entry.source.as_str(),
+                entry.score,
+                entry.discovered_at,
+            ])?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -987,7 +1000,7 @@ impl Storage {
         infohash: &[u8; 20],
         limit: usize,
     ) -> anyhow::Result<Vec<PeerHistoryRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT ip, port, source, score, discovered_at FROM peer_history WHERE infohash = ?1 ORDER BY discovered_at DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![infohash.as_slice(), limit as i64], |row| {
             Ok(PeerHistoryRow {
@@ -1003,7 +1016,7 @@ impl Storage {
 
     /// 清理过期 peer 历史（保留 days 天）
     pub fn cleanup_peer_history(&self, days: u64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86400);
         let deleted = conn.execute(
             "DELETE FROM peer_history WHERE discovered_at < ?1",
@@ -1020,7 +1033,7 @@ impl Storage {
     /// 记录统计快照
     pub fn record_stats(&self, metric: &str, value: f64) -> anyhow::Result<()> {
         self.record_write("stats", 1);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO stats_history (timestamp, metric, value) VALUES (?1, ?2, ?3)",
@@ -1041,7 +1054,7 @@ impl Storage {
 
     /// 查询统计历史
     pub fn query_stats_history(&self, metric: &str, hours: u64) -> anyhow::Result<Vec<(i64, f64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = chrono::Utc::now().timestamp() - (hours as i64 * 3600);
         let mut stmt = conn.prepare("SELECT timestamp, value FROM stats_history WHERE metric = ?1 AND timestamp >= ?2 ORDER BY timestamp")?;
         let rows = stmt.query_map(params![metric, cutoff], |row| {
@@ -1055,7 +1068,7 @@ impl Storage {
     /// 更新累计统计
     pub fn update_aggregate(&self, metric: &str, value: f64) -> anyhow::Result<()> {
         self.record_write("stats", 1);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO stats_aggregate (metric, value, updated_at) VALUES (?1, ?2, ?3)
@@ -1082,7 +1095,7 @@ impl Storage {
 
     /// 加载累计统计
     pub fn load_aggregate(&self, metric: &str) -> Option<f64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT value FROM stats_aggregate WHERE metric = ?1",
             params![metric],
@@ -1110,7 +1123,7 @@ impl Storage {
         if shards.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT id, ip, port FROM dht_nodes WHERE l2_shard IN ({})",
             Self::in_placeholders(shards.len())
@@ -1136,7 +1149,7 @@ impl Storage {
         if shards.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT infohash, ip, port, source, last_active FROM peers WHERE l2_shard IN ({})",
             Self::in_placeholders(shards.len())
@@ -1164,7 +1177,7 @@ impl Storage {
         if shards.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT infohash, last_seen, first_source FROM infohashes WHERE l2_shard IN ({})",
             Self::in_placeholders(shards.len())
@@ -1190,7 +1203,7 @@ impl Storage {
         if shards.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT url, disabled, last_used FROM trackers WHERE l2_shard IN ({})",
             Self::in_placeholders(shards.len())
@@ -1213,7 +1226,7 @@ impl Storage {
     /// 加载全部节点的 (key, data_hash)，用于 Merkle 冷根重算。
     /// key = "ip:port"，data_hash = blake3(id || ip || port_le)，与 build_node_sync_entry 一致。
     pub fn load_all_node_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT id, ip, port FROM dht_nodes")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
@@ -1238,7 +1251,7 @@ impl Storage {
     /// 加载全部 Peer 的 (key, data_hash)，用于 Merkle 冷根重算。
     /// key = "<hex_infohash>:<ip>:<port>"，data_hash = blake3(infohash || ip || port_le)。
     pub fn load_all_peer_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT infohash, ip, port FROM peers")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -1268,7 +1281,7 @@ impl Storage {
     /// 加载全部 Infohash 的 (key, data_hash)，用于 Merkle 冷根重算。
     /// key = infohash 原始字节，data_hash = blake3(infohash)。
     pub fn load_all_infohash_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT infohash FROM infohashes")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -1286,7 +1299,7 @@ impl Storage {
     /// 加载全部 Tracker 的 (key, data_hash)，用于 Merkle 冷根重算。
     /// key = url 字节，data_hash = blake3(url)。
     pub fn load_all_tracker_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT url FROM trackers")?;
         let rows = stmt.query_map([], |row| {
             let url: String = row.get(0)?;
@@ -1310,7 +1323,7 @@ impl Storage {
         min_score: f64,
         limit: usize,
     ) -> anyhow::Result<Vec<DhtNodeRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         let warm_cutoff = now - warm_threshold_secs as i64;
         let mut stmt = conn.prepare(
@@ -1346,7 +1359,7 @@ impl Storage {
 
     /// 按 (ip, port) 加载单个 DHT 节点（缓存未命中时按需加载）。
     pub fn load_dht_node_by_addr(&self, ip: &str, port: u16) -> anyhow::Result<Option<DhtNodeRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, \
              consecutive_failures, nodes_returned, last_query_time FROM dht_nodes \
@@ -1381,7 +1394,7 @@ impl Storage {
 
     /// 按 (ip, port) 加载单个 Peer（缓存未命中时按需加载）。
     pub fn load_peer_by_addr(&self, ip: &str, port: u16) -> anyhow::Result<Option<PeerRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, \
              last_active FROM peers WHERE ip = ?1 AND port = ?2",
@@ -1412,7 +1425,7 @@ impl Storage {
 
     /// 按 infohash 加载单个 Infohash 行（缓存未命中时按需加载）。
     pub fn load_infohash_by_hash(&self, ih: &[u8; 20]) -> anyhow::Result<Option<InfohashRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT infohash, ref_count, first_source, score FROM infohashes WHERE infohash = ?1",
         )?;
@@ -1438,7 +1451,7 @@ impl Storage {
 
     /// 按 url 加载单个 Tracker 行（缓存未命中时按需加载）。
     pub fn load_tracker_by_url(&self, url: &str) -> anyhow::Result<Option<TrackerRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT url, score, total_requests, success_requests, failed_requests, \
              total_peers_discovered, total_response_time_ms, consecutive_failures, disabled \
@@ -1466,7 +1479,7 @@ impl Storage {
 
     /// 统计表的总行数（表名为调用方硬编码常量，无注入风险）。
     pub fn count_table(&self, table: &str) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
             row.get(0)
         })?;
@@ -1547,7 +1560,7 @@ impl Storage {
     /// 一次性回填 l2_shard 列：旧库历史数据默认 0，按 blake3(key) 重算修正。
     /// 启动时调用一次，失败不阻断启动。
     pub fn backfill_shards(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         // dht_nodes: key = "ip:port"
         {
@@ -1621,7 +1634,7 @@ impl Storage {
 
     /// 释放 SQLite 内部缓存内存（PRAGMA shrink_memory），内存压力大时调用。
     pub fn shrink_memory(&self) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let _ = conn.execute_batch("PRAGMA shrink_memory;");
     }
 }

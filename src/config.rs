@@ -435,6 +435,13 @@ pub struct SqliteConfig {
     /// 同步模式（NORMAL/FULL/OFF）
     #[serde(default = "default_sqlite_synchronous")]
     pub synchronous: String,
+    /// 忙等待超时（毫秒，0=不等待）。避免 WAL checkpoint/VACUUM 与写事务并发时直接返回 SQLITE_BUSY。
+    #[serde(default = "default_sqlite_busy_timeout_ms")]
+    pub busy_timeout_ms: u32,
+}
+
+fn default_sqlite_busy_timeout_ms() -> u32 {
+    5000 // 5s：等待其他写事务/checkpoint 释放锁，而非立即 SQLITE_BUSY 丢写
 }
 
 fn default_sqlite_mmap_size() -> i64 {
@@ -461,6 +468,7 @@ impl Default for SqliteConfig {
             wal_autocheckpoint: default_sqlite_wal_autocheckpoint(),
             temp_store: default_sqlite_temp_store(),
             synchronous: default_sqlite_synchronous(),
+            busy_timeout_ms: default_sqlite_busy_timeout_ms(),
         }
     }
 }

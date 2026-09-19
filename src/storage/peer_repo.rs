@@ -141,6 +141,17 @@ impl PeerRepoImpl {
         self.dirty.read().iter().cloned().collect()
     }
 
+    /// 只清除指定 peer 的脏标记（避免全量清除误伤并发新增的脏标记）
+    pub fn clear_dirty_batch_sync(&self, addrs: &[SocketAddr]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let mut dirty = self.dirty.write();
+        for addr in addrs {
+            dirty.remove(addr);
+        }
+    }
+
     pub fn clear_all_dirty_sync(&self) {
         self.dirty.write().clear();
     }
@@ -612,8 +623,14 @@ impl PeerRepository for PeerRepoImpl {
 
     async fn remove_peer(&self, infohash: &Infohash, addr: &SocketAddr) {
         let mut cache = self.cache.write();
+        let mut remove_ih = false;
         if let Some(set) = cache.by_infohash.get_mut(infohash) {
             set.remove(addr);
+            // 该 infohash 下已无 peer → 移除空条目，避免 by_infohash 无界增长与计数虚高
+            remove_ih = set.is_empty();
+        }
+        if remove_ih {
+            cache.by_infohash.remove(infohash);
         }
         if let Some(refs) = cache.infohash_refs.get_mut(addr) {
             refs.remove(infohash);
@@ -663,6 +680,10 @@ impl PeerRepository for PeerRepoImpl {
 
     async fn dirty_peers(&self) -> Vec<SocketAddr> {
         self.dirty_peers_sync()
+    }
+
+    async fn clear_dirty_batch(&self, addrs: &[SocketAddr]) {
+        self.clear_dirty_batch_sync(addrs);
     }
 
     async fn clear_all_dirty(&self) {

@@ -37,6 +37,11 @@ const FEDERATION_QUERY_LIMIT: usize = 50;
 const FEDERATION_QUERY_TIMEOUT_MS: u64 = 500;
 /// scrape 统计时从 PeerRepo 拉取的 peer 上限
 const SCRAPE_REPO_PEER_LIMIT: usize = 1000;
+/// 发现任务认领 TTL：同一 infohash 在该窗口内不重复发起后端发现（防任务风暴）
+const DISCOVERY_INFLIGHT_TTL: Duration = Duration::from_secs(30);
+/// 发现认领的兜底清理阈值：远大于 `DISCOVERY_INFLIGHT_TTL`，
+/// 用于释放异常路径（panic/提前返回）未显式释放的认领，避免无界增长
+const DISCOVERY_INFLIGHT_STALE_TTL: Duration = Duration::from_secs(300);
 
 use crate::config::SuperTrackerConfig;
 use crate::data_plane::AppState;
@@ -80,6 +85,8 @@ pub struct SuperTrackerState {
     peer_repo: Option<Arc<PeerRepoImpl>>,
     /// 联邦服务（可选，peer 不足时跨节点查询补充）
     federation: Option<Arc<crate::federation::FederationService>>,
+    /// 正在进行的后端发现任务（去重 + 超时兜底）：infohash -> 认领时刻
+    discovery_inflight: Arc<DashMap<Infohash, Instant>>,
 }
 
 impl SuperTrackerState {
@@ -91,7 +98,31 @@ impl SuperTrackerState {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             peer_repo: None,
             federation: None,
+            discovery_inflight: Arc::new(DashMap::new()),
         }
+    }
+
+    /// 尝试认领一次后端发现任务。
+    ///
+    /// 返回 true 表示由本次调用发起发现；false 表示同一 infohash 已有发现进行中
+    /// （跳过，避免频繁 announce 触发大量重复的发现任务造成任务风暴）。
+    /// 超过 `DISCOVERY_INFLIGHT_TTL` 的陈旧认领会被回收后重新认领。
+    pub fn try_claim_discovery(&self, infohash: &Infohash) -> bool {
+        let now = Instant::now();
+        if let Some(mut e) = self.discovery_inflight.get_mut(infohash) {
+            if now.duration_since(*e) < DISCOVERY_INFLIGHT_TTL {
+                return false;
+            }
+            *e = now;
+            return true;
+        }
+        self.discovery_inflight.insert(*infohash, now);
+        true
+    }
+
+    /// 释放一次后端发现认领（发现任务结束后调用）
+    pub fn release_discovery(&self, infohash: &Infohash) {
+        self.discovery_inflight.remove(infohash);
     }
 
     /// 注入 PeerRepo（announce peer 双写到统一归口）
@@ -322,7 +353,8 @@ impl SuperTrackerState {
 
     /// 执行一次过期 peer 清理（由 TaskScheduler 按间隔调度）
     pub async fn cleanup_expired(&self) {
-        let ttl = self.config.read().await.peer_ttl_secs;
+        let cfg = self.config.read().await.clone();
+        let ttl = cfg.peer_ttl_secs;
         let mut removed = 0;
         self.peers.retain(|_, entry| {
             entry.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(ttl));
@@ -336,6 +368,18 @@ impl SuperTrackerState {
         if removed > 0 {
             debug!("[super_tracker] 清理了 {} 个空 infohash 条目", removed);
         }
+
+        // 清理过期的 announce 缓存（避免只增不减的无界增长）
+        if cfg.announce_cache_ttl_secs > 0 {
+            let max_age =
+                Duration::from_secs(cfg.announce_cache_ttl_secs.saturating_mul(4).max(60));
+            self.announce_cache
+                .retain(|_, (t, _)| t.elapsed() < max_age);
+        }
+
+        // 清理陈旧的发现认领（正常情况下由 release_discovery 移除，此处兜底）
+        self.discovery_inflight
+            .retain(|_, t| t.elapsed() < DISCOVERY_INFLIGHT_STALE_TTL);
     }
 
     /// 获取当前存储的 infohash 数量
@@ -369,7 +413,7 @@ impl SuperTrackerState {
         self.peers
             .get(infohash)
             .map(|entry| {
-                let cutoff = Instant::now() - Duration::from_secs(window_secs);
+                let cutoff = crate::utils::cutoff_before(Duration::from_secs(window_secs));
                 entry.values().filter(|p| p.last_seen >= cutoff).count() as u32
             })
             .unwrap_or(0)
@@ -624,13 +668,19 @@ async fn announce_handler(
         repo.register_sync(info_hash, "http_announce");
     }
 
-    // 如果 peer 不足，异步触发后端发现（不阻塞响应）
-    if response.peers.len() < 10 && config.super_tracker.trigger_backend_discovery {
+    // 如果 peer 不足，异步触发后端发现（不阻塞响应）。
+    // 通过 try_claim_discovery 对同一 infohash 去重，避免高频 announce 造成发现任务风暴。
+    if response.peers.len() < 10
+        && config.super_tracker.trigger_backend_discovery
+        && state.super_tracker.try_claim_discovery(&info_hash)
+    {
         let cp = state.control_plane.clone();
         let cache = state.peer_repo.clone();
         let bus = state.event_bus.clone();
+        let st = state.super_tracker.clone();
         tokio::spawn(async move {
             trigger_backend_discovery(cp, cache, bus, info_hash).await;
+            st.release_discovery(&info_hash);
         });
     }
 

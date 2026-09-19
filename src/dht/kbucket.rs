@@ -78,7 +78,7 @@ mod instant_serializer {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
         let elapsed = now.as_millis() as u64 - millis;
-        Ok(Instant::now() - Duration::from_millis(elapsed))
+        Ok(crate::utils::cutoff_before(Duration::from_millis(elapsed)))
     }
 }
 

@@ -232,24 +232,40 @@ impl TrackerDiscoverer {
     }
 
     /// 从 HTTP Tracker 响应解析 peer 列表
+    ///
+    /// 直接在原始字节上定位 `5:peers`：此前用 `String::from_utf8_lossy` 会把 compact
+    /// peer 中的非 UTF-8 字节替换成 U+FFFD（长度变化），导致偏移错位、解析出的 IP/端口
+    /// 是垃圾；长度前缀还可能造成 `usize` 溢出/切片越界。
     fn parse_http_peers(body: &[u8]) -> Result<Vec<SocketAddr>> {
-        let body_str = String::from_utf8_lossy(body);
+        const KEY: &[u8] = b"5:peers";
 
-        // 尝试解析 compact peers（二进制格式）
-        if let Some(peers_start) = body_str.find("5:peers") {
-            let rest = &body_str[peers_start + 7..];
-            if let Some(len_str) = rest.split(':').next() {
-                if let Ok(len) = len_str.parse::<usize>() {
-                    let data_start = len_str.len() + 1;
-                    if data_start + len <= rest.len() {
-                        let data = &rest.as_bytes()[data_start..data_start + len];
-                        return Ok(Self::parse_compact_peers(data));
-                    }
-                }
-            }
+        let Some(pos) = body.windows(KEY.len()).position(|w| w == KEY) else {
+            return Ok(vec![]);
+        };
+        let mut idx = pos + KEY.len();
+
+        // 读取长度前缀（ASCII 数字 + ':'）
+        let len_start = idx;
+        while idx < body.len() && body[idx].is_ascii_digit() {
+            idx += 1;
         }
+        if idx == len_start || idx >= body.len() || body[idx] != b':' {
+            return Ok(vec![]);
+        }
+        let Some(len) = std::str::from_utf8(&body[len_start..idx])
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            return Ok(vec![]);
+        };
+        idx += 1; // 跳过 ':'
 
-        Ok(vec![])
+        // 用 checked_add 防止长度前缀导致的溢出/越界
+        let end = match idx.checked_add(len) {
+            Some(e) if e <= body.len() => e,
+            _ => return Ok(vec![]),
+        };
+        Ok(Self::parse_compact_peers(&body[idx..end]))
     }
 
     /// 解析 compact peers 格式（每 6 字节一个 peer：4字节IP + 2字节端口）

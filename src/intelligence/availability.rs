@@ -135,7 +135,13 @@ impl AvailabilityCalculator {
     }
 
     /// 记录一个做种者（简化方式，不需要完整 bitfield）
+    ///
+    /// `total_pieces` 来自不可信的对端元数据；超上限直接忽略，避免按 u32::MAX 分配内存（DoS）。
     pub fn record_seeder(&self, infohash: Infohash, peer_addr: &str, total_pieces: u32) {
+        const MAX_TORRENT_PIECES: u32 = 1_000_000;
+        if total_pieces > MAX_TORRENT_PIECES {
+            return;
+        }
         // 做种者拥有所有分片
         let pieces: Vec<u32> = (0..total_pieces).collect();
         self.record_bitfield(infohash, peer_addr, pieces, total_pieces);
@@ -147,13 +153,17 @@ impl AvailabilityCalculator {
         infohash: Infohash,
         total_pieces: u32,
     ) -> Option<AvailabilityResult> {
+        const MAX_TORRENT_PIECES: u32 = 1_000_000;
+        if total_pieces > MAX_TORRENT_PIECES {
+            return None;
+        }
         let bitfields = self.bitfields.get(&infohash)?;
         if bitfields.is_empty() {
             return None;
         }
 
         // 清理过期的 bitfield
-        let cutoff = Instant::now() - self.bitfield_ttl;
+        let cutoff = crate::utils::cutoff_before(self.bitfield_ttl);
         let valid_bitfields: Vec<&PeerBitfield> =
             bitfields.iter().filter(|p| p.last_seen >= cutoff).collect();
 
@@ -320,7 +330,7 @@ impl AvailabilityCalculator {
         let mut removed = 0;
 
         // 清理缓存
-        let cache_cutoff = Instant::now() - self.cache_ttl;
+        let cache_cutoff = crate::utils::cutoff_before(self.cache_ttl);
         self.cache.retain(|_, v| {
             if v.calculated_at < cache_cutoff {
                 removed += 1;
@@ -331,7 +341,7 @@ impl AvailabilityCalculator {
         });
 
         // 清理 bitfield
-        let bf_cutoff = Instant::now() - self.bitfield_ttl;
+        let bf_cutoff = crate::utils::cutoff_before(self.bitfield_ttl);
         self.bitfields.retain(|_, v| {
             v.retain(|p| p.last_seen >= bf_cutoff);
             !v.is_empty()

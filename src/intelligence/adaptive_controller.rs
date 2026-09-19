@@ -3,8 +3,8 @@
 //! 根据历史响应率和预测模型，动态调整爬虫发送倍率。
 //! 支持三种运行模式：Managed（pk 设置目标）、Standalone（默认目标 30%）、Degraded（保守，倍率不超过 1.0）。
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use super::crawler_history::{CrawlerHistory, CrawlerRoundRecord, ResponseRatePredictor};
@@ -66,7 +66,7 @@ impl AdaptiveController {
         if !self.config.enabled {
             return 1.0;
         }
-        let history_len = self.history.lock().unwrap().len();
+        let history_len = self.history.lock().len();
         if history_len < self.config.warmup_rounds as usize {
             return 1.0;
         }
@@ -78,23 +78,23 @@ impl AdaptiveController {
         if !self.config.enabled {
             return;
         }
-        let history_len = self.history.lock().unwrap().len();
+        let history_len = self.history.lock().len();
         if history_len < self.config.warmup_rounds as usize {
             return;
         }
 
         // 获取目标响应率
-        let target = match *self.mode.lock().unwrap() {
+        let target = match *self.mode.lock() {
             RunMode::Managed => self.target_response_rate.load(Ordering::Relaxed),
             RunMode::Standalone | RunMode::Degraded => self.config.target_rate_standalone,
         };
 
         // 获取预测响应率（无预测时用实际响应率）
         let predicted = {
-            let history = self.history.lock().unwrap();
+            let history = self.history.lock();
             match history.extract_features() {
                 Some(features) => {
-                    let predictor = self.predictor.lock().unwrap();
+                    let predictor = self.predictor.lock();
                     predictor.predict(&features)
                 }
                 None => None,
@@ -122,7 +122,7 @@ impl AdaptiveController {
         };
 
         // Degraded 模式：倍率不超过 1.0
-        let new_mult = match *self.mode.lock().unwrap() {
+        let new_mult = match *self.mode.lock() {
             RunMode::Degraded => new_mult.min(1.0),
             _ => new_mult,
         };
@@ -167,13 +167,13 @@ impl AdaptiveController {
             nodes_quality,
         };
 
-        let mut history = self.history.lock().unwrap();
+        let mut history = self.history.lock();
         history.record(record);
 
         // 够提取特征后更新预测模型
         if history.len() >= 5 {
             if let Some(features) = history.extract_features() {
-                let mut predictor = self.predictor.lock().unwrap();
+                let mut predictor = self.predictor.lock();
                 predictor.update(&features, response_rate);
             }
         }
@@ -184,7 +184,7 @@ impl AdaptiveController {
     }
 
     pub fn set_mode(&self, mode: RunMode) {
-        *self.mode.lock().unwrap() = mode;
+        *self.mode.lock() = mode;
     }
 
     pub fn set_target_response_rate(&self, target: f64) {
@@ -196,10 +196,10 @@ impl AdaptiveController {
     }
 
     pub fn predicted_rate(&self) -> Option<f64> {
-        let history = self.history.lock().unwrap();
+        let history = self.history.lock();
         match history.extract_features() {
             Some(features) => {
-                let predictor = self.predictor.lock().unwrap();
+                let predictor = self.predictor.lock();
                 predictor.predict(&features)
             }
             None => None,
@@ -207,12 +207,12 @@ impl AdaptiveController {
     }
 
     pub fn model_update_count(&self) -> u64 {
-        let predictor = self.predictor.lock().unwrap();
+        let predictor = self.predictor.lock();
         predictor.update_count()
     }
 
     pub fn history_len(&self) -> usize {
-        self.history.lock().unwrap().len()
+        self.history.lock().len()
     }
 }
 

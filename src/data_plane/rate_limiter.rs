@@ -17,6 +17,17 @@ use rustc_hash::FxHashMap;
 const DEFAULT_BAN_DURATION: Duration = Duration::from_secs(60);
 /// 滑动窗口统计精度（1 秒）
 const WINDOW_PRECISION: Duration = Duration::from_secs(1);
+/// IP 状态表上限：超过即惰性清理空闲条目（UDP 源 IP 可伪造，避免无界增长 OOM）
+const MAX_IP_STATES: usize = 100_000;
+/// 空闲多久视为可清理
+const IP_STATE_IDLE: Duration = Duration::from_secs(600);
+
+/// 清理空闲且未封禁的 IP 状态条目
+fn prune_ip_states(states: &mut FxHashMap<IpAddr, IpRateState>, now: Instant) {
+    states.retain(|_, s| {
+        s.banned_until.is_some_and(|t| now < t) || now.duration_since(s.last_refill) < IP_STATE_IDLE
+    });
+}
 
 /// QPS 统计（滑动窗口，1 秒精度）
 #[derive(Debug, Clone, Default)]
@@ -126,6 +137,10 @@ impl RateLimiter {
 
         // IP 限流检查
         let mut states = self.ip_states.lock();
+        // 惰性清理：表超上限时清掉空闲且未封禁的条目，避免伪造源 IP 打爆内存
+        if states.len() > MAX_IP_STATES {
+            prune_ip_states(&mut states, now);
+        }
         let state = states.entry(ip).or_insert_with(IpRateState::new);
 
         // 检查是否被封禁
@@ -192,10 +207,21 @@ impl RateLimiter {
 
     /// 记录错误请求（可能触发封禁）
     pub fn record_error(&self, ip: IpAddr) {
+        let now = Instant::now();
         let mut states = self.ip_states.lock();
+        if states.len() > MAX_IP_STATES {
+            prune_ip_states(&mut states, now);
+        }
         let state = states.entry(ip).or_insert_with(IpRateState::new);
         // 错误请求也计入 recent_requests，连续错误可能触发异常封禁
-        state.recent_requests.push_back(Instant::now());
+        state.recent_requests.push_back(now);
+    }
+
+    /// 主动清理空闲 IP 状态（供 TaskScheduler/定期任务调用）
+    pub fn cleanup_idle(&self) {
+        let now = Instant::now();
+        let mut states = self.ip_states.lock();
+        prune_ip_states(&mut states, now);
     }
 
     /// 获取被封禁的 IP 数量

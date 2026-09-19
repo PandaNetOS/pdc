@@ -716,7 +716,7 @@ impl MetadataService {
 
     /// 清理过期缓存
     pub fn cleanup_expired(&self) -> usize {
-        let cutoff = Instant::now() - self.cache_ttl;
+        let cutoff = crate::utils::cutoff_before(self.cache_ttl);
         let mut removed = 0;
         self.cache.retain(|_, v| {
             if v.fetched_at < cutoff {

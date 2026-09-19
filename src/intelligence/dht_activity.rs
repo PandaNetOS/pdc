@@ -175,7 +175,7 @@ impl DhtActivityTracker {
 
     /// 获取活跃的 infohash 数量（最近1小时有活动）
     pub fn active_infohash_count(&self) -> usize {
-        let cutoff = Instant::now() - Duration::from_secs(self.window_secs);
+        let cutoff = crate::utils::cutoff_before(Duration::from_secs(self.window_secs));
         self.activities
             .iter()
             .filter(|a| *a.last_active.read() >= cutoff)
@@ -189,7 +189,7 @@ impl DhtActivityTracker {
 
     /// 清理长时间无活动的 infohash（超过24小时无活动则移除）
     pub fn cleanup_expired(&self) -> usize {
-        let cutoff = Instant::now() - ACTIVITY_HISTORY_WINDOW;
+        let cutoff = crate::utils::cutoff_before(ACTIVITY_HISTORY_WINDOW);
         let mut removed = 0;
         self.activities.retain(|_, v| {
             if *v.last_active.read() < cutoff {

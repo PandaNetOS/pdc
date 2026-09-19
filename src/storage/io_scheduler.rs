@@ -553,7 +553,7 @@ impl IoScheduler {
         let mut samples = self.idle_samples.lock();
         samples.push(sample);
         // 清理过期样本
-        let cutoff = Instant::now() - self.config.idle_window;
+        let cutoff = crate::utils::cutoff_before(self.config.idle_window);
         samples.retain(|s| s.timestamp >= cutoff);
     }
 
@@ -583,14 +583,28 @@ impl IoScheduler {
         };
 
         // 依次执行每个请求的 payload
+        // 单个 payload panic 不得穿出 writer_loop（否则该 task 终结、连接锁中毒），
+        // 也不得带着半提交状态继续 commit —— 出现 panic 时整批回滚。
+        let mut degraded = false;
         for entry in batch.drain(..) {
-            if let Err(e) = (entry.request.payload)(&tx) {
-                tracing::warn!("[io_scheduler] 写入失败: {}", e);
+            let payload = entry.request.payload;
+            let tx_ref: &Connection = &tx;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| payload(tx_ref)));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("[io_scheduler] 写入失败: {}", e),
+                Err(_) => {
+                    tracing::error!("[io_scheduler] payload panic，本批事务回滚");
+                    degraded = true;
+                    break;
+                }
             }
         }
 
         // 提交事务
-        if let Err(e) = tx.commit() {
+        if degraded {
+            drop(tx); // Transaction 的 Drop 会回滚
+        } else if let Err(e) = tx.commit() {
             tracing::warn!("[io_scheduler] 事务提交失败: {}", e);
         }
 
@@ -601,9 +615,10 @@ impl IoScheduler {
         if count > stats.max_batch_size {
             stats.max_batch_size = count;
         }
+        // 统一按“条数”口径统计，避免与 Normal/Background 量纲不一致
         match priority {
-            IoPriority::Critical => stats.critical_executed += 1,
-            IoPriority::Important => stats.important_executed += 1,
+            IoPriority::Critical => stats.critical_executed += count as u64,
+            IoPriority::Important => stats.important_executed += count as u64,
             IoPriority::Normal => stats.normal_executed += count as u64,
             IoPriority::Background => stats.background_executed += count as u64,
         }

@@ -196,10 +196,11 @@ impl HolePunchSignaling {
             .map_err(|e| anyhow::anyhow!("无效的发起方地址: {}", e))?;
 
         // 检查发起方是否已有活跃会话
+        // 统一加锁顺序 sessions → peer_sessions（与 complete/cleanup_expired 一致），避免 ABBA 死锁
         {
+            let sessions = self.sessions.read();
             let peer_sessions = self.peer_sessions.read();
             if let Some(existing_id) = peer_sessions.get(&req.initiator_peer_id) {
-                let sessions = self.sessions.read();
                 if let Some(existing) = sessions.get(existing_id) {
                     if !existing.is_expired() && existing.status != SessionStatus::Completed {
                         debug!(

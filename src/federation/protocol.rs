@@ -3,10 +3,19 @@
 //! 帧格式：`[4字节大端长度][1字节消息类型][payload]`
 //! payload 使用 bincode 序列化。
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use crate::federation::node_id::NodeAddress;
+use crate::federation::node_id::{NodeAddress, NodeId};
+
+/// 当前 UNIX 毫秒时间戳
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// 消息类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,12 +169,19 @@ pub struct HelloMessage {
     pub version: u32,
     /// 是否为中继节点
     pub is_relay: bool,
+    /// 发送时间戳（UNIX 毫秒），用于重放窗口校验
+    pub timestamp_ms: u64,
+    /// 随机 nonce，用于重放去重
+    pub nonce: [u8; 16],
     /// 对其余字段的 Ed25519 签名
     #[serde(with = "serde_big_array::BigArray")]
     pub signature: [u8; 64],
 }
 
 impl HelloMessage {
+    /// Hello 可接受的时间偏差窗口（毫秒）：超出则视为过期/未来消息，拒绝以防重放。
+    pub const REPLAY_WINDOW_MS: u64 = 120_000;
+
     /// 构造并签名 HelloMessage
     pub fn sign_and_build(
         identity: &crate::federation::node_id::NodeIdentity,
@@ -174,12 +190,16 @@ impl HelloMessage {
         is_relay: bool,
     ) -> Self {
         let public_key = identity.public_key_bytes();
+        let mut nonce = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut nonce);
         let mut msg = Self {
             node_id: identity.node_id.0,
             public_key,
             addresses,
             version,
             is_relay,
+            timestamp_ms: now_unix_ms(),
+            nonce,
             signature: [0u8; 64],
         };
         // 签名：先将签名字段置零，序列化后签名
@@ -187,6 +207,25 @@ impl HelloMessage {
         let sig = identity.sign(&data);
         msg.signature = sig.to_bytes();
         msg
+    }
+
+    /// 时间戳是否落在允许的重放窗口内
+    pub fn is_fresh(&self) -> bool {
+        now_unix_ms().abs_diff(self.timestamp_ms) <= Self::REPLAY_WINDOW_MS
+    }
+
+    /// 校验 node_id 是否由 public_key 派生（身份绑定），防止用自建密钥冒充任意 node_id。
+    pub fn verify_identity_binding(&self) -> bool {
+        NodeId::matches_public_key(&NodeId(self.node_id), &self.public_key)
+    }
+
+    /// nonce 的十六进制字符串（用于重放缓存去重键）
+    pub fn nonce_hex(&self) -> String {
+        let mut s = String::with_capacity(32);
+        for b in &self.nonce {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
     }
 
     /// 构造签名负载（node_id + public_key + addresses + version + is_relay）
@@ -203,6 +242,8 @@ impl HelloMessage {
         }
         data.extend_from_slice(&self.version.to_le_bytes());
         data.push(if self.is_relay { 1 } else { 0 });
+        data.extend_from_slice(&self.timestamp_ms.to_le_bytes());
+        data.extend_from_slice(&self.nonce);
         data
     }
 
@@ -721,20 +762,21 @@ pub fn decode_frame(data: &[u8]) -> anyhow::Result<(MessageType, &[u8])> {
 
 /// 检查缓冲区中是否有完整帧，返回完整帧的总字节数（含帧头）
 ///
-/// 如果缓冲区不足，返回 None。
-pub fn frame_size_in_buffer(data: &[u8]) -> Option<usize> {
+/// 返回 `Ok(Some(total))` 表示有完整帧；`Ok(None)` 表示数据不足需继续读；
+/// `Err` 表示帧长度非法（0 或超过上限）——调用方应据此断开连接，而不是继续累积缓冲。
+pub fn frame_size_in_buffer(data: &[u8]) -> anyhow::Result<Option<usize>> {
     if data.len() < 4 {
-        return None;
+        return Ok(None);
     }
     let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if length == 0 || length > MAX_FRAME_SIZE {
-        return None;
+        anyhow::bail!("非法帧长度: {}", length);
     }
     let total = FRAME_HEADER_SIZE + length - 1;
     if data.len() >= total {
-        Some(total)
+        Ok(Some(total))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -782,6 +824,34 @@ mod tests {
         assert_eq!(decoded.version, 1);
         assert!(!decoded.is_relay);
         assert!(decoded.verify_signature());
+        // node_id 由公钥派生，身份绑定校验应通过
+        assert!(decoded.verify_identity_binding());
+        // 新生成的 Hello 时间戳应在重放窗口内
+        assert!(decoded.is_fresh());
+    }
+
+    #[test]
+    fn test_hello_identity_binding_rejects_spoof() {
+        use crate::federation::node_id::NodeIdentity;
+        let identity = NodeIdentity::generate();
+        let mut hello = HelloMessage::sign_and_build(&identity, vec![], 1, false);
+        assert!(hello.verify_identity_binding());
+        // 冒充：篡改 node_id 后不再由公钥派生
+        hello.node_id = [0xab; 20];
+        assert!(!hello.verify_identity_binding());
+    }
+
+    #[test]
+    fn test_hello_stale_timestamp_rejected() {
+        use crate::federation::node_id::NodeIdentity;
+        let identity = NodeIdentity::generate();
+        let mut hello = HelloMessage::sign_and_build(&identity, vec![], 1, false);
+        assert!(hello.is_fresh());
+        // 时间戳回拨超过窗口
+        hello.timestamp_ms = hello
+            .timestamp_ms
+            .saturating_sub(HelloMessage::REPLAY_WINDOW_MS + 1);
+        assert!(!hello.is_fresh());
     }
 
     #[test]
@@ -861,15 +931,17 @@ mod tests {
         let frame_len = frame.len();
 
         // 完整帧
-        assert_eq!(frame_size_in_buffer(&frame), Some(frame_len));
+        assert_eq!(frame_size_in_buffer(&frame).unwrap(), Some(frame_len));
         // 不足4字节
-        assert_eq!(frame_size_in_buffer(&frame[..3]), None);
+        assert_eq!(frame_size_in_buffer(&frame[..3]).unwrap(), None);
         // 有帧头但数据不足
-        assert_eq!(frame_size_in_buffer(&frame[..frame_len - 1]), None);
+        assert_eq!(frame_size_in_buffer(&frame[..frame_len - 1]).unwrap(), None);
+        // 非法长度（0）应报错，而不是当作"未收全"
+        assert!(frame_size_in_buffer(&[0u8; 4]).is_err());
         // 多帧拼接
         let mut double = frame.clone();
         double.extend_from_slice(&frame);
-        assert_eq!(frame_size_in_buffer(&double), Some(frame_len));
+        assert_eq!(frame_size_in_buffer(&double).unwrap(), Some(frame_len));
     }
 
     #[test]

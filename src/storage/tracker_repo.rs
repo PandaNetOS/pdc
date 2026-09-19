@@ -131,22 +131,31 @@ impl TrackerRepoImpl {
                 }
             });
             if !updated {
-                self.cache.put(
-                    url.clone(),
-                    TrackerEntry {
-                        url: url.clone(),
-                        score: 15.0,
-                        disabled: false,
-                        total_requests: 0,
-                        success_requests: 0,
-                        failed_requests: 0,
-                        total_peers_discovered: 0,
-                        avg_response_time_ms: 0.0,
-                        consecutive_failures: 0,
-                        last_used: Some(*last_seen),
-                    },
-                );
-                new_urls.push(url.clone());
+                // 缓存未命中（可能在 Cold 层或 DB）：先回源，避免把已有 tracker 当新条目插入
+                // 而把 score / 请求统计整体清零，也避免向联邦误报为新建。
+                if let Some(mut entry) = self.get_tracker_sync(url) {
+                    if entry.last_used.is_none_or(|t| *last_seen > t) {
+                        entry.last_used = Some(*last_seen);
+                    }
+                    self.cache.put(url.clone(), entry);
+                } else {
+                    self.cache.put(
+                        url.clone(),
+                        TrackerEntry {
+                            url: url.clone(),
+                            score: 15.0,
+                            disabled: false,
+                            total_requests: 0,
+                            success_requests: 0,
+                            failed_requests: 0,
+                            total_peers_discovered: 0,
+                            avg_response_time_ms: 0.0,
+                            consecutive_failures: 0,
+                            last_used: Some(*last_seen),
+                        },
+                    );
+                    new_urls.push(url.clone());
+                }
             }
             // 标记该 tracker 为脏（数据变化，需要增量持久化）
             self.persist_dirty.write().insert(url.clone());
@@ -264,46 +273,45 @@ impl TrackerRepoImpl {
         }
     }
 
+    /// 将一次 tracker 请求结果应用到条目。
+    ///
+    /// 命中缓存与回源 DB 两条路径共用，避免"冷 tracker 反复失败永不禁用 / 平均响应时间失真"。
+    fn apply_request_stats(entry: &mut TrackerEntry, success: bool, peers: u64, latency_ms: u64) {
+        entry.total_requests += 1;
+        if success {
+            entry.success_requests += 1;
+            entry.total_peers_discovered += peers;
+            entry.consecutive_failures = 0;
+            if entry.avg_response_time_ms == 0.0 {
+                entry.avg_response_time_ms = latency_ms as f64;
+            } else {
+                entry.avg_response_time_ms =
+                    entry.avg_response_time_ms * 0.9 + latency_ms as f64 * 0.1;
+            }
+        } else {
+            entry.failed_requests += 1;
+            entry.consecutive_failures += 1;
+            if entry.consecutive_failures >= 10 {
+                entry.disabled = true;
+            }
+        }
+        entry.last_used = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+    }
+
     pub fn record_request_sync(&self, url: &str, success: bool, peers: u64, latency_ms: u64) {
         let key = url.to_string();
         let updated = self.cache.update(&key, |entry| {
-            entry.total_requests += 1;
-            if success {
-                entry.success_requests += 1;
-                entry.total_peers_discovered += peers;
-                entry.consecutive_failures = 0;
-                if entry.avg_response_time_ms == 0.0 {
-                    entry.avg_response_time_ms = latency_ms as f64;
-                } else {
-                    entry.avg_response_time_ms =
-                        entry.avg_response_time_ms * 0.9 + latency_ms as f64 * 0.1;
-                }
-            } else {
-                entry.failed_requests += 1;
-                entry.consecutive_failures += 1;
-                if entry.consecutive_failures >= 10 {
-                    entry.disabled = true;
-                }
-            }
-            entry.last_used = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
+            Self::apply_request_stats(entry, success, peers, latency_ms);
         });
         if !updated && self.tier_enabled {
             if let Some(mut entry) = self.get_tracker_sync(url) {
-                // 重新执行更新
-                entry.total_requests += 1;
-                if success {
-                    entry.success_requests += 1;
-                    entry.total_peers_discovered += peers;
-                    entry.consecutive_failures = 0;
-                } else {
-                    entry.failed_requests += 1;
-                    entry.consecutive_failures += 1;
-                }
+                // 与命中路径一致的统计更新
+                Self::apply_request_stats(&mut entry, success, peers, latency_ms);
                 self.cache.put(key, entry);
             }
         }
@@ -463,6 +471,17 @@ impl TrackerRepoImpl {
         self.persist_dirty.read().iter().cloned().collect()
     }
 
+    /// 只清除指定 tracker 的脏标记（避免全量清除误伤并发新增的脏标记）
+    pub fn clear_dirty_batch_sync(&self, urls: &[String]) {
+        if urls.is_empty() {
+            return;
+        }
+        let mut dirty = self.persist_dirty.write();
+        for url in urls {
+            dirty.remove(url);
+        }
+    }
+
     pub fn clear_all_dirty_sync(&self) {
         self.persist_dirty.write().clear();
     }
@@ -534,6 +553,17 @@ impl TrackerRepository for TrackerRepoImpl {
     async fn remove_tracker(&self, url: &str) {
         let key = url.to_string();
         self.cache.remove(&key);
+        // 清除脏标记，避免后续 save_dirty 又把它写回
+        self.persist_dirty.write().remove(&key);
+        self.score_dirty.write().remove(&key);
+        // 真正删除 DB 行，否则 get_tracker_sync 回源会把它"复活"
+        if let Err(e) = self.storage.delete_tracker_by_url(url) {
+            tracing::warn!("[tracker_repo] 删除 tracker 失败: {}", e);
+        }
+        // 联动 Merkle：标记分片 dirty，联邦重算时同步删除
+        if let Some(merkle) = self.merkle.get() {
+            merkle.mark_tombstone(url.as_bytes());
+        }
     }
 
     async fn get_tracker(&self, url: &str) -> Option<TrackerEntry> {
@@ -584,6 +614,10 @@ impl TrackerRepository for TrackerRepoImpl {
 
     async fn dirty_trackers(&self) -> Vec<String> {
         self.dirty_trackers_sync()
+    }
+
+    async fn clear_dirty_batch(&self, urls: &[String]) {
+        self.clear_dirty_batch_sync(urls);
     }
 
     async fn clear_all_dirty(&self) {

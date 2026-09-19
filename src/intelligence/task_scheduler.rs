@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use tracing::{debug, error, info, warn};
 
+use futures::FutureExt;
+
 use crate::intelligence::adaptive_controller::AdaptiveController;
 
 // ---------------------------------------------------------------------------
@@ -893,6 +895,21 @@ impl Eq for ScheduledItem {}
 type TaskFn =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
+/// RAII 守卫：任务执行体退出（含 panic 展开）时释放分类并发槽位，保证每次执行只释放一次。
+struct CategorySlotGuard {
+    scheduler: Arc<TaskScheduler>,
+    category: TaskCategory,
+}
+
+impl Drop for CategorySlotGuard {
+    fn drop(&mut self) {
+        let mut running = self.scheduler.running_by_category.write();
+        if let Some(cnt) = running.get_mut(&self.category) {
+            *cnt = cnt.saturating_sub(1);
+        }
+    }
+}
+
 /// 六个 runtime 的 Handle 集合，用于跨 runtime 调度任务
 #[derive(Clone)]
 pub struct RuntimeHandles {
@@ -1165,11 +1182,16 @@ impl TaskScheduler {
 
     /// 启动调度器
     pub fn start(self: &Arc<Self>) {
-        if *self.scheduler_started.read() {
-            warn!("[task_scheduler] 调度器已启动，忽略重复启动");
-            return;
+        // 原子 check-and-set：避免 read 与 write 之间的 TOCTOU 竞态导致重复启动
+        // （两个调用者同时通过判断 → 启动两个 run 循环 + 两个 watchdog 线程）
+        {
+            let mut started = self.scheduler_started.write();
+            if *started {
+                warn!("[task_scheduler] 调度器已启动，忽略重复启动");
+                return;
+            }
+            *started = true;
         }
-        *self.scheduler_started.write() = true;
 
         let scheduler = self.clone();
         if let Some(ref handles) = self.runtime_handles {
@@ -1226,6 +1248,24 @@ impl TaskScheduler {
         );
     }
 
+    /// 优雅停止调度器：置位运行标志，主循环与 watchdog 线程都会在下一轮检查后退出。
+    ///
+    /// 之前 watchdog 线程只有 `watchdog_running` 一个退出条件却无人置位，
+    /// 相当于永久驻留的宿主线程；此处提供正式停止入口。
+    pub fn stop(&self) {
+        let was_running = *self.scheduler_started.read();
+        *self.scheduler_started.write() = false;
+        self.watchdog_running.store(false, Ordering::Relaxed);
+        if was_running {
+            info!("[task_scheduler] 已请求停止调度器（主循环与 watchdog 将退出）");
+        }
+    }
+
+    /// 调度器是否正在运行
+    pub fn is_running(&self) -> bool {
+        *self.scheduler_started.read()
+    }
+
     /// 调度器主循环
     async fn run(self: Arc<Self>) {
         // 初始化：为每个任务安排第一次执行
@@ -1252,6 +1292,11 @@ impl TaskScheduler {
 
         loop {
             tick_interval.tick().await;
+            // 支持优雅停止：stop() 会将 scheduler_started 置 false，主循环退出
+            if !*self.scheduler_started.read() {
+                info!("[task_scheduler] 调度器已停止，主循环退出");
+                break;
+            }
             // S1-P3: 闭环重算自适应间隔（每 N 个 tick；关闭时 no-op）
             adaptive_tick = adaptive_tick.wrapping_add(1);
             let recalc_period = self.knobs.adaptive_recalc_ticks.max(1) as u64;
@@ -1574,6 +1619,12 @@ impl TaskScheduler {
             .entry(category)
             .or_insert(0) += 1;
 
+        // RAII 守卫：无论正常结束/超时/失败/panic，分类并发槽位只释放一次
+        let slot_guard = CategorySlotGuard {
+            scheduler: scheduler.clone(),
+            category,
+        };
+
         let task_id = item.task_id.clone();
 
         let runtime_handle = scheduler.runtime_handles.as_ref().map(|h| match category {
@@ -1585,8 +1636,14 @@ impl TaskScheduler {
         });
 
         let fut = async move {
+            // 移入 fut：执行体退出（含 panic 展开）时由 Drop 释放槽位
+            let _slot_guard = slot_guard;
+
             let start = Instant::now();
-            let result = tokio::time::timeout(meta.timeout, task_fn()).await;
+            // 捕获任务 panic：不得穿出 fut，否则槽位不释放、该任务静默停跑
+            let raw = std::panic::AssertUnwindSafe(tokio::time::timeout(meta.timeout, task_fn()))
+                .catch_unwind()
+                .await;
 
             let duration = start.elapsed();
 
@@ -1595,69 +1652,72 @@ impl TaskScheduler {
                 .profile_store
                 .record(&task_id, duration.as_secs_f64() * 1000.0);
 
-            match result {
-                Ok(Ok(())) => {
-                    scheduler
-                        .stats
-                        .write()
-                        .get_mut(&task_id)
-                        .unwrap()
-                        .record_success(duration);
+            // 归一化为 成功/失败/超时/panic 四态
+            enum Outcome {
+                Ok,
+                Failed(String),
+                Timeout,
+                Panicked,
+            }
+            let outcome = match raw {
+                Ok(Ok(Ok(()))) => Outcome::Ok,
+                Ok(Ok(Err(e))) => Outcome::Failed(e.to_string()),
+                Ok(Err(_elapsed)) => Outcome::Timeout,
+                Err(_panic) => Outcome::Panicked,
+            };
+
+            let mut retry_scheduled = false;
+            match outcome {
+                Outcome::Ok => {
+                    if let Some(s) = scheduler.stats.write().get_mut(&task_id) {
+                        s.record_success(duration);
+                    }
                     debug!(
                         "[task_scheduler] 任务完成: {} ({:.2}s)",
                         meta.name,
                         duration.as_secs_f64()
                     );
                 }
-                Ok(Err(e)) => {
-                    scheduler
-                        .stats
-                        .write()
-                        .get_mut(&task_id)
-                        .unwrap()
-                        .record_failure();
-                    let consecutive = scheduler
-                        .stats
-                        .read()
-                        .get(&task_id)
-                        .map(|s| s.consecutive_failures)
-                        .unwrap_or(0);
+                Outcome::Failed(ref e) => {
+                    let consecutive = {
+                        let mut stats = scheduler.stats.write();
+                        match stats.get_mut(&task_id) {
+                            Some(s) => {
+                                s.record_failure();
+                                s.consecutive_failures
+                            }
+                            None => 0,
+                        }
+                    };
                     warn!(
                         "[task_scheduler] 任务失败: {} - {} (连续失败 {})",
                         meta.name, e, consecutive
                     );
-                    // 标记依赖完成 + 释放分类计数（重试路径也需要）
-                    scheduler
-                        .completed_dependencies
-                        .write()
-                        .insert(task_id.clone());
-                    {
-                        let mut running = scheduler.running_by_category.write();
-                        if let Some(cnt) = running.get_mut(&category) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                        }
-                    }
-                    // 失败重试（指数退避），重试后 return 避免与下方正常周期重复安排
+                    // 失败重试（指数退避）；重试后不重复安排正常周期
                     if consecutive < meta.max_retries {
                         let backoff = Duration::from_secs(2u64.pow(consecutive.min(5)));
                         scheduler.schedule_task(&task_id, Instant::now() + backoff, meta.priority);
-                        return;
+                        retry_scheduled = true;
                     }
                     // 超过最大重试次数：走下方正常周期继续尝试
                 }
-                Err(_) => {
-                    scheduler
-                        .stats
-                        .write()
-                        .get_mut(&task_id)
-                        .unwrap()
-                        .record_failure();
+                Outcome::Timeout => {
+                    if let Some(s) = scheduler.stats.write().get_mut(&task_id) {
+                        s.record_failure();
+                    }
                     warn!(
                         "[task_scheduler] 任务超时: {} (>{:.0}s)",
                         meta.name,
                         meta.timeout.as_secs_f64()
+                    );
+                }
+                Outcome::Panicked => {
+                    if let Some(s) = scheduler.stats.write().get_mut(&task_id) {
+                        s.record_failure();
+                    }
+                    error!(
+                        "[task_scheduler] 任务 panic: {} —— 已记录失败并按正常周期重排",
+                        meta.name
                     );
                 }
             }
@@ -1668,13 +1728,9 @@ impl TaskScheduler {
                 .write()
                 .insert(task_id.clone());
 
-            {
-                let mut running = scheduler.running_by_category.write();
-                if let Some(cnt) = running.get_mut(&category) {
-                    if *cnt > 0 {
-                        *cnt -= 1;
-                    }
-                }
+            // 重试已单独排期 → 直接返回（槽位由 _slot_guard 的 Drop 释放）
+            if retry_scheduled {
+                return;
             }
 
             // 安排下一次执行（叠加既有固定 jitter + 可选每轮比例随机抖动）

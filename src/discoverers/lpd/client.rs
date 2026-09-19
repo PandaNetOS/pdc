@@ -157,6 +157,10 @@ impl LpdDiscoverer {
 
                             // 清理过期 peer
                             entry.retain(|p| p.last_seen.elapsed() < peer_ttl);
+                            // 列表清空后移除外层 infohash 键，避免 discovered_peers 无界增长
+                            if entry.is_empty() {
+                                peers.remove(&infohash);
+                            }
                         }
                     }
                     Err(e) => {
@@ -241,6 +245,12 @@ impl LpdDiscoverer {
         // 限流检查
         {
             let mut last = self.last_broadcast.write();
+            // 有界清理：避免 last_broadcast 随 infohash 数量无界增长
+            if last.len() > 4096 {
+                let ttl = self.config.min_broadcast_interval.saturating_mul(4);
+                let now = Instant::now();
+                last.retain(|_, t| now.duration_since(*t) < ttl);
+            }
             if let Some(time) = last.get(infohash) {
                 if time.elapsed() < self.config.min_broadcast_interval {
                     debug!(

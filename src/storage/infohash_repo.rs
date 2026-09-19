@@ -118,6 +118,17 @@ impl InfohashRepoImpl {
         self.dirty.read().iter().copied().collect()
     }
 
+    /// 只清除指定 infohash 的脏标记（避免全量清除误伤并发新增的脏标记）
+    pub fn clear_dirty_batch_sync(&self, hashes: &[Infohash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let mut dirty = self.dirty.write();
+        for h in hashes {
+            dirty.remove(h);
+        }
+    }
+
     pub fn clear_all_dirty_sync(&self) {
         self.dirty.write().clear();
     }
@@ -483,6 +494,10 @@ impl InfohashRepository for InfohashRepoImpl {
 
     async fn dirty_infohashes(&self) -> Vec<Infohash> {
         self.dirty_infohashes_sync()
+    }
+
+    async fn clear_dirty_batch(&self, hashes: &[Infohash]) {
+        self.clear_dirty_batch_sync(hashes);
     }
 
     async fn clear_all_dirty(&self) {

@@ -25,7 +25,12 @@ pub struct WriteStats {
     pub total_requests: u64,
     pub total_batches: u64,
     pub queue_size: usize,
+    /// 因队列满/通道关闭而丢弃的请求数（>0 表示发生了背压丢写，需关注）
+    pub dropped_requests: u64,
 }
+
+/// 写入队列通道容量上限。满时 `send` 不阻塞、丢弃并计数（避免无界增长 OOM）。
+const WRITE_QUEUE_CAPACITY: usize = 100_000;
 
 /// 写入队列（兼容层）
 ///
@@ -36,7 +41,7 @@ pub struct WriteStats {
 /// 当 IOScheduler 启用时，send() 委托给 IOScheduler 的优先级队列。
 pub struct WriteQueue {
     /// 原始 mpsc sender（IO Scheduler 未启用时使用）
-    sender: mpsc::UnboundedSender<WriteRequest>,
+    sender: mpsc::Sender<WriteRequest>,
     stats: Arc<ParkingMutex<WriteStats>>,
     batch: Arc<ParkingMutex<Vec<WriteRequest>>>,
     conn: Arc<StdMutex<Connection>>,
@@ -53,7 +58,7 @@ impl WriteQueue {
         batch_size: usize,
         _flush_interval: Duration,
     ) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel::<WriteRequest>();
+        let (sender, receiver) = mpsc::channel::<WriteRequest>(WRITE_QUEUE_CAPACITY);
         let stats = Arc::new(ParkingMutex::new(WriteStats::default()));
         let batch = Arc::new(ParkingMutex::new(Vec::with_capacity(batch_size)));
 
@@ -78,7 +83,7 @@ impl WriteQueue {
     ///
     /// send() 委托给 IOScheduler（Normal 优先级），flush() 调用 IOScheduler 的 barrier。
     pub fn with_scheduler(conn: Arc<StdMutex<Connection>>, io_scheduler: Arc<IoScheduler>) -> Self {
-        let (sender, _receiver) = mpsc::unbounded_channel::<WriteRequest>();
+        let (sender, _receiver) = mpsc::channel::<WriteRequest>(WRITE_QUEUE_CAPACITY);
         let stats = Arc::new(ParkingMutex::new(WriteStats::default()));
         let batch = Arc::new(ParkingMutex::new(Vec::new()));
 
@@ -106,10 +111,26 @@ impl WriteQueue {
             // IOScheduler 模式：以 Normal 优先级提交
             if let Err(e) = sched.submit(IoPriority::Normal, None, f, 1) {
                 tracing::warn!("[write_queue] IOScheduler 提交失败: {}", e);
+                self.stats.lock().dropped_requests += 1;
             }
         } else {
-            // 原始模式：mpsc 通道
-            let _ = self.sender.send(Box::new(f));
+            // 原始模式：有界 mpsc 通道，满则丢弃并计数（不阻塞调用方）
+            match self.sender.try_send(Box::new(f)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let mut s = self.stats.lock();
+                    s.dropped_requests += 1;
+                    tracing::error!(
+                        "[write_queue] 写入队列已满（容量 {}），丢弃请求（累计 {}）",
+                        WRITE_QUEUE_CAPACITY,
+                        s.dropped_requests
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.stats.lock().dropped_requests += 1;
+                    tracing::error!("[write_queue] 写入队列已关闭，请求被丢弃");
+                }
+            }
         }
     }
 
@@ -138,7 +159,7 @@ impl WriteQueue {
     /// writer 主循环（纯事件驱动，无独立定时）— 仅原始模式使用
     async fn writer_loop(
         conn: Arc<StdMutex<Connection>>,
-        mut receiver: mpsc::UnboundedReceiver<WriteRequest>,
+        mut receiver: mpsc::Receiver<WriteRequest>,
         batch_size: usize,
         batch: Arc<ParkingMutex<Vec<WriteRequest>>>,
         stats: Arc<ParkingMutex<WriteStats>>,
@@ -146,12 +167,11 @@ impl WriteQueue {
         loop {
             match receiver.recv().await {
                 Some(req) => {
+                    // 锁序固定为 batch → conn（与 flush() 一致），在 batch 锁内直接刷批
                     let mut b = batch.lock();
                     b.push(req);
                     if b.len() >= batch_size {
-                        drop(b);
-                        let mut guard = batch.lock();
-                        Self::flush_batch(&conn, &mut guard, &stats);
+                        Self::flush_batch(&conn, &mut b, &stats);
                     }
                 }
                 None => {
@@ -174,7 +194,7 @@ impl WriteQueue {
         let requests = std::mem::take(batch);
         let count = requests.len();
 
-        let conn = conn.lock().unwrap();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -183,13 +203,24 @@ impl WriteQueue {
             }
         };
 
+        // 单个 payload panic 不得穿出 writer_loop；出现 panic 时整批回滚
+        let mut degraded = false;
         for req in requests {
-            if let Err(e) = req(&conn) {
-                tracing::warn!("[write_queue] 写入失败: {}", e);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| req(&conn)));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("[write_queue] 写入失败: {}", e),
+                Err(_) => {
+                    tracing::error!("[write_queue] payload panic，本批事务回滚");
+                    degraded = true;
+                    break;
+                }
             }
         }
 
-        if let Err(e) = tx.commit() {
+        if degraded {
+            drop(tx); // Transaction 的 Drop 会回滚
+        } else if let Err(e) = tx.commit() {
             tracing::warn!("[write_queue] 事务提交失败: {}", e);
         }
 

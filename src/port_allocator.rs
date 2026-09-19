@@ -25,15 +25,20 @@ const OFFSET_GROUPS: [u16; 10] = [6880, 6980, 6080, 6180, 6280, 6380, 6480, 6580
 fn build_crawler_socket_ports(crawler_port: u16, socket_count: u16) -> Vec<u16> {
     let count = (socket_count as usize).clamp(1, MAX_CRAWLER_SOCKETS);
     let block_base = crawler_port - (crawler_port % 100);
-    let mut ports = Vec::with_capacity(count);
-    ports.push(crawler_port);
-    // 同百位段内 02,12,22,...,72,92（跳过 82=主端口）
+    let mut ports: Vec<u16> = Vec::with_capacity(count);
+    // 主端口优先；随后同百位段内 02,12,...,92。
+    // 去重：若 crawler_port 末两位本身落在该序列（如 6812），否则会与主端口重复，
+    // 导致整组 bind 因 EADDRINUSE 失败、端口自动分配彻底不可用。
     let tens: [u16; 9] = [2, 12, 22, 32, 42, 52, 62, 72, 92];
-    for off in tens {
+    let candidates =
+        std::iter::once(crawler_port).chain(tens.iter().map(|off| block_base.saturating_add(*off)));
+    for cand in candidates {
         if ports.len() >= count {
             break;
         }
-        ports.push(block_base + off);
+        if !ports.contains(&cand) {
+            ports.push(cand);
+        }
     }
     ports
 }

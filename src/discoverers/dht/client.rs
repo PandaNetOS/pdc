@@ -210,17 +210,34 @@ impl DhtDiscoverer {
 
         socket.send_to(&request, node_addr).await?;
 
+        // 单个 socket 被多个并发查询共用：必须校验响应 tid 与来源地址，
+        // 否则会把别的查询的响应当作自己的（peer/token 归属错误、统计失真）。
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut buf = vec![0u8; 4096];
-        let (n, _from) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await??;
-        buf.truncate(n);
-
-        if let Some((_resp_tid, response)) = DhtMessage::parse_get_peers_response(&buf) {
-            return Ok(QueryResult {
-                peers: response.values,
-                nodes: response.nodes,
-                responder_id: response.node_id,
-                token: response.token,
-            });
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (n, from) = match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await
+            {
+                Ok(Ok(v)) => v,
+                _ => break, // 超时 / 接收错误
+            };
+            if from != node_addr {
+                continue; // 非目标节点
+            }
+            if let Some((resp_tid, response)) = DhtMessage::parse_get_peers_response(&buf[..n]) {
+                if resp_tid != tid {
+                    continue; // tid 不匹配，属于其他并发查询
+                }
+                return Ok(QueryResult {
+                    peers: response.values,
+                    nodes: response.nodes,
+                    responder_id: response.node_id,
+                    token: response.token,
+                });
+            }
         }
 
         Ok(QueryResult {
@@ -557,29 +574,41 @@ impl PeerDiscoverer for DhtDiscoverer {
         }
 
         // 并发发送 get_peers 获取 token
+        // 每个任务使用独立 socket 并校验来源/tid，避免多任务共用同一 socket 时响应串话。
         let mut tasks = vec![];
         for node in &nodes {
-            let socket = socket.clone();
             let node_addr = node.addr;
             let our_id = self.config.node_id;
             let infohash = *infohash;
             let timeout = self.config.request_timeout;
 
             tasks.push(tokio::spawn(async move {
+                let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
                 let tid = rand::thread_rng().gen::<[u8; 2]>();
                 let request = DhtMessage::build_get_peers(&tid, &our_id, &infohash);
-                if socket.send_to(&request, node_addr).await.is_err() {
+                if sock.send_to(&request, node_addr).await.is_err() {
                     return None;
                 }
 
                 let mut buf = vec![0u8; 4096];
-                match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-                    Ok(Ok((n, _))) => {
-                        buf.truncate(n);
-                        DhtMessage::parse_get_peers_response(&buf)
-                            .and_then(|(_, resp)| resp.token.map(|t| (node_addr, t)))
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return None;
                     }
-                    _ => None,
+                    match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
+                        Ok(Ok((n, from))) if from == node_addr => {
+                            match DhtMessage::parse_get_peers_response(&buf[..n]) {
+                                Some((resp_tid, resp)) if resp_tid == tid => {
+                                    return resp.token.map(|t| (node_addr, t));
+                                }
+                                _ => continue, // tid 或报文不匹配
+                            }
+                        }
+                        Ok(Ok(_)) => continue, // 非目标来源，忽略
+                        _ => return None,      // 超时 / 错误
+                    }
                 }
             }));
         }

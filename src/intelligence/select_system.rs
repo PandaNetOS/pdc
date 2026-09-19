@@ -270,6 +270,7 @@ mod tests {
             Vec::new()
         }
         async fn clear_dirty(&self, _addr: &SocketAddr) {}
+        async fn clear_dirty_batch(&self, _addrs: &[SocketAddr]) {}
         async fn clear_all_dirty(&self) {}
     }
 

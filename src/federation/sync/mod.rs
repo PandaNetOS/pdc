@@ -540,9 +540,18 @@ impl SyncManager {
         // （历史上这里还收集 (key, data_hash) 去标记 Merkle dirty，已移除——见下方说明。）
         let deserialize_start = Instant::now();
         let mut items: Vec<([u8; 20], SocketAddr)> = Vec::new();
+        let mut deletes: Vec<SocketAddr> = Vec::new();
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
+                // 删除墓碑：key 为 addr 字符串，解析后从本地移除
+                // （入站路径不回播，避免 A->B->A 回环）
+                if let Ok(s) = std::str::from_utf8(&entry.key) {
+                    if let Ok(addr) = s.parse::<SocketAddr>() {
+                        deletes.push(addr);
+                        applied += 1;
+                    }
+                }
                 continue;
             }
             let payload: NodeSyncPayload = match bincode::deserialize(&entry.payload) {
@@ -564,6 +573,16 @@ impl SyncManager {
         let repo_start = Instant::now();
         if !items.is_empty() {
             self.node_repo.add_nodes_batch_internal(&items);
+        }
+        if !deletes.is_empty() {
+            let removed = self.node_repo.remove_nodes_batch_internal(&deletes);
+            if removed > 0 {
+                debug!(
+                    "[federation] Node 同步删除 {} 条（收到 {} 条墓碑）",
+                    removed,
+                    deletes.len()
+                );
+            }
         }
         let repo_elapsed = repo_start.elapsed();
 

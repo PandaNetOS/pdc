@@ -183,7 +183,7 @@ impl PeerHistoryManager {
 
     /// 清理长时间无快照的 infohash（超过保留时间则移除）
     pub fn cleanup_expired(&self) -> usize {
-        let cutoff = Instant::now() - Duration::from_secs(self.retention_secs);
+        let cutoff = crate::utils::cutoff_before(Duration::from_secs(self.retention_secs));
         let mut removed = 0;
         self.histories.retain(|_, v| {
             if *v.last_snapshot.read() < cutoff {

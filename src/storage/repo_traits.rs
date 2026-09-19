@@ -71,6 +71,8 @@ pub trait NodeRepository: Send + Sync {
     async fn dirty_nodes(&self) -> Vec<SocketAddr>;
     /// 清除单个节点的脏标记
     async fn clear_dirty(&self, addr: &SocketAddr);
+    /// 批量清除指定节点的脏标记（增量重算后调用，避免全量清除误伤并发新增的脏标记）
+    async fn clear_dirty_batch(&self, addrs: &[SocketAddr]);
     /// 清除所有脏标记
     async fn clear_all_dirty(&self);
 
@@ -122,6 +124,8 @@ pub trait PeerRepository: Send + Sync {
     async fn mark_dirty(&self, addr: &SocketAddr);
     /// 获取所有脏 peer 地址
     async fn dirty_peers(&self) -> Vec<SocketAddr>;
+    /// 批量清除指定 peer 的脏标记（增量重算后调用，避免全量清除误伤并发新增的脏标记）
+    async fn clear_dirty_batch(&self, addrs: &[SocketAddr]);
     /// 清除所有脏标记
     async fn clear_all_dirty(&self);
 
@@ -163,6 +167,8 @@ pub trait InfohashRepository: Send + Sync {
     async fn mark_dirty(&self, infohash: &Infohash);
     /// 获取所有脏 infohash
     async fn dirty_infohashes(&self) -> Vec<Infohash>;
+    /// 批量清除指定 infohash 的脏标记（增量重算后调用，避免全量清除误伤并发新增的脏标记）
+    async fn clear_dirty_batch(&self, hashes: &[Infohash]);
     /// 清除所有脏标记
     async fn clear_all_dirty(&self);
 }
@@ -209,6 +215,8 @@ pub trait TrackerRepository: Send + Sync {
     async fn mark_dirty(&self, url: &str);
     /// 获取所有脏 tracker URL
     async fn dirty_trackers(&self) -> Vec<String>;
+    /// 批量清除指定 tracker 的脏标记（增量重算后调用，避免全量清除误伤并发新增的脏标记）
+    async fn clear_dirty_batch(&self, urls: &[String]);
     /// 清除所有脏标记
     async fn clear_all_dirty(&self);
 

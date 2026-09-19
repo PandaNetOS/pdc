@@ -632,7 +632,23 @@ impl MerkleTree {
         let mut diffs = Vec::new();
         let count = self.shard_count.min(other.shard_count) as usize;
         for i in 0..count {
-            if state.l1_hashes[i] != other.roots[i] {
+            // 本地哈希缺失 → 记为差异
+            let local = match state.l1_hashes.get(i) {
+                Some(h) => h,
+                None => {
+                    diffs.push(i as u16);
+                    continue;
+                }
+            };
+            // 对端 roots 长度不足（bincode 不校验三者长度一致）→ 视为差异，避免越界 panic
+            let remote = match other.roots.get(i) {
+                Some(h) => h,
+                None => {
+                    diffs.push(i as u16);
+                    continue;
+                }
+            };
+            if local != remote {
                 diffs.push(i as u16);
             }
         }
