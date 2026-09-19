@@ -3,7 +3,7 @@
 //! 管理联邦网络中的所有 TCP 连接，包括监听、主动连接、握手、心跳和消息分发。
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -201,6 +201,9 @@ pub struct ConnectionManager {
     peer_query_responses: Arc<DashMap<[u8; 20], Vec<PeerQueryEntry>>>,
     /// 已见过的 Hello nonce（防重放）：nonce -> 首次见到时刻
     seen_hello_nonces: RwLock<FxHashMap<[u8; 16], Instant>>,
+    /// 已告警过的「自连接目标地址」集合：这类地址会被周期性重试，
+    /// 只首次打 warn、之后降级 debug，避免用新的一类刷屏取代旧的刷屏。
+    self_addr_warned: RwLock<FxHashSet<SocketAddr>>,
 }
 
 impl ConnectionManager {
@@ -234,6 +237,7 @@ impl ConnectionManager {
             last_reconnect_attempt: AtomicU64::new(0),
             peer_query_responses: Arc::new(DashMap::new()),
             seen_hello_nonces: RwLock::new(FxHashMap::default()),
+            self_addr_warned: RwLock::new(FxHashSet::default()),
         }
     }
 
@@ -426,12 +430,88 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// 判断目标地址是否就是本节点自己（出站前置过滤）
+    ///
+    /// 三条判定路径：
+    /// 1. `identity.addresses` 中登记的地址 —— 含 NAT/UPnP 映射后的公网地址
+    ///    （端口为外部端口，可能与 `listen_port` 不同）。这是「自身公网地址被回传
+    ///    后又连自己」这类场景的主判定依据；
+    /// 2. 回环地址 + 联邦监听端口；
+    /// 3. 本机网卡地址 + 联邦监听端口（NAT 探测尚未完成时的兜底）。
+    fn is_self_address(&self, addr: SocketAddr) -> bool {
+        // 1) 身份地址集合：ip + port 整体比对
+        if self
+            .identity
+            .addresses_snapshot()
+            .iter()
+            .any(|a| a.ipv4_addr == Some(addr) || a.ipv6_addr == Some(addr))
+        {
+            return true;
+        }
+        // 2) 回环地址 + 联邦监听端口
+        if addr.ip().is_loopback() && addr.port() == self.config.listen_port {
+            return true;
+        }
+        // 3) 本机网卡地址 + 联邦监听端口（兜底）
+        if addr.port() == self.config.listen_port && Self::is_local_interface_ip(addr.ip()) {
+            return true;
+        }
+        false
+    }
+
+    /// 判断 IP 是否属于本机网卡（不含 NAT 公网映射）
+    ///
+    /// 用「bind 后 connect 再读 local_addr」的路由表探测：不发出任何报文，
+    /// 若目标 IP 属于本机，内核选中的源地址就等于目标地址。
+    fn is_local_interface_ip(ip: IpAddr) -> bool {
+        let bind_addr: SocketAddr = if ip.is_ipv4() {
+            match "0.0.0.0:0".parse() {
+                Ok(a) => a,
+                Err(_) => return false,
+            }
+        } else {
+            match "[::]:0".parse() {
+                Ok(a) => a,
+                Err(_) => return false,
+            }
+        };
+        let sock = match std::net::UdpSocket::bind(bind_addr) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        // 端口取 1（discard），仅用于触发内核路由选择
+        match sock.connect(SocketAddr::new(ip, 1)) {
+            Ok(()) => sock.local_addr().map(|a| a.ip() == ip).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// 主动连接到节点
     pub async fn connect_to(
         self: Arc<Self>,
         node_id: NodeId,
         addr: SocketAddr,
     ) -> anyhow::Result<Arc<Connection>> {
+        // 出站自连接前置过滤：目标是本机地址时直接放弃，不建 TCP、不握手。
+        //
+        // 背景：seed / peer_cache / 节点发现里可能存有本节点经 NAT 映射后的公网地址。
+        // 这类入口（connect_seed / connect_cached_node）因为 node_id 未知，用随机
+        // temp_id 发起，握手前的 node_id 自连接判定对它们无效 —— 连出去经 NAT hairpin
+        // 回流到自己，要等握手才发现并拒绝；而随机 temp_id 每次都不同，不会进入按
+        // node_id 记录的重连冷却，于是形成「连接→拒绝→重连」的无限循环。
+        if self.is_self_address(addr) {
+            let first_time = self.self_addr_warned.write().insert(addr);
+            if first_time {
+                warn!(
+                    "[federation] 拒绝自连接（出站前置过滤）: {} 是本机地址，后续对该地址的连接将静默跳过",
+                    addr
+                );
+            } else {
+                debug!("[federation] 跳过自连接地址 {}", addr);
+            }
+            anyhow::bail!("拒绝自连接（目标为本机地址）: {}", addr);
+        }
+
         // 检查是否已连接（用实际节点ID）
         if let Some(conn) = self.get_connection(&node_id) {
             return Ok(conn);
@@ -1813,6 +1893,55 @@ mod tests {
         );
         assert_eq!(mgr.connection_count(), 0);
         assert!(mgr.all_connections().is_empty());
+    }
+
+    #[test]
+    fn test_is_self_address_filters_own_addresses() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let node_table = Arc::new(NodeTable::new(100));
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let mut cfg = make_test_config();
+        cfg.listen_port = 6885;
+        let mgr = ConnectionManager::new(
+            node_table,
+            identity.clone(),
+            cfg,
+            shutdown_tx,
+            Arc::new(FederationMetrics::new()),
+        );
+
+        // 1) 回环地址 + 联邦监听端口 → 自身
+        assert!(mgr.is_self_address("127.0.0.1:6885".parse().unwrap()));
+        // 2) 端口不同 → 不是自身（不误伤同机其它端口的服务）
+        assert!(!mgr.is_self_address("127.0.0.1:9999".parse().unwrap()));
+        // 3) 外部地址 → 不是自身
+        assert!(!mgr.is_self_address("8.8.8.8:6885".parse().unwrap()));
+
+        // 4) 模拟 NAT 映射后的自身公网地址（外部端口 == listen_port）
+        let mapped: SocketAddr = "183.158.254.70:6885".parse().unwrap();
+        identity.update_addresses(vec![crate::federation::node_id::NodeAddress {
+            node_id: identity.node_id.0,
+            ipv4_addr: Some(mapped),
+            ipv6_addr: None,
+            reachability: crate::federation::node_id::Reachability::Mapped,
+            last_seen: 0,
+            nat_type: None,
+        }]);
+        assert!(mgr.is_self_address(mapped));
+
+        // 5) 外部端口与 listen_port 不同时，仍应通过身份地址集合命中
+        let mapped2: SocketAddr = "183.158.254.70:46885".parse().unwrap();
+        identity.update_addresses(vec![crate::federation::node_id::NodeAddress {
+            node_id: identity.node_id.0,
+            ipv4_addr: Some(mapped2),
+            ipv6_addr: None,
+            reachability: crate::federation::node_id::Reachability::Mapped,
+            last_seen: 0,
+            nat_type: None,
+        }]);
+        assert!(mgr.is_self_address(mapped2));
+        // 已被覆盖掉的上一个地址不再算自身（地址集合是整体替换语义）
+        assert!(!mgr.is_self_address(mapped));
     }
 
     #[tokio::test]
