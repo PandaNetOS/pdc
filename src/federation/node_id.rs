@@ -222,11 +222,23 @@ impl NodeIdentity {
                 let stored = NodeId(node_id_bytes);
                 let derived = NodeId::from_public_key(&signing_key.verifying_key().to_bytes());
                 if derived != stored {
+                    // 一次性迁移。4de716a 之前 node_id 是随机生成的，与身份公钥没有任何
+                    // 绑定关系；而握手鉴权要求 `node_id == blake3(pubkey)[..20]`，于是旧身份
+                    // 每次握手都会被对端判定为冒充并直接拒绝（双向互拒 → 连接恒为 0）。
+                    // 这里保留私钥种子不动（历史签名继续有效），只把持久化的 node_id 改写为
+                    // 派生值，使本机身份自洽。
+                    Self::migrate_legacy_node_id(&identity_path, &data, &stored, &derived)?;
                     tracing::warn!(
-                        "[federation] 身份 node_id({}) 与公钥派生值({}) 不一致（旧格式），保持已有 node_id 以兼容",
+                        "[federation] 检测到旧格式身份（node_id 与公钥未绑定），已迁移: node_id {} → {}（私钥未变，历史签名仍有效；旧文件备份为 identity.bin.legacy.bak）",
                         stored.to_hex(),
                         derived.to_hex()
                     );
+                    tracing::info!("[federation] 已加载节点身份: {}", derived.to_hex());
+                    return Ok(Self {
+                        node_id: derived,
+                        signing_key,
+                        addresses: RwLock::new(Vec::new()),
+                    });
                 }
                 tracing::info!("[federation] 已加载节点身份: {}", stored.to_hex());
                 return Ok(Self {
@@ -248,6 +260,37 @@ impl NodeIdentity {
             identity.node_id.to_hex()
         );
         Ok(identity)
+    }
+
+    /// 把旧格式身份文件里的 node_id 字段改写为公钥派生值（私钥种子原样保留）。
+    ///
+    /// - 先落一份 `identity.bin.legacy.bak` 备份，且只在不存在时写，避免覆盖更早的备份；
+    /// - 改写走「临时文件 + rename」，避免写到一半失败留下半截文件导致身份丢失。
+    fn migrate_legacy_node_id(
+        identity_path: &Path,
+        original: &[u8],
+        stored: &NodeId,
+        derived: &NodeId,
+    ) -> anyhow::Result<()> {
+        let backup_path = identity_path.with_extension("bin.legacy.bak");
+        if !backup_path.exists() {
+            std::fs::write(&backup_path, original)?;
+        }
+
+        let mut migrated = original.to_vec();
+        migrated[0..20].copy_from_slice(&derived.0);
+
+        let tmp_path = identity_path.with_extension("bin.migrating");
+        std::fs::write(&tmp_path, &migrated)?;
+        std::fs::rename(&tmp_path, identity_path)?;
+
+        tracing::debug!(
+            "[federation] 身份文件已改写: {} (node_id {} → {})",
+            identity_path.display(),
+            stored.to_hex(),
+            derived.to_hex()
+        );
+        Ok(())
     }
 
     pub fn update_addresses(&self, addresses: Vec<NodeAddress>) {
@@ -378,6 +421,51 @@ mod tests {
         assert_eq!(id1.node_id, id2.node_id);
         assert_eq!(hex1, id2.node_id.to_hex());
         assert_eq!(pk1, id2.public_key_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_identity_is_migrated_to_derived_node_id() {
+        let dir = std::env::temp_dir().join(format!("pdc_fed_migrate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fed_dir = dir.join("federation");
+        std::fs::create_dir_all(&fed_dir).unwrap();
+
+        // 构造"旧格式"身份：随机 node_id + 各自独立的种子（两者互不绑定）
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let legacy_node_id = NodeId::random();
+        let mut raw = Vec::with_capacity(52);
+        raw.extend_from_slice(&legacy_node_id.0);
+        raw.extend_from_slice(&signing_key.to_bytes());
+        let path = fed_dir.join("identity.bin");
+        std::fs::write(&path, &raw).unwrap();
+
+        let identity = NodeIdentity::load_or_create(&dir).unwrap();
+        let expected = NodeId::from_public_key(&identity.public_key_bytes());
+
+        // node_id 被改写为派生值，且与公钥自洽
+        assert_eq!(identity.node_id, expected);
+        assert_ne!(identity.node_id, legacy_node_id);
+        assert!(NodeId::matches_public_key(
+            &identity.node_id,
+            &identity.public_key_bytes()
+        ));
+        // 私钥种子未变（历史签名仍有效）
+        assert_eq!(identity.signing_key.to_bytes(), signing_key.to_bytes());
+
+        // 再次加载保持稳定（不会二次迁移、不会再次改值）
+        let again = NodeIdentity::load_or_create(&dir).unwrap();
+        assert_eq!(again.node_id, expected);
+        assert_eq!(again.signing_key.to_bytes(), signing_key.to_bytes());
+
+        // 迁移前会备份旧文件
+        let backup = std::fs::read(fed_dir.join("identity.bin.legacy.bak")).unwrap();
+        assert_eq!(backup.len(), raw.len());
+        assert_eq!(&backup[0..20], &legacy_node_id.0[..]);
+        // 临时文件不残留
+        assert!(!fed_dir.join("identity.bin.migrating").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
