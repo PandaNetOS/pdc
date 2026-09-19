@@ -1,4 +1,4 @@
-﻿//! 配置管理
+//! 配置管理
 //!
 //! 支持从 config.yaml 加载配置，也支持环境变量覆盖。
 //! 配置结构按模块组织：server、super_tracker、discoverers、cache、health_check、crawler。
@@ -122,7 +122,7 @@ pub struct TaskSchedulerConfig {
     /// - 此外可用 `<任务名>_initial_delay` / `<任务名>_jitter` 覆盖该任务的初始延迟与抖动。
     ///
     /// 未配置的任务一律使用代码内默认值，行为与未引入本配置前完全一致（向后兼容）。
-    #[serde(default)]
+    #[serde(default = "default_task_scheduler_intervals")]
     pub intervals: HashMap<String, u64>,
     /// 资源感知准入控制总开关。false（默认）时调度行为与改造前完全一致。
     #[serde(default = "default_admission_control_enabled")]
@@ -254,6 +254,17 @@ fn default_adaptive_recalc_ticks() -> u32 {
     5
 }
 
+/// `task_scheduler.intervals` 的字段级 serde 默认值。
+///
+/// 必须与 `TaskSchedulerConfig` 的 `impl Default` 保持一致，否则
+/// 「YAML 写了 `task_scheduler:` 节但省略 `intervals`」时会静默丢掉这里的默认覆盖项。
+fn default_task_scheduler_intervals() -> HashMap<String, u64> {
+    let mut m = HashMap::new();
+    // 5 分钟（原 3600 秒 / 1 小时，缩短后 WAL 更频繁压缩）
+    m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 300u64);
+    m
+}
+
 /// 读取任务间隔数值。未在 `intervals` 中配置时返回 `default_value`，保持向后兼容。
 ///
 /// 单位由调用方决定（见 [`TaskSchedulerConfig.intervals`] 文档：秒级任务用秒，
@@ -273,11 +284,7 @@ impl Default for TaskSchedulerConfig {
             persistence_concurrency: default_persistence_concurrency(),
             monitor_concurrency: default_monitor_concurrency(),
             network_concurrency: default_network_concurrency(),
-            intervals: {
-                let mut m = HashMap::new();
-                m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 300u64); // 5分钟（原3600秒/1小时，缩短后WAL更频繁压缩）
-                m
-            },
+            intervals: default_task_scheduler_intervals(),
             admission_control_enabled: default_admission_control_enabled(),
             admission_cpu_threshold: default_admission_cpu_threshold(),
             admission_io_threshold: default_admission_io_threshold(),
@@ -1299,6 +1306,35 @@ log_level: debug
         assert_eq!(c.health_check.interval_secs, 300);
         assert_eq!(c.health_check.cache_cleanup_interval_secs, 600);
         assert_eq!(c.health_check.stats_output_interval_secs, 300);
+    }
+
+    /// `task_scheduler.intervals` 的字段级 serde 默认必须与 `impl Default` 一致：
+    /// YAML 出现 `task_scheduler:` 节但省略 `intervals` 时，默认覆盖项不得丢失。
+    #[test]
+    fn test_task_scheduler_intervals_default_consistent() {
+        const KEY: &str = "wal_checkpoint_truncate_interval_secs";
+
+        // 路径 1：整个 task_scheduler 节缺失 -> impl Default
+        let c1 = PdcConfig::default();
+        assert_eq!(c1.task_scheduler.intervals.get(KEY).copied(), Some(300));
+
+        // 路径 2：节存在但省略 intervals -> 字段级 serde 默认
+        let yaml = "task_scheduler:\n  crawl_concurrency: 4\n";
+        let c2 = PdcConfig::from_yaml(yaml).unwrap();
+        assert_eq!(c2.task_scheduler.crawl_concurrency, 4);
+        assert_eq!(c2.task_scheduler.intervals.get(KEY).copied(), Some(300));
+
+        // 路径 3：两条路径产出的默认表完全一致
+        assert_eq!(c1.task_scheduler.intervals, c2.task_scheduler.intervals);
+
+        // 路径 4：用户显式写 intervals 时仍按「整体替换」语义生效
+        let yaml2 = "task_scheduler:\n  intervals:\n    custom_task: 42\n";
+        let c3 = PdcConfig::from_yaml(yaml2).unwrap();
+        assert_eq!(c3.task_scheduler.intervals.len(), 1);
+        assert_eq!(
+            c3.task_scheduler.intervals.get("custom_task").copied(),
+            Some(42)
+        );
     }
 
     #[test]
