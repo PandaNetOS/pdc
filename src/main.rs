@@ -21,6 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use parking_lot::RwLock;
 use rand::Rng;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -95,6 +96,38 @@ impl WorkDir {
     fn node_id_file(&self) -> std::path::PathBuf {
         self.root.join("data").join("node_id")
     }
+}
+
+/// P1-5：把「受影响 L2 列表 + 从 DB 精确加载到的 (key, data_hash)」整理成
+/// `MerkleTree::recompute_l2_subset_from_db` 所需的入参：
+/// - `by_l1`：L1 → 该 L1 下本次加载到的条目（仅含受影响的 L2 的条目即可）；
+/// - `dirty_in_l1`：L1 → 该 L1 下需要重算的 L2 子集。
+///
+/// 对被删除后变空的 L2（加载不到条目），`recompute_l2_subset_from_db` 会写回 `[0u8;32], 0`
+/// 的「缺席」表示，从而让删除正确折进 Merkle。
+type L1EntryMap = FxHashMap<u16, Vec<(Vec<u8>, Vec<u8>)>>;
+type L1ShardSet = FxHashMap<u16, FxHashSet<u32>>;
+
+fn build_l2_recompute_input(
+    merkle: &PeerDiscoveryCenter::federation::merkle::MerkleTree,
+    l2s: &[u32],
+    keys_hashes: Vec<(Vec<u8>, Vec<u8>)>,
+) -> (L1EntryMap, L1ShardSet) {
+    let mut dirty_in_l1: L1ShardSet = FxHashMap::default();
+    for &l2 in l2s {
+        dirty_in_l1
+            .entry(PeerDiscoveryCenter::federation::merkle::MerkleTree::l1_for_l2(l2))
+            .or_default()
+            .insert(l2);
+    }
+    let mut by_l1: L1EntryMap = FxHashMap::default();
+    for (k, h) in keys_hashes {
+        let l1 = PeerDiscoveryCenter::federation::merkle::MerkleTree::l1_for_l2(
+            merkle.l2_shard_for_key(&k),
+        );
+        by_l1.entry(l1).or_default().push((k, h));
+    }
+    (by_l1, dirty_in_l1)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -552,6 +585,11 @@ async fn async_main(
     } else {
         None
     };
+
+    // P1-2：把本地节点身份注入 oplog 的 origin 列（用于诊断与将来的冲突仲裁）
+    if let Some(ref f) = federation_service {
+        PeerDiscoveryCenter::storage::oplog::set_local_origin(f.identity.node_id.0.to_vec());
+    }
 
     // 5. 创建超级 Tracker 状态（注入 peer_repo + 联邦服务）
     // 注意：创建时机推迟到 federation_service 之后，以便注入联邦引用
@@ -1042,43 +1080,13 @@ async fn async_main(
         );
     }
 
-    // 8.5.2a 分片列定期回填（每 300s，Persistence）
-    // 运行时 INSERT 不写 l2_shard（默认 0），若只在启动回填一次，
-    // 启动后新写入的行会一直停留在 shard 0，导致联邦分片同步按 shard
-    // 过滤时漏掉新数据（shard!=0 的请求取到空集）。此处周期性修正。
-    {
-        let st = storage.clone();
-        task_scheduler.register(
-            TaskMetadata::new(
-                "shard_backfill",
-                "分片列定期回填",
-                std::time::Duration::from_secs(get_interval_secs(intervals, "shard_backfill", 300)),
-            )
-            .with_category(TaskCategory::Persistence)
-            .with_priority(TaskPriority::Background)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Low,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Medium,
-                network: ResourceLevel::Low,
-                is_full_task: false,
-            })
-            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "shard_backfill_initial_delay",
-                120,
-            ))),
-            move || {
-                let st = st.clone();
-                async move {
-                    if let Err(e) = st.backfill_shards() {
-                        warn!("[shard_backfill] 分片列回填失败: {}", e);
-                    }
-                    Ok(())
-                }
-            },
-        );
-    }
+    // 8.5.2a 分片列回填：已由「写入即填」取代（P1-7）。
+    // 四个 repo 的全部 INSERT/UPSERT 路径（db.rs 的 save_dht_node(s)/save_peer(s)/save_infohash(es)/
+    // save_tracker(s) 及其 _in_tx 变体）现在都显式写入 l2_shard，且这些表的 key 均为主键、不会被
+    // UPDATE 改写，故分片索引不会再漂移。historically 这里每 300s 全表扫 `l2_shard = 0` 回填，
+    // 在亿级规模下会形成周期性全表扫描积压（R5），故取消。旧库的历史行仍由启动时的一次性
+    // `storage.backfill_shards()`（见上方启动流程）修正。
+    // （保留 interval 配置键 "shard_backfill" 不再读取，向后兼容旧 config 文件。）
 
     // 8.5.2b WriteQueue 定时 flush（每5秒，Persistence）
     {
@@ -1880,8 +1888,14 @@ async fn async_main(
         }
 
         // fed_merkle_anti_entropy
+        // P2-5：tick 周期取各 repo 周期的较小值（默认 NODE 30s / 其余 300s），
+        // 具体 repo 是否本轮对账由 SyncManager::anti_entropy_due 按 repo 差异化控制。
         let g = fed.gossip_engine.clone();
         let s = fed.sync_manager.clone();
+        let ae_tick_secs = config
+            .federation
+            .anti_entropy_node_interval_secs
+            .min(config.federation.anti_entropy_other_interval_secs);
         task_scheduler.register(
             TaskMetadata::new(
                 "fed_merkle_anti_entropy",
@@ -1889,7 +1903,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "fed_merkle_anti_entropy",
-                    60,
+                    ae_tick_secs,
                 )),
             )
             .with_category(TaskCategory::Network)
@@ -1916,6 +1930,82 @@ async fn async_main(
                 let s = s.clone();
                 async move {
                     g.anti_entropy_tick(s).await;
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_range_reconcile: P1-4 Range-based 反熵抽样对账
+        // 默认 range_reconcile_enabled=false 时为空转（no-op）；开启后先以只读诊断模式运行。
+        let sm_range = fed.sync_manager.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "fed_range_reconcile",
+                "联邦Range反熵对账",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_range_reconcile",
+                    60,
+                )),
+            )
+            .with_category(TaskCategory::Network)
+            .with_priority(TaskPriority::Normal)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Medium,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_range_reconcile_initial_delay",
+                90,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_range_reconcile_jitter",
+                15,
+            ))),
+            move || {
+                let sm = sm_range.clone();
+                async move {
+                    sm.range_reconcile_tick().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_bootstrap_resume: P2-1 bootstrap 断点续传（默认 bootstrap_enabled=false 时空转）
+        let sm_bootstrap = fed.sync_manager.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "fed_bootstrap_resume",
+                "联邦bootstrap续传",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_bootstrap_resume",
+                    60,
+                )),
+            )
+            .with_category(TaskCategory::Network)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Medium,
+                network: ResourceLevel::Medium,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_bootstrap_resume_initial_delay",
+                120,
+            ))),
+            move || {
+                let sm = sm_bootstrap.clone();
+                async move {
+                    sm.bootstrap_resume_tick().await;
                     Ok(())
                 }
             },
@@ -1951,41 +2041,6 @@ async fn async_main(
                 let f = fed_clone.clone();
                 async move {
                     f.sync_public_addr();
-                    Ok(())
-                }
-            },
-        );
-
-        // fed_push_pull_gossip: Push-Pull Gossip（30s）
-        let sm2 = fed.sync_manager.clone();
-        task_scheduler.register(
-            TaskMetadata::new(
-                "fed_push_pull_gossip",
-                "联邦Push-Pull Gossip",
-                std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "fed_push_pull_gossip",
-                    30,
-                )),
-            )
-            .with_category(TaskCategory::Network)
-            .with_priority(TaskPriority::Normal)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Low,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Low,
-                network: ResourceLevel::Low,
-                is_full_task: false,
-            })
-            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "fed_push_pull_gossip_initial_delay",
-                15,
-            ))),
-            move || {
-                let sm = sm2.clone();
-                async move {
-                    sm.push_pull_tick().await;
                     Ok(())
                 }
             },
@@ -2333,12 +2388,14 @@ async fn async_main(
             },
         );
 
-        // 8.8.4 Merkle 全量重算任务（4 个 repo 独立，Persistence 分类并发=1 串行执行，避免 DB 竞争）
-        // DB 驱动后：冷重算 = 全量重算（从 DB 全量加载重算所有分片根），默认 300s（5 分钟）
-        let cold_rebuild_interval = config.federation.merkle_full_rebuild_interval_secs;
+        // 8.8.4 Merkle 重算任务（4 个 repo 独立，Persistence 分类并发=1 串行执行，避免 DB 竞争）
+        // P1-5：常态维护已下沉到「增量任务」（按 dirty L2 精确重算，10s 一次）；
+        // 全量冷重算降级为**低频兜底**（默认 3600s = 1h），不再每 300s 全表重算
+        // （亿级规模下 300s 全表重算不可行，且与增量维护重复）。
+        let cold_rebuild_interval = config.federation.merkle_cold_rebuild_interval_secs;
         let incremental_interval = config.federation.merkle_incremental_update_interval_secs;
         info!(
-            "[main] 注册 Merkle 全量重算任务（4 repo，间隔 {}s）+ 增量更新任务（{}s）",
+            "[main] 注册 Merkle 冷重算任务（4 repo，兜底间隔 {}s）+ 增量更新任务（{}s，按 L2 精确重算）",
             cold_rebuild_interval, incremental_interval
         );
 
@@ -2370,23 +2427,26 @@ async fn async_main(
                     let sm = sm.clone();
                     async move {
                         let merkle = sm.node_merkle();
-                        let dirty = merkle.take_dirty_shards();
+                        let dirty = merkle.take_dirty_l2_shards();
                         if dirty.is_empty() {
                             return Ok(());
                         }
-                        let shards: Vec<u16> = dirty.into_iter().collect();
+                        // P1-5：按真 L2 精确加载受影响的 L2（DB 分片列已存 L2），
+                        // 用批量 recompute_l2_subset_from_db 一次锁内完成，替代旧的「L1 粒度 + 整 L1 重算」。
+                        let l2s: Vec<u32> = dirty.into_iter().collect();
+                        let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
                         match st.load_node_keys_hashes_by_shards(&shards) {
                             Ok(keys_hashes) => {
-                                for &shard in &shards {
-                                    let shard_data: Vec<_> = keys_hashes
-                                        .iter()
-                                        .filter(|(k, _)| merkle.shard_for_key(k) == shard)
-                                        .cloned()
-                                        .collect();
-                                    merkle.recompute_shard_from_db(shard, &shard_data);
+                                let (by_l1, dirty_in_l1) =
+                                    build_l2_recompute_input(&merkle, &l2s, keys_hashes);
+                                merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
+                            }
+                            Err(e) => {
+                                warn!("[merkle_incremental] Node 失败: {}", e);
+                                for &l2 in &l2s {
+                                    merkle.mark_dirty_l2(l2);
                                 }
                             }
-                            Err(e) => warn!("[merkle_incremental] Node 失败: {}", e),
                         }
                         Ok(())
                     }
@@ -2420,23 +2480,24 @@ async fn async_main(
                     let sm = sm.clone();
                     async move {
                         if let Some(merkle) = sm.peer_merkle() {
-                            let dirty = merkle.take_dirty_shards();
+                            let dirty = merkle.take_dirty_l2_shards();
                             if dirty.is_empty() {
                                 return Ok(());
                             }
-                            let shards: Vec<u16> = dirty.into_iter().collect();
+                            let l2s: Vec<u32> = dirty.into_iter().collect();
+                            let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
                             match st.load_peer_keys_hashes_by_shards(&shards) {
                                 Ok(keys_hashes) => {
-                                    for &shard in &shards {
-                                        let shard_data: Vec<_> = keys_hashes
-                                            .iter()
-                                            .filter(|(k, _)| merkle.shard_for_key(k) == shard)
-                                            .cloned()
-                                            .collect();
-                                        merkle.recompute_shard_from_db(shard, &shard_data);
+                                    let (by_l1, dirty_in_l1) =
+                                        build_l2_recompute_input(&merkle, &l2s, keys_hashes);
+                                    merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
+                                }
+                                Err(e) => {
+                                    warn!("[merkle_incremental] Peer 失败: {}", e);
+                                    for &l2 in &l2s {
+                                        merkle.mark_dirty_l2(l2);
                                     }
                                 }
-                                Err(e) => warn!("[merkle_incremental] Peer 失败: {}", e),
                             }
                         }
                         Ok(())
@@ -2471,23 +2532,24 @@ async fn async_main(
                     let sm = sm.clone();
                     async move {
                         if let Some(merkle) = sm.infohash_merkle() {
-                            let dirty = merkle.take_dirty_shards();
+                            let dirty = merkle.take_dirty_l2_shards();
                             if dirty.is_empty() {
                                 return Ok(());
                             }
-                            let shards: Vec<u16> = dirty.into_iter().collect();
+                            let l2s: Vec<u32> = dirty.into_iter().collect();
+                            let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
                             match st.load_infohash_keys_hashes_by_shards(&shards) {
                                 Ok(keys_hashes) => {
-                                    for &shard in &shards {
-                                        let shard_data: Vec<_> = keys_hashes
-                                            .iter()
-                                            .filter(|(k, _)| merkle.shard_for_key(k) == shard)
-                                            .cloned()
-                                            .collect();
-                                        merkle.recompute_shard_from_db(shard, &shard_data);
+                                    let (by_l1, dirty_in_l1) =
+                                        build_l2_recompute_input(&merkle, &l2s, keys_hashes);
+                                    merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
+                                }
+                                Err(e) => {
+                                    warn!("[merkle_incremental] Infohash 失败: {}", e);
+                                    for &l2 in &l2s {
+                                        merkle.mark_dirty_l2(l2);
                                     }
                                 }
-                                Err(e) => warn!("[merkle_incremental] Infohash 失败: {}", e),
                             }
                         }
                         Ok(())
@@ -2522,23 +2584,24 @@ async fn async_main(
                     let sm = sm.clone();
                     async move {
                         if let Some(merkle) = sm.tracker_merkle() {
-                            let dirty = merkle.take_dirty_shards();
+                            let dirty = merkle.take_dirty_l2_shards();
                             if dirty.is_empty() {
                                 return Ok(());
                             }
-                            let shards: Vec<u16> = dirty.into_iter().collect();
+                            let l2s: Vec<u32> = dirty.into_iter().collect();
+                            let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
                             match st.load_tracker_keys_hashes_by_shards(&shards) {
                                 Ok(keys_hashes) => {
-                                    for &shard in &shards {
-                                        let shard_data: Vec<_> = keys_hashes
-                                            .iter()
-                                            .filter(|(k, _)| merkle.shard_for_key(k) == shard)
-                                            .cloned()
-                                            .collect();
-                                        merkle.recompute_shard_from_db(shard, &shard_data);
+                                    let (by_l1, dirty_in_l1) =
+                                        build_l2_recompute_input(&merkle, &l2s, keys_hashes);
+                                    merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
+                                }
+                                Err(e) => {
+                                    warn!("[merkle_incremental] Tracker 失败: {}", e);
+                                    for &l2 in &l2s {
+                                        merkle.mark_dirty_l2(l2);
                                     }
                                 }
-                                Err(e) => warn!("[merkle_incremental] Tracker 失败: {}", e),
                             }
                         }
                         Ok(())
@@ -2720,6 +2783,50 @@ async fn async_main(
                                 }
                                 Err(e) => warn!("[merkle_cold_rebuild] Tracker 失败: {}", e),
                             }
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
+
+        // P1-2：oplog 保留窗口裁剪（窗口默认 24h，必须 > 预估 bootstrap 时长）
+        {
+            let st = storage.clone();
+            let retention = config.federation.oplog_retention_secs;
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "oplog_trim",
+                    "oplog保留窗口裁剪",
+                    std::time::Duration::from_secs(get_interval_secs(
+                        intervals,
+                        "oplog_trim_interval",
+                        config.federation.oplog_trim_interval_secs,
+                    )),
+                )
+                .with_category(TaskCategory::Persistence)
+                .with_priority(TaskPriority::Background)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "oplog_trim_initial_delay",
+                    300,
+                ))),
+                move || {
+                    let st = st.clone();
+                    async move {
+                        match st.trim_oplog_by_retention(retention) {
+                            Ok(n) if n > 0 => {
+                                debug!("[oplog] 裁剪 {} 条（保留窗口 {}s）", n, retention)
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("[oplog] 裁剪失败: {}", e),
                         }
                         Ok(())
                     }

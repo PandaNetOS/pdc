@@ -33,8 +33,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 1：旧版本（仅全量推送差异分片）。
 /// 2：支持 DiffSync key 列表交换（先交换 key 列表，只推送对方缺失条目，重复率 ~90%→<5%）。
 /// 3：支持分层 Merkle 对比 + 分片并行同步（L0→L1→L2 三层定位差异，只同步差异 L2 分片，支持并行+断点续传+流式加载）。
-/// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle。
-pub const HELLO_PROTOCOL_VERSION: u32 = 3;
+/// 4：支持增量（delta）同步通道（OpsRequest/OpsBatch，基于本地 oplog 的 O(Δ) 稳态同步）。
+/// 5：支持 Range-based（有序区间 + 分界点下钻）反熵（RangeReconcileRequest/Response）。
+/// 6：支持 bootstrap 专用通道（BootstrapManifest*/BootstrapChunk*，与在线反熵解耦的全量引导）。
+/// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle；
+/// version >= 4 且 `federation.delta_sync_enabled=true` 时启用 delta 通道；
+/// version >= 5 且 `federation.range_reconcile_enabled=true` 时启用 range 反熵；
+/// version >= 6 且 `federation.bootstrap_enabled=true` 时启用 bootstrap 通道。
+pub const HELLO_PROTOCOL_VERSION: u32 = 6;
 
 /// 单条连接
 pub struct Connection {
@@ -89,6 +95,26 @@ impl Connection {
     /// 对端是否支持分层 Merkle 对比 + 分片并行同步（协议版本 >= 3）
     pub fn supports_layered_merkle(&self) -> bool {
         self.peer_protocol_version.load(Ordering::Relaxed) >= 3
+    }
+
+    /// 对端是否支持增量（delta）同步通道（协议版本 >= 4）
+    pub fn supports_delta_sync(&self) -> bool {
+        crate::federation::sync::delta::supports_delta_sync(
+            self.peer_protocol_version.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 对端是否支持 Range-based（有序区间下钻）反熵（协议版本 >= 5）
+    pub fn supports_range_reconcile(&self) -> bool {
+        crate::federation::sync::range_reconcile::supports_range_reconcile(
+            self.peer_protocol_version.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 对端是否支持 bootstrap 专用通道（协议版本 >= 6）
+    pub fn supports_bootstrap(&self) -> bool {
+        self.peer_protocol_version.load(Ordering::Relaxed)
+            >= crate::federation::sync::bootstrap::BOOTSTRAP_PROTOCOL_VERSION
     }
 
     /// 发送消息
@@ -1138,44 +1164,6 @@ impl ConnectionManager {
                 }
                 false
             }
-            MessageType::GossipDigest => {
-                // Push-Pull Gossip：收到对端最近变更摘要，对比本地后请求缺失的 key
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = connection.clone();
-                    if let Ok(msg) = bincode::deserialize::<GossipDigestMessage>(&payload) {
-                        tokio::spawn(async move {
-                            sync_mgr.handle_gossip_digest(&conn, msg).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::GossipPullRequest => {
-                // Push-Pull Gossip：对端请求指定 key 的完整数据
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = connection.clone();
-                    if let Ok(msg) = bincode::deserialize::<GossipPullRequestMessage>(&payload) {
-                        tokio::spawn(async move {
-                            sync_mgr.handle_gossip_pull_request(&conn, msg).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::GossipPullResponse => {
-                // Push-Pull Gossip：收到拉取的完整数据，应用到本地
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<GossipPullResponseMessage>(&payload) {
-                        sync_mgr.handle_gossip_pull_response(msg);
-                    }
-                }
-                false
-            }
             MessageType::FullSyncComplete => {
                 self.metrics.record_message_recv();
                 if let Ok(msg) = bincode::deserialize::<FullSyncCompleteMessage>(&payload) {
@@ -1347,6 +1335,126 @@ impl ConnectionManager {
                 if let Some(sync_mgr) = self.sync_manager.get() {
                     if let Ok(msg) = bincode::deserialize::<ShardSyncMissingMessage>(&payload) {
                         sync_mgr.handle_shard_sync_missing(msg);
+                    }
+                }
+                false
+            }
+            MessageType::OpsRequest => {
+                // P1-3：增量拉取请求（数据服务器侧）—— 从本地 oplog 取 seq>since_seq 回 OpsBatch（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<OpsRequestMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_ops_request(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::OpsBatch => {
+                // P1-3：增量拉取响应（请求方侧）—— 幂等应用 ops、推进版本向量、续拉下一批（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<OpsBatchMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_ops_batch(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::RangeReconcileRequest => {
+                // P1-4：Range-based 反熵请求（应答方）—— 回该区间摘要 + 分界点/行指纹（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<RangeReconcileRequestMessage>(&payload)
+                    {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_range_reconcile_request(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::RangeReconcileResponse => {
+                // P1-4：Range-based 反熵响应（请求方）—— 剪枝 / 求差 / 继续下钻（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<RangeReconcileResponseMessage>(&payload)
+                    {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_range_reconcile_response(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::BootstrapManifestRequest => {
+                // P2-1：bootstrap 清单请求（应答方）—— 建 w0 水位 + 有序逻辑分块清单（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) =
+                        bincode::deserialize::<BootstrapManifestRequestMessage>(&payload)
+                    {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_bootstrap_manifest_request(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::BootstrapManifestResponse => {
+                // P2-1：bootstrap 清单响应（请求方）—— 保存进度并开始拉第一块（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) =
+                        bincode::deserialize::<BootstrapManifestResponseMessage>(&payload)
+                    {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_bootstrap_manifest_response(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::BootstrapChunkRequest => {
+                // P2-1：bootstrap 分块请求（应答方）—— 按区间取条目回发（受令牌桶限流，异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<BootstrapChunkRequestMessage>(&payload)
+                    {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_bootstrap_chunk_request(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::BootstrapChunkResponse => {
+                // P2-1：bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉/切追尾（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<BootstrapChunkResponseMessage>(&payload)
+                    {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_bootstrap_chunk_response(conn, msg).await;
+                        });
                     }
                 }
                 false

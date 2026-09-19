@@ -164,6 +164,8 @@ impl InfohashRepoImpl {
                 payload,
             })
             .collect();
+        // P1-2：本地新增/更新记入 oplog（delta 同步来源）；失败只告警。
+        crate::storage::oplog::record_local_ops(&self.storage, rt, &entries);
         gossip.submit_gossip(rt, entries);
     }
 

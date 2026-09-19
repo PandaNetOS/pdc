@@ -939,6 +939,14 @@ impl GossipEngine {
             repo_type::INFOHASH,
             repo_type::TRACKER,
         ] {
+            // P1-4：该 repo 若已由 range-based 反熵接管，则不再发 MerkleDigest（避免双重对账）。
+            if merkle_provider.range_reconcile_owns(*repo_type) {
+                continue;
+            }
+            // P2-5：按 repo 差异化周期——未到期的 repo 本轮跳过。
+            if !merkle_provider.anti_entropy_due(*repo_type) {
+                continue;
+            }
             let digest = merkle_provider.get_digest(*repo_type);
             if let Err(e) = conn.send_message(MessageType::MerkleDigest, &digest).await {
                 warn!(

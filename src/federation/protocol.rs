@@ -103,6 +103,26 @@ pub enum MessageType {
     /// 分片同步缺失 key 列表（请求方 → 数据服务器）：请求方对比本地 DB 后，
     /// 回传本地缺失的 key 列表，数据服务器只推送这些 key 的完整数据。
     ShardSyncMissing = 36,
+    /// P1-3：增量（delta）拉取请求（B → A）：`OpsRequest { repo, since_seq, limit }`。
+    /// 仅当 `federation.delta_sync_enabled = true` 时发送；对端不支持时该消息被丢弃（回退反熵）。
+    OpsRequest = 37,
+    /// P1-3：增量（delta）拉取响应（A → B）：`OpsBatch { repo, ops, next_seq, has_more }`。
+    OpsBatch = 38,
+    /// P1-4：Range-based 反熵请求（B → A）：`RangeReconcile { repo, lo, hi, digest, depth }`。
+    /// 有序区间 `[lo, hi)` 的摘要对账；对端回摘要 + 分界点（或叶级行指纹）。
+    /// 仅当 `federation.range_reconcile_enabled = true` 时发送；对端 < v5 不支持时退化为既有分层 Merkle。
+    RangeReconcileRequest = 39,
+    /// P1-4：Range-based 反熵响应（A → B）。
+    RangeReconcileResponse = 40,
+    /// P2-1：bootstrap 清单请求（B → A）：请求指定 repo 的全量分块清单。
+    /// 仅当 `federation.bootstrap_enabled = true` 且对端 >= v6 时发送。
+    BootstrapManifestRequest = 41,
+    /// P2-1：bootstrap 清单响应（A → B）：携带 `BootstrapManifest`。
+    BootstrapManifestResponse = 42,
+    /// P2-1：bootstrap 分块请求（B → A）：请求清单中第 `index` 块的数据。
+    BootstrapChunkRequest = 43,
+    /// P2-1：bootstrap 分块响应（A → B）：携带该块完整条目。
+    BootstrapChunkResponse = 44,
 }
 
 impl MessageType {
@@ -146,6 +166,14 @@ impl MessageType {
             34 => Some(MessageType::ShardSyncComplete),
             35 => Some(MessageType::ShardSyncHashList),
             36 => Some(MessageType::ShardSyncMissing),
+            37 => Some(MessageType::OpsRequest),
+            38 => Some(MessageType::OpsBatch),
+            39 => Some(MessageType::RangeReconcileRequest),
+            40 => Some(MessageType::RangeReconcileResponse),
+            41 => Some(MessageType::BootstrapManifestRequest),
+            42 => Some(MessageType::BootstrapManifestResponse),
+            43 => Some(MessageType::BootstrapChunkRequest),
+            44 => Some(MessageType::BootstrapChunkResponse),
             _ => None,
         }
     }
@@ -623,6 +651,125 @@ pub struct ShardSyncMissingMessage {
     /// 请求方缺失的 key 列表
     pub missing_keys: Vec<Vec<u8>>,
     /// 是否为最后一片
+    pub is_last: bool,
+}
+
+/// P1-3：单条变更操作（oplog 条目在协议上的表示）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpEntry {
+    /// oplog 全局 seq（对端以最大 seq 推进版本向量）
+    pub seq: u64,
+    /// true = delete（墓碑），false = upsert
+    pub is_delete: bool,
+    /// 条目 key（node="ip:port"，peer="<hex_ih>:<ip>:<port>"，infohash=原始字节，tracker=url）
+    pub key: Vec<u8>,
+    /// upsert 时携带完整 payload（与 SyncEntry.payload 同格式）；delete 时为空
+    pub value: Vec<u8>,
+}
+
+/// P1-3：增量拉取请求（B → A）。成本 O(Δ)，与库总量无关。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpsRequestMessage {
+    /// 仓库类型（repo_type::NODE/PEER/INFOHASH/TRACKER）
+    pub repo: u8,
+    /// 请求方已同步到的 oplog seq（断点）
+    pub since_seq: u64,
+    /// 单批上限
+    pub limit: u32,
+}
+
+/// P1-3：增量拉取响应（A → B）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpsBatchMessage {
+    /// 仓库类型
+    pub repo: u8,
+    /// 本批 ops（seq 升序）
+    pub ops: Vec<OpEntry>,
+    /// 下一断点：本批最后一条 op 的 seq；本批为空时回显请求的 since_seq
+    pub next_seq: u64,
+    /// 是否还有更多（true 时请求方应立即再发一次 OpsRequest）
+    pub has_more: bool,
+}
+
+/// P1-4：Range-based 反熵请求（有序区间 `[lo, hi)` 摘要对账）。
+///
+/// 空 `lo` 表示下界 -∞，空 `hi` 表示上界 +∞（key 为非空字节串，故空串可安全作哨兵）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeReconcileRequestMessage {
+    /// 仓库类型（当前仅 NODE 走 range 通道）
+    pub repo: u8,
+    /// 区间下界（含）；空 = -∞
+    pub lo: Vec<u8>,
+    /// 区间上界（不含）；空 = +∞
+    pub hi: Vec<u8>,
+    /// 请求方该区间的摘要（`range_digest`）
+    pub digest: [u8; 32],
+    /// 请求方建议的叶级行数阈值
+    pub leaf_rows: u32,
+    /// 当前下钻深度（应答方原样回显，供请求方递归计数）
+    pub depth: u8,
+}
+
+/// P1-4：Range-based 反熵响应。
+///
+/// - 非叶（`is_leaf == false`）：`digest` + `split_points`，请求方据此继续下钻；
+/// - 叶（`is_leaf == true`）：`digest` + `entries`（该区间内应答方的 `(key, data_hash)` 清单），
+///   请求方对本地清单求集合差。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeReconcileResponseMessage {
+    /// 仓库类型
+    pub repo: u8,
+    /// 区间下界（回显）
+    pub lo: Vec<u8>,
+    /// 区间上界（回显）
+    pub hi: Vec<u8>,
+    /// 应答方该区间的摘要
+    pub digest: [u8; 32],
+    /// 分界点（非叶时非空；叶时为空）
+    pub split_points: Vec<Vec<u8>>,
+    /// 行指纹清单（叶时携带；非叶为空）
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 应答方该区间是否为叶
+    pub is_leaf: bool,
+    /// 下钻深度（回显请求）
+    pub depth: u8,
+}
+
+/// P2-1：bootstrap 清单请求（B → A）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootstrapManifestRequestMessage {
+    /// 仓库类型（按 repo 分别 bootstrap，铁律 7）
+    pub repo: u8,
+}
+
+/// P2-1：bootstrap 清单响应（A → B）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootstrapManifestResponseMessage {
+    /// 分块清单（含 w0 水位、显式区间边界与内容哈希）
+    pub manifest: crate::federation::sync::bootstrap::BootstrapManifest,
+}
+
+/// P2-1：bootstrap 分块请求（B → A）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootstrapChunkRequestMessage {
+    /// 仓库类型
+    pub repo: u8,
+    /// 块序号（对应清单 `chunks` 下标）
+    pub index: u32,
+}
+
+/// P2-1：bootstrap 分块响应（A → B）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootstrapChunkResponseMessage {
+    /// 仓库类型
+    pub repo: u8,
+    /// 块序号
+    pub index: u32,
+    /// 块内条目（接收方**批量 upsert**，严禁逐条 INSERT）
+    pub entries: Vec<SyncEntry>,
+    /// 服务端该块内容哈希（应等于清单中同 index 块的 `hash`）
+    pub hash: [u8; 32],
+    /// 是否为最后一块
     pub is_last: bool,
 }
 

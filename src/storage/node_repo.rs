@@ -156,6 +156,8 @@ impl NodeRepoImpl {
                 payload,
             })
             .collect();
+        // P1-2：本地新增/更新记入 oplog（delta 同步来源）；失败只告警。
+        crate::storage::oplog::record_local_ops(&self.storage, rt, &entries);
         gossip.submit_gossip(rt, entries);
     }
 
@@ -297,6 +299,17 @@ impl NodeRepoImpl {
                     dirty.remove(addr);
                 }
             }
+        }
+
+        // P1-6: 落库软删墓碑（DB deleted_at）。对入站 DELETE 墓碑必须落库，否则重启后旧行会被
+        // 重新加载（"删了又活"）。这里对所有 addrs 都写墓碑，而非仅内存命中的那些：本地可能因
+        // 冷驱逐先把该节点移出内存，但 DB 行仍在，只有落墓碑才能让两端 Merkle 收敛到 0。
+        let pairs: Vec<(String, u16)> = addrs
+            .iter()
+            .map(|a| (a.ip().to_string(), a.port()))
+            .collect();
+        if let Err(e) = self.storage.soft_delete_nodes_batch(&pairs) {
+            tracing::warn!("[node_repo] 入站删除落库墓碑失败: {}", e);
         }
         removed
     }
@@ -640,26 +653,36 @@ impl NodeRepository for NodeRepoImpl {
         self.cold_addrs.write().remove(addr);
         // 节点已删除，不再是待评分脏节点
         self.dirty.write().remove(addr);
+        // P1-6: persist soft-delete tombstone (deleted_at) so a restart cannot resurrect the row.
+        // Without this, "removed locally" and "never existed" are indistinguishable in set
+        // semantics, so the peer's Merkle never converges to 0. ip/port formatting mirrors
+        // to_rows() (ip = addr.ip().to_string()), keeping the UPDATE key aligned with inserts.
+        if let Err(e) = self
+            .storage
+            .soft_delete_node(&addr.ip().to_string(), addr.port())
+        {
+            tracing::warn!("[node_repo] soft_delete_node failed for {}: {}", addr, e);
+        }
         // 联动 Merkle：标记该 key 所在分片为 dirty（墓碑）
         let key = addr.to_string().into_bytes();
         if let Some(merkle) = self.merkle.get() {
             merkle.mark_tombstone(&key);
         }
         // 联邦删除传播：提交 DELETE 条目，避免对端 upsert-only 合并导致"删除复活"
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let items = vec![SyncEntry {
+            key,
+            operation: operation::DELETE,
+            version: now,
+            payload: Vec::new(),
+        }];
+        // P1-2：删除同样记入 oplog（delta 通道需要传播删除，否则对端永不删）
+        crate::storage::oplog::record_local_ops(&self.storage, repo_type::NODE, &items);
         if let Some(gossip) = self.gossip.get() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            gossip.submit_gossip(
-                repo_type::NODE,
-                vec![SyncEntry {
-                    key,
-                    operation: operation::DELETE,
-                    version: now,
-                    payload: Vec::new(),
-                }],
-            );
+            gossip.submit_gossip(repo_type::NODE, items);
         }
         true
     }

@@ -314,6 +314,10 @@ pub fn routes(state: AppState) -> Router {
             get(federation_sync_stats_handler),
         )
         .route(
+            "/api/v1/federation/sync-observability",
+            get(federation_sync_observability_handler),
+        )
+        .route(
             "/api/v1/federation/relay/setup",
             get(federation_relay_setup_handler),
         )
@@ -964,6 +968,22 @@ async fn federation_sync_stats_handler(State(state): State<AppState>) -> Respons
             }))
             .into_response()
         }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "federation not enabled" })),
+        )
+            .into_response(),
+    }
+}
+
+/// P2-3：同步面可观测性（P1-2/P1-3/P1-4/P2-1 的运维观测点）。
+///
+/// 返回：oplog 水位与保留窗口、每个对端每个 repo 的增量落后量（`ops_lag_seq`）、
+/// 未完成的 bootstrap 进度（`{phase, chunks_done/total, bytes, eta 由 ratio 推得}`）、
+/// range 反熵访问区间数（`reconcile_nodes_visited`）与各开关状态。
+async fn federation_sync_observability_handler(State(state): State<AppState>) -> Response {
+    match &state.federation {
+        Some(fed) => Json(fed.sync_observability()).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "federation not enabled" })),

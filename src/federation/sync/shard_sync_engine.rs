@@ -381,6 +381,22 @@ impl ShardSyncEngine {
             }
         };
 
+        // P0-B 兜底：load_fn 已按 L2 过滤，这里再做一次防御性过滤，确保只发送属于本 L2 的条目
+        // （万一上游漏了过滤，也不会把整条 L1 推给对端造成最多 256× 的数据放大）。
+        let before_filter = entries.len();
+        let entries: Vec<SyncEntry> = entries
+            .into_iter()
+            .filter(|e| self.merkle.l2_shard_for_key(&e.key) == l2)
+            .collect();
+        if entries.len() != before_filter {
+            debug!(
+                "[shard-sync] L2={} 防御性过滤: {} -> {}（上游 load_fn 未完全按 L2 过滤）",
+                l2,
+                before_filter,
+                entries.len()
+            );
+        }
+
         if entries.is_empty() {
             debug!(
                 "[shard-sync] L2={} 无数据，直接标记完成: repo={}",

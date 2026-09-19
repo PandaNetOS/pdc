@@ -113,6 +113,8 @@ impl TrackerRepoImpl {
                 payload,
             })
             .collect();
+        // P1-2：本地新增/更新记入 oplog（delta 同步来源）；失败只告警。
+        crate::storage::oplog::record_local_ops(&self.storage, rt, &entries);
         gossip.submit_gossip(rt, entries);
     }
 
@@ -556,14 +558,31 @@ impl TrackerRepository for TrackerRepoImpl {
         // 清除脏标记，避免后续 save_dirty 又把它写回
         self.persist_dirty.write().remove(&key);
         self.score_dirty.write().remove(&key);
-        // 真正删除 DB 行，否则 get_tracker_sync 回源会把它"复活"
-        if let Err(e) = self.storage.delete_tracker_by_url(url) {
-            tracing::warn!("[tracker_repo] 删除 tracker 失败: {}", e);
+        // P1-6：写 deleted_at 墓碑而非物理删除；load_trackers 已过滤墓碑，回源不会再"复活"。
+        // 物理删除无法与"从来没有"区分，会破坏两端 Merkle 的删除闭环。
+        if let Err(e) = self.storage.soft_delete_tracker(url) {
+            tracing::warn!("[tracker_repo] 软删除 tracker 失败: {}", e);
         }
         // 联动 Merkle：标记分片 dirty，联邦重算时同步删除
         if let Some(merkle) = self.merkle.get() {
             merkle.mark_tombstone(url.as_bytes());
         }
+        // P1-2：删除记入 oplog（delta 通道传播删除）；失败只告警。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let items = vec![SyncEntry {
+            key: url.as_bytes().to_vec(),
+            operation: operation::DELETE,
+            version: now,
+            payload: Vec::new(),
+        }];
+        crate::storage::oplog::record_local_ops(
+            &self.storage,
+            crate::federation::protocol::repo_type::TRACKER,
+            &items,
+        );
     }
 
     async fn get_tracker(&self, url: &str) -> Option<TrackerEntry> {

@@ -305,6 +305,35 @@ impl Storage {
             [],
         );
 
+        // ===== P1-1：删除闭环 + 版本向量基础列 =====
+        // version   —— 该行最后写入的逻辑版本（LWW 比较用；0 = 未知/旧数据）
+        // origin_node—— 该行最初来源节点 node_id（20B，诊断/溯源用，可空）
+        // updated_at —— 该行最后写入的 unix 秒（可空）
+        // deleted_at —— 软删除墓碑：非 NULL 表示已删除，查询一律过滤（删除闭环的关键，
+        //              否则「侧删了」在集合语义下与「侧从来没有」无法区分，Merkle 永远收敛不到 0）
+        // 全部 ADD COLUMN 用 let _ 吞掉重复列错误，兼容新旧库。
+        for tbl in ["dht_nodes", "trackers", "infohashes", "peers"] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE {} ADD COLUMN version INTEGER DEFAULT 0", tbl),
+                [],
+            );
+            let _ = conn.execute(
+                &format!("ALTER TABLE {} ADD COLUMN origin_node BLOB", tbl),
+                [],
+            );
+            let _ = conn.execute(
+                &format!(
+                    "ALTER TABLE {} ADD COLUMN updated_at INTEGER DEFAULT 0",
+                    tbl
+                ),
+                [],
+            );
+            let _ = conn.execute(
+                &format!("ALTER TABLE {} ADD COLUMN deleted_at INTEGER", tbl),
+                [],
+            );
+        }
+
         // l2_shard 索引必须在 ALTER TABLE 之后创建（旧表此时才具备该列）。
         // 严禁放回上方 CREATE TABLE 的 execute_batch 块中：旧库 CREATE TABLE IF NOT EXISTS
         // 是 no-op，紧接着的 CREATE INDEX 会因列尚不存在而报 no such column: l2_shard 导致启动失败。
@@ -314,8 +343,21 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_trackers_l2_shard ON trackers(l2_shard);
             CREATE INDEX IF NOT EXISTS idx_infohashes_l2_shard ON infohashes(l2_shard);
             CREATE INDEX IF NOT EXISTS idx_peers_l2_shard ON peers(l2_shard);
+            CREATE INDEX IF NOT EXISTS idx_dht_nodes_deleted ON dht_nodes(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_trackers_deleted ON trackers(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_infohashes_deleted ON infohashes(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_peers_deleted ON peers(deleted_at);
             "#,
         )?;
+
+        // P1-2：变更日志表（联邦 delta 同步的权威来源）
+        crate::storage::oplog::init_oplog_table(&conn)?;
+
+        // P1-3 / P2-1：联邦层拥有的两张表也在此统一建（幂等）。
+        // 放在 init_tables 是为了让 `Storage::memory()`（单元测试）与 `Storage::open`（生产）
+        // 都能拿到完整 schema，避免「运行期才发现 no such table」的隐患。
+        crate::federation::sync::delta::init_delta_tables(&conn)?;
+        crate::federation::sync::bootstrap::init_bootstrap_table(&conn)?;
 
         debug!("[storage] 表结构初始化完成");
         Ok(())
@@ -341,11 +383,13 @@ impl Storage {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
+        // P1-7：写入即填 l2_shard（key = "ip:port"），不再依赖周期全表回填
+        let l2 = compute_l2_shard(format!("{}:{}", ip, port).as_bytes()) as i64;
         conn.execute(
             r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
                 total_latency_ms, consecutive_failures, nodes_returned, last_query_time,
-                last_active, first_seen)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                last_active, first_seen, l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, NULL)
                ON CONFLICT(ip, port) DO UPDATE SET
                 id=excluded.id, score=excluded.score, state=excluded.state,
                 query_count=excluded.query_count, success_count=excluded.success_count,
@@ -353,7 +397,8 @@ impl Storage {
                 consecutive_failures=excluded.consecutive_failures,
                 nodes_returned=excluded.nodes_returned,
                 last_query_time=excluded.last_query_time,
-                last_active=excluded.last_active"#,
+                last_active=excluded.last_active,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
             params![
                 id.as_slice(),
                 ip,
@@ -366,6 +411,8 @@ impl Storage {
                 consecutive_failures as i64,
                 nodes_returned as i64,
                 last_query_time,
+                now,
+                l2,
                 now
             ],
         )?;
@@ -375,7 +422,7 @@ impl Storage {
     /// 加载所有 DHT 节点
     pub fn load_dht_nodes(&self) -> anyhow::Result<Vec<DhtNodeRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time FROM dht_nodes")?;
+        let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time FROM dht_nodes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
             let mut id_arr = [0u8; 20];
@@ -406,6 +453,41 @@ impl Storage {
         Ok(())
     }
 
+    /// P1-6：软删除单个 DHT 节点（写 deleted_at 墓碑，不物理删除）。
+    /// 返回受影响行数（0 表示行不存在或已删除）。upsert 会自动清除墓碑以支持复活。
+    pub fn soft_delete_node(&self, ip: &str, port: u16) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE dht_nodes SET deleted_at = ?1, updated_at = ?1 \
+             WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
+            params![now, ip, port as i64],
+        )?;
+        Ok(n)
+    }
+
+    /// P1-6：批量软删除 DHT 节点（一次事务）。
+    pub fn soft_delete_nodes_batch(&self, addrs: &[(String, u16)]) -> anyhow::Result<usize> {
+        if addrs.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        let tx = conn.unchecked_transaction()?;
+        let mut total = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE dht_nodes SET deleted_at = ?1, updated_at = ?1 \
+                 WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
+            )?;
+            for (ip, port) in addrs {
+                total += stmt.execute(params![now, ip, *port as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(total)
+    }
+
     /// 批量保存 DHT 节点（事务批量插入，一次获取锁完成所有操作）
     pub fn save_dht_nodes_batch(&self, nodes: &[DhtNodeRow]) -> anyhow::Result<()> {
         if nodes.is_empty() {
@@ -427,8 +509,8 @@ impl Storage {
             let mut stmt = tx.prepare(
                 r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
                     total_latency_ms, consecutive_failures, nodes_returned, last_query_time,
-                    last_active, first_seen)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                    last_active, first_seen, l2_shard, updated_at, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, NULL)
                    ON CONFLICT(ip, port) DO UPDATE SET
                     id=excluded.id, score=excluded.score, state=excluded.state,
                     query_count=excluded.query_count, success_count=excluded.success_count,
@@ -436,9 +518,11 @@ impl Storage {
                     consecutive_failures=excluded.consecutive_failures,
                     nodes_returned=excluded.nodes_returned,
                     last_query_time=excluded.last_query_time,
-                    last_active=excluded.last_active"#,
+                    last_active=excluded.last_active,
+                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
             )?;
             for node in nodes {
+                let l2 = compute_l2_shard(format!("{}:{}", node.ip, node.port).as_bytes()) as i64;
                 stmt.execute(params![
                     node.id.as_slice(),
                     node.ip.as_str(),
@@ -451,6 +535,8 @@ impl Storage {
                     node.consecutive_failures as i64,
                     node.nodes_returned as i64,
                     node.last_query_time,
+                    now,
+                    l2,
                     now
                 ])?;
             }
@@ -469,8 +555,8 @@ impl Storage {
         let mut stmt = conn.prepare(
             r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
                 total_latency_ms, consecutive_failures, nodes_returned, last_query_time,
-                last_active, first_seen)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                last_active, first_seen, l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, NULL)
                ON CONFLICT(ip, port) DO UPDATE SET
                 id=excluded.id, score=excluded.score, state=excluded.state,
                 query_count=excluded.query_count, success_count=excluded.success_count,
@@ -478,9 +564,11 @@ impl Storage {
                 consecutive_failures=excluded.consecutive_failures,
                 nodes_returned=excluded.nodes_returned,
                 last_query_time=excluded.last_query_time,
-                last_active=excluded.last_active"#,
+                last_active=excluded.last_active,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
         )?;
         for node in nodes {
+            let l2 = compute_l2_shard(format!("{}:{}", node.ip, node.port).as_bytes()) as i64;
             stmt.execute(params![
                 node.id.as_slice(),
                 node.ip.as_str(),
@@ -493,6 +581,8 @@ impl Storage {
                 node.consecutive_failures as i64,
                 node.nodes_returned as i64,
                 node.last_query_time,
+                now,
+                l2,
                 now
             ])?;
         }
@@ -518,10 +608,13 @@ impl Storage {
         self.record_write("trackers", 1);
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
+        // P1-7：写入即填 l2_shard（key = url）
+        let l2 = compute_l2_shard(url.as_bytes()) as i64;
         conn.execute(
             r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
-                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
                ON CONFLICT(url) DO UPDATE SET
                 score=excluded.score, total_requests=excluded.total_requests,
                 success_requests=excluded.success_requests,
@@ -529,22 +622,30 @@ impl Storage {
                 total_peers_discovered=excluded.total_peers_discovered,
                 total_response_time_ms=excluded.total_response_time_ms,
                 consecutive_failures=excluded.consecutive_failures,
-                disabled=excluded.disabled, last_used=excluded.last_used"#,
+                disabled=excluded.disabled, last_used=excluded.last_used,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
             params![
                 url, score, total_requests as i64, success_requests as i64,
                 failed_requests as i64, total_peers_discovered as i64,
                 total_response_time_ms, consecutive_failures as i64,
-                disabled as i64, now
+                disabled as i64, now, l2, now
             ],
         )?;
         Ok(())
     }
 
-    /// 删除指定 tracker（同步，autocommit）。用于 remove_tracker，避免删除后回源"复活"。
-    pub fn delete_tracker_by_url(&self, url: &str) -> anyhow::Result<()> {
+    /// P1-6：软删除指定 tracker（写 `deleted_at` 墓碑，不物理删除）。用于 `remove_tracker`。
+    /// 物理删除会让「本地删了」与「本地从来没有」在集合语义下无法区分，重启后
+    /// `load_trackers` 回源又会把它"复活"；改成墓碑 + 查询过滤后两端 Merkle 才能收敛到 0。
+    pub fn soft_delete_tracker(&self, url: &str) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM trackers WHERE url = ?1", params![url])?;
-        Ok(())
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE trackers SET deleted_at = ?1, updated_at = ?1 \
+             WHERE url = ?2 AND deleted_at IS NULL",
+            params![now, url],
+        )?;
+        Ok(n)
     }
 
     /// 在已有连接上批量保存 trackers（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -558,8 +659,9 @@ impl Storage {
         let now = chrono::Utc::now().timestamp();
         let mut stmt = conn.prepare(
             r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
-                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
                ON CONFLICT(url) DO UPDATE SET
                 score=excluded.score, total_requests=excluded.total_requests,
                 success_requests=excluded.success_requests,
@@ -567,9 +669,11 @@ impl Storage {
                 total_peers_discovered=excluded.total_peers_discovered,
                 total_response_time_ms=excluded.total_response_time_ms,
                 consecutive_failures=excluded.consecutive_failures,
-                disabled=excluded.disabled, last_used=excluded.last_used"#,
+                disabled=excluded.disabled, last_used=excluded.last_used,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
         )?;
         for t in trackers {
+            let l2 = compute_l2_shard(t.url.as_bytes()) as i64;
             stmt.execute(params![
                 t.url.as_str(),
                 t.score,
@@ -581,6 +685,8 @@ impl Storage {
                 t.consecutive_failures as i64,
                 t.disabled as i64,
                 now,
+                l2,
+                now,
             ])?;
         }
         Ok(())
@@ -588,7 +694,7 @@ impl Storage {
 
     pub fn load_trackers(&self) -> anyhow::Result<Vec<TrackerRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled FROM trackers")?;
+        let mut stmt = conn.prepare("SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled FROM trackers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok(TrackerRow {
                 url: row.get(0)?,
@@ -629,12 +735,16 @@ impl Storage {
         score: f64,
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
+        // P1-7：写入即填 l2_shard（key = infohash 原始字节）
+        let l2 = compute_l2_shard(infohash) as i64;
         conn.execute(
-            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score)
-               VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?4, NULL)
                ON CONFLICT(infohash) DO UPDATE SET
-                ref_count=excluded.ref_count, last_seen=excluded.last_seen, score=excluded.score"#,
-            params![infohash.as_slice(), ref_count as i64, first_source, now, score],
+                ref_count=excluded.ref_count, last_seen=excluded.last_seen, score=excluded.score,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
+            params![infohash.as_slice(), ref_count as i64, first_source, now, score, l2],
         )?;
         Ok(())
     }
@@ -649,18 +759,22 @@ impl Storage {
         }
         let now = chrono::Utc::now().timestamp();
         let mut stmt = conn.prepare(
-            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score)
-               VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+            r#"INSERT INTO infohashes (infohash, ref_count, first_source, first_seen, last_seen, score,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?4, NULL)
                ON CONFLICT(infohash) DO UPDATE SET
-                ref_count=excluded.ref_count, last_seen=excluded.last_seen, score=excluded.score"#,
+                ref_count=excluded.ref_count, last_seen=excluded.last_seen, score=excluded.score,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
         )?;
         for entry in entries {
+            let l2 = compute_l2_shard(entry.infohash.as_slice()) as i64;
             stmt.execute(params![
                 entry.infohash.as_slice(),
                 entry.ref_count as i64,
                 entry.first_source.as_str(),
                 now,
                 entry.score,
+                l2,
             ])?;
         }
         Ok(())
@@ -671,7 +785,7 @@ impl Storage {
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt =
-            conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes")?;
+            conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
             let mut arr = [0u8; 20];
@@ -766,18 +880,24 @@ impl Storage {
         last_active: i64,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        // P1-7：写入即填 l2_shard（key = "<hex_ih>:<ip>:<port>"）
+        let l2 = peer_shard_index(infohash, ip, port);
         conn.execute(
-            r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
                ON CONFLICT(infohash, ip, port) DO UPDATE SET
                 source=excluded.source, score=excluded.score,
                 connection_attempts=excluded.connection_attempts,
                 connection_successes=excluded.connection_successes,
-                last_active=excluded.last_active"#,
+                last_active=excluded.last_active,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
             params![
                 infohash.as_slice(), ip, port as i64, source,
                 score, connection_attempts as i64,
                 connection_successes as i64, last_active,
+                l2, now,
             ],
         )?;
         Ok(())
@@ -786,7 +906,7 @@ impl Storage {
     /// 加载所有 peer
     pub fn load_peers(&self) -> anyhow::Result<Vec<PeerRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active FROM peers")?;
+        let mut stmt = conn.prepare("SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active FROM peers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
             let mut arr = [0u8; 20];
@@ -821,18 +941,22 @@ impl Storage {
         }
         self.record_write("peers", peers.len() as u64);
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
+                    l2_shard, updated_at, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
                    ON CONFLICT(infohash, ip, port) DO UPDATE SET
                     source=excluded.source, score=excluded.score,
                     connection_attempts=excluded.connection_attempts,
                     connection_successes=excluded.connection_successes,
-                    last_active=excluded.last_active"#,
+                    last_active=excluded.last_active,
+                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
             )?;
             for peer in peers {
+                let l2 = peer_shard_index(&peer.infohash, peer.ip.as_str(), peer.port);
                 stmt.execute(params![
                     peer.infohash.as_slice(),
                     peer.ip.as_str(),
@@ -841,7 +965,9 @@ impl Storage {
                     peer.score,
                     peer.connection_attempts as i64,
                     peer.connection_successes as i64,
-                    peer.last_active
+                    peer.last_active,
+                    l2,
+                    now,
                 ])?;
             }
         }
@@ -854,16 +980,20 @@ impl Storage {
         if peers.is_empty() {
             return Ok(());
         }
+        let now = chrono::Utc::now().timestamp();
         let mut stmt = conn.prepare(
-            r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
                ON CONFLICT(infohash, ip, port) DO UPDATE SET
                 source=excluded.source, score=excluded.score,
                 connection_attempts=excluded.connection_attempts,
                 connection_successes=excluded.connection_successes,
-                last_active=excluded.last_active"#,
+                last_active=excluded.last_active,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
         )?;
         for peer in peers {
+            let l2 = peer_shard_index(&peer.infohash, peer.ip.as_str(), peer.port);
             stmt.execute(params![
                 peer.infohash.as_slice(),
                 peer.ip.as_str(),
@@ -873,6 +1003,8 @@ impl Storage {
                 peer.connection_attempts as i64,
                 peer.connection_successes as i64,
                 peer.last_active,
+                l2,
+                now,
             ])?;
         }
         Ok(())
@@ -1104,7 +1236,7 @@ impl Storage {
         .ok()
     }
 
-    // ---- 分层 Merkle 同步：按 L1 分片加载行 ----
+    // ---- 分层 Merkle 同步：按 L2 精确分片加载行 ----
 
     /// 构建 `WHERE col IN (?1, ?2, ...)` 占位符 SQL 片段
     fn in_placeholders(n: usize) -> String {
@@ -1114,8 +1246,8 @@ impl Storage {
             .join(",")
     }
 
-    /// 按 L1 分片加载 DHT 节点行（id, ip, port），走 l2_shard 索引。
-    /// 分片列存 L1 分片（0..255）。
+    /// 按 **L2 二级分片**加载 DHT 节点行（id, ip, port），走 l2_shard 索引。
+    /// P1-5：分片列存真 L2（0..65535），传入 L2 值即可精确命中，避免整条 L1 加载的 256× 放大。
     pub fn load_node_rows_by_shards(
         &self,
         shards: &[u16],
@@ -1125,7 +1257,7 @@ impl Storage {
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
-            "SELECT id, ip, port FROM dht_nodes WHERE l2_shard IN ({})",
+            "SELECT id, ip, port FROM dht_nodes WHERE l2_shard IN ({}) AND deleted_at IS NULL",
             Self::in_placeholders(shards.len())
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1141,7 +1273,7 @@ impl Storage {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// 按 L1 分片加载 Peer 行（infohash, ip, port, source, last_active），走 l2_shard 索引。
+    /// 按 **L2 二级分片**加载 Peer 行（infohash, ip, port, source, last_active），走 l2_shard 索引。
     pub fn load_peer_rows_by_shards(
         &self,
         shards: &[u16],
@@ -1151,7 +1283,7 @@ impl Storage {
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
-            "SELECT infohash, ip, port, source, last_active FROM peers WHERE l2_shard IN ({})",
+            "SELECT infohash, ip, port, source, last_active FROM peers WHERE l2_shard IN ({}) AND deleted_at IS NULL",
             Self::in_placeholders(shards.len())
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1169,7 +1301,7 @@ impl Storage {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// 按 L1 分片加载 Infohash 行（infohash, last_seen, first_source），走 l2_shard 索引。
+    /// 按 **L2 二级分片**加载 Infohash 行（infohash, last_seen, first_source），走 l2_shard 索引。
     pub fn load_infohash_rows_by_shards(
         &self,
         shards: &[u16],
@@ -1179,7 +1311,7 @@ impl Storage {
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
-            "SELECT infohash, last_seen, first_source FROM infohashes WHERE l2_shard IN ({})",
+            "SELECT infohash, last_seen, first_source FROM infohashes WHERE l2_shard IN ({}) AND deleted_at IS NULL",
             Self::in_placeholders(shards.len())
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1195,7 +1327,7 @@ impl Storage {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// 按 L1 分片加载 Tracker 行（url, disabled, last_used），走 l2_shard 索引。
+    /// 按 **L2 二级分片**加载 Tracker 行（url, disabled, last_used），走 l2_shard 索引。
     pub fn load_tracker_rows_by_shards(
         &self,
         shards: &[u16],
@@ -1205,7 +1337,7 @@ impl Storage {
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
-            "SELECT url, disabled, last_used FROM trackers WHERE l2_shard IN ({})",
+            "SELECT url, disabled, last_used FROM trackers WHERE l2_shard IN ({}) AND deleted_at IS NULL",
             Self::in_placeholders(shards.len())
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1227,7 +1359,8 @@ impl Storage {
     /// key = "ip:port"，data_hash = blake3(id || ip || port_le)，与 build_node_sync_entry 一致。
     pub fn load_all_node_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT id, ip, port FROM dht_nodes")?;
+        let mut stmt =
+            conn.prepare("SELECT id, ip, port FROM dht_nodes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
             let ip: String = row.get(1)?;
@@ -1252,7 +1385,8 @@ impl Storage {
     /// key = "<hex_infohash>:<ip>:<port>"，data_hash = blake3(infohash || ip || port_le)。
     pub fn load_all_peer_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT infohash, ip, port FROM peers")?;
+        let mut stmt =
+            conn.prepare("SELECT infohash, ip, port FROM peers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
             let ip: String = row.get(1)?;
@@ -1282,7 +1416,7 @@ impl Storage {
     /// key = infohash 原始字节，data_hash = blake3(infohash)。
     pub fn load_all_infohash_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT infohash FROM infohashes")?;
+        let mut stmt = conn.prepare("SELECT infohash FROM infohashes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
             Ok(ih)
@@ -1300,7 +1434,7 @@ impl Storage {
     /// key = url 字节，data_hash = blake3(url)。
     pub fn load_all_tracker_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT url FROM trackers")?;
+        let mut stmt = conn.prepare("SELECT url FROM trackers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let url: String = row.get(0)?;
             Ok(url)
@@ -1330,7 +1464,7 @@ impl Storage {
             r#"SELECT id, ip, port, score, state, query_count, success_count,
                   total_latency_ms, consecutive_failures, nodes_returned, last_query_time
                FROM dht_nodes
-               WHERE last_active > ?1 OR score >= ?2
+               WHERE deleted_at IS NULL AND (last_active > ?1 OR score >= ?2)
                ORDER BY score DESC
                LIMIT ?3"#,
         )?;
@@ -1363,7 +1497,7 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, \
              consecutive_failures, nodes_returned, last_query_time FROM dht_nodes \
-             WHERE ip = ?1 AND port = ?2",
+             WHERE ip = ?1 AND port = ?2 AND deleted_at IS NULL",
         )?;
         let result = stmt.query_row(params![ip, port as i64], |row| {
             let id: Vec<u8> = row.get(0)?;
@@ -1397,7 +1531,7 @@ impl Storage {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, \
-             last_active FROM peers WHERE ip = ?1 AND port = ?2",
+             last_active FROM peers WHERE ip = ?1 AND port = ?2 AND deleted_at IS NULL",
         )?;
         let result = stmt.query_row(params![ip, port as i64], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -1427,7 +1561,8 @@ impl Storage {
     pub fn load_infohash_by_hash(&self, ih: &[u8; 20]) -> anyhow::Result<Option<InfohashRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT infohash, ref_count, first_source, score FROM infohashes WHERE infohash = ?1",
+            "SELECT infohash, ref_count, first_source, score FROM infohashes \
+             WHERE infohash = ?1 AND deleted_at IS NULL",
         )?;
         let result = stmt.query_row(params![ih.as_slice()], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -1455,7 +1590,7 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT url, score, total_requests, success_requests, failed_requests, \
              total_peers_discovered, total_response_time_ms, consecutive_failures, disabled \
-             FROM trackers WHERE url = ?1",
+             FROM trackers WHERE url = ?1 AND deleted_at IS NULL",
         )?;
         let result = stmt.query_row(params![url], |row| {
             Ok(TrackerRow {
@@ -1486,7 +1621,7 @@ impl Storage {
         Ok(count as u64)
     }
 
-    /// 按 L1 分片加载节点 (key, data_hash)，用于 Merkle 增量重算。
+    /// 按 L2 二级分片加载节点 (key, data_hash)，用于 Merkle 增量重算。
     pub fn load_node_keys_hashes_by_shards(
         &self,
         shards: &[u16],
@@ -1505,7 +1640,121 @@ impl Storage {
         Ok(out)
     }
 
-    /// 按 L1 分片加载 Peer (key, data_hash)，用于 Merkle 增量重算。
+    /// P2-1：按 key（"ip:port" 字符串）升序加载 NODE 原始行 `(id, ip, port)`，范围 `[lo, hi)`，最多 `limit` 条。
+    ///
+    /// 供 bootstrap 分块服务端组装完整 `SyncEntry`（需要 id/ip/port 构造 payload）使用；
+    /// 排序/比较键与 [`Self::load_node_key_hashes_in_range`] 严格一致。
+    pub fn load_node_rows_in_range(
+        &self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, String, i64)>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+        let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+        let mut stmt = conn.prepare(
+            "SELECT id, ip, port FROM dht_nodes \
+             WHERE deleted_at IS NULL \
+               AND (?1 IS NULL OR (ip || ':' || port) >= ?1) \
+               AND (?2 IS NULL OR (ip || ':' || port) < ?2) \
+             ORDER BY (ip || ':' || port) ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// P1-4：按 key（"ip:port" 字符串）升序加载 NODE 的 (key, data_hash)，范围 `[lo, hi)`，最多 `limit` 条。
+    ///
+    /// - 用表达式 `(ip || ':' || port)` 作为排序/比较键，与 Merkle 的 key 编码严格一致，
+    ///   保证「按 key 排序」与「区间比较」自洽（若用 ip/port 双列排序会产生偏差）。
+    /// - `lo = None` 表示下界 -∞；`hi = None` 表示上界 +∞。
+    pub fn load_node_key_hashes_in_range(
+        &self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+        let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+        let mut stmt = conn.prepare(
+            "SELECT id, ip, port FROM dht_nodes \
+             WHERE deleted_at IS NULL \
+               AND (?1 IS NULL OR (ip || ':' || port) >= ?1) \
+               AND (?2 IS NULL OR (ip || ':' || port) < ?2) \
+             ORDER BY (ip || ':' || port) ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, ip, port) = r?;
+            let key = format!("{}:{}", ip, port).into_bytes();
+            let mut buf = Vec::with_capacity(id.len() + ip.len() + 2);
+            buf.extend_from_slice(&id);
+            buf.extend_from_slice(ip.as_bytes());
+            buf.extend_from_slice(&port.to_le_bytes());
+            out.push((key, blake3::hash(&buf).as_bytes().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// P1-4：均匀抽取 `n` 个 NODE key 作为区间分界（用 rowid 伪随机探针，避免全表扫描）。
+    ///
+    /// 返回**已排序去重**的 key 列表。`MAX(rowid)` 为 O(1)，每个探针为 O(log N) 的 rowid 查找，
+    /// 整体 O(n log N)（相对 O(N) 全表扫描可忽略）。
+    pub fn sample_node_range_keys(&self, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let max_rowid: i64 =
+            conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM dht_nodes", [], |r| {
+                r.get(0)
+            })?;
+        if max_rowid <= 0 {
+            return Ok(Vec::new());
+        }
+        // 手写 LCG（避免引入 rand 依赖；seed 取自当前时间，保证每轮抽样不同）
+        let mut state: u64 = (chrono::Utc::now().timestamp_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut stmt = conn.prepare_cached(
+            "SELECT ip, port FROM dht_nodes WHERE deleted_at IS NULL AND rowid >= ?1 \
+             ORDER BY rowid ASC LIMIT 1",
+        )?;
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let probe = ((state >> 33) % (max_rowid as u64)) as i64;
+            if let Ok((ip, port)) = stmt.query_row(params![probe], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                keys.push(format!("{}:{}", ip, port).into_bytes());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    /// 按 L2 二级分片加载 Peer (key, data_hash)，用于 Merkle 增量重算。
     pub fn load_peer_keys_hashes_by_shards(
         &self,
         shards: &[u16],
@@ -1529,7 +1778,7 @@ impl Storage {
         Ok(out)
     }
 
-    /// 按 L1 分片加载 Infohash (key, data_hash)，用于 Merkle 增量重算。
+    /// 按 L2 二级分片加载 Infohash (key, data_hash)，用于 Merkle 增量重算。
     pub fn load_infohash_keys_hashes_by_shards(
         &self,
         shards: &[u16],
@@ -1543,7 +1792,7 @@ impl Storage {
         Ok(out)
     }
 
-    /// 按 L1 分片加载 Tracker (key, data_hash)，用于 Merkle 增量重算。
+    /// 按 L2 二级分片加载 Tracker (key, data_hash)，用于 Merkle 增量重算。
     pub fn load_tracker_keys_hashes_by_shards(
         &self,
         shards: &[u16],
@@ -1557,14 +1806,29 @@ impl Storage {
         Ok(out)
     }
 
-    /// 一次性回填 l2_shard 列：旧库历史数据默认 0，按 blake3(key) 重算修正。
-    /// 启动时调用一次，失败不阻断启动。
+    /// 一次性迁移/回填 `l2_shard` 列（P1-5）。
+    ///
+    /// 以 SQLite 内置 `PRAGMA user_version` 作为迁移标记：达到 [`SHARD_SCHEME_VERSION`] 即视为
+    /// 已是「真 L2」方案，直接返回（O(1) 元数据检查，不扫表）。否则**全表重算**四表的 `l2_shard`
+    /// 为真 L2 值并写回标记。
+    ///
+    /// 为什么必须全表重算而非只补 `l2_shard = 0`：旧库该列存的是 **L1**（0..255），与新方案（L2，
+    /// 0..65535）语义不同，只补 0 值会让两套语义混存，导致按 L2 查询漏行/错行。故本次一次性全表
+    /// 重算；此后所有写入路径都「写入即填」真 L2，不再需要任何回填。
+    /// 启动时调用一次，失败不阻断启动（下次启动会因标记未写入而重试）。
     pub fn backfill_shards(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if uv >= SHARD_SCHEME_VERSION {
+            return Ok(());
+        }
+
         let tx = conn.unchecked_transaction()?;
         // dht_nodes: key = "ip:port"
         {
-            let mut sel = tx.prepare("SELECT id, ip, port FROM dht_nodes WHERE l2_shard = 0")?;
+            let mut sel = tx.prepare("SELECT id, ip, port FROM dht_nodes")?;
             let rows: Vec<(Vec<u8>, String, i64)> = sel
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .filter_map(|r| r.ok())
@@ -1574,13 +1838,13 @@ impl Storage {
                 tx.prepare("UPDATE dht_nodes SET l2_shard = ?1 WHERE ip = ?2 AND port = ?3")?;
             for (_id, ip, port) in &rows {
                 let key = format!("{}:{}", ip, port);
-                let shard = compute_shard(key.as_bytes()) as i64;
+                let shard = compute_l2_shard(key.as_bytes()) as i64;
                 upd.execute(params![shard, ip, port])?;
             }
         }
         // peers: key = "<hex_ih>:<ip>:<port>"
         {
-            let mut sel = tx.prepare("SELECT infohash, ip, port FROM peers WHERE l2_shard = 0")?;
+            let mut sel = tx.prepare("SELECT infohash, ip, port FROM peers")?;
             let rows: Vec<(Vec<u8>, String, i64)> = sel
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .filter_map(|r| r.ok())
@@ -1596,13 +1860,13 @@ impl Storage {
                 }
                 let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
                 let key = format!("{}:{}:{}", ih_hex, ip, port);
-                let shard = compute_shard(key.as_bytes()) as i64;
+                let shard = compute_l2_shard(key.as_bytes()) as i64;
                 upd.execute(params![shard, ih, ip, port])?;
             }
         }
         // infohashes: key = infohash 原始字节
         {
-            let mut sel = tx.prepare("SELECT infohash FROM infohashes WHERE l2_shard = 0")?;
+            let mut sel = tx.prepare("SELECT infohash FROM infohashes")?;
             let rows: Vec<Vec<u8>> = sel
                 .query_map([], |row| row.get::<_, Vec<u8>>(0))?
                 .filter_map(|r| r.ok())
@@ -1610,13 +1874,13 @@ impl Storage {
             drop(sel);
             let mut upd = tx.prepare("UPDATE infohashes SET l2_shard = ?1 WHERE infohash = ?2")?;
             for ih in &rows {
-                let shard = compute_shard(ih) as i64;
+                let shard = compute_l2_shard(ih) as i64;
                 upd.execute(params![shard, ih])?;
             }
         }
         // trackers: key = url
         {
-            let mut sel = tx.prepare("SELECT url FROM trackers WHERE l2_shard = 0")?;
+            let mut sel = tx.prepare("SELECT url FROM trackers")?;
             let rows: Vec<String> = sel
                 .query_map([], |row| row.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
@@ -1624,11 +1888,17 @@ impl Storage {
             drop(sel);
             let mut upd = tx.prepare("UPDATE trackers SET l2_shard = ?1 WHERE url = ?2")?;
             for url in &rows {
-                let shard = compute_shard(url.as_bytes()) as i64;
+                let shard = compute_l2_shard(url.as_bytes()) as i64;
                 upd.execute(params![shard, url])?;
             }
         }
         tx.commit()?;
+        // 迁移标记写入必须成功，否则下次启动会重复全表重算（幂等，无副作用）
+        conn.execute_batch(&format!("PRAGMA user_version = {}", SHARD_SCHEME_VERSION))?;
+        info!(
+            "[storage] l2_shard 迁移完成：4 表已重算为真 L2 分片（scheme v{}）",
+            SHARD_SCHEME_VERSION
+        );
         Ok(())
     }
 
@@ -1643,6 +1913,30 @@ impl Storage {
 /// 取 blake3(key) 首字节（shard_count=256 时 bytes[0] 即 L1 = L2/256）。
 pub fn compute_shard(key: &[u8]) -> u16 {
     blake3::hash(key).as_bytes()[0] as u16
+}
+
+/// 计算 key 所属 L2 二级分片（0..65535）。
+/// L2 = blake3(key)[0] * 256 + blake3(key)[1]，与 `MerkleTree::l2_shard_for_key` 在
+/// shard_count=256（生产固定值）时**完全一致**。L1 = L2 / 256 = blake3(key)[0]。
+///
+/// P1-5：`dht_nodes/trackers/infohashes/peers` 四表的 `l2_shard` 列自 scheme v2 起**存真 L2 值**
+/// （此前存的是 L1，属历史遗留）；写入即填此值，查询按精确 L2 命中，从而消除「按 L2 取数却整条
+/// L1 加载」的 256× 放大（R3）。
+pub fn compute_l2_shard(key: &[u8]) -> u32 {
+    let h = blake3::hash(key);
+    let b = h.as_bytes();
+    (b[0] as u32) * 256 + (b[1] as u32)
+}
+
+/// 四表 `l2_shard` 列的分片方案版本。v2 = 存真 L2；v0/v1 = 历史 L1 方案。
+/// 以 SQLite 内置 `PRAGMA user_version` 作为一次性迁移标记。
+const SHARD_SCHEME_VERSION: i64 = 2;
+
+/// peers 表分片索引值（真 L2）。
+/// key = "<hex_ih>:<ip>:<port>"，与 `load_all_peer_keys_hashes` / Merkle 侧 peer key 约定一致。
+fn peer_shard_index(infohash: &[u8], ip: &str, port: u16) -> i64 {
+    let hex: String = infohash.iter().map(|b| format!("{:02x}", b)).collect();
+    compute_l2_shard(format!("{}:{}:{}", hex, ip, port).as_bytes()) as i64
 }
 
 /// DHT 节点行

@@ -579,6 +579,11 @@ impl FederationService {
         }
     }
 
+    /// P2-3：同步面可观测性（oplog 水位 / 每对端增量落后 / bootstrap 进度 / range 对账统计）。
+    pub fn sync_observability(&self) -> serde_json::Value {
+        self.sync_manager.sync_observability()
+    }
+
     /// 向所有已连接的联邦节点并行发送 PeerQueryRequest，等待 `timeout` 后收集响应中的 peer 地址，去重返回。
     ///
     /// 用于 SuperTracker announce 时本地 peer 不足，实时向联邦节点拉取同 infohash 的 peer。

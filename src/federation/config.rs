@@ -174,9 +174,58 @@ pub struct FederationConfig {
     #[serde(default = "default_merkle_incremental_update_interval_secs")]
     pub merkle_incremental_update_interval_secs: u64,
     /// Merkle 全量重算间隔（秒）。
-    /// 兜底任务：每此间隔从 DB 全量重算所有分片根，默认 300 秒（5 分钟）。
+    /// 【已废弃】P1-5 起常态维护改由增量任务（按 dirty L2 精确重算）承担，全量重算降级为
+    /// 低频兜底并使用 `merkle_cold_rebuild_interval_secs`。该字段保留仅为向后兼容旧配置文件。
     #[serde(default = "default_merkle_full_rebuild_interval_secs")]
     pub merkle_full_rebuild_interval_secs: u64,
+    /// P1-2：oplog 保留窗口（秒）。默认 86400（24h）。
+    /// **必须 > 预估 bootstrap 时长**（架构文档铁律 4），否则新节点追尾时水位 W0 之后的 op
+    /// 已被裁掉，只能重打快照。设为 0 表示永不裁剪（表会无界增长，不建议）。
+    #[serde(default = "default_oplog_retention_secs")]
+    pub oplog_retention_secs: u64,
+    /// P1-2：oplog 裁剪任务间隔（秒）。默认 3600（1h）。
+    #[serde(default = "default_oplog_trim_interval_secs")]
+    pub oplog_trim_interval_secs: u64,
+    /// P1-3：是否启用 delta（oplog 增量）同步通道。默认 false。
+    /// 该通道改变线上协议（新增 OpsRequest/OpsBatch 消息），必须两端同版本后开启；
+    /// 关闭时完全不发这些消息，行为与改造前一致。
+    #[serde(default)]
+    pub delta_sync_enabled: bool,
+    /// P1-4：是否启用 Range-based（有序区间 + 分界点下钻）反熵作为 NODE repo 的反熵主链。
+    /// 默认 false：行为与改造前一致（既有分层 Merkle 反熵），必须两端同版本（>= v5）后开启。
+    #[serde(default)]
+    pub range_reconcile_enabled: bool,
+    /// P1-4 灰度：只读诊断模式。true（默认）时只求差集并打印统计、**不修改任何数据**。
+    #[serde(default = "default_true")]
+    pub range_reconcile_diagnostic_only: bool,
+    /// P1-4：叶级行数阈值（区间内行数 ≤ 该值即交换行指纹清单求差）。
+    #[serde(default = "default_range_leaf_rows")]
+    pub range_reconcile_leaf_rows: u32,
+    /// P1-4：单次响应的最大分界点数。
+    #[serde(default = "default_range_max_splits")]
+    pub range_reconcile_max_splits: u32,
+    /// P1-4：最大下钻深度（防御性，避免病态区间无限下钻）。
+    #[serde(default = "default_range_max_depth")]
+    pub range_reconcile_max_depth: u8,
+    /// P1-4：单轮诊断抽样的区间数。
+    #[serde(default = "default_range_sample_ranges")]
+    pub range_reconcile_sample_ranges: u32,
+    /// P2-1：是否启用 bootstrap 专用通道（与在线反熵解耦的全量引导）。
+    /// 默认 false：不注册、不发起、不响应任何 bootstrap 消息。
+    #[serde(default)]
+    pub bootstrap_enabled: bool,
+    /// P2-1：bootstrap 单块行数。
+    #[serde(default = "default_bootstrap_chunk_rows")]
+    pub bootstrap_chunk_rows: u32,
+    /// P2-1：bootstrap 服务端带宽预算（字节/秒）。0 = 不限流。
+    #[serde(default = "default_bootstrap_rate_bytes_per_sec")]
+    pub bootstrap_rate_bytes_per_sec: u64,
+    /// P2-5：NODE repo 的反熵周期（秒）。NODE churn 最高，用更短周期。
+    #[serde(default = "default_anti_entropy_node_interval_secs")]
+    pub anti_entropy_node_interval_secs: u64,
+    /// P2-5：其余 repo 的反熵周期（秒）。
+    #[serde(default = "default_anti_entropy_other_interval_secs")]
+    pub anti_entropy_other_interval_secs: u64,
     /// 发送端 GossipBatch 合并为 bulk 帧的最大 batch 数量。
     /// 同一连接的多个 batch 合并为一个 GossipBatchBulk 发送，减少网络往返。
     #[serde(default = "default_gossip_bulk_max_batches")]
@@ -407,6 +456,36 @@ fn default_merkle_incremental_update_interval_secs() -> u64 {
 fn default_merkle_full_rebuild_interval_secs() -> u64 {
     300
 }
+fn default_oplog_retention_secs() -> u64 {
+    86_400
+}
+fn default_oplog_trim_interval_secs() -> u64 {
+    3_600
+}
+fn default_range_leaf_rows() -> u32 {
+    crate::federation::sync::range_reconcile::DEFAULT_LEAF_ROWS
+}
+fn default_range_max_splits() -> u32 {
+    crate::federation::sync::range_reconcile::DEFAULT_MAX_SPLITS
+}
+fn default_range_max_depth() -> u8 {
+    crate::federation::sync::range_reconcile::DEFAULT_MAX_DEPTH
+}
+fn default_range_sample_ranges() -> u32 {
+    crate::federation::sync::range_reconcile::DEFAULT_SAMPLE_RANGES
+}
+fn default_bootstrap_chunk_rows() -> u32 {
+    crate::federation::sync::bootstrap::DEFAULT_CHUNK_ROWS
+}
+fn default_bootstrap_rate_bytes_per_sec() -> u64 {
+    crate::federation::sync::bootstrap::DEFAULT_RATE_BYTES_PER_SEC
+}
+fn default_anti_entropy_node_interval_secs() -> u64 {
+    30
+}
+fn default_anti_entropy_other_interval_secs() -> u64 {
+    300
+}
 fn default_gossip_bulk_max_batches() -> usize {
     50
 }
@@ -526,6 +605,20 @@ impl Default for FederationConfig {
             merkle_incremental_update_interval_secs:
                 default_merkle_incremental_update_interval_secs(),
             merkle_full_rebuild_interval_secs: default_merkle_full_rebuild_interval_secs(),
+            oplog_retention_secs: default_oplog_retention_secs(),
+            oplog_trim_interval_secs: default_oplog_trim_interval_secs(),
+            delta_sync_enabled: false,
+            range_reconcile_enabled: false,
+            range_reconcile_diagnostic_only: true,
+            range_reconcile_leaf_rows: default_range_leaf_rows(),
+            range_reconcile_max_splits: default_range_max_splits(),
+            range_reconcile_max_depth: default_range_max_depth(),
+            range_reconcile_sample_ranges: default_range_sample_ranges(),
+            bootstrap_enabled: false,
+            bootstrap_chunk_rows: default_bootstrap_chunk_rows(),
+            bootstrap_rate_bytes_per_sec: default_bootstrap_rate_bytes_per_sec(),
+            anti_entropy_node_interval_secs: default_anti_entropy_node_interval_secs(),
+            anti_entropy_other_interval_secs: default_anti_entropy_other_interval_secs(),
             gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
             gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
             parallel_propagation: default_parallel_propagation(),

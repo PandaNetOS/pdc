@@ -324,8 +324,17 @@ impl MerkleTree {
     ///
     /// 仅重算单个 L2，然后传播到其父 L1 和 L0。
     /// 用于增量更新中精准重算少量脏 L2。
+    ///
+    /// 空集语义：`entries` 为空表示该 L2 已无行（例如删除了最后一个 key），必须写回
+    /// `([0u8;32], 0)` 这一「缺席」表示，与 `recompute_l1_from_db` / `rebuild_all_from_db`
+    /// 保持一致；若直接 `compute_shard_root(&[])` 会得到 blake3 空输入的非零哈希，导致同一
+    /// 「空 L2」在不同重算路径下产生不同哈希，反熵永远收敛不到 0。
     pub fn recompute_l2_from_db(&self, l2: u32, entries: &[(Vec<u8>, Vec<u8>)]) {
-        let (hash, count) = Self::compute_shard_root(entries);
+        let (hash, count) = if entries.is_empty() {
+            ([0u8; 32], 0u32)
+        } else {
+            Self::compute_shard_root(entries)
+        };
         let mut state = self.state.write();
         state.apply_l2_updates(&[(l2, hash, count)]);
     }
@@ -784,6 +793,17 @@ impl MerkleTree {
 pub trait MerkleProvider: Send + Sync {
     fn get_digest(&self, repo_type: u8) -> MerkleDigestMessage;
     fn get_shard_entries(&self, repo_type: u8, shard: u16) -> Vec<(Vec<u8>, Vec<u8>)>;
+    /// P1-4：该 repo 是否已由 range-based（有序区间下钻）反熵接管。
+    /// 返回 true 时反熵不再对该 repo 发送 MerkleDigest（避免与 range 通道双重对账）。
+    /// 默认 false：全部 repo 继续走既有分层 Merkle，行为与改造前一致。
+    fn range_reconcile_owns(&self, _repo_type: u8) -> bool {
+        false
+    }
+    /// P2-5：该 repo 本轮是否「到期」需要反熵对账（按 repo 差异化周期）。
+    /// 默认 true：每次 tick 都对所有 repo 对账，行为与改造前一致。
+    fn anti_entropy_due(&self, _repo_type: u8) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

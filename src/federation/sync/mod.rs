@@ -5,18 +5,21 @@
 
 #![allow(clippy::type_complexity)]
 
+pub mod bootstrap;
+pub mod delta;
 pub mod infohash_sync;
 pub mod merkle_updater;
 pub mod peer_sync;
+pub mod range_reconcile;
 pub mod shard_sync_engine;
 pub mod tracker_sync;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
@@ -101,9 +104,6 @@ pub struct SyncManager {
     /// 大差异（Merkle 差异分片≥20%）时触发，只拉差异部分。
     /// 全局最多4个并发（每repo1个）。
     diff_sync_states: RwLock<FxHashMap<u8, (NodeId, Instant, Instant)>>,
-    /// 最近变更缓冲区（Push-Pull Gossip 用）：(repo_type, key, version)
-    /// 固定容量 500，写入时追加，超过容量弹出最旧。
-    recent_changes: RwLock<VecDeque<(u8, Vec<u8>, u64)>>,
     /// 已见过的对端 Merkle 摘要（对端 node_id -> 各 repo 条目数），
     /// 供数据源选择时按「数据最完整（与本地差异最大）」排序。
     peer_digests: RwLock<FxHashMap<NodeId, Vec<u32>>>,
@@ -122,8 +122,14 @@ pub struct SyncManager {
     /// 分层 Merkle 对比会话：key=(peer, repo_type)。
     /// 追踪正在进行的 L0→L1→L2 分层对比流程。
     layered_compare_sessions: RwLock<FxHashMap<(NodeId, u8), LayeredCompareSession>>,
-    /// 增量同步互斥标记：每个 repo 同时只进行一次增量同步。
-    incremental_sync_active: RwLock<FxHashSet<u8>>,
+    /// P2-1：服务端为每个对端缓存最近一次发出的 bootstrap 清单（分块边界由它决定）。
+    bootstrap_manifests: RwLock<FxHashMap<NodeId, bootstrap::BootstrapManifest>>,
+    /// P2-1：bootstrap 服务端带宽令牌桶（限流，铁律 1：低优先级、可抢占）。
+    bootstrap_bucket: ParkingMutex<bootstrap::TokenBucket>,
+    /// P1-4：range 反熵累计访问的区间数（可观测性）。
+    range_ranges_visited: std::sync::atomic::AtomicU64,
+    /// P2-5：反熵按 repo 差异化的上次执行时刻。
+    anti_entropy_last: RwLock<FxHashMap<u8, Instant>>,
 }
 
 /// DiffSync key 列表请求累计缓冲（请求方侧）
@@ -231,6 +237,10 @@ impl SyncManager {
             None
         };
 
+        let bootstrap_bucket = ParkingMutex::new(bootstrap::TokenBucket::new(
+            config.bootstrap_rate_bytes_per_sec,
+        ));
+
         Self {
             connection_manager,
             node_repo,
@@ -249,14 +259,16 @@ impl SyncManager {
             shutdown,
             initial_sync_peers: RwLock::new(HashSet::new()),
             diff_sync_states: RwLock::new(FxHashMap::default()),
-            recent_changes: RwLock::new(VecDeque::with_capacity(500)),
             peer_digests: RwLock::new(FxHashMap::default()),
             diff_key_req_buffer: RwLock::new(FxHashMap::default()),
             pending_diff_key_resp: RwLock::new(FxHashMap::default()),
             active_shard_engines: RwLock::new(FxHashMap::default()),
             shard_hash_list_buffer: RwLock::new(FxHashMap::default()),
             layered_compare_sessions: RwLock::new(FxHashMap::default()),
-            incremental_sync_active: RwLock::new(FxHashSet::default()),
+            bootstrap_manifests: RwLock::new(FxHashMap::default()),
+            bootstrap_bucket,
+            range_ranges_visited: std::sync::atomic::AtomicU64::new(0),
+            anti_entropy_last: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -464,13 +476,11 @@ impl SyncManager {
     /// Merkle + 提交 Gossip，此处不再轮询传播，也不再 take_dirty（避免与 save_all 抢脏标记）。
     pub async fn do_node_sync(self: Arc<Self>) {}
 
-    /// 处理收到的同步批量消息（阶段1 SyncBatch 协议）
+    /// 处理收到的同步批量消息（阶段1 SyncBatch 协议 / P1-3 delta 通道）
     pub fn handle_sync_batch(&self, repo_type: u8, entries: &[SyncEntry]) {
-        // 【回环修复】此处不再把入站条目登记进 recent_changes。
-        // recent_changes 是「本地最近变更广告位」，只应装本地产生的变更（本地新节点走
-        // propagate->submit_gossip 直接传播）。若把对端发来的条目登记进去，push_pull_tick /
-        // incremental_sync_tick 会把它当作本地变更再用 GossipDigest 广告回对端，对端 pull
-        // 回来又登记、再广告 -> A->B->A 无限拉取回环。
+        // 【回环修复】入站条目一律**不写回 oplog**（oplog 只记本地 origin 的变更），
+        // 也不登记进任何「本地最近变更」缓冲（Push-Pull Gossip 路径已随 P1-9 移除）。
+        // 否则 A->B->A 会形成无限回灌：对端发来的数据被当成本地变更再广告/回推。
         match repo_type {
             repo_type::NODE => self.apply_node_sync(entries),
             repo_type::PEER => {
@@ -491,6 +501,114 @@ impl SyncManager {
             _ => {
                 warn!("[federation] 未知仓库类型: {}", repo_type);
             }
+        }
+
+        // 【P0-C/P1-6】入站落库后把受影响的分片折进内存 Merkle。
+        // 只重算受影响的 L2（按 L1 分组、每个 L1 从 DB 读一次），既不 rebuild 全树、
+        // 也不标 dirty 触发回推，因此不会形成 A->B->A 回环；作用是把「本地 Merkle 相对 DB
+        // 的滞后」从一整个冷重算周期（300s）压缩为本批立刻收敛，避免下一轮反熵继续判出假差异。
+        // 注意：这里**包含 DELETE 键**——折算以 DB 为权威（查询已过滤 deleted_at），被删的 key
+        // 在重算后自然从对应 L2 消失，从而让删除也立刻折进 Merkle；若排除 DELETE，则入站删除会
+        // 在 Merkle 中残留一个幽灵叶子，直到下次冷重算才消失。
+        let keys: Vec<Vec<u8>> = entries.iter().map(|e| e.key.clone()).collect();
+        self.fold_merkle_from_keys(repo_type, &keys);
+    }
+
+    /// 【P0-C/P1-5】把一批入站 key 所影响的 L2 折进内存 Merkle。
+    ///
+    /// 只重算受影响的 L2：按 L2 去重后，一次性从 DB 精确加载这些 L2 的 (key, data_hash)
+    /// （P1-5 起 `l2_shard` 列存真 L2，可按 L2 命中，不再有 256× 放大），
+    /// 再对每个受影响 L2 调用 `recompute_l2_from_db`（其余 L2 保持不变）。
+    /// - 不调用 `rebuild_all`（那会把全部 65536 个 L2 标记脏、开销 O(N)）；
+    /// - 不标记 dirty（因此不会触发任何回推，无 A->B->A 风险）。
+    ///
+    /// 若本批触及的 L2 过多（≈全表），退化为标 dirty，交给周期增量任务/冷重算兜底，
+    /// 避免在本路径里重载整表。
+    fn fold_merkle_from_keys(&self, repo_type: u8, keys: &[Vec<u8>]) {
+        if keys.is_empty() {
+            return;
+        }
+        let merkle = match self.merkle_for_repo(repo_type) {
+            Some(m) => m,
+            None => return,
+        };
+
+        // 受影响 L2 集合（P1-5：DB 分片列存真 L2，可按 L2 精确加载，无需按 L1 放大）
+        let affected: FxHashSet<u32> = keys.iter().map(|k| merkle.l2_shard_for_key(k)).collect();
+        if affected.is_empty() {
+            return;
+        }
+
+        // 触及 L2 过多（≈全表）→ 交给周期增量任务，避免本路径重载过多
+        const MAX_FOLD_L2: usize = 4096;
+        if affected.len() > MAX_FOLD_L2 {
+            for &l2 in &affected {
+                merkle.mark_dirty_l2(l2);
+            }
+            debug!(
+                "[federation] 入站批次触及 {} 个 L2（>{}），转为 dirty 交周期增量任务兜底: repo={}",
+                affected.len(),
+                MAX_FOLD_L2,
+                repo_type
+            );
+            return;
+        }
+
+        let l2s: Vec<u16> = affected.iter().map(|&l2| l2 as u16).collect();
+        match self.load_keys_hashes_by_shards(repo_type, &l2s) {
+            Ok(entries) => {
+                // 按实际 L2 归并（用 merkle 的 key→L2 映射，保证与写入/加载口径一致）
+                let mut grouped: FxHashMap<u32, Vec<(Vec<u8>, Vec<u8>)>> = FxHashMap::default();
+                for (k, h) in entries {
+                    grouped
+                        .entry(merkle.l2_shard_for_key(&k))
+                        .or_default()
+                        .push((k, h));
+                }
+                // 受影响的 L2 即使加载不到条目（删除后变空）也必须重算写回「缺席」表示，
+                // 否则删除不会折进 Merkle（幽灵叶子残留到下次冷重算）。
+                for &l2 in &affected {
+                    let v = grouped.remove(&l2).unwrap_or_default();
+                    merkle.recompute_l2_from_db(l2, &v);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[federation] 折 Merkle 加载 {} 个 L2 失败: {}，转为 dirty",
+                    affected.len(),
+                    e
+                );
+                for &l2 in &affected {
+                    merkle.mark_dirty_l2(l2);
+                }
+            }
+        }
+    }
+
+    /// 按 repo 类型、按 L2 二级分片加载 (key, data_hash)（供 Merkle 增量重算使用）。
+    fn load_keys_hashes_by_shards(
+        &self,
+        repo_type: u8,
+        shards: &[u16],
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match repo_type {
+            repo_type::NODE => self
+                .node_repo
+                .storage()
+                .load_node_keys_hashes_by_shards(shards),
+            repo_type::PEER => match &self.peer_repo {
+                Some(r) => r.storage().load_peer_keys_hashes_by_shards(shards),
+                None => Ok(Vec::new()),
+            },
+            repo_type::INFOHASH => match &self.infohash_repo {
+                Some(r) => r.storage().load_infohash_keys_hashes_by_shards(shards),
+                None => Ok(Vec::new()),
+            },
+            repo_type::TRACKER => match &self.tracker_repo {
+                Some(r) => r.storage().load_tracker_keys_hashes_by_shards(shards),
+                None => Ok(Vec::new()),
+            },
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -830,17 +948,36 @@ impl SyncManager {
     /// 将对端各 repo 条目数记录到 peer_digests，供全量同步数据源选择时
     /// 判断哪个节点数据最完整。PeerInfo 在握手后立即到达，远早于 60s 反熵
     /// 的 MerkleDigest，确保数据源选择时有真实数据可用。
-    pub fn handle_peer_info(&self, from_node_id: NodeId, counts: Vec<u32>) {
-        let mut digests = self.peer_digests.write();
-        let entry = digests.entry(from_node_id).or_insert_with(|| vec![0u32; 4]);
-        for (i, &c) in counts.iter().take(4).enumerate() {
-            entry[i] = c;
-        }
-        let total: u64 = entry.iter().map(|c| *c as u64).sum();
+    pub fn handle_peer_info(self: &Arc<Self>, from_node_id: NodeId, counts: Vec<u32>) {
+        let total = {
+            let mut digests = self.peer_digests.write();
+            let entry = digests.entry(from_node_id).or_insert_with(|| vec![0u32; 4]);
+            for (i, &c) in counts.iter().take(4).enumerate() {
+                entry[i] = c;
+            }
+            entry.iter().map(|c| *c as u64).sum::<u64>()
+        };
         debug!(
             "[federation] 收到 PeerInfo from={}, 条目总数={}",
             from_node_id, total
         );
+
+        // P1-3：握手完成（PeerInfo 到达）后，若 delta 通道开启且对端支持（version>=4），
+        // 立即对四个 repo 各发起一次增量拉取（断点来自持久化的 delta_peer_seq，重启后续传）。
+        // 关闭 delta 时完全不发 OpsRequest，行为与改造前一致。
+        if self.config.delta_sync_enabled {
+            let this = self.clone();
+            tokio::spawn(async move {
+                for &rt in &[
+                    repo_type::NODE,
+                    repo_type::PEER,
+                    repo_type::INFOHASH,
+                    repo_type::TRACKER,
+                ] {
+                    this.trigger_delta_sync(from_node_id, rt).await;
+                }
+            });
+        }
     }
 
     /// 触发差异全量同步（接收方），按 repo 独立触发、独立并发。
@@ -997,139 +1134,6 @@ impl SyncManager {
         for repo_type in expired {
             self.finish_diff_sync(repo_type);
         }
-    }
-
-    // ========================================================================
-    // Push-Pull Gossip（每30秒交换最近变更，兜底纯 Push 丢失的消息）
-    // ========================================================================
-
-    /// 启动 Push-Pull Gossip 定时任务（已迁移到 TaskScheduler）
-    ///
-    /// 周期性 Push-Pull 由 TaskScheduler 调用 `push_pull_tick()` 驱动。
-    /// 此方法保留为空以兼容现有调用点，不再内部 spawn。
-    pub fn spawn_push_pull_gossip(self: Arc<Self>) {
-        // 已迁移：Push-Pull Gossip 由 TaskScheduler 调度 push_pull_tick()
-    }
-
-    /// 单次 Push-Pull：随机选1个邻居，发送最近变更摘要（由 TaskScheduler 调度）
-    pub async fn push_pull_tick(&self) {
-        let conns = self.connection_manager.all_connections();
-        if conns.is_empty() {
-            return;
-        }
-        // 随机选1个邻居
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let idx = (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as usize)
-            % conns.len();
-        let conn = &conns[idx];
-
-        let changes = self
-            .recent_changes
-            .read()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        if changes.is_empty() {
-            return;
-        }
-
-        let digest = GossipDigestMessage { changes };
-        if let Err(e) = conn.send_message(MessageType::GossipDigest, &digest).await {
-            debug!("[federation] Push-Pull GossipDigest 发送失败: {}", e);
-        } else {
-            self.metrics.record_message_sent();
-            debug!(
-                "[federation] Push-Pull: 发送 {} 条变更摘要 to={}",
-                digest.changes.len(),
-                conn.node_id
-            );
-        }
-    }
-
-    /// 处理收到的 GossipDigest：对比本地，找出对端有而本地没有的 key，发送 PullRequest
-    pub async fn handle_gossip_digest(&self, conn: &Connection, digest: GossipDigestMessage) {
-        // 收集本地缺失的 key（对端有而本地没有）。
-        // 【回环修复】不能用 merkle.contains_key 判断本地是否持有：当前 Merkle 是 DB 驱动的，
-        // contains_key() 恒返回 false（merkle.rs 无 per-key 内存索引），会把本地已持有的 key
-        // 全部误判为「缺失」-> 对每个 key 都发 PullRequest -> 对端回传 -> 又登记 -> 再广告，
-        // 形成 A<->B 无限拉取回环。NODE repo 直接查存储层按 addr 判断存在性。
-        let mut missing: Vec<(u8, Vec<u8>)> = Vec::new();
-        for (repo_type, key, _version) in &digest.changes {
-            let already_here: bool = match *repo_type {
-                repo_type::NODE => std::str::from_utf8(key)
-                    .ok()
-                    .and_then(|s| s.parse::<SocketAddr>().ok())
-                    .map(|addr| self.node_repo.contains_sync(addr))
-                    .unwrap_or(false),
-                _ => self
-                    .merkle_for_repo(*repo_type)
-                    .map(|m| m.contains_key(key))
-                    .unwrap_or(false),
-            };
-            if !already_here {
-                missing.push((*repo_type, key.clone()));
-            }
-        }
-
-        if missing.is_empty() {
-            return;
-        }
-
-        debug!(
-            "[federation] Push-Pull: 发现 {} 个缺失 key，请求拉取 from={}",
-            missing.len(),
-            conn.node_id
-        );
-
-        let req = GossipPullRequestMessage { keys: missing };
-        if let Err(e) = conn
-            .send_message(MessageType::GossipPullRequest, &req)
-            .await
-        {
-            debug!("[federation] GossipPullRequest 发送失败: {}", e);
-        } else {
-            self.metrics.record_message_sent();
-        }
-    }
-
-    /// 处理收到的 GossipPullRequest：返回指定 key 的完整数据
-    pub async fn handle_gossip_pull_request(
-        &self,
-        conn: &Connection,
-        req: GossipPullRequestMessage,
-    ) {
-        let mut entries: Vec<(u8, SyncEntry)> = Vec::new();
-        for (repo_type, key) in &req.keys {
-            if let Some(entry) = self.load_entry_by_key(*repo_type, key) {
-                entries.push((*repo_type, entry));
-            }
-        }
-
-        if entries.is_empty() {
-            return;
-        }
-
-        let resp = GossipPullResponseMessage { entries };
-        if let Err(e) = conn
-            .send_message(MessageType::GossipPullResponse, &resp)
-            .await
-        {
-            debug!("[federation] GossipPullResponse 发送失败: {}", e);
-        } else {
-            self.metrics.record_message_sent();
-        }
-    }
-
-    /// 处理收到的 GossipPullResponse：应用到本地
-    pub fn handle_gossip_pull_response(&self, resp: GossipPullResponseMessage) {
-        let count = resp.entries.len();
-        for (repo_type, entry) in resp.entries {
-            self.handle_sync_batch(repo_type, std::slice::from_ref(&entry));
-        }
-        debug!("[federation] Push-Pull: 应用 {} 条拉取数据", count);
     }
 
     /// 处理收到的 DiffSyncRequest（本节点作为数据源 / 服务端）。
@@ -1811,12 +1815,6 @@ impl SyncManager {
         }
     }
 
-    /// 从数据库按 key 加载单个 SyncEntry（用于 Gossip Pull）。
-    pub fn load_entry_by_key(&self, repo_type: u8, key: &[u8]) -> Option<SyncEntry> {
-        let shard = self.merkle_for_repo(repo_type)?.shard_for_key(key);
-        let entries = self.load_entries_by_shards(repo_type, &[shard]);
-        entries.into_iter().find(|e| e.key == key)
-    }
     /// 获取同步统计（各 repo 同步计数 + Gossip 传播次数）
     pub fn sync_stats(&self) -> crate::federation::SyncStats {
         let snap = self.metrics.snapshot();
@@ -1872,7 +1870,8 @@ impl SyncManager {
             return;
         }
 
-        let diff_ratio = diffs.len() as f64 / 256.0;
+        let l1_total = merkle.shard_count().max(1) as f64;
+        let diff_ratio = diffs.len() as f64 / l1_total;
         info!(
             "[federation] Merkle 对账发现 {} 个差异分片（{:.1}%）: repo_type={}, from={}",
             diffs.len(),
@@ -1881,22 +1880,34 @@ impl SyncManager {
             conn.node_id
         );
 
-        // 大差异（≥20%分片）：优先走分层 Merkle + 分片并行同步（version>=3）
+        // ===== P0-A：升级判定改用 L2 粒度 =====
+        // 背景：L1 每桶约 1600 行，高 churn 表（NODE）只要有 ~2% 的散列差异，256 个 L1 的哈希
+        // 就会全部不同，于是「L1 差异 ≥20%」这个判据恒为真、永远走最重路径；而且 L1 比例
+        // 无法区分「整表发散」与「个别行新增」。
+        // 新逻辑：只要 L1 有差异且对端支持分层 Merkle，就先下钻到 L2（MerkleLevelRequest），
+        // 拿到精确的差异 L2 集合后，在 handle_merkle_level_response 里按 L2 比例决定走
+        // 「轻量 MerkleRequest（差异小且集中时）」还是「分片同步引擎（差异大/分散时）」。
+        // 注意：本改动不改变任何线上消息格式（digest 仍携带 L1 哈希）。
+        if conn.supports_layered_merkle() && self.config.layered_merkle_enabled {
+            info!(
+                "[federation] L1 差异 {} 个（{:.1}%），下钻 L2 精确对账: repo_type={}, from={}",
+                diffs.len(),
+                diff_ratio * 100.0,
+                digest.repo_type,
+                conn.node_id
+            );
+            self.trigger_layered_sync(conn.node_id, digest.repo_type)
+                .await;
+            return;
+        }
+
+        // 对端不支持分层 Merkle：退回旧判据（大差异走 DiffSync、小差异走逐分片 MerkleRequest）
         if diffs.len() * 5 >= 256 {
-            if conn.supports_layered_merkle() && self.config.layered_merkle_enabled {
-                info!(
-                    "[federation] 差异≥20%，触发分层Merkle+分片同步（repo_type={}, from={}）",
-                    digest.repo_type, conn.node_id
-                );
-                self.trigger_layered_sync(conn.node_id, digest.repo_type)
-                    .await;
-            } else {
-                info!(
-                    "[federation] 差异≥20%，对端不支持分层Merkle，触发旧版DiffSync（repo_type={}, from={}）",
-                    digest.repo_type, conn.node_id
-                );
-                self.trigger_diff_sync(conn.node_id, digest.repo_type).await;
-            }
+            info!(
+                "[federation] 对端不支持分层Merkle，触发旧版DiffSync（repo_type={}, from={}）",
+                digest.repo_type, conn.node_id
+            );
+            self.trigger_diff_sync(conn.node_id, digest.repo_type).await;
             return;
         }
 
@@ -2176,37 +2187,83 @@ impl SyncManager {
                     absolute_diff_l2.len()
                 );
 
-                // 更新会话状态
-                let mut sessions = self.layered_compare_sessions.write();
-                if let Some(session) = sessions.get_mut(&key) {
-                    if let crate::federation::sync::shard_sync_engine::LayeredComparePhase::AwaitingL2 {
-                        compared_l1,
-                        diff_l2,
-                        pending_l1_count,
-                    } = &mut session.phase
-                    {
-                        compared_l1.push(resp.parent_shard);
-                        for &l2 in &absolute_diff_l2 {
-                            diff_l2.insert(l2);
+                // 更新会话状态；把「收齐后的差异 L2 集合」带出锁作用域，锁随即释放。
+                // 关键：后续的网络发送（.await）绝不能持有 parking_lot 写锁 ——
+                // 否则该 future 非 Send，tokio::spawn 会编译失败（见 connection.rs 的调用点）。
+                let ready_diff_l2: Option<Vec<u32>> = {
+                    let mut sessions = self.layered_compare_sessions.write();
+                    let mut ready: Option<Vec<u32>> = None;
+                    if let Some(session) = sessions.get_mut(&key) {
+                        if let crate::federation::sync::shard_sync_engine::LayeredComparePhase::AwaitingL2 {
+                            compared_l1,
+                            diff_l2,
+                            pending_l1_count,
+                        } = &mut session.phase
+                        {
+                            compared_l1.push(resp.parent_shard);
+                            for &l2 in &absolute_diff_l2 {
+                                diff_l2.insert(l2);
+                            }
+                            *pending_l1_count -= 1;
+                            if *pending_l1_count == 0 {
+                                ready = Some(std::mem::take(diff_l2).into_iter().collect());
+                            }
                         }
-                        *pending_l1_count -= 1;
+                    }
+                    ready
+                };
 
-                        // 所有 L1 都收齐了，启动分片同步
-                        if *pending_l1_count == 0 {
-                            let diff_l2_list: Vec<u32> =
-                                std::mem::take(diff_l2).into_iter().collect();
-                            drop(sessions);
+                // 所有 L1 都收齐了：按 L2 粒度决定修复路径（P0-A）
+                let diff_l2_list = match ready_diff_l2 {
+                    Some(list) => list,
+                    None => return,
+                };
 
-                            info!(
-                                "[shard-sync] 分层对比完成: repo={}, peer={}, 差异L2总数={}",
-                                resp.repo_type,
-                                conn.node_id,
-                                diff_l2_list.len()
-                            );
+                let total_l2 = merkle.l2_total_count().max(1) as f64;
+                let l2_ratio = diff_l2_list.len() as f64 / total_l2;
 
-                            // 启动分片同步引擎
-                            self.start_shard_sync(conn.clone(), resp.repo_type, diff_l2_list);
-                        }
+                info!(
+                    "[shard-sync] 分层对比完成: repo={}, peer={}, 差异L2总数={}/{}（{:.1}%）",
+                    resp.repo_type,
+                    conn.node_id,
+                    diff_l2_list.len(),
+                    total_l2 as u64,
+                    l2_ratio * 100.0
+                );
+
+                if diff_l2_list.is_empty() {
+                    return;
+                }
+
+                // 差异 L2 的父 L1 集合（判断差异是否「集中」）
+                let mut parents: FxHashSet<u16> = FxHashSet::default();
+                for &l2 in &diff_l2_list {
+                    parents.insert(MerkleTree::l1_for_l2(l2));
+                }
+
+                // 阈值：差异 L2 ≥20%（整表级差异），或差异分散到 >32 个 L1
+                // （按 L1 拉取会退化为接近全表）→ 走分片同步引擎（按 L2 定向推送）；
+                // 否则差异小且集中 → 走轻量 MerkleRequest（只拉差异 L2 所在的少数 L1）。
+                const REPAIR_MAX_L1: usize = 32;
+                if l2_ratio >= 0.20 || parents.len() > REPAIR_MAX_L1 {
+                    // 启动分片同步引擎
+                    self.start_shard_sync(conn.clone(), resp.repo_type, diff_l2_list);
+                } else {
+                    let shards: Vec<u16> = parents.into_iter().collect();
+                    info!(
+                        "[shard-sync] L2 差异小且集中（{} 个 L2 / {} 个 L1），走轻量 MerkleRequest: repo={}",
+                        diff_l2_list.len(),
+                        shards.len(),
+                        resp.repo_type
+                    );
+                    let req = MerkleRequestMessage {
+                        repo_type: resp.repo_type,
+                        shards,
+                    };
+                    if let Err(e) = conn.send_message(MessageType::MerkleRequest, &req).await {
+                        warn!("[shard-sync] 发送轻量 MerkleRequest 失败: {}", e);
+                    } else {
+                        self.metrics.record_message_sent();
                     }
                 }
             }
@@ -2299,11 +2356,10 @@ impl SyncManager {
             .remove(&key)
             .unwrap_or_default();
 
-        // NODE repo：查本地该 L1 分片的 key 集合（走 shard 索引），计算缺失
+        // NODE repo：查本地该 L2 分片的 key 集合（走 l2_shard 索引，P1-5 起列为真 L2），计算缺失
         let missing: Vec<Vec<u8>> = if msg.repo_type == repo_type::NODE {
-            let l1 = MerkleTree::l1_for_l2(msg.l2_shard);
             let storage = self.node_repo.storage();
-            match storage.load_node_rows_by_shards(&[l1]) {
+            match storage.load_node_rows_by_shards(&[msg.l2_shard as u16]) {
                 Ok(rows) => {
                     let local_keys: FxHashSet<Vec<u8>> = rows
                         .into_iter()
@@ -2383,6 +2439,881 @@ impl SyncManager {
             "[shard-sync] 收到 ShardSyncComplete（入站已落库；不实时维护内存 Merkle、不标 dirty，根由周期 cold rebuild 收敛）: repo={}, total_l2={}, total_entries={}, max_seq={}",
             msg.repo_type, msg.total_l2_shards, msg.total_entries, msg.max_seq
         );
+    }
+
+    // ========================================================================
+    // P1-3：增量（delta）同步通道
+    //
+    // 稳态主线 = delta：请求方只发 `OpsRequest { repo, since_seq }`，数据服务器从本地
+    // `feed_oplog` 取 `seq > since_seq` 回 `OpsBatch`，成本 O(Δ)（Δ = 单轮新增变更数），
+    // 与库总量 N、与差异量 d 都无关。丢包/裁剪越界/首次接触时由反熵（Merkle 对账）兜底。
+    // 入站 apply 走既有幂等路径且**不写回 oplog**（否则 A→B→A 回环）。
+    // ========================================================================
+
+    /// delta 通道使用的 Storage（`feed_oplog` / `delta_peer_seq` 均为全局表，任取一个 repo 的 storage 即可）。
+    fn delta_storage(&self) -> Arc<crate::storage::db::Storage> {
+        self.node_repo.storage()
+    }
+
+    /// 对某对端某 repo 发起增量拉取（发送首个 OpsRequest）。
+    ///
+    /// 断点来自本地持久化的版本向量 `delta_peer_seq`（重启后续传，不重来）。
+    /// `delta_sync_enabled=false` 或对端协议 < 4 时直接返回（回退反熵）。
+    pub async fn trigger_delta_sync(self: &Arc<Self>, peer: NodeId, repo: u8) {
+        if !self.config.delta_sync_enabled {
+            return;
+        }
+        let conn = match self.connection_manager.get_connection(&peer) {
+            Some(c) => c,
+            None => return,
+        };
+        if !conn.supports_delta_sync() {
+            debug!(
+                "[delta] 对端 {} 不支持 delta（version<4），跳过 repo={}（回退反熵）",
+                peer, repo
+            );
+            return;
+        }
+        let since = self
+            .delta_storage()
+            .get_peer_seq(&peer.0, repo)
+            .unwrap_or(0)
+            .max(0) as u64;
+        let req = OpsRequestMessage {
+            repo,
+            since_seq: since,
+            limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
+        };
+        match conn.send_message(MessageType::OpsRequest, &req).await {
+            Ok(()) => {
+                self.metrics.record_message_sent();
+                debug!(
+                    "[delta] 发起增量拉取: peer={}, repo={}, since_seq={}",
+                    peer, repo, since
+                );
+            }
+            Err(e) => warn!("[delta] 发送 OpsRequest 失败 peer={}: {}", peer, e),
+        }
+    }
+
+    /// 处理对端的增量拉取请求（数据服务器侧）
+    ///
+    /// 从本地 oplog 取 `seq > since_seq` 的变更（升序，最多 limit 条），组装 OpsBatch 回发。
+    /// 仅回发**本地 origin** 的变更（oplog 只记本地变更），成本 O(Δ)。
+    pub async fn handle_ops_request(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        req: OpsRequestMessage,
+    ) {
+        if !self.config.delta_sync_enabled {
+            debug!(
+                "[delta] 收到 OpsRequest 但 delta_sync_enabled=false，忽略: peer={}",
+                conn.node_id
+            );
+            return;
+        }
+        let limit = if req.limit == 0 {
+            delta::DELTA_BATCH_LIMIT_DEFAULT as usize
+        } else {
+            req.limit as usize
+        };
+        let since = delta::seq_to_i64(req.since_seq);
+        let records = match self.delta_storage().load_ops_since(req.repo, since, limit) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[delta] 加载 oplog 失败 repo={}: {}", req.repo, e);
+                return;
+            }
+        };
+        let ops = delta::records_to_entries(&records);
+        let next_seq = ops.last().map(|o| o.seq).unwrap_or(req.since_seq);
+        let has_more = !ops.is_empty() && ops.len() >= limit;
+        debug!(
+            "[delta] 响应 OpsRequest: peer={}, repo={}, since_seq={}, 返回={}, has_more={}",
+            conn.node_id,
+            req.repo,
+            req.since_seq,
+            ops.len(),
+            has_more
+        );
+        let batch = OpsBatchMessage {
+            repo: req.repo,
+            ops,
+            next_seq,
+            has_more,
+        };
+        if let Err(e) = conn.send_message(MessageType::OpsBatch, &batch).await {
+            warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// 处理对端的增量响应（请求方侧）
+    ///
+    /// 幂等应用 ops（走既有 `handle_sync_batch`，**不写回 oplog**），推进本地版本向量；
+    /// `has_more=true` 时立即续拉下一批，直到对端返回空批。
+    pub async fn handle_ops_batch(self: Arc<Self>, conn: Arc<Connection>, batch: OpsBatchMessage) {
+        if !self.config.delta_sync_enabled {
+            return;
+        }
+        let entries = delta::ops_to_sync_entries(&batch.ops);
+        if !entries.is_empty() {
+            self.handle_sync_batch(batch.repo, &entries);
+        }
+        // 推进版本向量（仅前进，不回退）
+        if let Err(e) = self.delta_storage().set_peer_seq(
+            &conn.node_id.0,
+            batch.repo,
+            delta::seq_to_i64(batch.next_seq),
+        ) {
+            warn!("[delta] 推进版本向量失败 peer={}: {}", conn.node_id, e);
+        }
+        if !entries.is_empty() || batch.has_more {
+            delta::log_applied(batch.repo, entries.len(), batch.next_seq);
+        }
+
+        // 还有更多：立即续拉下一批
+        if batch.has_more {
+            let req = OpsRequestMessage {
+                repo: batch.repo,
+                since_seq: batch.next_seq,
+                limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
+            };
+            if let Err(e) = conn.send_message(MessageType::OpsRequest, &req).await {
+                warn!("[delta] 续拉 OpsRequest 失败 to={}: {}", conn.node_id, e);
+            } else {
+                self.metrics.record_message_sent();
+            }
+        }
+    }
+
+    // ========================================================================
+    // P1-4：Range-based（有序区间 + 分界点下钻）反熵
+    //
+    // 仅接管 NODE repo（churn 最高）；默认 range_reconcile_enabled=false，开启后先以
+    // 只读诊断模式运行（只求差集 + 打印统计，不改数据），确认口径一致后再走实际修复。
+    // 其余 repo 与旧版本对端仍走既有分层 Merkle（兼容路径）。
+    // ========================================================================
+
+    /// 区间边界转换：空 `&[u8]` 表示 ±∞（`None`）。
+    fn range_bound(b: &[u8]) -> Option<&[u8]> {
+        if b.is_empty() {
+            None
+        } else {
+            Some(b)
+        }
+    }
+
+    /// P1-4：处理对端的 RangeReconcile 请求（应答方）。
+    pub async fn handle_range_reconcile_request(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        req: RangeReconcileRequestMessage,
+    ) {
+        if !self.config.range_reconcile_enabled {
+            return;
+        }
+        // 当前仅 NODE 走 range 通道；其他 repo 不响应（由对端回退兼容路径）。
+        if req.repo != repo_type::NODE {
+            return;
+        }
+        let leaf_rows = if req.leaf_rows == 0 {
+            range_reconcile::DEFAULT_LEAF_ROWS as usize
+        } else {
+            req.leaf_rows as usize
+        };
+        // 多取 1 条以判断是否超过叶级阈值
+        let rows = match self.delta_storage().load_node_key_hashes_in_range(
+            Self::range_bound(&req.lo),
+            Self::range_bound(&req.hi),
+            leaf_rows + 1,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[range] 加载区间失败 repo={}: {}", req.repo, e);
+                return;
+            }
+        };
+        let is_leaf = rows.len() <= leaf_rows;
+        let resp = if is_leaf {
+            RangeReconcileResponseMessage {
+                repo: req.repo,
+                lo: req.lo.clone(),
+                hi: req.hi.clone(),
+                digest: range_reconcile::range_digest(&rows),
+                split_points: Vec::new(),
+                entries: rows
+                    .into_iter()
+                    .take(range_reconcile::MAX_LEAF_ENTRIES)
+                    .collect(),
+                is_leaf: true,
+                depth: req.depth,
+            }
+        } else {
+            let sp = range_reconcile::split_points(
+                &rows,
+                self.config.range_reconcile_max_splits as usize,
+            );
+            RangeReconcileResponseMessage {
+                repo: req.repo,
+                lo: req.lo.clone(),
+                hi: req.hi.clone(),
+                digest: range_reconcile::range_digest(&rows),
+                split_points: sp,
+                entries: Vec::new(),
+                is_leaf: false,
+                depth: req.depth,
+            }
+        };
+        if let Err(e) = conn
+            .send_message(MessageType::RangeReconcileResponse, &resp)
+            .await
+        {
+            warn!(
+                "[range] 发送 RangeReconcileResponse 失败 to={}: {}",
+                conn.node_id, e
+            );
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// P1-4：处理对端的 RangeReconcile 响应（请求方）。
+    ///
+    /// - 摘要相同 → 剪枝；
+    /// - 对端为叶（或深度到顶）→ 对本地清单求集合差并**打印统计**；
+    /// - 否则按对端分界点继续下钻（`depth+1`，受 `range_reconcile_max_depth` 约束）。
+    pub async fn handle_range_reconcile_response(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        resp: RangeReconcileResponseMessage,
+    ) {
+        if !self.config.range_reconcile_enabled {
+            return;
+        }
+        if resp.repo != repo_type::NODE {
+            return;
+        }
+        let leaf_rows = self.config.range_reconcile_leaf_rows.max(1) as usize;
+        let lo = Self::range_bound(&resp.lo);
+        let hi = Self::range_bound(&resp.hi);
+        let local = match self.delta_storage().load_node_key_hashes_in_range(
+            lo,
+            hi,
+            range_reconcile::MAX_LEAF_ENTRIES + 1,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[range] 请求方加载区间失败: {}", e);
+                return;
+            }
+        };
+        let local_digest = range_reconcile::range_digest(&local);
+        // 可观测性：累计访问的区间数（衡量下钻效率）
+        self.range_ranges_visited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let decision = range_reconcile::decide(
+            &local_digest,
+            &resp.digest,
+            resp.is_leaf,
+            resp.depth,
+            self.config.range_reconcile_max_depth,
+        );
+
+        match decision {
+            range_reconcile::RangeDecision::Prune => {
+                debug!(
+                    "[range] 剪枝 repo={} [{}, {}) depth={}",
+                    resp.repo,
+                    String::from_utf8_lossy(&resp.lo),
+                    String::from_utf8_lossy(&resp.hi),
+                    resp.depth
+                );
+            }
+            range_reconcile::RangeDecision::Leaf => {
+                let (local_only, remote_only) = range_reconcile::key_diff(&local, &resp.entries);
+                info!(
+                    "[range][{}] 叶级对账 repo={} [{}, {}) depth={}: 本地多={}, 对端多={}",
+                    if self.config.range_reconcile_diagnostic_only {
+                        "诊断"
+                    } else {
+                        "修复"
+                    },
+                    resp.repo,
+                    String::from_utf8_lossy(&resp.lo),
+                    String::from_utf8_lossy(&resp.hi),
+                    resp.depth,
+                    local_only.len(),
+                    remote_only.len()
+                );
+                // 灰度阶段只打印差集统计，供与既有反熵口径对照；真正的修复仍由既有
+                // 分片同步 / DiffSync / delta 路径承担，避免未经验证的写入语义引入回环。
+            }
+            range_reconcile::RangeDecision::Descend => {
+                if resp.depth >= self.config.range_reconcile_max_depth {
+                    return;
+                }
+                let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(resp.split_points.len() + 2);
+                bounds.push(resp.lo.clone());
+                bounds.extend(resp.split_points.iter().cloned());
+                bounds.push(resp.hi.clone());
+                for w in bounds.windows(2) {
+                    let sub_lo = w[0].clone();
+                    let sub_hi = w[1].clone();
+                    if sub_lo == sub_hi {
+                        continue;
+                    }
+                    let rows = match self.delta_storage().load_node_key_hashes_in_range(
+                        Self::range_bound(&sub_lo),
+                        Self::range_bound(&sub_hi),
+                        leaf_rows + 1,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let digest = range_reconcile::range_digest(&rows);
+                    let sub_req = RangeReconcileRequestMessage {
+                        repo: resp.repo,
+                        lo: sub_lo,
+                        hi: sub_hi,
+                        digest,
+                        leaf_rows: leaf_rows as u32,
+                        depth: resp.depth + 1,
+                    };
+                    if let Err(e) = conn
+                        .send_message(MessageType::RangeReconcileRequest, &sub_req)
+                        .await
+                    {
+                        warn!("[range] 下钻请求发送失败 to={}: {}", conn.node_id, e);
+                        break;
+                    }
+                    self.metrics.record_message_sent();
+                }
+            }
+        }
+    }
+
+    /// P1-4：单轮 range-based 反熵（请求方驱动，由 TaskScheduler 周期调用）。
+    ///
+    /// 抽样 `range_reconcile_sample_ranges + 1` 个分界 key 形成若干区间（首尾接 ±∞），
+    /// 对每个区间发一个 depth=0 的 RangeReconcileRequest。
+    /// 默认 `range_reconcile_enabled=false` 时为 no-op（行为与改造前一致）。
+    pub async fn range_reconcile_tick(self: Arc<Self>) {
+        if !self.config.range_reconcile_enabled {
+            return;
+        }
+        let conns = self.connection_manager.all_connections();
+        if conns.is_empty() {
+            return;
+        }
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let idx = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as usize)
+            % conns.len();
+        let conn = &conns[idx];
+        if !conn.supports_range_reconcile() {
+            debug!(
+                "[range] 对端 {} 不支持 range 反熵（version<{}），跳过",
+                conn.node_id,
+                range_reconcile::RANGE_RECONCILE_PROTOCOL_VERSION
+            );
+            return;
+        }
+        let n = self.config.range_reconcile_sample_ranges.max(1) as usize;
+        let keys = match self.delta_storage().sample_node_range_keys(n + 1) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!("[range] 抽样分界 key 失败: {}", e);
+                return;
+            }
+        };
+        if keys.len() < 2 {
+            debug!("[range] 本地 NODE 数据不足，跳过抽样对账");
+            return;
+        }
+        let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(keys.len() + 2);
+        bounds.push(Vec::new()); // -∞
+        bounds.extend(keys);
+        bounds.push(Vec::new()); // +∞
+        let leaf_rows = self.config.range_reconcile_leaf_rows.max(1);
+        let storage = self.delta_storage();
+        let mut sent = 0u32;
+        for w in bounds.windows(2) {
+            let lo = w[0].clone();
+            let hi = w[1].clone();
+            let rows = match storage.load_node_key_hashes_in_range(
+                Self::range_bound(&lo),
+                Self::range_bound(&hi),
+                leaf_rows as usize + 1,
+            ) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let digest = range_reconcile::range_digest(&rows);
+            let req = RangeReconcileRequestMessage {
+                repo: repo_type::NODE,
+                lo,
+                hi,
+                digest,
+                leaf_rows,
+                depth: 0,
+            };
+            if let Err(e) = conn
+                .send_message(MessageType::RangeReconcileRequest, &req)
+                .await
+            {
+                warn!(
+                    "[range] 发送 RangeReconcileRequest 失败 to={}: {}",
+                    conn.node_id, e
+                );
+                break;
+            }
+            self.metrics.record_message_sent();
+            sent += 1;
+        }
+        info!(
+            "[range] 反熵抽样对账发送到 {} ({} 个区间, 连接数={})",
+            conn.node_id,
+            sent,
+            conns.len()
+        );
+    }
+
+    // ========================================================================
+    // P2-1/P2-2：bootstrap 专用通道（六阶段，与在线反熵解耦）
+    //
+    // 仅接管 NODE repo；默认 bootstrap_enabled=false（不注册、不发起、不响应）。
+    // 一致性：用「显式区间边界的逻辑分块 + W0 水位 + 末段哈希校验」替代物理快照文件，
+    // 漂移由阶段 ⑥ 校验发现并重拉该块（幂等）。
+    // ========================================================================
+
+    /// P2-1：处理对端的 bootstrap 清单请求（应答方）。
+    ///
+    /// 取水位 `w0 = oplog_max_seq()`，按有序 key 区间流式分块，缓存清单供后续分块请求使用。
+    pub async fn handle_bootstrap_manifest_request(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        req: BootstrapManifestRequestMessage,
+    ) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        if req.repo != repo_type::NODE {
+            return;
+        }
+        let storage = self.delta_storage();
+        let w0 = storage.oplog_max_seq().unwrap_or(0).max(0) as u64;
+        let version = w0.wrapping_add(1) as u32; // 以 w0 派生：重新打清单即换版本
+        let manifest = match bootstrap::build_node_manifest(
+            &storage,
+            self.config.bootstrap_chunk_rows,
+            w0,
+            version,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[bootstrap] 建清单失败: {}", e);
+                return;
+            }
+        };
+        info!(
+            "[bootstrap] 响应清单请求 from={}: 总行={}, 块数={}, w0={}",
+            conn.node_id,
+            manifest.total_rows,
+            manifest.chunks.len(),
+            w0
+        );
+        self.bootstrap_manifests
+            .write()
+            .insert(conn.node_id, manifest.clone());
+        let resp = BootstrapManifestResponseMessage { manifest };
+        if let Err(e) = conn
+            .send_message(MessageType::BootstrapManifestResponse, &resp)
+            .await
+        {
+            warn!("[bootstrap] 发送清单失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// P2-1：处理对端的 bootstrap 分块请求（应答方）—— 按清单边界取条目回发（令牌桶限流）。
+    pub async fn handle_bootstrap_chunk_request(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        req: BootstrapChunkRequestMessage,
+    ) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        if req.repo != repo_type::NODE {
+            return;
+        }
+        let manifest = match self.bootstrap_manifests.read().get(&conn.node_id).cloned() {
+            Some(m) => m,
+            None => {
+                warn!(
+                    "[bootstrap] 收到分块请求但无清单缓存 peer={}（需先发清单请求）",
+                    conn.node_id
+                );
+                return;
+            }
+        };
+        let chunk = match manifest.chunks.iter().find(|c| c.index == req.index) {
+            Some(c) => c.clone(),
+            None => {
+                warn!(
+                    "[bootstrap] 分块 index={} 越界（共 {} 块）",
+                    req.index,
+                    manifest.chunks.len()
+                );
+                return;
+            }
+        };
+        let lo = Self::range_bound(&chunk.lo);
+        let hi = Self::range_bound(&chunk.hi);
+        let storage = self.delta_storage();
+        // ① 内容哈希：与建清单同源（(key, data_hash) 有序流）
+        let hash_rows = match storage.load_node_key_hashes_in_range(lo, hi, chunk.rows as usize + 1)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[bootstrap] 取块哈希失败 index={}: {}", req.index, e);
+                return;
+            }
+        };
+        let take = hash_rows.len().min(chunk.rows as usize);
+        let hash = bootstrap::chunk_hash(&hash_rows[..take]);
+        // ② 完整条目（含 payload，供接收方批量 upsert）
+        let entries: Vec<SyncEntry> =
+            match storage.load_node_rows_in_range(lo, hi, chunk.rows as usize + 1) {
+                Ok(rows) => rows
+                    .into_iter()
+                    .take(chunk.rows as usize)
+                    .filter_map(|(id, ip, port)| {
+                        let mut arr = [0u8; 20];
+                        if id.len() == 20 {
+                            arr.copy_from_slice(&id);
+                        }
+                        let addr: SocketAddr = format!("{}:{}", ip, port).parse().ok()?;
+                        let (key, payload, _dh) = build_node_sync_entry(arr, addr)?;
+                        Some(SyncEntry {
+                            key,
+                            operation: operation::UPSERT,
+                            version: 0,
+                            payload,
+                        })
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
+                    return;
+                }
+            };
+        // ③ 令牌桶限流（不跨 await 持锁）
+        let bytes: u64 = entries
+            .iter()
+            .map(|e| (e.key.len() + e.payload.len() + 16) as u64)
+            .sum();
+        let wait = {
+            let mut bucket = self.bootstrap_bucket.lock();
+            bucket.wait_duration(bytes)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let is_last = (req.index as usize + 1) >= manifest.chunks.len();
+        let resp = BootstrapChunkResponseMessage {
+            repo: req.repo,
+            index: req.index,
+            entries,
+            hash,
+            is_last,
+        };
+        if let Err(e) = conn
+            .send_message(MessageType::BootstrapChunkResponse, &resp)
+            .await
+        {
+            warn!("[bootstrap] 发送块 {} 失败: {}", req.index, e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// P2-1：处理对端的 bootstrap 清单响应（请求方）—— 落进度并开始拉第一块。
+    pub async fn handle_bootstrap_manifest_response(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        resp: BootstrapManifestResponseMessage,
+    ) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        let mf = resp.manifest;
+        if mf.repo != repo_type::NODE {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut progress = bootstrap::BootstrapProgress::new(mf.repo, conn.node_id.0.to_vec(), now);
+        progress.phase = bootstrap::BootstrapPhase::Transfer;
+        progress.version = mf.version;
+        progress.w0_seq = mf.w0_seq;
+        progress.total_chunks = mf.chunks.len() as u64;
+        progress.done_chunks = 0;
+        // 把该对端该 repo 的版本向量对齐到 w0（追尾起点；MAX 语义下仅前进）
+        let _ = self.delta_storage().set_peer_seq(
+            &conn.node_id.0,
+            mf.repo,
+            delta::seq_to_i64(mf.w0_seq),
+        );
+        if let Err(e) = self.delta_storage().bootstrap_save(&progress, Some(&mf)) {
+            warn!("[bootstrap] 保存进度失败: {}", e);
+        }
+        info!(
+            "[bootstrap] 收到清单 from={}: 总行={}, 块数={}, w0={}",
+            conn.node_id,
+            mf.total_rows,
+            mf.chunks.len(),
+            mf.w0_seq
+        );
+        if mf.chunks.is_empty() {
+            self.finish_bootstrap(&conn, mf.repo, mf.w0_seq).await;
+            return;
+        }
+        self.request_bootstrap_chunk(&conn, mf.repo, 0, &mf).await;
+    }
+
+    /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉或切追尾。
+    pub async fn handle_bootstrap_chunk_response(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        resp: BootstrapChunkResponseMessage,
+    ) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        let (mut progress, mf) = match self.delta_storage().bootstrap_load(resp.repo) {
+            Ok(Some((p, Some(m)))) => (p, m),
+            Ok(_) => {
+                warn!("[bootstrap] 收到块 {} 但无进度/清单，忽略", resp.index);
+                return;
+            }
+            Err(e) => {
+                warn!("[bootstrap] 读进度失败: {}", e);
+                return;
+            }
+        };
+        let chunk = match mf.chunks.iter().find(|c| c.index == resp.index) {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        // ④ 批量 upsert（复用既有 apply_node_sync → add_nodes_batch_internal，严禁逐条 INSERT）
+        if !resp.entries.is_empty() {
+            self.handle_sync_batch(resp.repo, &resp.entries);
+        }
+        // ⑥ 校验：落地后重算该块 DB 摘要，与清单 hash 比对（幂等：不符只记 warn，重拉无害）
+        let lo = Self::range_bound(&chunk.lo);
+        let hi = Self::range_bound(&chunk.hi);
+        let rows = self
+            .delta_storage()
+            .load_node_key_hashes_in_range(lo, hi, chunk.rows as usize + 1)
+            .unwrap_or_default();
+        let take = rows.len().min(chunk.rows as usize);
+        let ok = bootstrap::verify_chunk(&chunk.hash, &rows[..take]);
+        if ok {
+            progress.done_chunks = (resp.index as u64 + 1).max(progress.done_chunks);
+            progress.bytes += resp
+                .entries
+                .iter()
+                .map(|e| (e.key.len() + e.payload.len() + 16) as u64)
+                .sum::<u64>();
+            progress.phase = bootstrap::BootstrapPhase::Transfer;
+        } else {
+            // 传输期漂移或丢包：不改 done_chunks，等下一轮恢复任务重拉
+            warn!(
+                "[bootstrap] 块 {} 校验失败（可能传输期漂移），保持进度 done={}",
+                resp.index, progress.done_chunks
+            );
+        }
+        progress.updated_ms = chrono::Utc::now().timestamp_millis();
+        let _ = self.delta_storage().bootstrap_save(&progress, None);
+
+        let last = resp.is_last || (resp.index as usize + 1) >= mf.chunks.len();
+        if last && ok {
+            self.finish_bootstrap(&conn, resp.repo, mf.w0_seq).await;
+        } else if !last {
+            self.request_bootstrap_chunk(&conn, resp.repo, resp.index + 1, &mf)
+                .await;
+        }
+    }
+
+    /// 请求清单中第 `index` 块。
+    async fn request_bootstrap_chunk(
+        &self,
+        conn: &Connection,
+        repo: u8,
+        index: u32,
+        manifest: &bootstrap::BootstrapManifest,
+    ) {
+        if manifest.chunks.iter().all(|c| c.index != index) {
+            return;
+        }
+        let req = BootstrapChunkRequestMessage { repo, index };
+        match conn
+            .send_message(MessageType::BootstrapChunkRequest, &req)
+            .await
+        {
+            Ok(()) => self.metrics.record_message_sent(),
+            Err(e) => warn!("[bootstrap] 请求块 {} 失败: {}", index, e),
+        }
+    }
+
+    /// 完成 ③④ 后进入 ⑤ 追尾（复用 P1-3 delta 通道拉 `seq > w0`）。
+    async fn finish_bootstrap(self: &Arc<Self>, conn: &Connection, repo: u8, w0_seq: u64) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Ok(Some((mut p, mf))) = self.delta_storage().bootstrap_load(repo) {
+            p.phase = bootstrap::BootstrapPhase::Done;
+            p.updated_ms = now;
+            let _ = self.delta_storage().bootstrap_save(&p, mf.as_ref());
+        }
+        info!(
+            "[bootstrap] {} 块全部落地并校验通过，切 delta 追尾（since_seq={}）",
+            conn.node_id, w0_seq
+        );
+        // ⑤ 追尾：从 w0 拉 oplog 增量（P1-3 通道）
+        self.trigger_delta_sync(conn.node_id, repo).await;
+    }
+
+    /// P2-1：重启后恢复未完成的 bootstrap（按已落进度续传）。
+    pub async fn bootstrap_resume_tick(self: Arc<Self>) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        let list = match self.delta_storage().bootstrap_list() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        for p in list {
+            if p.phase == bootstrap::BootstrapPhase::Done || p.peer.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&p.peer);
+            let peer = NodeId(arr);
+            match self.delta_storage().bootstrap_load(p.repo) {
+                Ok(Some((_, Some(mf)))) if (mf.chunks.len() as u64) > p.done_chunks => {
+                    if let Some(conn) = self.connection_manager.get_connection(&peer) {
+                        debug!(
+                            "[bootstrap] 恢复续传: peer={}, repo={}, 从块 {} 继续",
+                            peer, p.repo, p.done_chunks
+                        );
+                        self.request_bootstrap_chunk(&conn, p.repo, p.done_chunks as u32, &mf)
+                            .await;
+                    }
+                }
+                _ => {
+                    // 无清单或已到末尾：重拉清单
+                    self.clone().start_bootstrap(peer, p.repo).await;
+                }
+            }
+        }
+    }
+
+    /// P2-1：向指定对端发起某 repo 的 bootstrap（拉清单 → 分块 → 追尾）。默认关闭。
+    pub async fn start_bootstrap(self: Arc<Self>, peer: NodeId, repo: u8) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        if repo != repo_type::NODE {
+            return;
+        }
+        let conn = match self.connection_manager.get_connection(&peer) {
+            Some(c) => c,
+            None => {
+                warn!("[bootstrap] 目标 {} 无连接，取消", peer);
+                return;
+            }
+        };
+        if !conn.supports_bootstrap() {
+            warn!(
+                "[bootstrap] 对端 {} 不支持 bootstrap（version<{}）",
+                peer,
+                bootstrap::BOOTSTRAP_PROTOCOL_VERSION
+            );
+            return;
+        }
+        info!("[bootstrap] 向 {} 请求 repo={} 清单", peer, repo);
+        let req = BootstrapManifestRequestMessage { repo };
+        match conn
+            .send_message(MessageType::BootstrapManifestRequest, &req)
+            .await
+        {
+            Ok(()) => self.metrics.record_message_sent(),
+            Err(e) => warn!("[bootstrap] 发送清单请求失败: {}", e),
+        }
+    }
+
+    /// P2-3：同步面可观测性快照（oplog 水位 / 每对端增量落后 / bootstrap 进度 / range 对账）。
+    pub fn sync_observability(&self) -> serde_json::Value {
+        let st = self.delta_storage();
+        let oplog_len = st.oplog_len().unwrap_or(0);
+        let oplog_max = st.oplog_max_seq().unwrap_or(0).max(0) as u64;
+        let oplog_min = st.oplog_min_seq().unwrap_or(0).max(0) as u64;
+        let lag: Vec<serde_json::Value> = st
+            .all_peer_seqs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(peer, repo, seq)| {
+                let seqv = seq.max(0) as u64;
+                serde_json::json!({
+                    "peer": peer.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                    "repo": repo,
+                    "synced_seq": seqv,
+                    "lag_seq": oplog_max.saturating_sub(seqv),
+                })
+            })
+            .collect();
+        let bootstraps: Vec<serde_json::Value> = st
+            .bootstrap_list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                serde_json::json!({
+                    "repo": p.repo,
+                    "phase": p.phase.as_str(),
+                    "total_chunks": p.total_chunks,
+                    "done_chunks": p.done_chunks,
+                    "ratio": p.ratio(),
+                    "bytes": p.bytes,
+                    "w0_seq": p.w0_seq,
+                    "error": p.error,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "oplog": {
+                "len": oplog_len,
+                "min_seq": oplog_min,
+                "max_seq": oplog_max,
+                "retention_secs": self.config.oplog_retention_secs,
+            },
+            "ops_lag": lag,
+            "delta_sync_enabled": self.config.delta_sync_enabled,
+            "range_reconcile_enabled": self.config.range_reconcile_enabled,
+            "range_reconcile_diagnostic_only": self.config.range_reconcile_diagnostic_only,
+            "bootstrap_enabled": self.config.bootstrap_enabled,
+            "bootstrap": bootstraps,
+            "reconcile_nodes_visited": self
+                .range_ranges_visited
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "anti_entropy": {
+                "node_interval_secs": self.config.anti_entropy_node_interval_secs,
+                "other_interval_secs": self.config.anti_entropy_other_interval_secs,
+            },
+        })
     }
 
     /// 启动分层 Merkle 对比 + 分片同步流程
@@ -2496,10 +3427,13 @@ impl SyncManager {
             let infohash_repo = self.infohash_repo.clone();
             let tracker_repo = self.tracker_repo.clone();
             let repo_type_clone = repo_type;
+            // P0-B/P1-5：DB 分片列现已存真 L2，按 L2 取数即精确；下列内存过滤保留为**防御性兜底**
+            // （防止个别旧行残留错误分片值被误纳入）。
+            let merkle_l2 = merkle.clone();
             Arc::new(move |l2: u32| -> Vec<SyncEntry> {
-                // l2 是 0..65535 的绝对 L2 索引，DB 的 shard 列存的是 L1 分片 0..255（= L2 / 256）
-                let shard = MerkleTree::l1_for_l2(l2);
-                let shards = [shard];
+                // P1-5：DB 的 l2_shard 列存的是真 L2（0..65535），直接按 l2 精确加载，
+                // 不再需要「取整条 L1 再内存过滤」的 256× 放大。
+                let shards = [l2 as u16];
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2520,6 +3454,10 @@ impl SyncManager {
                                         format!("{}:{}", ip, port).parse().ok()?;
                                     let (key, payload, _hash) =
                                         build_node_sync_entry(node_id, addr)?;
+                                    // P0-B：按 L2 精确过滤（DB 只按 L1 取数，这里剔除不属于本 L2 的行，避免 256× 放大）
+                                    if merkle_l2.l2_shard_for_key(&key) != l2 {
+                                        return None;
+                                    }
                                     Some(SyncEntry {
                                         key,
                                         operation: operation::UPSERT,
@@ -2553,6 +3491,10 @@ impl SyncManager {
                                         crate::federation::sync::peer_sync::build_peer_sync_entry(
                                             ih, addr,
                                         )?;
+                                    // P0-B：按 L2 精确过滤
+                                    if merkle_l2.l2_shard_for_key(&key) != l2 {
+                                        return None;
+                                    }
                                     Some(SyncEntry {
                                         key,
                                         operation: operation::UPSERT,
@@ -2582,6 +3524,10 @@ impl SyncManager {
                                         }
                                         let (key, payload, _hash) =
                                             crate::federation::sync::infohash_sync::build_infohash_sync_entry(ih)?;
+                                        // P0-B：按 L2 精确过滤
+                                        if merkle_l2.l2_shard_for_key(&key) != l2 {
+                                            return None;
+                                        }
                                         Some(SyncEntry {
                                             key,
                                             operation: operation::UPSERT,
@@ -2609,6 +3555,10 @@ impl SyncManager {
                                         let ts = last_used.unwrap_or(0) as u64;
                                         let (key, payload, _hash) =
                                             crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url)?;
+                                        // P0-B：按 L2 精确过滤
+                                        if merkle_l2.l2_shard_for_key(&key) != l2 {
+                                            return None;
+                                        }
                                         Some(SyncEntry {
                                             key,
                                             operation: operation::UPSERT,
@@ -2636,20 +3586,24 @@ impl SyncManager {
         let hash_list_fn: Option<Arc<dyn Fn(u32) -> Vec<(Vec<u8>, Vec<u8>)> + Send + Sync>> =
             if repo_type == repo_type::NODE {
                 let node_repo_hl = self.node_repo.clone();
+                let merkle_hl = merkle.clone();
                 Some(Arc::new(move |l2: u32| -> Vec<(Vec<u8>, Vec<u8>)> {
-                    let l1 = MerkleTree::l1_for_l2(l2);
                     let storage = node_repo_hl.storage();
-                    match storage.load_node_rows_by_shards(&[l1]) {
+                    match storage.load_node_rows_by_shards(&[l2 as u16]) {
                         Ok(rows) => rows
                             .into_iter()
-                            .map(|(id, ip, port)| {
+                            .filter_map(|(id, ip, port)| {
                                 let key = format!("{}:{}", ip, port).into_bytes();
+                                // P0-B：按 L2 精确过滤（hash 清单同样只需本 L2 的条目，避免整条 L1）
+                                if merkle_hl.l2_shard_for_key(&key) != l2 {
+                                    return None;
+                                }
                                 let mut buf = Vec::with_capacity(id.len() + ip.len() + 2);
                                 buf.extend_from_slice(&id);
                                 buf.extend_from_slice(ip.as_bytes());
                                 buf.extend_from_slice(&port.to_le_bytes());
                                 let data_hash = blake3::hash(&buf).as_bytes().to_vec();
-                                (key, data_hash)
+                                Some((key, data_hash))
                             })
                             .collect(),
                         Err(e) => {
@@ -2708,125 +3662,6 @@ impl SyncManager {
             );
         });
     }
-
-    /// 增量同步 tick：基于 dirty L2 标记同步变更数据
-    ///
-    /// 由 TaskScheduler 周期性调用。对每个 repo：
-    /// 1. 取出 dirty L2 分片
-    /// 2. 如果有 dirty 分片且对端支持分层 Merkle，触发增量分片同步
-    /// 3. 增量失败时降级到分层 Merkle 差异同步
-    pub async fn incremental_sync_tick(self: Arc<Self>) {
-        if !self.config.incremental_sync_enabled {
-            return;
-        }
-
-        let repos = [
-            repo_type::NODE,
-            repo_type::PEER,
-            repo_type::INFOHASH,
-            repo_type::TRACKER,
-        ];
-
-        for &repo_type in &repos {
-            let merkle = match self.merkle_for_repo(repo_type) {
-                Some(m) => m,
-                None => continue,
-            };
-
-            // 检查是否已有增量同步在进行
-            {
-                let active = self.incremental_sync_active.read();
-                if active.contains(&repo_type) {
-                    continue;
-                }
-            }
-
-            // 取出 dirty L2 分片
-            let dirty_l2 = merkle.take_dirty_l2_shards();
-            if dirty_l2.is_empty() {
-                continue;
-            }
-
-            debug!(
-                "[shard-sync] 增量同步 tick: repo={}, dirty_l2数={}",
-                repo_type,
-                dirty_l2.len()
-            );
-
-            // 标记为活跃
-            self.incremental_sync_active.write().insert(repo_type);
-
-            // 找支持分层 Merkle 的活跃连接
-            let connections = self.connection_manager.all_connections();
-            let layered_peers: Vec<_> = connections
-                .iter()
-                .filter(|c| c.supports_layered_merkle())
-                .cloned()
-                .collect();
-
-            if layered_peers.is_empty() {
-                debug!(
-                    "[shard-sync] 增量同步: 无支持分层Merkle的连接, repo={}",
-                    repo_type
-                );
-                self.incremental_sync_active.write().remove(&repo_type);
-                continue;
-            }
-
-            // 先发送最近变更的增量摘要（Push-Pull 优化）：把本 repo 的近期变更
-            // 推给所有支持分层 Merkle 的邻居（不仅随机1个），对端对比后拉取缺失 key。
-            let recent: Vec<(u8, Vec<u8>, u64)> = self
-                .recent_changes
-                .read()
-                .iter()
-                .filter(|(rt, _, _)| *rt == repo_type)
-                .cloned()
-                .collect();
-            if !recent.is_empty() {
-                for conn in &layered_peers {
-                    let digest = GossipDigestMessage {
-                        changes: recent.clone(),
-                    };
-                    if let Err(e) = conn.send_message(MessageType::GossipDigest, &digest).await {
-                        debug!(
-                            "[shard-sync] 增量 GossipDigest 发送失败 to={}: {}",
-                            conn.node_id, e
-                        );
-                    } else {
-                        self.metrics.record_message_sent();
-                    }
-                }
-            }
-
-            // 选择第一个分层 Merkle 节点作为同步目标
-            let target = &layered_peers[0];
-            let dirty_list: Vec<u32> = dirty_l2.into_iter().collect();
-
-            info!(
-                "[shard-sync] 触发增量分片同步: repo={}, peer={}, dirty_l2数={}",
-                repo_type,
-                target.node_id,
-                dirty_list.len()
-            );
-
-            // 启动分片同步引擎推送 dirty L2
-            self.start_shard_sync(target.clone(), repo_type, dirty_list);
-
-            // 异步清理活跃标记
-            let self_clone = self.clone();
-            tokio::spawn(async move {
-                // 等待一段时间后清理
-                tokio::time::sleep(Duration::from_secs(
-                    self_clone.config.incremental_sync_active_cleanup_secs,
-                ))
-                .await;
-                self_clone
-                    .incremental_sync_active
-                    .write()
-                    .remove(&repo_type);
-            });
-        }
-    }
 }
 
 /// MerkleProvider 实现：为 GossipEngine 反熵任务提供各 repo 的 Merkle 摘要和分片数据
@@ -2856,6 +3691,30 @@ impl MerkleProvider for SyncManager {
         } else {
             Vec::new()
         }
+    }
+
+    /// P1-4：开启 range 反熵后，NODE repo 由 range 通道接管，反熵不再对它发 MerkleDigest。
+    fn range_reconcile_owns(&self, repo_type: u8) -> bool {
+        self.config.range_reconcile_enabled && repo_type == repo_type::NODE
+    }
+
+    /// P2-5：反熵按 repo 差异化 —— NODE（高 churn）用更短周期，其余用更长周期。
+    fn anti_entropy_due(&self, repo_type: u8) -> bool {
+        let interval = if repo_type == repo_type::NODE {
+            self.config.anti_entropy_node_interval_secs
+        } else {
+            self.config.anti_entropy_other_interval_secs
+        };
+        let now = Instant::now();
+        let mut last = self.anti_entropy_last.write();
+        let due = match last.get(&repo_type) {
+            Some(t) => now.duration_since(*t).as_secs() >= interval,
+            None => true,
+        };
+        if due {
+            last.insert(repo_type, now);
+        }
+        due
     }
 }
 

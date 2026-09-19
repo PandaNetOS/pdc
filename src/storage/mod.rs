@@ -7,6 +7,7 @@ pub mod db;
 pub mod infohash_repo;
 pub mod io_scheduler;
 pub mod node_repo;
+pub mod oplog;
 pub mod peer_repo;
 pub mod repo_traits;
 pub mod sharded_map;
