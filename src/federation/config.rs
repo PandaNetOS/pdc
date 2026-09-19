@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationConfig {
     /// 是否启用联邦网络
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 自定义节点 ID（十六进制字符串，40 字符），为空则自动生成
     #[serde(default)]
@@ -622,6 +622,32 @@ max_connections: 64
         // 未指定字段使用默认值
         assert_eq!(cfg.target_neighbors, 8);
         assert!(cfg.sync_node_enabled);
+    }
+
+    /// 回归：`federation:` 节存在但省略 `enabled` 时必须回退为 `true`，
+    /// 与 `FederationConfig::default()` 保持一致。此前该字段是裸 `#[serde(default)]`，
+    /// serde 字段级回退为 `bool::default()` = false，导致"写了 federation 节却漏掉
+    /// enabled"时联邦被静默关闭（`main.rs` 的 else 分支不打任何日志）。
+    #[test]
+    fn test_enabled_defaults_true_when_key_omitted() {
+        // 1) 有 federation 节但省略 enabled → true
+        let yaml = r#"
+listen_port: 7000
+max_connections: 64
+"#;
+        let cfg: FederationConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            cfg.enabled,
+            "省略 enabled 时应回退为 true，而非 bool::default()=false"
+        );
+
+        // 2) 显式 enabled: false 仍应被尊重
+        let yaml_off = "enabled: false";
+        let cfg_off: FederationConfig = serde_yaml::from_str(yaml_off).unwrap();
+        assert!(!cfg_off.enabled, "显式 enabled: false 应保持 false");
+
+        // 3) 与 impl Default 保持一致
+        assert_eq!(cfg.enabled, FederationConfig::default().enabled);
     }
 
     #[test]
