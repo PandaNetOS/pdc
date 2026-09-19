@@ -23,7 +23,7 @@ use crate::federation::node_table::NodeTable;
 use crate::federation::ConnectionManager;
 use crate::storage::node_repo::NodeRepoImpl;
 use crate::types::Infohash;
-use pnos_net::types::{DiscoveredNode, DiscoverySource, Reachability as NetReachability};
+use pnos_net::types::DiscoveredNode;
 
 /// PDC 联邦网络魔法 infohash
 ///
@@ -181,48 +181,4 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// 处理 DHT 发现的 peer 列表：加入节点表 + 发送到 pnos-net 事件通道
-#[allow(dead_code)]
-fn process_peers(
-    peers: &[crate::types::PeerInfo],
-    node_table: &Arc<NodeTable>,
-    discovered_tx: Option<&broadcast::Sender<DiscoveredNode>>,
-) {
-    let now = current_unix_secs();
-    let mut new_count = 0;
-    for peer in peers {
-        let addr = peer.addr;
-        let temp_id = NodeId::random();
-        let node_addr = NodeAddress {
-            node_id: temp_id.0,
-            ipv4_addr: if addr.is_ipv4() { Some(addr) } else { None },
-            ipv6_addr: if addr.is_ipv6() { Some(addr) } else { None },
-            reachability: Reachability::Unknown,
-            last_seen: now,
-            nat_type: None,
-        };
-        if node_table.add_or_update(node_addr) {
-            new_count += 1;
-        }
-        if let Some(tx) = discovered_tx {
-            let discovered = DiscoveredNode {
-                node_id: pnos_net::types::NodeId(temp_id.0),
-                addresses: vec![addr],
-                reachability: NetReachability::Unknown,
-                nat_type: None,
-                source: DiscoverySource::Dht,
-                last_seen: now,
-            };
-            let _ = tx.send(discovered);
-        }
-    }
-    if new_count > 0 {
-        info!(
-            "[federation] DHT 发现 {} 个新 PDC 节点，节点表总数: {}",
-            new_count,
-            node_table.len()
-        );
-    }
 }

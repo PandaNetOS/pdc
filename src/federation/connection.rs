@@ -1551,33 +1551,6 @@ impl ConnectionManager {
         offloaded
     }
 
-    /// 异步执行重量级消息处理（GossipBatch / MerkleRepair）。
-    ///
-    /// 先从 `heavy_task_semaphore` 获取 permit（有界并发），再用
-    /// `spawn_blocking` 把阻塞型 DB 写入移出异步运行时线程。
-    /// 任务完成后递减该连接的 pending 待处理计数。
-    #[allow(dead_code)]
-    fn spawn_heavy_handler<F>(&self, conn: Arc<Connection>, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let sem = self.heavy_task_semaphore.clone();
-        tokio::spawn(async move {
-            // 等待 permit：信号量饱和时在此排队，对应消息计入 pending（背压可见）
-            let _permit = match sem.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    conn.pending.fetch_sub(1, Ordering::Relaxed);
-                    return;
-                }
-            };
-            // 阻塞型处理移入 blocking 线程池
-            let _ = tokio::task::spawn_blocking(f).await;
-            drop(_permit);
-            conn.pending.fetch_sub(1, Ordering::Relaxed);
-        });
-    }
-
     /// P0-2: 异步执行纯内存消息处理（不经过 spawn_blocking）。
     ///
     /// GossipBatch 处理是纯内存操作（HashMap + Merkle），不需要阻塞线程池。

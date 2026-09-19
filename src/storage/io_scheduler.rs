@@ -115,13 +115,11 @@ impl PartialOrd for HeapEntry {
 ///
 /// 使用 AtomicUsize 的 compare_exchange 实现无锁获取。
 /// 补充在 writer_loop 内根据时间差计算，不单独 spawn interval task。
-#[allow(dead_code)]
 pub(crate) struct TokenBucket {
     tokens: AtomicUsize,
     max_tokens: usize,
 }
 
-#[allow(dead_code)]
 impl TokenBucket {
     fn new(max_tokens: usize, _refill_rate: usize) -> Self {
         Self {
@@ -131,6 +129,8 @@ impl TokenBucket {
     }
 
     /// 尝试获取 n 个令牌（无锁）
+    // 仅单元测试使用（生产路径经 IoScheduler 统一取令牌），故单独压制 dead_code
+    #[allow(dead_code)]
     fn try_acquire(&self, n: usize) -> bool {
         if n == 0 {
             return true;
@@ -154,6 +154,8 @@ impl TokenBucket {
     }
 
     /// 补充令牌（writer_loop 根据 elapsed 调用）
+    // 仅单元测试使用（原 refill_tokens 调用点已移除），故单独压制 dead_code
+    #[allow(dead_code)]
     fn refill(&self, tokens_to_add: usize) {
         if tokens_to_add == 0 {
             return;
@@ -276,9 +278,6 @@ pub struct IoScheduler {
     shutdown: Arc<AtomicBool>,
     /// 唤醒 writer_loop 的通知器
     notify: Arc<Notify>,
-    /// 上次令牌桶补充时间
-    #[allow(dead_code)]
-    last_refill: ParkingMutex<Instant>,
     /// 空闲检测滑动窗口
     idle_samples: ParkingMutex<Vec<IdleSample>>,
 }
@@ -304,7 +303,6 @@ impl IoScheduler {
             stats: Arc::new(ParkingMutex::new(IoSchedulerStats::default())),
             shutdown: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
-            last_refill: ParkingMutex::new(Instant::now()),
             idle_samples: ParkingMutex::new(Vec::new()),
         });
 
@@ -522,21 +520,6 @@ impl IoScheduler {
             if elapsed < tick_interval {
                 tokio::time::sleep(tick_interval - elapsed).await;
             }
-        }
-    }
-
-    /// 根据经过时间补充令牌
-    #[allow(dead_code)]
-    fn refill_tokens(&self) {
-        let elapsed = {
-            let mut last = self.last_refill.lock();
-            let elapsed = last.elapsed();
-            *last = Instant::now();
-            elapsed
-        };
-        let tokens_to_add = (elapsed.as_secs_f64() * self.config.token_bucket_rate as f64) as usize;
-        if tokens_to_add > 0 {
-            self.token_bucket.refill(tokens_to_add);
         }
     }
 

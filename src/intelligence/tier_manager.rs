@@ -113,21 +113,6 @@ impl PeerTierManager {
         self.write_queue = Some(wq);
         self
     }
-
-    /// 判断 peer 的温度层级
-    #[allow(dead_code)]
-    fn classify_peer(last_active: SystemTime, config: &TierConfig) -> DataTier {
-        let elapsed = last_active
-            .elapsed()
-            .unwrap_or(Duration::from_secs(u64::MAX));
-        if elapsed.as_secs() < config.hot_threshold_secs {
-            DataTier::Hot
-        } else if elapsed.as_secs() < config.warm_threshold_secs {
-            DataTier::Warm
-        } else {
-            DataTier::Cold
-        }
-    }
 }
 
 #[async_trait]

@@ -16,10 +16,6 @@ const BITTORRENT_PROTOCOL: &[u8] = b"BitTorrent protocol";
 /// 扩展协议消息类型
 const EXTENDED_MESSAGE_ID: u8 = 20;
 
-/// 扩展握手的扩展 ID
-#[allow(dead_code)]
-const EXTENSION_HANDSHAKE_ID: u8 = 0;
-
 /// BitTorrent 握手消息（68 字节）
 pub struct BtHandshake {
     pub infohash: [u8; 20],

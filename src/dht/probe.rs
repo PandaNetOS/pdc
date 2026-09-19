@@ -29,12 +29,8 @@ use crate::storage::{NodeRepoImpl, PeerRepoImpl};
 const MAX_CONCURRENT: usize = 20;
 /// ping 超时
 const PING_TIMEOUT: Duration = Duration::from_secs(3);
-/// TCP BT 握手连接与读取超时
-const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 已探测地址缓存上限（防止内存膨胀）
 const MAX_PROBED_CACHE: usize = 100_000;
-/// 从 PeerRepo 拉取未探测 peer 的间隔
-const _PEER_REPO_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// 每次从 PeerRepo 拉取的最大 peer 数
 const MAX_PEERS_PER_POLL: usize = 100;
 
@@ -346,54 +342,6 @@ impl DhtProbe {
             }
         }
         false
-    }
-
-    /// TCP BT 握手预过滤（已弃用，保留供参考）
-    ///
-    /// 返回 Ok(true) 表示支持 DHT，Ok(false) 表示在线但不支持 DHT，
-    /// Err 表示连接失败或握手失败。
-    #[allow(dead_code)]
-    async fn tcp_handshake_check(addr: SocketAddr) -> anyhow::Result<bool> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        // TCP 连接（超时 5 秒）
-        let stream =
-            tokio::time::timeout(TCP_HANDSHAKE_TIMEOUT, TcpStream::connect(addr)).await??;
-
-        // 构造 BT 握手
-        let mut handshake = Vec::with_capacity(68);
-        handshake.push(19); // protocol name length
-        handshake.extend_from_slice(b"BitTorrent protocol");
-        // reserved bytes：设置 DHT 扩展位（第 7 字节最低位）
-        let mut reserved = [0u8; 8];
-        reserved[7] |= 0x01;
-        handshake.extend_from_slice(&reserved);
-        // infohash：随机（握手只检查支持的扩展，不验证 infohash）
-        let mut infohash = [0u8; 20];
-        rand::thread_rng().fill(&mut infohash);
-        handshake.extend_from_slice(&infohash);
-        // peer_id
-        let mut peer_id = [0u8; 20];
-        peer_id[0..8].copy_from_slice(b"-PD0003-");
-        rand::thread_rng().fill(&mut peer_id[8..]);
-        handshake.extend_from_slice(&peer_id);
-
-        let mut stream = stream;
-        stream.write_all(&handshake).await?;
-
-        // 读取响应握手（68 字节）
-        let mut resp = vec![0u8; 68];
-        tokio::time::timeout(TCP_HANDSHAKE_TIMEOUT, stream.read_exact(&mut resp)).await??;
-
-        // 验证响应格式
-        if resp[0] != 19 || &resp[1..20] != b"BitTorrent protocol" {
-            return Err(anyhow::anyhow!("无效的 BT 握手响应"));
-        }
-
-        // 检查 DHT 扩展位（reserved 第 7 字节最低位）
-        let supports_dht = resp[27] & 0x01 != 0;
-        Ok(supports_dht)
     }
 }
 
