@@ -168,7 +168,7 @@ DHT 节点表是**两节点各自爬虫独立发现**的高 churn 数据（实�
 ### R2（差异高估 5.4×）入站数据不折进 Merkle
 
 - `sync/mod.rs:589-593`：入站 apply **不**更新内存 Merkle；`handle_shard_sync_complete`（`:2372-2386`）也明确**不 rebuild**。
-- 唯一收敛靠 `merkle_cold_rebuild_*`（`main.rs:2551`，间隔 = `merkle_full_rebuild_interval_secs` = **300 s**）。
+- 唯一收敛靠 `merkle_cold_rebuild_*`（`main.rs:2450`，间隔 = `merkle_cold_rebuild_interval_secs` = **3600 s**）。
 - 而反熵是 **60 s** 一次、单次分片同步要 **187 s**。
 - → 下一轮对账时，本地树里还没包含「刚拉回来的 16.8 万条」+「本地爬虫这段时间新发现的」 → 实测 L2 差异 **43,172 / 65,536 = 66%**，而按 DB 真实差异推算应只有 **约 12%**。
 

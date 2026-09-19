@@ -145,9 +145,6 @@ pub struct TaskSchedulerConfig {
     /// 任务画像 EWMA 平滑系数 alpha（0.0-1.0）。
     #[serde(default = "default_profile_ewma_alpha")]
     pub profile_ewma_alpha: f32,
-    /// 系统负载采样间隔（秒）。采样任务由 main.rs 注册，本字段为参考配置。
-    #[serde(default = "default_load_sample_interval_secs")]
-    pub load_sample_interval_secs: u64,
     /// 预测式调度总开关（S1-P2）。false（默认）时调度行为与改造前完全一致。
     #[serde(default = "default_predictive_scheduling_enabled")]
     pub predictive_scheduling_enabled: bool,
@@ -194,7 +191,7 @@ fn default_network_concurrency() -> u32 {
 }
 
 fn default_admission_control_enabled() -> bool {
-    true
+    false
 }
 
 fn default_admission_cpu_threshold() -> f32 {
@@ -210,7 +207,7 @@ fn default_admission_max_delay_ticks() -> u32 {
 }
 
 fn default_random_jitter_enabled() -> bool {
-    true
+    false
 }
 
 fn default_random_jitter_ratio() -> f32 {
@@ -221,12 +218,8 @@ fn default_profile_ewma_alpha() -> f32 {
     0.2
 }
 
-fn default_load_sample_interval_secs() -> u64 {
-    5
-}
-
 fn default_predictive_scheduling_enabled() -> bool {
-    true
+    false
 }
 
 fn default_predict_ewma_alpha() -> f32 {
@@ -242,7 +235,7 @@ fn default_predict_lookahead_ticks() -> u32 {
 }
 
 fn default_adaptive_interval_enabled() -> bool {
-    true
+    false
 }
 
 fn default_adaptive_target_load() -> f32 {
@@ -292,7 +285,6 @@ impl Default for TaskSchedulerConfig {
             random_jitter_enabled: default_random_jitter_enabled(),
             random_jitter_ratio: default_random_jitter_ratio(),
             profile_ewma_alpha: default_profile_ewma_alpha(),
-            load_sample_interval_secs: default_load_sample_interval_secs(),
             predictive_scheduling_enabled: default_predictive_scheduling_enabled(),
             predict_ewma_alpha: default_predict_ewma_alpha(),
             predict_history_size: default_predict_history_size(),
@@ -337,82 +329,26 @@ impl Default for StorageConfig {
 /// 持久化优化配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceConfig {
-    /// 全量保存间隔（秒）
-    #[serde(default = "default_save_interval")]
-    pub save_interval_secs: u64,
-    /// WAL checkpoint 间隔（秒）
-    #[serde(default = "default_checkpoint_interval")]
-    pub wal_checkpoint_interval_secs: u64,
-    /// WAL 自动 checkpoint 页数
-    #[serde(default = "default_wal_autocheckpoint")]
-    pub wal_autocheckpoint_pages: u32,
     /// 批量写入大小
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// WriteQueue 异步刷盘间隔（秒，攒批事务写入）
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
-    /// 是否启用增量持久化（变更日志）
-    #[serde(default = "default_false")]
-    pub enable_incremental: bool,
-    /// 冷热分层检查间隔（秒）
-    #[serde(default = "default_tier_check_interval")]
-    pub tier_check_interval_secs: u64,
-    /// 热数据阈值（秒，最近 N 秒内有活跃视为热）
-    #[serde(default = "default_hot_threshold")]
-    pub hot_threshold_secs: u64,
-    /// 温数据阈值（秒，超过则为冷）
-    #[serde(default = "default_warm_threshold")]
-    pub warm_threshold_secs: u64,
-    /// 内存热数据上限
-    #[serde(default = "default_max_hot_in_memory")]
-    pub max_hot_in_memory: usize,
 }
 
-fn default_save_interval() -> u64 {
-    60
-}
-fn default_checkpoint_interval() -> u64 {
-    600
-}
-fn default_wal_autocheckpoint() -> u32 {
-    2000
-}
 fn default_batch_size() -> usize {
     500
 }
 fn default_flush_interval_secs() -> u64 {
     10
 }
-fn default_false() -> bool {
-    false
-}
-fn default_tier_check_interval() -> u64 {
-    300
-}
-fn default_hot_threshold() -> u64 {
-    1800
-}
-fn default_warm_threshold() -> u64 {
-    7200
-}
-fn default_max_hot_in_memory() -> usize {
-    5000
-}
 
 impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
-            save_interval_secs: default_save_interval(),
-            wal_checkpoint_interval_secs: default_checkpoint_interval(),
-            wal_autocheckpoint_pages: default_wal_autocheckpoint(),
             batch_size: default_batch_size(),
             flush_interval_secs: default_flush_interval_secs(),
-            enable_incremental: default_false(),
-            tier_check_interval_secs: default_tier_check_interval(),
-            hot_threshold_secs: default_hot_threshold(),
-            warm_threshold_secs: default_warm_threshold(),
-            max_hot_in_memory: default_max_hot_in_memory(),
         }
     }
 }
@@ -642,9 +578,6 @@ pub struct TierConfig {
     /// 全局内存硬限制（MB，默认 500）
     #[serde(default = "default_tier_memory_limit_mb")]
     pub memory_limit_mb: usize,
-    /// Repo 数据缓存预算（MB，默认 250；其余为程序基础+爬虫+联邦）
-    #[serde(default = "default_tier_repo_cache_mb")]
-    pub repo_cache_mb: usize,
     /// Hot LRU 最大条目数（默认 500,000）
     #[serde(default = "default_tier_hot_max_count")]
     pub hot_max_count: usize,
@@ -663,9 +596,6 @@ pub struct TierConfig {
     /// 分层驱逐任务间隔（秒，默认 60）
     #[serde(default = "default_tier_evict_interval_secs")]
     pub evict_interval_secs: u64,
-    /// 启动时预热 Top-N 高评分节点（默认 100,000）
-    #[serde(default = "default_tier_preload_top_n")]
-    pub preload_top_n: usize,
     /// 全局内存监控采样间隔（秒，默认 30）
     #[serde(default = "default_tier_memory_monitor_interval_secs")]
     pub memory_monitor_interval_secs: u64,
@@ -679,14 +609,12 @@ impl Default for TierConfig {
         Self {
             enabled: default_tier_enabled(),
             memory_limit_mb: default_tier_memory_limit_mb(),
-            repo_cache_mb: default_tier_repo_cache_mb(),
             hot_max_count: default_tier_hot_max_count(),
             warm_max_count: default_tier_warm_max_count(),
             peer_warm_max_count: default_tier_peer_warm_max_count(),
             hot_threshold_secs: default_tier_hot_threshold_secs(),
             warm_threshold_secs: default_tier_warm_threshold_secs(),
             evict_interval_secs: default_tier_evict_interval_secs(),
-            preload_top_n: default_tier_preload_top_n(),
             memory_monitor_interval_secs: default_tier_memory_monitor_interval_secs(),
             emergency_threshold: default_tier_emergency_threshold(),
         }
@@ -698,9 +626,6 @@ fn default_tier_enabled() -> bool {
 }
 fn default_tier_memory_limit_mb() -> usize {
     500
-}
-fn default_tier_repo_cache_mb() -> usize {
-    250
 }
 fn default_tier_hot_max_count() -> usize {
     200_000
@@ -719,9 +644,6 @@ fn default_tier_warm_threshold_secs() -> u64 {
 }
 fn default_tier_evict_interval_secs() -> u64 {
     60
-}
-fn default_tier_preload_top_n() -> usize {
-    100_000
 }
 fn default_tier_memory_monitor_interval_secs() -> u64 {
     30
@@ -821,9 +743,6 @@ pub struct ServerConfig {
     /// API 鉴权 token（为空则不鉴权）
     #[serde(default)]
     pub token: Option<String>,
-    /// 工作目录
-    #[serde(default = "default_work_dir")]
-    pub work_dir: String,
 }
 
 fn default_listen() -> String {
@@ -836,9 +755,6 @@ fn default_port() -> u16 {
 fn default_api_port() -> u16 {
     6886
 }
-fn default_work_dir() -> String {
-    "pdc-data".to_string()
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -847,7 +763,6 @@ impl Default for ServerConfig {
             port: default_port(),
             api_port: default_api_port(),
             token: None,
-            work_dir: default_work_dir(),
         }
     }
 }
@@ -861,12 +776,6 @@ pub struct SuperTrackerConfig {
     /// 是否启用超级 Tracker（/announce /scrape）
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// announce 路径
-    #[serde(default = "default_announce_path")]
-    pub announce_path: String,
-    /// scrape 路径
-    #[serde(default = "default_scrape_path")]
-    pub scrape_path: String,
     /// 推荐的再次 announce 间隔（秒）
     #[serde(default = "default_interval")]
     pub interval: i64,
@@ -896,12 +805,6 @@ pub struct SuperTrackerConfig {
 fn default_true() -> bool {
     true
 }
-fn default_announce_path() -> String {
-    "/announce".to_string()
-}
-fn default_scrape_path() -> String {
-    "/scrape".to_string()
-}
 fn default_interval() -> i64 {
     30
 }
@@ -925,8 +828,6 @@ impl Default for SuperTrackerConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
-            announce_path: default_announce_path(),
-            scrape_path: default_scrape_path(),
             interval: default_interval(),
             min_interval: default_min_interval(),
             max_numwant: default_numwant(),
@@ -975,9 +876,6 @@ pub struct DiscoverersConfig {
     /// 远程 Tracker 列表 URL
     #[serde(default = "default_remote_tracker_url")]
     pub remote_tracker_url: String,
-    /// 远程 Tracker 列表刷新间隔（秒）
-    #[serde(default = "default_remote_tracker_refresh")]
-    pub remote_tracker_refresh_secs: u64,
     /// DHT 监听端口
     #[serde(default = "default_dht_port")]
     pub dht_listen_port: u16,
@@ -1004,9 +902,6 @@ fn default_lpd_multicast_port() -> u16 {
 fn default_remote_tracker_url() -> String {
     "https://cdn.jsdelivr.net/gh/adysec/tracker@main/trackers_best.txt".to_string()
 }
-fn default_remote_tracker_refresh() -> u64 {
-    3600 // 每小时刷新一次
-}
 
 impl Default for DiscoverersConfig {
     fn default() -> Self {
@@ -1021,7 +916,6 @@ impl Default for DiscoverersConfig {
             custom_trackers: vec![],
             enable_remote_tracker: default_true(),
             remote_tracker_url: default_remote_tracker_url(),
-            remote_tracker_refresh_secs: default_remote_tracker_refresh(),
             dht_listen_port: default_dht_port(),
             lpd_multicast_port: default_lpd_multicast_port(),
             discovery_timeout: Duration::from_secs(default_discovery_timeout()),
@@ -1035,9 +929,6 @@ impl Default for DiscoverersConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// 最大缓存 peer 数（全局）
-    #[serde(default = "default_max_cached")]
-    pub max_cached_peers: usize,
     /// Peer 过期时间（秒）
     #[serde(default = "default_cache_ttl")]
     pub peer_ttl_secs: u64,
@@ -1046,9 +937,6 @@ pub struct CacheConfig {
     pub max_peers_per_discovery: usize,
 }
 
-fn default_max_cached() -> usize {
-    10000
-}
 fn default_cache_ttl() -> u64 {
     86400
 }
@@ -1059,7 +947,6 @@ fn default_max_peers() -> usize {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_cached_peers: default_max_cached(),
             peer_ttl_secs: default_cache_ttl(),
             max_peers_per_discovery: default_max_peers(),
         }
@@ -1112,12 +999,6 @@ pub struct CrawlerConfig {
     /// 是否启用爬虫引擎
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 爬行间隔（秒）
-    #[serde(default = "default_crawl_interval")]
-    pub crawl_interval_secs: u64,
-    /// 最大爬行节点数
-    #[serde(default = "default_max_crawl_nodes")]
-    pub max_nodes: usize,
     /// 最大收集的 infohash 数
     #[serde(default = "default_max_infohashes")]
     pub max_infohashes: usize,
@@ -1139,18 +1020,6 @@ pub struct CrawlerConfig {
     /// 自适应限速滑动窗口大小（秒）
     #[serde(default = "default_rate_limit_window_secs")]
     pub rate_limit_window_secs: u64,
-    /// 进入限速的响应率阈值（响应率低于此值进入限速）
-    #[serde(default = "default_rate_limit_enter_threshold")]
-    pub rate_limit_enter_threshold: f64,
-    /// 解除限速的响应率阈值（响应率高于此值退出限速）
-    #[serde(default = "default_rate_limit_exit_threshold")]
-    pub rate_limit_exit_threshold: f64,
-    /// 限速判断所需最小请求样本数
-    #[serde(default = "default_rate_limit_min_samples")]
-    pub rate_limit_min_samples: usize,
-    /// 限速时跳过发送的比例（0.5 = 跳过 50% 的请求）
-    #[serde(default = "default_rate_limit_throttle_skip_ratio")]
-    pub rate_limit_throttle_skip_ratio: f64,
     /// Bootstrap 节点列表
     #[serde(default = "default_crawler_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<(String, u16)>,
@@ -1171,29 +1040,6 @@ pub struct CrawlerConfig {
     pub inbound_sources_max: usize,
 }
 
-/// NAT 穿透协议类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NatProtocol {
-    /// UPnP IGDv1/v2
-    Upnp,
-    /// NAT-PMP（Apple/企业路由器）
-    #[serde(rename = "natpmp")]
-    NatPmp,
-    /// PCP（端口控制协议，NAT-PMP 继任者）
-    Pcp,
-}
-
-impl NatProtocol {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            NatProtocol::Upnp => "upnp",
-            NatProtocol::NatPmp => "natpmp",
-            NatProtocol::Pcp => "pcp",
-        }
-    }
-}
-
 /// NAT 穿透配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatConfig {
@@ -1203,38 +1049,16 @@ pub struct NatConfig {
     /// 映射租期（秒，0=永久，建议 3600）
     #[serde(default = "default_nat_lease")]
     pub lease_duration: u32,
-    /// 协议优先级（按顺序尝试，第一个成功的为准）
-    #[serde(default = "default_nat_protocols")]
-    pub protocols: Vec<NatProtocol>,
-    /// 指定绑定网卡名称（为空自动选择有默认路由的网卡）
-    #[serde(default)]
-    pub bind_interface: Option<String>,
-    /// 指定绑定 IP（为空自动检测）
-    #[serde(default)]
-    pub bind_ip: Option<String>,
     /// STUN 服务器列表（用于公网可达性自检和 NAT 类型检测）
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<String>,
     /// 是否启用公网可达性自检
     #[serde(default = "default_true")]
     pub enable_reachability_check: bool,
-    /// 是否启用网关自动重连和映射恢复
-    #[serde(default = "default_true")]
-    pub enable_auto_recover: bool,
-    /// 网关健康检查间隔（秒）
-    #[serde(default = "default_nat_health_check_interval")]
-    pub health_check_interval: u64,
-    /// 映射失败时最大重试次数
-    #[serde(default = "default_nat_max_retries")]
-    pub max_retries: u32,
 }
 
 fn default_nat_lease() -> u32 {
     3600
-}
-
-fn default_nat_protocols() -> Vec<NatProtocol> {
-    vec![NatProtocol::Upnp, NatProtocol::NatPmp, NatProtocol::Pcp]
 }
 
 fn default_stun_servers() -> Vec<String> {
@@ -1245,37 +1069,17 @@ fn default_stun_servers() -> Vec<String> {
     ]
 }
 
-fn default_nat_health_check_interval() -> u64 {
-    300 // 5 分钟
-}
-
-fn default_nat_max_retries() -> u32 {
-    10
-}
-
 impl Default for NatConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             lease_duration: default_nat_lease(),
-            protocols: default_nat_protocols(),
-            bind_interface: None,
-            bind_ip: None,
             stun_servers: default_stun_servers(),
             enable_reachability_check: true,
-            enable_auto_recover: true,
-            health_check_interval: default_nat_health_check_interval(),
-            max_retries: default_nat_max_retries(),
         }
     }
 }
 
-fn default_crawl_interval() -> u64 {
-    60
-}
-fn default_max_crawl_nodes() -> usize {
-    1000
-}
 fn default_max_infohashes() -> usize {
     100000
 }
@@ -1296,18 +1100,6 @@ fn default_adaptive_rate_limit() -> bool {
 }
 fn default_rate_limit_window_secs() -> u64 {
     60
-}
-fn default_rate_limit_enter_threshold() -> f64 {
-    0.15
-}
-fn default_rate_limit_exit_threshold() -> f64 {
-    0.30
-}
-fn default_rate_limit_min_samples() -> usize {
-    50
-}
-fn default_rate_limit_throttle_skip_ratio() -> f64 {
-    0.5
 }
 fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
@@ -1352,8 +1144,6 @@ impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            crawl_interval_secs: default_crawl_interval(),
-            max_nodes: default_max_crawl_nodes(),
             max_infohashes: default_max_infohashes(),
             listen_port: default_crawler_listen_port(),
             utp_port: default_utp_port(),
@@ -1361,10 +1151,6 @@ impl Default for CrawlerConfig {
             socket_count: default_crawler_socket_count(),
             adaptive_rate_limit: default_adaptive_rate_limit(),
             rate_limit_window_secs: default_rate_limit_window_secs(),
-            rate_limit_enter_threshold: default_rate_limit_enter_threshold(),
-            rate_limit_exit_threshold: default_rate_limit_exit_threshold(),
-            rate_limit_min_samples: default_rate_limit_min_samples(),
-            rate_limit_throttle_skip_ratio: default_rate_limit_throttle_skip_ratio(),
             bootstrap_nodes: default_crawler_bootstrap_nodes(),
             warmup_node_count: default_warmup_node_count(),
             warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),
@@ -1463,6 +1249,58 @@ mod tests {
         assert!(config.crawler.enabled);
     }
 
+    /// 已删除的失效配置项若仍残留在旧配置文件中，应被 serde 静默忽略（向后兼容）。
+    #[test]
+    fn test_removed_legacy_keys_are_ignored() {
+        let yaml = r#"
+server:
+  work_dir: pdc-data
+cache:
+  max_cached_peers: 12345
+crawler:
+  socket_count: 8
+  crawl_interval_secs: 60
+nat:
+  bind_ip: 10.0.0.1
+  max_retries: 10
+persistence:
+  max_hot_in_memory: 9999
+  wal_autocheckpoint_pages: 2000
+federation:
+  heartbeat_interval_secs: 30
+log_level: debug
+"#;
+        let config = PdcConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.server.port, 6880);
+        // 未删除的有效字段仍生效
+        assert_eq!(config.crawler.socket_count, 8);
+    }
+
+    /// 调度器 4 个「新功能」开关默认必须关闭：接线后行为与改造前一致。
+    #[test]
+    fn test_scheduler_new_features_default_off() {
+        let c = PdcConfig::default();
+        assert!(!c.task_scheduler.admission_control_enabled);
+        assert!(!c.task_scheduler.random_jitter_enabled);
+        assert!(!c.task_scheduler.predictive_scheduling_enabled);
+        assert!(!c.task_scheduler.adaptive_interval_enabled);
+        // 真正生效的并发度默认值保持不变
+        assert_eq!(c.task_scheduler.crawl_concurrency, 4);
+        assert_eq!(c.task_scheduler.persistence_concurrency, 1);
+        assert_eq!(c.task_scheduler.monitor_concurrency, 2);
+        assert_eq!(c.task_scheduler.network_concurrency, 4);
+    }
+
+    /// health_check 三个周期字段现在由 TaskScheduler 以默认值下发，默认值与历史一致。
+    #[test]
+    fn test_health_check_intervals_defaults() {
+        let c = PdcConfig::default();
+        assert_eq!(c.health_check.interval_secs, 300);
+        assert_eq!(c.health_check.cache_cleanup_interval_secs, 600);
+        assert_eq!(c.health_check.stats_output_interval_secs, 300);
+    }
+
     #[test]
     fn test_parse_yaml() {
         let yaml = r#"
@@ -1481,6 +1319,6 @@ crawler:
         assert!(config.discoverers.enable_lpd);
         assert!(config.crawler.enabled);
         // 未指定的字段使用默认值
-        assert_eq!(config.cache.max_cached_peers, 10000);
+        assert_eq!(config.cache.peer_ttl_secs, 86400);
     }
 }

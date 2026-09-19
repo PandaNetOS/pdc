@@ -200,6 +200,22 @@ impl super::db::Storage {
         Ok(v)
     }
 
+    /// 指定 repo 的最大 seq（该 repo 最后一条变更的 seq；该 repo 无记录时 0）。
+    ///
+    /// 与 `oplog_max_seq`（全局）不同：delta 请求方是**按 repo** 维护独立断点的
+    /// （`delta_peer_seq(peer, repo)`），因此「落后量」必须与同一 repo 的水位相减，
+    /// 否则 op 稀疏的 repo 会虚高（F2）。走 `idx_feed_oplog_repo_seq(repo, seq)` 索引。
+    pub fn oplog_max_seq_for_repo(&self, repo: u8) -> anyhow::Result<i64> {
+        let conn = self.connection();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let v: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM feed_oplog WHERE repo = ?1",
+            params![repo as i64],
+            |r| r.get(0),
+        )?;
+        Ok(v)
+    }
+
     /// 最小 seq（无记录时 0）。
     pub fn oplog_min_seq(&self) -> anyhow::Result<i64> {
         let conn = self.connection();

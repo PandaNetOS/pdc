@@ -609,7 +609,16 @@ mod tests {
     }
 
     fn test_data_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pdc_disc_test_{}", std::process::id()));
+        // 每个测试用**唯一**子目录：本函数被 5 个测试共用，若都落在同一路径，并发执行时
+        // 彼此的 remove_dir_all / create_dir_all 会互相竞争，在 Windows 上表现为
+        // create_dir_all 偶发失败（flaky）。加进程内自增序号即消除竞争。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pdc_disc_test_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

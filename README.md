@@ -129,7 +129,6 @@ async fn main() -> anyhow::Result<()> {
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `max_cached_peers` | `usize` | 10000 | 最大缓存 peer 数 |
 | `peer_ttl` | `Duration` | 24小时 | Peer 过期时间 |
 | `discovery_timeout` | `Duration` | 30秒 | 单次发现超时 |
 | `max_concurrent_discoverers` | `usize` | 10 | 并发发现器数量限制 |

@@ -685,6 +685,13 @@ pub struct OpsBatchMessage {
     pub next_seq: u64,
     /// 是否还有更多（true 时请求方应立即再发一次 OpsRequest）
     pub has_more: bool,
+    /// F2：应答方**在该 repo 上**的 oplog 最高 seq（= 该 repo 最后一条变更的 seq）。
+    ///
+    /// 请求方据此算真实落后量 `server_max_seq - synced_seq`（二者同属应答方 seq 空间、
+    /// 且同一 repo）。该 repo 在应答方无任何变更时为 0，此时可观测性里的 `lag_seq`
+    /// 返回 null —— 而非修复前那样「跨节点空间」或「跨 repo 维度」相减出的噪声/虚高值。
+    #[serde(default)]
+    pub server_max_seq: u64,
 }
 
 /// P1-4：Range-based 反熵请求（有序区间 `[lo, hi)` 摘要对账）。

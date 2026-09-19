@@ -34,9 +34,6 @@ pub struct FederationConfig {
     /// 目标邻居数
     #[serde(default = "default_target_neighbors")]
     pub target_neighbors: usize,
-    /// 心跳间隔（秒）
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval_secs: u64,
     /// 心跳超时（秒），超过此时间无响应则断开
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_secs: u64,
@@ -77,9 +74,6 @@ pub struct FederationConfig {
     /// 是否启用 Node 同步
     #[serde(default = "default_true")]
     pub sync_node_enabled: bool,
-    /// Node 同步间隔（秒）
-    #[serde(default = "default_sync_node_interval")]
-    pub sync_node_interval_secs: u64,
     /// 是否启用 Infohash 同步（阶段2实现）
     #[serde(default = "default_true")]
     pub sync_infohash_enabled: bool,
@@ -136,10 +130,6 @@ pub struct FederationConfig {
     /// 默认 5000，比旧的硬编码 100 减少 50 倍消息开销。
     #[serde(default = "default_initial_sync_batch_size")]
     pub initial_sync_batch_size: usize,
-    /// 接收端 GossipBatch 攒批刷新间隔（毫秒）。
-    /// 收到的 GossipBatch 先进入 per-connection 缓冲区，到期后一次性 flush。
-    #[serde(default = "default_gossip_flush_interval_ms")]
-    pub gossip_flush_interval_ms: u64,
     /// 接收端 GossipBatch 攒批最大批次数，达到则立即刷新。
     #[serde(default = "default_gossip_flush_max_batches")]
     pub gossip_flush_max_batches: usize,
@@ -156,10 +146,6 @@ pub struct FederationConfig {
     /// 全量同步期间 Gossip 每秒最多发送字节数（临时放开限流）。
     #[serde(default = "default_full_sync_gossip_max_bytes_per_second")]
     pub full_sync_gossip_max_bytes_per_second: u64,
-    /// Merkle 树异步批量更新间隔（毫秒）。
-    /// 联邦同步 apply 时仅入队，后台任务每此间隔批量 flush 到 Merkle 树，降低 apply 路径 CPU 占用。
-    #[serde(default = "default_merkle_async_update_interval_ms")]
-    pub merkle_async_update_interval_ms: u64,
     /// Merkle 树异步批量更新触发阈值（条数）。
     /// 队列累计达到此条数时通过 Notify 立即唤醒后台 flush，无需等待间隔。
     #[serde(default = "default_merkle_async_update_batch_size")]
@@ -173,11 +159,6 @@ pub struct FederationConfig {
     /// 默认 10 秒。
     #[serde(default = "default_merkle_incremental_update_interval_secs")]
     pub merkle_incremental_update_interval_secs: u64,
-    /// Merkle 全量重算间隔（秒）。
-    /// 【已废弃】P1-5 起常态维护改由增量任务（按 dirty L2 精确重算）承担，全量重算降级为
-    /// 低频兜底并使用 `merkle_cold_rebuild_interval_secs`。该字段保留仅为向后兼容旧配置文件。
-    #[serde(default = "default_merkle_full_rebuild_interval_secs")]
-    pub merkle_full_rebuild_interval_secs: u64,
     /// P1-2：oplog 保留窗口（秒）。默认 86400（24h）。
     /// **必须 > 预估 bootstrap 时长**（架构文档铁律 4），否则新节点追尾时水位 W0 之后的 op
     /// 已被裁掉，只能重打快照。设为 0 表示永不裁剪（表会无界增长，不建议）。
@@ -191,6 +172,12 @@ pub struct FederationConfig {
     /// 关闭时完全不发这些消息，行为与改造前一致。
     #[serde(default)]
     pub delta_sync_enabled: bool,
+    /// P1-3：delta 增量拉取周期（秒）。默认 15。
+    ///
+    /// 建连时的首次拉取之外，还需该周期任务持续向每个已连接对端追问「有没有新 op」，
+    /// 否则稳态新写入只能靠 gossip 传播，delta 通道会退化成一次性拉取（F1）。
+    #[serde(default = "default_delta_sync_interval_secs")]
+    pub delta_sync_interval_secs: u64,
     /// P1-4：是否启用 Range-based（有序区间 + 分界点下钻）反熵作为 NODE repo 的反熵主链。
     /// 默认 false：行为与改造前一致（既有分层 Merkle 反熵），必须两端同版本（>= v5）后开启。
     #[serde(default)]
@@ -241,11 +228,6 @@ pub struct FederationConfig {
     /// false：串行发送（单连接 localhost 场景并行无收益且放大 write timeout，保留作为 fallback）。
     #[serde(default = "default_parallel_propagation")]
     pub parallel_propagation: bool,
-    /// 连接就绪后，等待多少毫秒再选择全量数据源并发送 FullSyncRequest。
-    /// 默认 60 秒：等待 pdc 启动初期数据加载完成、资源占用回落，
-    /// 同时让 PeerInfo 中的条目数趋于准确，避免基于不完整快照做决策。
-    #[serde(default = "default_full_sync_source_select_settle_ms")]
-    pub full_sync_source_select_settle_ms: u64,
     /// 发起拉取后，接收全量期间保持「收到的 Gossip 只本地写入不转发」的稳态时长（毫秒）。
     /// 超过此时长自动恢复正常转发（Gossip 拉取无显式完成信号，用可配置时长兜底）。
     #[serde(default = "default_full_sync_receiving_settle_ms")]
@@ -279,10 +261,6 @@ pub struct FederationConfig {
     /// 用于避免同步期间占用过多磁盘 IO 和网络带宽，影响爬虫和 Tracker 正常运行。
     #[serde(default = "default_shard_sync_rate_limit_per_sec")]
     pub shard_sync_rate_limit_per_sec: u64,
-    /// 流式加载每批条目数（从 DB 流式读取差异分片数据时的批次大小）。
-    /// 默认 5000，每批发送后释放内存，避免亿级数据同步时内存爆炸。
-    #[serde(default = "default_sync_stream_batch_size")]
-    pub sync_stream_batch_size: usize,
     /// 分片同步窗口大小（发送方未确认的在途批次数）。
     #[serde(default = "default_shard_sync_window_size")]
     pub shard_sync_window_size: usize,
@@ -330,9 +308,6 @@ fn default_max_connections() -> usize {
 fn default_target_neighbors() -> usize {
     8
 }
-fn default_heartbeat_interval() -> u64 {
-    30
-}
 fn default_heartbeat_timeout() -> u64 {
     90
 }
@@ -367,9 +342,6 @@ fn default_gossip_fanout() -> usize {
 }
 fn default_gossip_seen_shards() -> usize {
     16
-}
-fn default_sync_node_interval() -> u64 {
-    300
 }
 fn default_dht_interval() -> u64 {
     300
@@ -411,9 +383,6 @@ fn default_receive_pending_threshold() -> u32 {
 fn default_initial_sync_batch_size() -> usize {
     5000
 }
-fn default_gossip_flush_interval_ms() -> u64 {
-    50
-}
 fn default_gossip_flush_max_batches() -> usize {
     10
 }
@@ -429,9 +398,6 @@ fn default_full_sync_gossip_max_messages_per_second() -> u32 {
 fn default_full_sync_gossip_max_bytes_per_second() -> u64 {
     50 * 1024 * 1024
 }
-fn default_merkle_async_update_interval_ms() -> u64 {
-    1000
-}
 fn default_merkle_async_update_batch_size() -> usize {
     10000
 }
@@ -441,14 +407,14 @@ fn default_merkle_cold_rebuild_interval_secs() -> u64 {
 fn default_merkle_incremental_update_interval_secs() -> u64 {
     10
 }
-fn default_merkle_full_rebuild_interval_secs() -> u64 {
-    300
-}
 fn default_oplog_retention_secs() -> u64 {
     86_400
 }
 fn default_oplog_trim_interval_secs() -> u64 {
     3_600
+}
+fn default_delta_sync_interval_secs() -> u64 {
+    15
 }
 fn default_range_leaf_rows() -> u32 {
     crate::federation::sync::range_reconcile::DEFAULT_LEAF_ROWS
@@ -483,9 +449,6 @@ fn default_gossip_bulk_max_bytes() -> usize {
 fn default_parallel_propagation() -> bool {
     true
 }
-fn default_full_sync_source_select_settle_ms() -> u64 {
-    60_000
-}
 fn default_full_sync_receiving_settle_ms() -> u64 {
     60_000
 }
@@ -506,9 +469,6 @@ fn default_shard_sync_batch_size() -> usize {
 }
 fn default_shard_sync_rate_limit_per_sec() -> u64 {
     0
-}
-fn default_sync_stream_batch_size() -> usize {
-    5000
 }
 fn default_shard_sync_window_size() -> usize {
     3
@@ -544,7 +504,6 @@ impl Default for FederationConfig {
             lpd_multicast_port: default_lpd_multicast_port(),
             max_connections: default_max_connections(),
             target_neighbors: default_target_neighbors(),
-            heartbeat_interval_secs: default_heartbeat_interval(),
             heartbeat_timeout_secs: default_heartbeat_timeout(),
             nat_mapping_enabled: default_true(),
             stun_servers: default_stun_servers(),
@@ -557,7 +516,6 @@ impl Default for FederationConfig {
             gossip_seen_shards: default_gossip_seen_shards(),
             sync_peer_enabled: default_true(),
             sync_node_enabled: default_true(),
-            sync_node_interval_secs: default_sync_node_interval(),
             sync_infohash_enabled: default_true(),
             sync_tracker_enabled: default_true(),
             dht_discovery_enabled: default_true(),
@@ -574,22 +532,20 @@ impl Default for FederationConfig {
             gossip_max_messages_per_second: default_gossip_max_messages_per_second(),
             receive_pending_threshold: default_receive_pending_threshold(),
             initial_sync_batch_size: default_initial_sync_batch_size(),
-            gossip_flush_interval_ms: default_gossip_flush_interval_ms(),
             gossip_flush_max_batches: default_gossip_flush_max_batches(),
             full_sync_batch_size: default_full_sync_batch_size(),
             full_sync_window_size: default_full_sync_window_size(),
             full_sync_gossip_max_messages_per_second:
                 default_full_sync_gossip_max_messages_per_second(),
             full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
-            merkle_async_update_interval_ms: default_merkle_async_update_interval_ms(),
             merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
             merkle_cold_rebuild_interval_secs: default_merkle_cold_rebuild_interval_secs(),
             merkle_incremental_update_interval_secs:
                 default_merkle_incremental_update_interval_secs(),
-            merkle_full_rebuild_interval_secs: default_merkle_full_rebuild_interval_secs(),
             oplog_retention_secs: default_oplog_retention_secs(),
             oplog_trim_interval_secs: default_oplog_trim_interval_secs(),
             delta_sync_enabled: false,
+            delta_sync_interval_secs: default_delta_sync_interval_secs(),
             range_reconcile_enabled: false,
             range_reconcile_diagnostic_only: true,
             range_reconcile_leaf_rows: default_range_leaf_rows(),
@@ -604,7 +560,6 @@ impl Default for FederationConfig {
             gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
             gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
             parallel_propagation: default_parallel_propagation(),
-            full_sync_source_select_settle_ms: default_full_sync_source_select_settle_ms(),
             full_sync_receiving_settle_ms: default_full_sync_receiving_settle_ms(),
             diff_key_exchange_timeout_secs: default_diff_key_exchange_timeout_secs(),
             layered_merkle_enabled: default_true(),
@@ -613,7 +568,6 @@ impl Default for FederationConfig {
             shard_sync_retry_count: default_shard_sync_retry_count(),
             shard_sync_batch_size: default_shard_sync_batch_size(),
             shard_sync_rate_limit_per_sec: default_shard_sync_rate_limit_per_sec(),
-            sync_stream_batch_size: default_sync_stream_batch_size(),
             shard_sync_window_size: default_shard_sync_window_size(),
             shard_sync_max_retries: default_shard_sync_max_retries(),
             shard_sync_base_backoff_ms: default_shard_sync_base_backoff_ms(),
@@ -636,7 +590,6 @@ mod tests {
         assert_eq!(cfg.listen_port, 6885);
         assert_eq!(cfg.max_connections, 32);
         assert_eq!(cfg.target_neighbors, 8);
-        assert_eq!(cfg.heartbeat_interval_secs, 30);
         assert_eq!(cfg.heartbeat_timeout_secs, 90);
         assert!(cfg.nat_mapping_enabled);
         assert!(cfg.enable_relay);
@@ -645,7 +598,6 @@ mod tests {
         assert_eq!(cfg.gossip_interval_ms, 1000);
         assert_eq!(cfg.gossip_fanout, 8);
         assert!(cfg.sync_node_enabled);
-        assert_eq!(cfg.sync_node_interval_secs, 300);
         assert!(cfg.dht_discovery_enabled);
         assert_eq!(cfg.dht_discovery_interval_secs, 300);
         assert!(cfg.peer_cache_enabled);

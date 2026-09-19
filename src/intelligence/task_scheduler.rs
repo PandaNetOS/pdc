@@ -501,8 +501,6 @@ pub struct SchedulerKnobs {
     pub random_jitter_ratio: f32,
     /// 任务画像 EWMA 平滑系数
     pub profile_ewma_alpha: f32,
-    /// 系统负载采样间隔（秒）
-    pub load_sample_interval_secs: u64,
     /// 预测式调度总开关（S1-P2，默认 false）
     pub predictive_scheduling_enabled: bool,
     /// 负载预测 EWMA 平滑系数 alpha
@@ -533,7 +531,6 @@ impl Default for SchedulerKnobs {
             random_jitter_enabled: false,
             random_jitter_ratio: 0.1,
             profile_ewma_alpha: 0.2,
-            load_sample_interval_secs: 5,
             predictive_scheduling_enabled: false,
             predict_ewma_alpha: 0.3,
             predict_history_size: 20,
@@ -544,6 +541,104 @@ impl Default for SchedulerKnobs {
             adaptive_max_ratio: 2.0,
             adaptive_recalc_ticks: 5,
         }
+    }
+}
+
+impl SchedulerKnobs {
+    /// 从 `config.task_scheduler` 构建运行时旋钮。
+    ///
+    /// `main.rs` 在装配 `TaskScheduler` 时调用（`with_knobs`），使 YAML 中
+    /// 的准入控制 / 随机抖动 / 预测式调度 / 自适应间隔参数真正生效。
+    /// 全部字段默认关闭时，行为与未注入旋钮（改造前）完全一致。
+    pub fn from_config(cfg: &crate::config::TaskSchedulerConfig) -> Self {
+        Self {
+            admission_control_enabled: cfg.admission_control_enabled,
+            admission_cpu_threshold: cfg.admission_cpu_threshold,
+            admission_io_threshold: cfg.admission_io_threshold,
+            admission_max_delay_ticks: cfg.admission_max_delay_ticks,
+            random_jitter_enabled: cfg.random_jitter_enabled,
+            random_jitter_ratio: cfg.random_jitter_ratio,
+            profile_ewma_alpha: cfg.profile_ewma_alpha,
+            predictive_scheduling_enabled: cfg.predictive_scheduling_enabled,
+            predict_ewma_alpha: cfg.predict_ewma_alpha,
+            predict_history_size: cfg.predict_history_size,
+            predict_lookahead_ticks: cfg.predict_lookahead_ticks,
+            adaptive_interval_enabled: cfg.adaptive_interval_enabled,
+            adaptive_target_load: cfg.adaptive_target_load,
+            adaptive_min_ratio: cfg.adaptive_min_ratio,
+            adaptive_max_ratio: cfg.adaptive_max_ratio,
+            adaptive_recalc_ticks: cfg.adaptive_recalc_ticks,
+        }
+    }
+}
+
+#[cfg(test)]
+mod knobs_from_config_tests {
+    use super::*;
+    use crate::config::TaskSchedulerConfig;
+
+    /// 默认配置必须映射为「全部新功能关闭」，行为与改造前一致（回归守卫）。
+    #[test]
+    fn test_knobs_from_default_config_is_backward_compatible() {
+        let k = SchedulerKnobs::from_config(&TaskSchedulerConfig::default());
+        let d = SchedulerKnobs::default();
+        assert!(!k.admission_control_enabled);
+        assert!(!k.random_jitter_enabled);
+        assert!(!k.predictive_scheduling_enabled);
+        assert!(!k.adaptive_interval_enabled);
+        assert_eq!(k.admission_cpu_threshold, d.admission_cpu_threshold);
+        assert_eq!(k.admission_io_threshold, d.admission_io_threshold);
+        assert_eq!(k.admission_max_delay_ticks, d.admission_max_delay_ticks);
+        assert_eq!(k.random_jitter_ratio, d.random_jitter_ratio);
+        assert_eq!(k.profile_ewma_alpha, d.profile_ewma_alpha);
+        assert_eq!(k.predict_ewma_alpha, d.predict_ewma_alpha);
+        assert_eq!(k.predict_history_size, d.predict_history_size);
+        assert_eq!(k.predict_lookahead_ticks, d.predict_lookahead_ticks);
+        assert_eq!(k.adaptive_target_load, d.adaptive_target_load);
+        assert_eq!(k.adaptive_min_ratio, d.adaptive_min_ratio);
+        assert_eq!(k.adaptive_max_ratio, d.adaptive_max_ratio);
+        assert_eq!(k.adaptive_recalc_ticks, d.adaptive_recalc_ticks);
+    }
+
+    /// 16 个字段逐个透传，不得有漏接或错位。
+    #[test]
+    fn test_knobs_from_config_field_by_field() {
+        let cfg = TaskSchedulerConfig {
+            admission_control_enabled: true,
+            admission_cpu_threshold: 0.55,
+            admission_io_threshold: 0.66,
+            admission_max_delay_ticks: 7,
+            random_jitter_enabled: true,
+            random_jitter_ratio: 0.33,
+            profile_ewma_alpha: 0.44,
+            predictive_scheduling_enabled: true,
+            predict_ewma_alpha: 0.22,
+            predict_history_size: 42,
+            predict_lookahead_ticks: 4,
+            adaptive_interval_enabled: true,
+            adaptive_target_load: 0.77,
+            adaptive_min_ratio: 0.4,
+            adaptive_max_ratio: 1.5,
+            adaptive_recalc_ticks: 9,
+            ..Default::default()
+        };
+        let k = SchedulerKnobs::from_config(&cfg);
+        assert!(k.admission_control_enabled);
+        assert_eq!(k.admission_cpu_threshold, 0.55);
+        assert_eq!(k.admission_io_threshold, 0.66);
+        assert_eq!(k.admission_max_delay_ticks, 7);
+        assert!(k.random_jitter_enabled);
+        assert_eq!(k.random_jitter_ratio, 0.33);
+        assert_eq!(k.profile_ewma_alpha, 0.44);
+        assert!(k.predictive_scheduling_enabled);
+        assert_eq!(k.predict_ewma_alpha, 0.22);
+        assert_eq!(k.predict_history_size, 42);
+        assert_eq!(k.predict_lookahead_ticks, 4);
+        assert!(k.adaptive_interval_enabled);
+        assert_eq!(k.adaptive_target_load, 0.77);
+        assert_eq!(k.adaptive_min_ratio, 0.4);
+        assert_eq!(k.adaptive_max_ratio, 1.5);
+        assert_eq!(k.adaptive_recalc_ticks, 9);
     }
 }
 

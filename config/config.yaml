@@ -3,11 +3,8 @@ server:
   port: 6880
   api_port: 6886
   token: null
-  work_dir: pdc-data
 super_tracker:
   enabled: true
-  announce_path: /announce
-  scrape_path: /scrape
   interval: 1800
   min_interval: 900
   max_numwant: 100
@@ -26,11 +23,9 @@ discoverers:
   custom_trackers: []
   enable_remote_tracker: true
   remote_tracker_url: https://cdn.jsdelivr.net/gh/adysec/tracker@main/trackers_best.txt
-  remote_tracker_refresh_secs: 3600
   dht_listen_port: 6881
   lpd_multicast_port: 6771
 cache:
-  max_cached_peers: 10000
   peer_ttl_secs: 86400
   max_peers_per_discovery: 200
 health_check:
@@ -39,8 +34,6 @@ health_check:
   stats_output_interval_secs: 300
 crawler:
   enabled: true
-  crawl_interval_secs: 60
-  max_nodes: 1000
   max_infohashes: 100000
   listen_port: 6882
   socket_count: 8
@@ -74,33 +67,16 @@ crawler:
 nat:
   enabled: true
   lease_duration: 3600
-  protocols:
-  - upnp
-  - natpmp
-  - pcp
-  bind_interface: null
-  bind_ip: null
   stun_servers:
   - stun.l.google.com:19302
   - stun1.l.google.com:19302
   - stun.ekiga.net:3478
   enable_reachability_check: true
-  enable_auto_recover: true
-  health_check_interval: 300
-  max_retries: 10
 storage:
   path: ./data/pdc.db
   enabled: true
 persistence:
-  save_interval_secs: 60
-  wal_checkpoint_interval_secs: 600
-  wal_autocheckpoint_pages: 2000
   batch_size: 500
-  enable_incremental: false
-  tier_check_interval_secs: 300
-  hot_threshold_secs: 1800
-  warm_threshold_secs: 7200
-  max_hot_in_memory: 5000
 federation:
   enabled: true
   node_id: null
@@ -110,7 +86,6 @@ federation:
   lpd_multicast_port: 6772
   max_connections: 32
   target_neighbors: 8
-  heartbeat_interval_secs: 30
   heartbeat_timeout_secs: 90
   nat_mapping_enabled: true
   stun_servers:
@@ -128,7 +103,6 @@ federation:
   gossip_seen_shards: 16
   sync_peer_enabled: true
   sync_node_enabled: true
-  sync_node_interval_secs: 300
   sync_infohash_enabled: true
   sync_tracker_enabled: true
   dht_discovery_enabled: true
@@ -143,18 +117,15 @@ federation:
   gossip_max_messages_per_second: 100
   receive_pending_threshold: 1000
   initial_sync_batch_size: 5000
-  gossip_flush_interval_ms: 50
   gossip_flush_max_batches: 10
   full_sync_batch_size: 5000
   full_sync_window_size: 3
   full_sync_gossip_max_messages_per_second: 5000
   full_sync_gossip_max_bytes_per_second: 52428800
-  merkle_async_update_interval_ms: 1000
   merkle_async_update_batch_size: 10000
   gossip_bulk_max_batches: 50
   gossip_bulk_max_bytes: 2097152
   parallel_propagation: true
-  full_sync_source_select_settle_ms: 60000
   full_sync_receiving_settle_ms: 60000
 log_level: info
 port_auto_alloc: true

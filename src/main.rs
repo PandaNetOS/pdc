@@ -39,7 +39,7 @@ use PeerDiscoveryCenter::discoverers::DiscovererRegistry;
 use PeerDiscoveryCenter::event_bus::EventBus;
 use PeerDiscoveryCenter::federation::FederationService;
 use PeerDiscoveryCenter::firewall::FirewallManager;
-use PeerDiscoveryCenter::health_check::{HealthCheckConfig, HealthCheckTask};
+use PeerDiscoveryCenter::health_check::HealthCheckTask;
 use PeerDiscoveryCenter::intelligence::{
     AdaptiveController, AvailabilityCalculator, CategoryConcurrency, DhtActivityTracker,
     PeerHistoryManager, ResourceLevel, ResourceProfile, TaskCategory, TaskMetadata, TaskPriority,
@@ -150,8 +150,8 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     install_console_ctrl_handler();
 
-    // 1. 初始化日志
-    init_logging();
+    // 1. 初始化日志（级别：RUST_LOG 环境变量 > 配置文件 log_level > info）
+    init_logging(&peek_log_level(&work_dir));
 
     // 1.5 初始化 Prometheus metrics
     PeerDiscoveryCenter::data_plane::metrics::init_metrics();
@@ -928,15 +928,8 @@ async fn async_main(
     let active_pex_clone = app_state.active_pex.clone();
 
     // 8. 健康检查任务（注册到 TaskScheduler）
-    let hc_config = HealthCheckConfig {
-        interval: std::time::Duration::from_secs(config.health_check.interval_secs),
-        cache_cleanup_interval: std::time::Duration::from_secs(
-            config.health_check.cache_cleanup_interval_secs,
-        ),
-        stats_output_interval: std::time::Duration::from_secs(
-            config.health_check.stats_output_interval_secs,
-        ),
-    };
+    //    三个周期（主检查/统计输出/缓存清理）在下方 register 处以
+    //    config.health_check.* 作为默认值下发，可被 task_scheduler.intervals 覆盖。
     let health_check = Arc::new(
         HealthCheckTask::new(
             registry.clone(),
@@ -944,14 +937,13 @@ async fn async_main(
             Some(node_repo.clone()),
             Some(tracker_repo.clone()),
             Some(infohash_repo.clone()),
-            hc_config,
             Some(storage.clone()),
         )
         .with_pause_gate(full_sync_gate.clone()),
     );
 
     // 8.5 创建统一 TaskScheduler（所有后台任务纳管，按分类分级并发 + 六 runtime 隔离）
-    use PeerDiscoveryCenter::intelligence::task_scheduler::RuntimeHandles;
+    use PeerDiscoveryCenter::intelligence::task_scheduler::{RuntimeHandles, SchedulerKnobs};
     let task_scheduler = Arc::new(
         TaskScheduler::new()
             .with_category_concurrency(CategoryConcurrency {
@@ -970,7 +962,9 @@ async fn async_main(
                 scheduler: scheduler_handle.clone(),
                 persistence: persistence_handle.clone(),
             })
-            .with_adaptive_controller(adaptive_controller.clone()),
+            .with_adaptive_controller(adaptive_controller.clone())
+            // 把 config.task_scheduler 的准入/抖动/预测/自适应旋钮真正注入调度器（乙类接线）
+            .with_knobs(SchedulerKnobs::from_config(&config.task_scheduler)),
     );
 
     // 任务间隔覆盖表：未配置的任务使用代码内默认值（与改造前行为一致）。
@@ -1251,7 +1245,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "health_check_main",
-                    300,
+                    config.health_check.interval_secs,
                 )),
             )
             .with_category(TaskCategory::Monitor)
@@ -1286,7 +1280,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "health_check_stats",
-                    300,
+                    config.health_check.stats_output_interval_secs,
                 )),
             )
             .with_category(TaskCategory::Monitor)
@@ -1326,7 +1320,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "health_cache_cleanup",
-                    600,
+                    config.health_check.cache_cleanup_interval_secs,
                 )),
             )
             .with_category(TaskCategory::Monitor)
@@ -1930,6 +1924,49 @@ async fn async_main(
                 let s = s.clone();
                 async move {
                     g.anti_entropy_tick(s).await;
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_delta_sync: F1 修复 —— delta 通道的周期驱动
+        // 默认 delta_sync_enabled=false 时为空转（no-op）；开启后按 delta_sync_interval_secs
+        // 周期向每个已连接对端追问新 op，否则 delta 只在建连时拉一次、之后完全停摆。
+        let sm_delta = fed.sync_manager.clone();
+        let delta_tick_secs = config.federation.delta_sync_interval_secs.max(1);
+        task_scheduler.register(
+            TaskMetadata::new(
+                "fed_delta_sync",
+                "联邦delta增量拉取",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_delta_sync",
+                    delta_tick_secs,
+                )),
+            )
+            .with_category(TaskCategory::Network)
+            .with_priority(TaskPriority::Normal)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Medium,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_delta_sync_initial_delay",
+                20,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_delta_sync_jitter",
+                5,
+            ))),
+            move || {
+                let sm = sm_delta.clone();
+                async move {
+                    sm.delta_sync_tick().await;
                     Ok(())
                 }
             },
@@ -3811,8 +3848,40 @@ fn load_or_generate_node_id(node_id_path: &std::path::Path) -> [u8; 20] {
     id
 }
 
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+/// 预读配置文件中的 `log_level`（此时完整配置尚未加载，只取该字段）。
+///
+/// 路径解析顺序与 [`main`] 一致：`-c/--config` 显式指定 > 工作目录下 config.yaml。
+/// 文件不存在 / 解析失败 / 值为空时回落 `info`。
+fn peek_log_level(work_dir: &WorkDir) -> String {
+    let path = match parse_config_path() {
+        Some(p) => p,
+        None => {
+            let p = work_dir.config_file();
+            if !p.exists() {
+                return "info".to_string();
+            }
+            p.to_string_lossy().to_string()
+        }
+    };
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
+        .and_then(|v| {
+            v.get("log_level")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "info".to_string())
+}
+
+/// 初始化日志。
+///
+/// 级别来源优先级：`RUST_LOG` 环境变量 > 配置文件 `log_level` > `info`。
+fn init_logging(config_log_level: &str) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::try_new(config_log_level).unwrap_or_else(|_| EnvFilter::new("info"))
+    });
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

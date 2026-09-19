@@ -9,7 +9,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -73,27 +72,6 @@ impl SystemHealth {
     }
 }
 
-/// 健康检查配置
-#[derive(Debug, Clone)]
-pub struct HealthCheckConfig {
-    /// 检查间隔
-    pub interval: Duration,
-    /// 缓存清理间隔
-    pub cache_cleanup_interval: Duration,
-    /// 统计输出间隔
-    pub stats_output_interval: Duration,
-}
-
-impl Default for HealthCheckConfig {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(300),
-            cache_cleanup_interval: Duration::from_secs(600),
-            stats_output_interval: Duration::from_secs(300),
-        }
-    }
-}
-
 /// 健康检查后台任务
 pub struct HealthCheckTask {
     registry: Arc<DiscovererRegistry>,
@@ -101,7 +79,6 @@ pub struct HealthCheckTask {
     node_repo: Option<Arc<NodeRepoImpl>>,
     tracker_repo: Option<Arc<TrackerRepoImpl>>,
     infohash_repo: Option<Arc<InfohashRepoImpl>>,
-    _config: HealthCheckConfig,
     storage: Option<Arc<crate::storage::Storage>>,
     health_scorer: HealthScorerImpl,
     /// 全量同步暂停门：为 true 时跳过健康检查/缓存清理/统计输出
@@ -117,7 +94,6 @@ impl HealthCheckTask {
         node_repo: Option<Arc<NodeRepoImpl>>,
         tracker_repo: Option<Arc<TrackerRepoImpl>>,
         infohash_repo: Option<Arc<InfohashRepoImpl>>,
-        config: HealthCheckConfig,
         storage: Option<Arc<crate::storage::Storage>>,
     ) -> Self {
         Self {
@@ -126,7 +102,6 @@ impl HealthCheckTask {
             node_repo,
             tracker_repo,
             infohash_repo,
-            _config: config,
             storage,
             health_scorer: HealthScorerImpl::new(),
             pause_gate: None,
@@ -148,7 +123,6 @@ impl HealthCheckTask {
             node_repo,
             tracker_repo,
             infohash_repo,
-            HealthCheckConfig::default(),
             None,
         )
     }
@@ -352,7 +326,7 @@ mod tests {
         let registry = Arc::new(DiscovererRegistry::new());
         let storage = Arc::new(crate::storage::Storage::memory().unwrap());
         let cache = Arc::new(PeerRepoImpl::new(storage));
-        let task = HealthCheckTask::with_default_config(registry, cache, None, None, None);
-        assert_eq!(task._config.interval, Duration::from_secs(300));
+        // 周期由 TaskScheduler 以 config.health_check.* 作为默认值下发，构造函数只需成功。
+        let _task = HealthCheckTask::with_default_config(registry, cache, None, None, None);
     }
 }

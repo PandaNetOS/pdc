@@ -128,6 +128,17 @@ pub struct SyncManager {
     bootstrap_bucket: ParkingMutex<bootstrap::TokenBucket>,
     /// P1-4：range 反熵累计访问的区间数（可观测性）。
     range_ranges_visited: std::sync::atomic::AtomicU64,
+    /// F3：range 叶级对账累计统计（区间数 / 本地多 / 对端多 / 触发修复次数）。
+    /// 叶级明细降为 debug 后，由这些累加器在每轮 tick 收尾时汇总输出，避免刷屏。
+    range_leaf_ranges: std::sync::atomic::AtomicU64,
+    range_local_only_total: std::sync::atomic::AtomicU64,
+    range_remote_only_total: std::sync::atomic::AtomicU64,
+    range_repair_triggers: std::sync::atomic::AtomicU64,
+    /// F1：每个 (对端, repo) 最近一次 delta 拉取发起时刻。
+    /// 周期 tick 据此节流（间隔内不重发）并在无响应时超时重试。
+    delta_request_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// F2：对端最近一次回报的 oplog 水位（与本地 synced_seq 同序列空间，用于算真实 lag）。
+    delta_peer_max: RwLock<FxHashMap<(NodeId, u8), u64>>,
     /// P2-5：反熵按 repo 差异化的上次执行时刻。
     anti_entropy_last: RwLock<FxHashMap<u8, Instant>>,
 }
@@ -268,6 +279,12 @@ impl SyncManager {
             bootstrap_manifests: RwLock::new(FxHashMap::default()),
             bootstrap_bucket,
             range_ranges_visited: std::sync::atomic::AtomicU64::new(0),
+            range_leaf_ranges: std::sync::atomic::AtomicU64::new(0),
+            range_local_only_total: std::sync::atomic::AtomicU64::new(0),
+            range_remote_only_total: std::sync::atomic::AtomicU64::new(0),
+            range_repair_triggers: std::sync::atomic::AtomicU64::new(0),
+            delta_request_at: RwLock::new(FxHashMap::default()),
+            delta_peer_max: RwLock::new(FxHashMap::default()),
             anti_entropy_last: RwLock::new(FxHashMap::default()),
         }
     }
@@ -2429,7 +2446,7 @@ impl SyncManager {
     /// 会被 Merkle 增量更新任务重算并可能经反熵再推回对端，形成无限回灌）。
     ///
     /// 内存 Merkle 根不靠这里维护，而是由周期任务 merkle_cold_rebuild_*（间隔
-    /// merkle_full_rebuild_interval_secs）从 DB 全量 load_all_*_keys_hashes 后调用
+    /// merkle_cold_rebuild_interval_secs）从 DB 全量 load_all_*_keys_hashes 后调用
     /// rebuild_cold_from_db / rebuild_all_from_db 重算 L2/L1/L0，并清空 dirty_l2，收敛到 DB 状态。
     ///
     /// 此处**不**调用 rebuild_all()：rebuild_all() 会把全部 65536 个 L2 标 dirty，
@@ -2479,6 +2496,10 @@ impl SyncManager {
             .get_peer_seq(&peer.0, repo)
             .unwrap_or(0)
             .max(0) as u64;
+        // F1：记录发起时刻。周期 tick 据此节流；若对端无响应，超过间隔后会重试。
+        self.delta_request_at
+            .write()
+            .insert((peer, repo), Instant::now());
         let req = OpsRequestMessage {
             repo,
             since_seq: since,
@@ -2528,19 +2549,29 @@ impl SyncManager {
         let ops = delta::records_to_entries(&records);
         let next_seq = ops.last().map(|o| o.seq).unwrap_or(req.since_seq);
         let has_more = !ops.is_empty() && ops.len() >= limit;
+        // F2：回带「本机在该 repo 上的」oplog 水位（= 该 repo 最后一条变更的 seq；无则 0）。
+        // 必须**按 repo** 取水位：请求方的断点是按 repo 独立维护的，若用全局水位相减，
+        // op 稀疏的 repo（如 TRACKER）会被算成「落后上千条」的虚高值。
+        let server_max_seq = self
+            .delta_storage()
+            .oplog_max_seq_for_repo(req.repo)
+            .unwrap_or(0)
+            .max(0) as u64;
         debug!(
-            "[delta] 响应 OpsRequest: peer={}, repo={}, since_seq={}, 返回={}, has_more={}",
+            "[delta] 响应 OpsRequest: peer={}, repo={}, since_seq={}, 返回={}, has_more={}, repo水位={}",
             conn.node_id,
             req.repo,
             req.since_seq,
             ops.len(),
-            has_more
+            has_more,
+            server_max_seq
         );
         let batch = OpsBatchMessage {
             repo: req.repo,
             ops,
             next_seq,
             has_more,
+            server_max_seq,
         };
         if let Err(e) = conn.send_message(MessageType::OpsBatch, &batch).await {
             warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
@@ -2569,6 +2600,17 @@ impl SyncManager {
         ) {
             warn!("[delta] 推进版本向量失败 peer={}: {}", conn.node_id, e);
         }
+        // F2：记录对端在本 repo 的 oplog 水位。它与本机记录的 synced_seq 同属对端 seq
+        // 空间，二者相减才是「真实落后量」；无此值时 lag 报 null（不跨空间相减）。
+        if batch.server_max_seq > 0 {
+            self.delta_peer_max
+                .write()
+                .insert((conn.node_id, batch.repo), batch.server_max_seq);
+        }
+        // 拉取往返成功：把节流计时推后，避免同一轮里 tick 立刻重发
+        self.delta_request_at
+            .write()
+            .insert((conn.node_id, batch.repo), Instant::now());
         if !entries.is_empty() || batch.has_more {
             delta::log_applied(batch.repo, entries.len(), batch.next_seq);
         }
@@ -2585,6 +2627,57 @@ impl SyncManager {
             } else {
                 self.metrics.record_message_sent();
             }
+        }
+    }
+
+    /// F1：delta 通道的周期驱动（由 TaskScheduler 周期调用）。
+    ///
+    /// 修复「delta 只在建连（PeerInfo）与 bootstrap 追尾时拉一次」的缺陷 —— 否则建连瞬间
+    /// 本机 oplog 为空会导致空批返回、此后新写入永远不被拉取（实测 2185 条 op 从未被拉走）。
+    ///
+    /// 对每个已连接且支持 delta（v>=4）的对端 × 四个 repo，若距上次发起已超过
+    /// `delta_sync_interval_secs`，则再发一次 OpsRequest。空批成本 = 一个极小请求 + 极小响应
+    /// （O(Δ) 且 Δ=0），与库总量无关，可安全高频；节流表同时充当无响应时的重试计时器。
+    /// `delta_sync_enabled=false` 时为 no-op（行为与改造前一致）。
+    pub async fn delta_sync_tick(self: Arc<Self>) {
+        if !self.config.delta_sync_enabled {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(self.config.delta_sync_interval_secs.max(1));
+        let conns = self.connection_manager.all_connections();
+        if conns.is_empty() {
+            return;
+        }
+        let n_conns = conns.len();
+        let mut triggered = 0u32;
+        for conn in conns {
+            if !conn.supports_delta_sync() {
+                continue;
+            }
+            for &rt in &[
+                repo_type::NODE,
+                repo_type::PEER,
+                repo_type::INFOHASH,
+                repo_type::TRACKER,
+            ] {
+                let due = {
+                    let last = self.delta_request_at.read();
+                    match last.get(&(conn.node_id, rt)) {
+                        Some(t) => t.elapsed() >= interval,
+                        None => true,
+                    }
+                };
+                if due {
+                    self.trigger_delta_sync(conn.node_id, rt).await;
+                    triggered += 1;
+                }
+            }
+        }
+        if triggered > 0 {
+            debug!(
+                "[delta] 周期拉取触发 {} 次（连接数={}，间隔={}s）",
+                triggered, n_conns, self.config.delta_sync_interval_secs
+            );
         }
     }
 
@@ -2733,22 +2826,36 @@ impl SyncManager {
             }
             range_reconcile::RangeDecision::Leaf => {
                 let (local_only, remote_only) = range_reconcile::key_diff(&local, &resp.entries);
-                info!(
-                    "[range][{}] 叶级对账 repo={} [{}, {}) depth={}: 本地多={}, 对端多={}",
-                    if self.config.range_reconcile_diagnostic_only {
-                        "诊断"
-                    } else {
-                        "修复"
-                    },
-                    resp.repo,
-                    String::from_utf8_lossy(&resp.lo),
-                    String::from_utf8_lossy(&resp.hi),
-                    resp.depth,
-                    local_only.len(),
-                    remote_only.len()
-                );
-                // 灰度阶段只打印差集统计，供与既有反熵口径对照；真正的修复仍由既有
-                // 分片同步 / DiffSync / delta 路径承担，避免未经验证的写入语义引入回环。
+                let n_local = local_only.len() as u64;
+                let n_remote = remote_only.len() as u64;
+                // F3：叶级明细由 info 降为 debug，并累加到计数器，由每轮 tick 收尾汇总输出。
+                // 之前每轮下钻会打上千行 INFO（每区间一行），实测把 stdout.log 刷到 150MB。
+                self.range_leaf_ranges
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.range_local_only_total
+                    .fetch_add(n_local, std::sync::atomic::Ordering::Relaxed);
+                self.range_remote_only_total
+                    .fetch_add(n_remote, std::sync::atomic::Ordering::Relaxed);
+                if n_local > 0 || n_remote > 0 {
+                    debug!(
+                        "[range] 叶级差异 repo={} [{}, {}) depth={}: 本地多={}, 对端多={}",
+                        resp.repo,
+                        String::from_utf8_lossy(&resp.lo),
+                        String::from_utf8_lossy(&resp.hi),
+                        resp.depth,
+                        n_local,
+                        n_remote
+                    );
+                }
+                // F3：非诊断模式下真正执行修复 —— 触发该 (对端, repo) 的 delta 拉取，
+                // 由 oplog 通道按 seq 补齐本机缺失的条目（O(Δ)）；
+                // 反向的「本地多」由本机 gossip 推送路径负责，无需在此写入。
+                // 诊断模式（默认）保持只读，仅累计统计。
+                if !self.config.range_reconcile_diagnostic_only && (n_local > 0 || n_remote > 0) {
+                    self.range_repair_triggers
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.trigger_delta_sync(conn.node_id, resp.repo).await;
+                }
             }
             range_reconcile::RangeDecision::Descend => {
                 if resp.depth >= self.config.range_reconcile_max_depth {
@@ -2874,11 +2981,33 @@ impl SyncManager {
             self.metrics.record_message_sent();
             sent += 1;
         }
+        // F3：叶级明细已降为 debug，这里给出每轮一行汇总（轮内发送量 + 累计对账统计 + 当前模式）
+        let leaf_ranges = self
+            .range_leaf_ranges
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let local_only = self
+            .range_local_only_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let remote_only = self
+            .range_remote_only_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let repairs = self
+            .range_repair_triggers
+            .load(std::sync::atomic::Ordering::Relaxed);
         info!(
-            "[range] 反熵抽样对账发送到 {} ({} 个区间, 连接数={})",
+            "[range] 抽样对账发送到 {}（{} 个区间，连接数={}）| 累计 叶级对账={} 本地多={} 对端多={} 触发修复={} 模式={}",
             conn.node_id,
             sent,
-            conns.len()
+            conns.len(),
+            leaf_ranges,
+            local_only,
+            remote_only,
+            repairs,
+            if self.config.range_reconcile_diagnostic_only {
+                "诊断(只读)"
+            } else {
+                "修复"
+            }
         );
     }
 
@@ -3262,20 +3391,31 @@ impl SyncManager {
         let oplog_len = st.oplog_len().unwrap_or(0);
         let oplog_max = st.oplog_max_seq().unwrap_or(0).max(0) as u64;
         let oplog_min = st.oplog_min_seq().unwrap_or(0).max(0) as u64;
+        // F2：lag 必须同序列空间相减。`synced_seq` 是本机已从该对端消费到的「对端 seq」，
+        // 因此对照物只能是「对端回报的 oplog 水位」（delta_peer_max），不能用本机 oplog_max
+        // （那是本机的 seq 空间，二者相减得到的是纯噪声）。未知时 lag 报 null。
+        let peer_max = self.delta_peer_max.read();
         let lag: Vec<serde_json::Value> = st
             .all_peer_seqs()
             .unwrap_or_default()
             .into_iter()
             .map(|(peer, repo, seq)| {
                 let seqv = seq.max(0) as u64;
+                let mut arr = [0u8; 20];
+                if peer.len() == 20 {
+                    arr.copy_from_slice(&peer);
+                }
+                let pv = peer_max.get(&(NodeId(arr), repo)).copied();
                 serde_json::json!({
                     "peer": peer.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
                     "repo": repo,
                     "synced_seq": seqv,
-                    "lag_seq": oplog_max.saturating_sub(seqv),
+                    "peer_max_seq": pv,
+                    "lag_seq": pv.map(|m| m.saturating_sub(seqv)),
                 })
             })
             .collect();
+        drop(peer_max);
         let bootstraps: Vec<serde_json::Value> = st
             .bootstrap_list()
             .unwrap_or_default()
@@ -3293,6 +3433,23 @@ impl SyncManager {
                 })
             })
             .collect();
+        let range_stats = serde_json::json!({
+            "leaf_ranges": self
+                .range_leaf_ranges
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "local_only": self
+                .range_local_only_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "remote_only": self
+                .range_remote_only_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "repair_triggers": self
+                .range_repair_triggers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "diagnostic_only": self.config.range_reconcile_diagnostic_only,
+        });
+        // F1：当前被节流表跟踪的 (对端, repo) 对数 ≈ 活跃的 delta 拉取通道数
+        let delta_tracked = self.delta_request_at.read().len();
         serde_json::json!({
             "oplog": {
                 "len": oplog_len,
@@ -3301,6 +3458,11 @@ impl SyncManager {
                 "retention_secs": self.config.oplog_retention_secs,
             },
             "ops_lag": lag,
+            "delta_sync": {
+                "enabled": self.config.delta_sync_enabled,
+                "interval_secs": self.config.delta_sync_interval_secs,
+                "tracked_pairs": delta_tracked,
+            },
             "delta_sync_enabled": self.config.delta_sync_enabled,
             "range_reconcile_enabled": self.config.range_reconcile_enabled,
             "range_reconcile_diagnostic_only": self.config.range_reconcile_diagnostic_only,
@@ -3309,6 +3471,7 @@ impl SyncManager {
             "reconcile_nodes_visited": self
                 .range_ranges_visited
                 .load(std::sync::atomic::Ordering::Relaxed),
+            "range_stats": range_stats,
             "anti_entropy": {
                 "node_interval_secs": self.config.anti_entropy_node_interval_secs,
                 "other_interval_secs": self.config.anti_entropy_other_interval_secs,
@@ -3731,7 +3894,6 @@ mod tests {
             listen_port: 0,
             max_connections: 10,
             sync_node_enabled: true,
-            sync_node_interval_secs: 300,
             sync_peer_enabled: true,
             sync_infohash_enabled: true,
             ..Default::default()

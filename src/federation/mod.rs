@@ -671,7 +671,6 @@ mod tests {
             seed_nodes: vec![],
             nat_mapping_enabled: false,
             sync_node_enabled: true,
-            sync_node_interval_secs: 300,
             sync_peer_enabled: false,
             sync_infohash_enabled: false,
             dht_discovery_enabled: false,
