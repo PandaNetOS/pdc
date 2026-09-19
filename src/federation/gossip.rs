@@ -388,7 +388,7 @@ impl GossipEngine {
         let in_flight_added = batches.len();
         self.in_flight_count
             .fetch_add(in_flight_added, Ordering::Relaxed);
-        warn!(
+        debug!(
             "[federation][DIAG] propagation_tick: took={} batches, outbox_remaining={}, in_flight_after_add={}",
             batches.len(),
             self.outbox_size(),
@@ -624,7 +624,7 @@ impl GossipEngine {
             .filter(|b| !assigned_msg_ids.contains(&b.msg_id))
             .count();
         if orphan_count > 0 {
-            warn!(
+            debug!(
                 "[federation][DIAG] propagation_tick: {} 条 batch 未分配到连接，回退 outbox",
                 orphan_count
             );
@@ -641,7 +641,7 @@ impl GossipEngine {
             batches.len(),
             fanout
         );
-        warn!(
+        debug!(
             "[federation][DIAG] propagation_tick: sent={} batches, success={}, failed={}, rate_skipped={}, rate_dropped={}, retry={}, in_flight_before_sub={}",
             batches.len(),
             successful_msg_ids.len(),
@@ -892,7 +892,7 @@ impl GossipEngine {
         let total_elapsed = total_start.elapsed();
 
         if entry_count > 100 {
-            warn!(
+            debug!(
                 "[federation][perf] handle_gossip_batch: entries={} seen={}ms clone={}ms total={}ms",
                 entry_count,
                 seen_elapsed.as_millis(),
@@ -1028,7 +1028,7 @@ impl GossipEngine {
         while start.elapsed() < timeout {
             let outbox = self.outbox_size();
             let in_flight = self.in_flight_count.load(Ordering::Relaxed);
-            warn!(
+            debug!(
                 "[federation][DIAG] wait_outbox_empty: outbox_size={}, in_flight={}, elapsed={}ms",
                 outbox,
                 in_flight,

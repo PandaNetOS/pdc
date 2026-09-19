@@ -631,13 +631,13 @@ impl SyncManager {
 
     /// 处理收到的 Gossip 消息
     pub fn handle_gossip_batch(&self, batch: GossipBatchMessage) {
-        warn!(
+        debug!(
             "[federation][DIAG] SyncManager::handle_gossip_batch ENTER: repo_type={}, entries={}",
             batch.repo_type,
             batch.entries.len()
         );
         let entries = self.gossip_engine.handle_gossip_batch(batch.clone());
-        warn!(
+        debug!(
             "[federation][perf] handle_gossip_batch returned: entries_len={}, repo_type={}",
             entries.len(),
             batch.repo_type
@@ -659,12 +659,12 @@ impl SyncManager {
 
     /// 应用 Node 同步数据
     pub fn apply_node_sync(&self, entries: &[SyncEntry]) {
-        warn!(
+        debug!(
             "[federation][perf] apply_node_sync ENTER: entries_len={}",
             entries.len()
         );
         if entries.len() > 100 {
-            warn!(
+            debug!(
                 "[federation][perf] apply_node_sync start: entries={}",
                 entries.len()
             );
@@ -728,7 +728,7 @@ impl SyncManager {
         // NodeRepoImpl.propagate 的 update_batch 负责，与本入站路径无关。
         let total_elapsed = total_start.elapsed();
 
-        warn!(
+        debug!(
             "[federation][perf] apply_node_sync: count={} deserialize={}ms repo_write={}ms total={}ms",
             entries.len(),
             deserialize_elapsed.as_millis(),

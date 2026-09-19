@@ -986,7 +986,7 @@ impl ConnectionManager {
                 // 由后台 flush 任务统一处理。N 个 batch 只需要 1 次 permit + 1 次 spawn。
                 // P0-2: flush 任务内不使用 spawn_blocking（纯内存操作）。
                 if let Ok(batch) = bincode::deserialize::<GossipBatchMessage>(&payload) {
-                    warn!(
+                    debug!(
                         "[federation][perf] 收到 GossipBatch: entries={}",
                         batch.entries.len()
                     );
@@ -995,7 +995,7 @@ impl ConnectionManager {
                         let diag_repo_type = batch.repo_type;
                         let diag_entries = batch.entries.len();
                         buf.push_back(batch);
-                        warn!("[federation][DIAG] GossipBatch received: repo_type={}, entries={}, buffer_len={}", diag_repo_type, diag_entries, buf.len());
+                        debug!("[federation][DIAG] GossipBatch received: repo_type={}, entries={}, buffer_len={}", diag_repo_type, diag_entries, buf.len());
                     }
                     // 通知 flush 任务（达到 max_batches 时立即刷新，否则等定时 tick）
                     connection.gossip_flush_notify.notify_one();
@@ -1010,7 +1010,7 @@ impl ConnectionManager {
                     let count = bulk.batches.len();
                     // 计算所有 batch 的 entries 总数（在 move 进 buffer 之前）
                     let total_entries: usize = bulk.batches.iter().map(|b| b.entries.len()).sum();
-                    warn!(
+                    debug!(
                         "[federation][perf] 收到 GossipBatchBulk: {} 个 batch, 总条目 {}",
                         count, total_entries
                     );
@@ -1019,7 +1019,7 @@ impl ConnectionManager {
                         for batch in bulk.batches {
                             buf.push_back(batch);
                         }
-                        warn!("[federation][DIAG] GossipBatchBulk received: batches={}, buffer_len={}", count, buf.len());
+                        debug!("[federation][DIAG] GossipBatchBulk received: batches={}, buffer_len={}", count, buf.len());
                     }
                     // 主循环已对每条消息 +1，Bulk 包含 N 个 batch，需补 +(N-1) 使计数与
                     // flush_gossip_buffer 按 batch 数 -group_len 递减匹配，避免 pending 下溢为巨大值触发虚假背压。
@@ -1529,7 +1529,7 @@ impl ConnectionManager {
     /// 各自获取 1 个 `heavy_task_semaphore` permit 后顺序处理本组 batch。
     /// 组间并行，组内顺序；每个 task 完成后按本组 batch 数递减 `conn.pending`。
     async fn flush_gossip_buffer(self: Arc<Self>, conn: Arc<Connection>, _max_batches: usize) {
-        warn!(
+        debug!(
             "[federation][DIAG] flush_gossip_buffer ENTER, buffer_len={}",
             conn.gossip_buffer.lock().len()
         );
@@ -1540,7 +1540,7 @@ impl ConnectionManager {
         let tick = FLUSH_TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if tick.is_multiple_of(10) {
             let buffer_len = conn.gossip_buffer.lock().len();
-            warn!("[federation][perf] flush tick: buffer_len={}", buffer_len);
+            debug!("[federation][perf] flush tick: buffer_len={}", buffer_len);
         }
 
         let total_start = Instant::now();
@@ -1572,7 +1572,7 @@ impl ConnectionManager {
                 .collect();
             let dropped = before - filtered.len();
             if dropped > 0 {
-                warn!(
+                debug!(
                     "[federation][perf] flush 提前去重: 丢弃 {} 条重复 batch（剩余 {}）",
                     dropped,
                     filtered.len()
@@ -1587,7 +1587,7 @@ impl ConnectionManager {
         }
 
         let batch_count = batches.len();
-        warn!("[federation][perf] flush drain: batches={}", batches.len());
+        debug!("[federation][perf] flush drain: batches={}", batches.len());
 
         // 按 repo_type 分流到最多 4 组（使用 protocol::repo_type 常量，不硬编码数值）
         let mut node_group: Vec<GossipBatchMessage> = Vec::new();
@@ -1645,7 +1645,7 @@ impl ConnectionManager {
         }
 
         let total_elapsed = total_start.elapsed();
-        warn!(
+        debug!(
             "[federation][perf] flush_gossip_buffer: batches={} groups={} drain={}ms total={}ms",
             batch_count,
             group_count,
