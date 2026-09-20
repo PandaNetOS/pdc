@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::discoverers::dht::{DhtConfig, DhtDiscoverer};
 use crate::federation::node_id::{NodeAddress, NodeId, Reachability};
 use crate::federation::node_table::NodeTable;
-use crate::federation::ConnectionManager;
+use crate::federation::session::SessionsHandle;
 use crate::storage::node_repo::NodeRepoImpl;
 use crate::types::Infohash;
 use pnos_net::types::DiscoveredNode;
@@ -52,7 +52,7 @@ pub struct DhtDiscoveryService {
     /// pnos-net 发现事件发送端
     _discovered_tx: Option<broadcast::Sender<DiscoveredNode>>,
     /// 连接管理器（发现节点后触发自动连接）
-    connection_manager: Option<Arc<ConnectionManager>>,
+    sessions: Option<Arc<SessionsHandle>>,
 }
 
 impl DhtDiscoveryService {
@@ -70,7 +70,7 @@ impl DhtDiscoveryService {
         _shutdown: broadcast::Sender<()>,
         node_repo: Option<Arc<NodeRepoImpl>>,
         external_dht: Option<Arc<DhtDiscoverer>>,
-        connection_manager: Option<Arc<ConnectionManager>>,
+        sessions: Option<Arc<SessionsHandle>>,
     ) -> Self {
         let dht =
             external_dht.unwrap_or_else(|| Arc::new(DhtDiscoverer::new(DhtConfig::default())));
@@ -82,13 +82,13 @@ impl DhtDiscoveryService {
             interval_secs,
             _shutdown,
             _discovered_tx: None,
-            connection_manager,
+            sessions,
         }
     }
 
     /// 设置连接管理器（发现节点后触发自动连接）
-    pub fn with_connection_manager(mut self, cm: Arc<ConnectionManager>) -> Self {
-        self.connection_manager = Some(cm);
+    pub fn with_sessions(mut self, cm: Arc<SessionsHandle>) -> Self {
+        self.sessions = Some(cm);
         self
     }
 
@@ -155,7 +155,7 @@ impl DhtDiscoveryService {
                     );
                 }
                 // 触发自动连接：对新发现的节点尝试建立连接
-                if let Some(cm) = &self.connection_manager {
+                if let Some(cm) = &self.sessions {
                     for peer in &peers {
                         let addr = peer.addr;
                         let temp_id = NodeId::random();

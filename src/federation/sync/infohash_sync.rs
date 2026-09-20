@@ -198,6 +198,7 @@ impl InfohashSync {
 mod tests {
     use super::*;
     use crate::federation::node_id::NodeId;
+    use crate::federation::session::SessionsHandle;
     use crate::storage::Storage;
 
     fn make_infohash_repo() -> Arc<InfohashRepoImpl> {
@@ -217,16 +218,7 @@ mod tests {
     fn test_apply_infohash_sync() {
         let repo = make_infohash_repo();
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let identity = crate::federation::node_id::NodeIdentity::generate();
-        let node_table = Arc::new(crate::federation::node_table::NodeTable::new(100));
-        let cm = Arc::new(crate::federation::connection::ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            crate::federation::config::FederationConfig::default(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
             cm,

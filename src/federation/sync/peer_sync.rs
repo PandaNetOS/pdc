@@ -264,6 +264,7 @@ impl PeerSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::session::SessionsHandle;
     use crate::storage::Storage;
 
     fn make_peer_repo() -> Arc<PeerRepoImpl> {
@@ -290,16 +291,7 @@ mod tests {
     fn test_apply_peer_sync() {
         let peer_repo = make_peer_repo();
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let identity = crate::federation::node_id::NodeIdentity::generate();
-        let node_table = Arc::new(crate::federation::node_table::NodeTable::new(100));
-        let cm = Arc::new(crate::federation::connection::ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            crate::federation::config::FederationConfig::default(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
             cm,

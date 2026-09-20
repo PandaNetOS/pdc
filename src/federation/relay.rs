@@ -12,10 +12,10 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::ConnectionManager;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::{NodeId, NodeIdentity};
 use crate::federation::protocol::*;
+use crate::federation::session::SessionsHandle;
 
 /// 中继限流滑动窗口长度（1 秒）
 const RELAY_RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -140,7 +140,7 @@ impl BandwidthTracker {
 /// 中继管理器
 pub struct RelayManager {
     channels: RwLock<FxHashMap<u64, Arc<RelayChannel>>>,
-    connection_manager: Arc<ConnectionManager>,
+    sessions: Arc<SessionsHandle>,
     identity: Arc<NodeIdentity>,
     config: FederationConfig,
     metrics: Arc<FederationMetrics>,
@@ -150,7 +150,7 @@ pub struct RelayManager {
 
 impl RelayManager {
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        sessions: Arc<SessionsHandle>,
         identity: Arc<NodeIdentity>,
         config: FederationConfig,
         metrics: Arc<FederationMetrics>,
@@ -161,7 +161,7 @@ impl RelayManager {
         ));
         Self {
             channels: RwLock::new(FxHashMap::default()),
-            connection_manager,
+            sessions,
             identity,
             config,
             metrics,
@@ -196,8 +196,8 @@ impl RelayManager {
             action: relay_action::REQUEST,
         };
 
-        if let Some(conn) = self.connection_manager.get_connection(&target_node) {
-            let _cm = self.connection_manager.clone();
+        if let Some(conn) = self.sessions.get_connection(&target_node) {
+            let _cm = self.sessions.clone();
             tokio::spawn(async move {
                 let _ = conn.send_message(MessageType::RelaySetup, &msg).await;
             });
@@ -246,8 +246,8 @@ impl RelayManager {
                 target_node: from_node.0,
                 action: relay_action::REJECT,
             };
-            if let Some(conn) = self.connection_manager.get_connection(&from_node) {
-                let _cm = self.connection_manager.clone();
+            if let Some(conn) = self.sessions.get_connection(&from_node) {
+                let _cm = self.sessions.clone();
                 tokio::spawn(async move {
                     let _ = conn.send_message(MessageType::RelaySetup, &reject).await;
                 });
@@ -269,8 +269,8 @@ impl RelayManager {
             target_node: from_node.0,
             action: relay_action::ACCEPT,
         };
-        if let Some(conn) = self.connection_manager.get_connection(&from_node) {
-            let _cm = self.connection_manager.clone();
+        if let Some(conn) = self.sessions.get_connection(&from_node) {
+            let _cm = self.sessions.clone();
             tokio::spawn(async move {
                 let _ = conn.send_message(MessageType::RelaySetup, &accept).await;
             });
@@ -354,12 +354,12 @@ impl RelayManager {
         };
 
         // 转发
-        if let Some(conn) = self.connection_manager.get_connection(&forward_to) {
+        if let Some(conn) = self.sessions.get_connection(&forward_to) {
             let forward_msg = RelayDataMessage {
                 channel_id: msg.channel_id,
                 data: msg.data,
             };
-            let _cm = self.connection_manager.clone();
+            let _cm = self.sessions.clone();
             tokio::spawn(async move {
                 if let Err(e) = conn
                     .send_message(MessageType::RelayData, &forward_msg)
@@ -388,8 +388,8 @@ impl RelayManager {
                 target_node: channel.target_node.0,
                 action: relay_action::CLOSE,
             };
-            if let Some(conn) = self.connection_manager.get_connection(&channel.target_node) {
-                let _cm = self.connection_manager.clone();
+            if let Some(conn) = self.sessions.get_connection(&channel.target_node) {
+                let _cm = self.sessions.clone();
                 tokio::spawn(async move {
                     let _ = conn.send_message(MessageType::RelaySetup, &close_msg).await;
                 });
@@ -463,7 +463,6 @@ impl RelayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::node_table::NodeTable;
 
     fn make_config() -> FederationConfig {
         FederationConfig {
@@ -479,15 +478,7 @@ mod tests {
 
     fn make_relay_manager() -> Arc<RelayManager> {
         let identity = Arc::new(NodeIdentity::generate());
-        let node_table = Arc::new(NodeTable::new(100));
-        let (cm_shutdown, _) = tokio::sync::broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            identity.clone(),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         Arc::new(RelayManager::new(cm, identity, make_config(), metrics))
     }
@@ -532,15 +523,7 @@ mod tests {
         let mut config = make_config();
         config.enable_relay = false;
         let identity = Arc::new(NodeIdentity::generate());
-        let node_table = Arc::new(NodeTable::new(100));
-        let (cm_shutdown, _) = tokio::sync::broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            identity.clone(),
-            config.clone(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let relay = RelayManager::new(cm, identity, config, metrics);
 

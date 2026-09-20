@@ -1017,7 +1017,7 @@ impl NodeRepository for NodeRepoImpl {
                 removed += 1;
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     if let Some(bucket) = subnet_index.get_mut(&subnet) {
-                        bucket.retain(|x| !nodes.contains_key(addr));
+                        bucket.retain(|_x| !nodes.contains_key(addr));
                         if bucket.is_empty() {
                             subnet_index.remove(&subnet);
                         }

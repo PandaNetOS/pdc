@@ -286,9 +286,7 @@ impl TrackerSync {
 mod tests {
     use super::*;
     use crate::federation::config::FederationConfig;
-    use crate::federation::connection::ConnectionManager;
-    use crate::federation::node_id::NodeIdentity;
-    use crate::federation::node_table::NodeTable;
+    use crate::federation::session::SessionsHandle;
     use crate::storage::Storage;
 
     fn make_tracker_repo() -> Arc<TrackerRepoImpl> {
@@ -297,16 +295,7 @@ mod tests {
     }
 
     fn make_gossip_engine(shutdown_tx: broadcast::Sender<()>) -> Arc<GossipEngine> {
-        let identity = Arc::new(NodeIdentity::generate());
-        let node_table = Arc::new(NodeTable::new(100));
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            identity,
-            FederationConfig::default(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         Arc::new(GossipEngine::new(
             cm,

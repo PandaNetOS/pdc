@@ -25,7 +25,6 @@ use crate::dht::routing_table::RoutingTable;
 use crate::discoverers::dht::message::{DhtMessage, DhtNode, QueryMethod};
 use crate::event_bus::EventBus;
 use crate::net::socket_opts::create_udp_socket;
-use crate::storage::repo_traits::NodeRepository;
 use crate::storage::PeerRepoImpl;
 use crate::types::{Event, Infohash, PeerInfo, PeerSource};
 

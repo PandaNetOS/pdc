@@ -2797,6 +2797,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "bytes",
  "hex",
  "hickory-resolver",
  "hkdf",

@@ -6,18 +6,21 @@
 //! Gossip 传播、Merkle 对账和打洞信令。
 
 pub mod config;
-pub mod connection;
 pub mod dht_discovery;
 pub mod discovery;
+pub mod dispatch;
 pub mod gossip;
 pub mod merkle;
 pub mod metrics;
 pub mod nat_integration;
 pub mod node_id;
 pub mod node_table;
-pub mod peer_cache;
+pub mod peer_caps;
+pub mod peer_conn;
+pub mod peer_query_store;
 pub mod protocol;
 pub mod relay;
+pub mod session;
 pub mod sharded_lru;
 pub mod signaling;
 pub mod sync;
@@ -35,15 +38,18 @@ use tracing::{debug, info};
 
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::ConnectionManager;
 use crate::federation::dht_discovery::DhtDiscoveryService;
 use crate::federation::discovery::DiscoveryService;
+use crate::federation::dispatch::FederationDispatcher;
 use crate::federation::gossip::GossipEngine;
 use crate::federation::metrics::{FederationMetrics, FederationMetricsSnapshot};
 use crate::federation::nat_integration::NatIntegration;
 use crate::federation::node_id::{NodeId, NodeIdentity};
 use crate::federation::node_table::NodeTable;
+use crate::federation::peer_caps::PeerCapsTable;
+use crate::federation::peer_query_store::PeerQueryStore;
 use crate::federation::relay::RelayManager;
+use crate::federation::session::{bind_federation_sessions, SessionsHandle};
 use crate::federation::signaling::SignalingService;
 use crate::federation::sync::SyncManager;
 use crate::federation::transport::UdpTransport;
@@ -145,8 +151,18 @@ pub struct FederationService {
     pub identity: Arc<NodeIdentity>,
     /// 节点表
     pub node_table: Arc<NodeTable>,
-    /// 连接管理器
-    pub connection_manager: Arc<ConnectionManager>,
+    /// 业务分派器（G6 起所有 `MessageType` 分派与承载态归口于此）
+    pub dispatcher: Arc<FederationDispatcher>,
+    /// SDK 会话门面句柄（**延迟绑定**：`NetAgent` 就绪后由 `init_net_agent` 填充）
+    ///
+    /// 连接域 100% 归 `pnos-net`：入站 accept / 握手 / 保活 / 候选拨号全部由 SDK 承担。
+    /// pdc 侧**不持有任何连接状态**，只经此句柄查询与下发指令；
+    /// 未绑定（`NetAgent` 就绪前）时查询一律返回「无连接」语义。
+    pub sessions: Arc<SessionsHandle>,
+    /// 对端协议能力表（`peer_id → protocol_version`，从连接对象剥离）
+    pub peer_caps: Arc<PeerCapsTable>,
+    /// 联邦实时 peer 查询响应收集器（PT 业务，从连接对象剥离）
+    pub peer_query_store: Arc<PeerQueryStore>,
     /// 节点发现服务
     pub discovery: Arc<DiscoveryService>,
     /// NAT 集成
@@ -211,18 +227,38 @@ impl FederationService {
         // 4. 创建节点表
         let node_table = Arc::new(NodeTable::new(config.max_connections * 4));
 
-        // 5. 创建连接管理器（传入共享 metrics，确保 transport 层字节统计与 REST API 返回同一实例）
-        let connection_manager = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
+        // 4.1 连接域剥离出的两张业务表（协议能力 / peer 查询结果）
+        //     二者原本混在 ConnectionManager 内，属 pdc 业务语义，不下沉通用 SDK。
+        let peer_caps = Arc::new(PeerCapsTable::new());
+        let peer_query_store = Arc::new(PeerQueryStore::new());
+
+        // 4.2 业务分派器：连接层与业务层由**上层装配**，连接层不反向持有业务对象（迁移计划 K3）
+        let dispatcher = Arc::new(FederationDispatcher::new(
             config.clone(),
-            shutdown_tx.clone(),
+            node_table.clone(),
             metrics.clone(),
+            peer_caps.clone(),
+            peer_query_store.clone(),
         ));
+
+        // 5. SDK 会话门面句柄（延迟绑定：`init_net_agent` 里 NetAgent 就绪后填充）
+        //
+        // 连接域 100% 归 `pnos-net`：门面是 pdc 侧唯一的连接适配点，
+        // 6 个业务模块只持句柄 —— 未绑定时查询返回「无连接」语义。
+        let sessions_handle = Arc::new(SessionsHandle::new());
+
+        // 5.1 「主动断连」的执行权在**承载侧**＝ SDK 会话层：
+        //     分派器只发指令，不自持连接、不关 socket。
+        {
+            let s = sessions_handle.clone();
+            dispatcher.set_disconnector(Arc::new(move |peer, _reason| {
+                s.remove_connection(&peer);
+            }));
+        }
 
         // 6. 创建 Gossip 引擎
         let gossip_engine = Arc::new(GossipEngine::new(
-            connection_manager.clone(),
+            sessions_handle.clone(),
             config.clone(),
             identity.node_id,
             metrics.clone(),
@@ -231,7 +267,7 @@ impl FederationService {
 
         // 7. 创建发现服务
         let discovery = Arc::new(DiscoveryService::new(
-            connection_manager.clone(),
+            sessions_handle.clone(),
             node_table.clone(),
             identity.clone(),
             config.clone(),
@@ -244,7 +280,7 @@ impl FederationService {
 
         // 8. 创建中继管理器
         let relay_manager = Arc::new(RelayManager::new(
-            connection_manager.clone(),
+            sessions_handle.clone(),
             identity.clone(),
             config.clone(),
             metrics.clone(),
@@ -252,7 +288,7 @@ impl FederationService {
 
         // 9. 创建同步管理器（含 PeerSync / InfohashSync / TrackerSync）
         let sync_manager = Arc::new(SyncManager::new(
-            connection_manager.clone(),
+            sessions_handle.clone(),
             node_repo.clone(),
             config.clone(),
             shutdown_tx.clone(),
@@ -280,7 +316,7 @@ impl FederationService {
 
         // 11. 创建打洞信令服务
         let signaling_service = Arc::new(SignalingService::new(
-            connection_manager.clone(),
+            sessions_handle.clone(),
             node_table.clone(),
             identity.clone(),
             udp_transport.clone(),
@@ -289,10 +325,11 @@ impl FederationService {
         ));
 
         // 12. 注入循环依赖
-        connection_manager.set_discovery(discovery.clone());
-        connection_manager.set_sync_manager(sync_manager.clone());
-        connection_manager.set_signaling_service(signaling_service.clone());
-        connection_manager.set_relay_manager(relay_manager.clone());
+        //     三个业务对象注入**分派器**：翻转后分派由 `SessionEvent` 驱动，
+        //     连接层（SDK）不持有任何业务对象 —— 这正是 K3 要的结果。
+        dispatcher.set_discovery(discovery.clone());
+        dispatcher.set_sync_manager(sync_manager.clone());
+        dispatcher.set_signaling_service(signaling_service.clone());
 
         // 13. 创建 DHT 魔法 infohash 发现服务（从 DiscoveryService 迁移至此，由 TaskScheduler 统一调度）
         let dht_discovery = if config.dht_discovery_enabled {
@@ -303,7 +340,7 @@ impl FederationService {
                 shutdown_tx.clone(),
                 Some(node_repo.clone()),
                 dht_discoverer.clone(),
-                Some(connection_manager.clone()),
+                Some(sessions_handle.clone()),
             )))
         } else {
             None
@@ -319,7 +356,10 @@ impl FederationService {
         Ok(Self {
             identity,
             node_table,
-            connection_manager,
+            dispatcher,
+            sessions: sessions_handle,
+            peer_caps,
+            peer_query_store,
             discovery,
             nat_integration,
             sync_manager,
@@ -336,7 +376,7 @@ impl FederationService {
         })
     }
 
-    /// 初始化 NetAgent（Iroh+TCP 传输层）并注入 ConnectionManager
+    /// 初始化 NetAgent（Iroh+TCP 传输层）并绑定 SDK 会话层
     ///
     /// 根据 config.transport_mode 创建 TransportRouter：
     /// - tcp_only: 仅 TCP
@@ -376,11 +416,14 @@ impl FederationService {
             listen_port: self.config.listen_port,
             api_port: self.config.api_port,
             data_dir: self.data_dir.clone(),
-            lpd_multicast_port: 6771,
-            lpd_enabled: false,        // PDC 已有独立 LPD
-            peer_cache_enabled: false, // PDC 已有独立 peer_cache
-            nat_enabled: false,        // PDC 已有独立 NAT
-            hole_punch_enabled: false, // PDC 已有独立打洞
+            // 取联邦层 LPD 端口（与 `discovery.rs` 实际启动的 LPD 服务保持一致）。
+            // 注意：`lpd_enabled=false` 时该字段当前未被 NetAgent 使用，
+            // 但保持值一致可避免后续启用时踩到「两个同名 lpd_multicast_port」的坑。
+            lpd_multicast_port: self.config.federation_lpd_multicast_port,
+            lpd_enabled: false, // 联邦层 LPD 由 discovery.rs 自行启动，不用 NetAgent 内建
+            peer_cache_enabled: false, // peer cache 由 discovery.rs 自行持有
+            nat_enabled: false, // UPnP/NAT 由业务层 nat_service 自行驱动
+            hole_punch_enabled: false, // 打洞当前由业务层信令 + 外部执行，不启用 SDK 内建
             connect_config: Default::default(),
             transport_mode: mode,
             iroh_config,
@@ -388,8 +431,32 @@ impl FederationService {
 
         let net_agent = pnos_net::NetAgent::new(net_config).await?;
         net_agent.start_transport_only().await?;
-        self.connection_manager.set_net_agent(net_agent);
-        info!("[federation] NetAgent 已注入 ConnectionManager");
+
+        // 把 SDK 会话层绑到 NetAgent：**SDK 独占监听端口**（`listen = true`）
+        //
+        // 翻转后入站 accept / 握手 / 保活 / 候选拨号全部由 SDK 的 `SessionManager`
+        // 承担，pdc 侧不再有连接状态；业务分派由下方 `spawn_event_loop` 驱动。
+        let sessions = bind_federation_sessions(
+            &self.config,
+            net_agent,
+            self.identity.clone(),
+            self.node_table.clone(),
+            self.metrics.clone(),
+            self.peer_caps.clone(),
+            true,
+        )
+        .await?;
+        let sessions = Arc::new(sessions);
+        self.sessions.bind_once(sessions.clone())?;
+        info!(
+            "[federation] SDK 会话层已绑定并独占监听端口 {}（listen=true）",
+            self.config.listen_port
+        );
+
+        // 启动业务分派事件循环：订阅 `SessionEvent`，替代原
+        // `ConnectionManager::spawn_message_handler` 的字节回调路径。
+        self.dispatcher.clone().spawn_event_loop(sessions);
+
         Ok(())
     }
 
@@ -400,8 +467,7 @@ impl FederationService {
         // 0. 创建并注入 NetAgent（Iroh+TCP 传输层）
         self.init_net_agent().await?;
 
-        // 1. 启动 TCP 监听
-        self.connection_manager.clone().start_listen().await?;
+        // 1. TCP 监听由 SDK `SessionManager` 在 `init_net_agent` 内独占（pdc 侧无监听）
 
         // 2. 心跳任务已迁移到 TaskScheduler（fed_heartbeat）
 
@@ -483,7 +549,7 @@ impl FederationService {
         tokio::time::sleep(SHUTDOWN_MESSAGE_FLUSH_GRACE).await;
 
         // 4. 关闭所有 TCP 连接
-        self.connection_manager.shutdown_all().await;
+        self.sessions.shutdown_all().await;
 
         info!("[federation] 联邦服务已关闭");
     }
@@ -493,14 +559,14 @@ impl FederationService {
         let status = self.status();
 
         // 连接列表
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         let _now = std::time::Instant::now();
         let connections: Vec<ConnectionInfo> = conns
             .iter()
             .map(|c| ConnectionInfo {
                 node_id: c.node_id.to_hex(),
-                addr: c.addr.to_string(),
-                connected_at_secs: c.connected_at.elapsed().as_secs(),
+                addr: c.addr().map(|a| a.to_string()).unwrap_or_default(),
+                connected_at_secs: c.connected_secs(),
                 rtt_ms: self.node_table.get(&c.node_id).and_then(|e| e.rtt_ms),
             })
             .collect();
@@ -562,7 +628,7 @@ impl FederationService {
         FederationStatus {
             enabled: self.config.enabled,
             node_id: self.identity.node_id.to_hex(),
-            connections: self.connection_manager.connection_count(),
+            connections: self.sessions.connection_count(),
             known_nodes: self.node_table.len(),
             reachability,
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -597,13 +663,13 @@ impl FederationService {
         use crate::federation::protocol::{MessageType, PeerQueryRequestMessage};
         use std::collections::HashSet;
 
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         if conns.is_empty() {
             return Vec::new();
         }
 
         // 清空该 infohash 的旧响应，避免上一次查询残留
-        self.connection_manager.clear_peer_query_responses(infohash);
+        self.peer_query_store.clear(infohash);
 
         let req = PeerQueryRequestMessage {
             infohash: *infohash,
@@ -625,7 +691,7 @@ impl FederationService {
         tokio::time::sleep(timeout).await;
 
         // 收集所有节点返回的 peer，按 SocketAddr 去重
-        let entries = self.connection_manager.take_peer_query_responses(infohash);
+        let entries = self.peer_query_store.take(infohash);
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for e in entries {
@@ -650,7 +716,7 @@ impl std::fmt::Debug for FederationService {
         f.debug_struct("FederationService")
             .field("node_id", &self.identity.node_id)
             .field("config", &self.config)
-            .field("connections", &self.connection_manager.connection_count())
+            .field("connections", &self.sessions.connection_count())
             .field("known_nodes", &self.node_table.len())
             .finish()
     }
@@ -706,7 +772,7 @@ mod tests {
         .unwrap();
 
         assert!(service.config.enabled);
-        assert_eq!(service.connection_manager.connection_count(), 0);
+        assert_eq!(service.sessions.connection_count(), 0);
         assert_eq!(service.node_table.len(), 0);
 
         let status = service.status();

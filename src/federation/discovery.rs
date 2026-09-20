@@ -17,20 +17,21 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::{Connection, ConnectionManager};
 use crate::federation::node_id::{NodeAddress, NodeId, NodeIdentity, Reachability};
 use crate::federation::node_table::NodeTable;
-use crate::federation::peer_cache::PeerCache;
+use crate::federation::peer_conn::PeerConn;
 use crate::federation::protocol::*;
+use crate::federation::session::SessionsHandle;
 use crate::storage::node_repo::NodeRepoImpl;
 use pnos_net::discovery::lpd::LpdDiscoveryService;
 use pnos_net::discovery::mqtt::MqttDiscoveryService;
+use pnos_net::discovery::peer_cache::PeerCache;
 use pnos_net::types::DiscoveredNode;
 
 /// 节点发现服务
 pub struct DiscoveryService {
     /// 连接管理器
-    connection_manager: Arc<ConnectionManager>,
+    sessions: Arc<SessionsHandle>,
     /// 节点表
     node_table: Arc<NodeTable>,
     /// 主爬虫节点库
@@ -59,7 +60,7 @@ impl DiscoveryService {
     /// 如果 `config.peer_cache_enabled` 为 true，会从 `data_dir/federation_peers.json` 加载历史节点缓存。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        sessions: Arc<SessionsHandle>,
         node_table: Arc<NodeTable>,
         identity: Arc<NodeIdentity>,
         config: FederationConfig,
@@ -76,7 +77,7 @@ impl DiscoveryService {
         };
 
         Self {
-            connection_manager,
+            sessions,
             node_table,
             identity,
             config,
@@ -171,7 +172,7 @@ impl DiscoveryService {
             self.identity.node_id.0,
             self.config.listen_port,
             self.api_port,
-            self.config.lpd_multicast_port,
+            self.config.federation_lpd_multicast_port,
             discovered_tx.clone(),
             self.shutdown.clone(),
         ));
@@ -265,12 +266,7 @@ impl DiscoveryService {
             .map_err(|e| anyhow::anyhow!("缓存节点地址解析失败 {}: {}", addr, e))?;
 
         let temp_id = NodeId::random();
-        match self
-            .connection_manager
-            .clone()
-            .connect_to(temp_id, socket_addr)
-            .await
-        {
+        match self.sessions.clone().connect_to(temp_id, socket_addr).await {
             Ok(conn) => {
                 info!(
                     "[federation] 缓存节点连接成功: {} ({})",
@@ -315,12 +311,7 @@ impl DiscoveryService {
                 nat_type: None,
             });
 
-            match self
-                .connection_manager
-                .clone()
-                .connect_to(temp_id, addr)
-                .await
-            {
+            match self.sessions.clone().connect_to(temp_id, addr).await {
                 Ok(conn) => {
                     info!("[federation] 种子节点连接成功: {} ({})", conn.node_id, addr);
                     // 连接成功后发送 GetNodes
@@ -340,7 +331,7 @@ impl DiscoveryService {
     }
 
     /// 处理 GetNodes 请求：返回本地最活跃的节点
-    pub async fn handle_get_nodes(&self, conn: &Connection, count: u16) {
+    pub async fn handle_get_nodes(&self, conn: &PeerConn, count: u16) {
         let nodes = self.node_table.top_active_nodes(count as usize);
         let addresses: Vec<NodeAddress> = nodes
             .into_iter()
@@ -408,7 +399,7 @@ impl DiscoveryService {
 
             for entry in candidates {
                 if let Some(addr) = entry.info.preferred_addr() {
-                    let cm = self.connection_manager.clone();
+                    let cm = self.sessions.clone();
                     let node_id = NodeId(entry.info.node_id);
                     tokio::spawn(async move {
                         if let Err(e) = cm.connect_to(node_id, addr).await {
@@ -483,9 +474,9 @@ impl DiscoveryService {
             }
             if let Ok(addr) = seed.parse::<SocketAddr>() {
                 // 检查是否已连接（优先 node_id 匹配，兼容入站连接临时端口场景）
-                let already_connected = self.connection_manager.is_seed_connected(addr);
+                let already_connected = self.sessions.is_seed_connected(addr);
                 if !already_connected {
-                    let cm = self.connection_manager.clone();
+                    let cm = self.sessions.clone();
                     let temp_id = NodeId::random();
                     tokio::spawn(async move {
                         if let Err(e) = cm.connect_to(temp_id, addr).await {
@@ -499,7 +490,7 @@ impl DiscoveryService {
         // 3. 连接节点表中其他未连接的节点
         // 双重检查：node_table 状态 + connections map，避免入站连接未更新状态时被误重连
         let connected_ids: std::collections::HashSet<NodeId> = self
-            .connection_manager
+            .sessions
             .all_connections()
             .iter()
             .map(|c| c.node_id)
@@ -525,7 +516,7 @@ impl DiscoveryService {
 
         for entry in candidates {
             if let Some(addr) = entry.info.preferred_addr() {
-                let cm = self.connection_manager.clone();
+                let cm = self.sessions.clone();
                 let node_id = NodeId(entry.info.node_id);
                 tokio::spawn(async move {
                     if let Err(e) = cm.connect_to(node_id, addr).await {
@@ -538,7 +529,7 @@ impl DiscoveryService {
 
     /// PEX 交换单次执行
     pub async fn pex_exchange_tick(self: Arc<Self>) {
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         if conns.is_empty() {
             return;
         }
@@ -583,7 +574,6 @@ impl DiscoveryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::metrics::FederationMetrics;
     use crate::federation::node_table::NodeTable;
 
     fn make_test_config() -> FederationConfig {
@@ -630,14 +620,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
-            make_test_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let discovery = DiscoveryService::new(
             cm,
             node_table.clone(),
@@ -671,14 +654,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
-            make_test_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let discovery = DiscoveryService::new(
             cm,
             node_table.clone(),
@@ -704,14 +680,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
-            make_test_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let discovery = DiscoveryService::new(
             cm,
             node_table.clone(),
@@ -742,14 +711,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
-            make_test_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let discovery = Arc::new(DiscoveryService::new(
             cm,
             node_table,
@@ -774,14 +736,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
-            make_test_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let discovery = DiscoveryService::new(
             cm,
             node_table.clone(),
