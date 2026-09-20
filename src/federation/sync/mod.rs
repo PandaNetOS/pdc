@@ -1,4 +1,4 @@
-﻿//! 同步管理器
+//! 同步管理器
 //!
 //! 阶段2扩展：集成 Gossip 引擎、PeerRepo 同步、InfohashRepo 同步。
 //! 阶段1的 NodeRepo 同步保留。
@@ -27,13 +27,14 @@ use tracing::{debug, info, warn};
 
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::{Connection, ConnectionManager};
 use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::{MerkleProvider, MerkleTree};
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
+use crate::federation::peer_conn::PeerConn;
 use crate::federation::protocol::*;
 use crate::federation::relay::RelayManager;
+use crate::federation::session::SessionsHandle;
 use crate::federation::sync::infohash_sync::InfohashSync;
 use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::federation::sync::peer_sync::PeerSync;
@@ -80,7 +81,7 @@ pub(crate) fn build_node_sync_entry(
 
 /// 同步管理器
 pub struct SyncManager {
-    connection_manager: Arc<ConnectionManager>,
+    sessions: Arc<SessionsHandle>,
     node_repo: Arc<NodeRepoImpl>,
     gossip_engine: Arc<GossipEngine>,
     peer_sync: Option<Arc<PeerSync>>,
@@ -162,7 +163,7 @@ impl SyncManager {
     /// 创建同步管理器
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        sessions: Arc<SessionsHandle>,
         node_repo: Arc<NodeRepoImpl>,
         config: FederationConfig,
         shutdown: broadcast::Sender<()>,
@@ -253,7 +254,7 @@ impl SyncManager {
         ));
 
         Self {
-            connection_manager,
+            sessions,
             node_repo,
             gossip_engine,
             peer_sync,
@@ -1018,7 +1019,7 @@ impl SyncManager {
 
         let digest = self.get_digest(repo_type);
         let req = DiffSyncRequestMessage { digest };
-        let sent = match self.connection_manager.get_connection(&peer) {
+        let sent = match self.sessions.get_connection(&peer) {
             Some(conn) => conn
                 .send_message(MessageType::DiffSyncRequest, &req)
                 .await
@@ -1162,7 +1163,7 @@ impl SyncManager {
         from_node_id: NodeId,
         req: DiffSyncRequestMessage,
     ) {
-        let conn = match self.connection_manager.get_connection(&from_node_id) {
+        let conn = match self.sessions.get_connection(&from_node_id) {
             Some(c) => c,
             None => {
                 warn!("[federation] DiffSync: 目标 {} 无连接，取消", from_node_id);
@@ -1299,7 +1300,7 @@ impl SyncManager {
     /// 超时或发送失败时返回 Err，调用方回退到全量推送。
     async fn run_diff_key_exchange(
         self: Arc<Self>,
-        conn: &Connection,
+        conn: &PeerConn,
         peer: NodeId,
         repo_type: u8,
         diff_shards: &[u16],
@@ -1389,7 +1390,7 @@ impl SyncManager {
     /// 对比出对方有而本地缺失的 key，分片回传 DiffSyncKeyResponse。
     pub async fn handle_diff_sync_key_request(
         self: Arc<Self>,
-        conn: &Connection,
+        conn: &PeerConn,
         msg: DiffSyncKeyRequestMessage,
     ) {
         let repo_type = msg.repo_type;
@@ -1464,11 +1465,7 @@ impl SyncManager {
     /// P0-2: 处理收到的 DiffSyncKeyResponse（数据服务器侧）。
     ///
     /// 累计请求方回传的缺失 key 分片，收齐到 is_last 后唤醒等待中的推送任务。
-    pub fn handle_diff_sync_key_response(
-        &self,
-        conn: &Connection,
-        msg: DiffSyncKeyResponseMessage,
-    ) {
+    pub fn handle_diff_sync_key_response(&self, conn: &PeerConn, msg: DiffSyncKeyResponseMessage) {
         let repo_type = msg.repo_type;
         let key = (conn.node_id, repo_type);
 
@@ -1558,7 +1555,7 @@ impl SyncManager {
     ///
     /// 注意：当前为简化版，按 repo_type 逐个 repo 同步。窗口流控由 full_sync_window_size 控制。
     pub async fn start_full_sync(self: Arc<Self>, target_node_id: NodeId) {
-        let conn = match self.connection_manager.get_connection(&target_node_id) {
+        let conn = match self.sessions.get_connection(&target_node_id) {
             Some(c) => c,
             None => {
                 warn!(
@@ -1861,7 +1858,7 @@ impl SyncManager {
     /// 大差异（≥20%分片）：触发差异全量同步，一次性拉取所有差异分片数据。
     pub async fn handle_merkle_digest(
         self: Arc<Self>,
-        conn: &Connection,
+        conn: &PeerConn,
         digest: MerkleDigestMessage,
     ) {
         let merkle = match self.merkle_for_repo(digest.repo_type) {
@@ -1948,7 +1945,7 @@ impl SyncManager {
     ///
     /// 收到对端的分片请求后，从本地 Merkle 树收集指定分片的所有条目，
     /// 打包成 MerkleRepair 消息发送回对端。
-    pub async fn handle_merkle_request(&self, conn: &Connection, request: MerkleRequestMessage) {
+    pub async fn handle_merkle_request(&self, conn: &PeerConn, request: MerkleRequestMessage) {
         let _merkle = match self.merkle_for_repo(request.repo_type) {
             Some(m) => m,
             None => return,
@@ -2060,7 +2057,7 @@ impl SyncManager {
     /// - level=2: 返回指定 L1 下的 L2 二级分片哈希（256个）
     pub async fn handle_merkle_level_request(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         req: MerkleLevelRequestMessage,
     ) {
         let merkle = match self.merkle_for_repo(req.repo_type) {
@@ -2130,7 +2127,7 @@ impl SyncManager {
     /// - level=2: 对比 L2，收集差异 L2，全部收齐后启动分片同步
     pub async fn handle_merkle_level_response(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         resp: MerkleLevelResponseMessage,
     ) {
         let merkle = match self.merkle_for_repo(resp.repo_type) {
@@ -2293,7 +2290,7 @@ impl SyncManager {
     /// 接收方将批次中的条目应用到本地 repo，然后回复 ShardSyncAck。
     pub fn handle_shard_sync_batch(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         msg: ShardSyncBatchMessage,
     ) {
         debug!(
@@ -2353,7 +2350,7 @@ impl SyncManager {
     /// 回传本地缺失的 key 列表，数据服务器只推送这些 key 的完整数据。
     pub async fn handle_shard_sync_hash_list(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         msg: ShardSyncHashListMessage,
     ) {
         let key = (conn.node_id, msg.repo_type, msg.l2_shard);
@@ -2480,7 +2477,7 @@ impl SyncManager {
         if !self.config.delta_sync_enabled {
             return;
         }
-        let conn = match self.connection_manager.get_connection(&peer) {
+        let conn = match self.sessions.get_connection(&peer) {
             Some(c) => c,
             None => return,
         };
@@ -2521,11 +2518,7 @@ impl SyncManager {
     ///
     /// 从本地 oplog 取 `seq > since_seq` 的变更（升序，最多 limit 条），组装 OpsBatch 回发。
     /// 仅回发**本地 origin** 的变更（oplog 只记本地变更），成本 O(Δ)。
-    pub async fn handle_ops_request(
-        self: Arc<Self>,
-        conn: Arc<Connection>,
-        req: OpsRequestMessage,
-    ) {
+    pub async fn handle_ops_request(self: Arc<Self>, conn: Arc<PeerConn>, req: OpsRequestMessage) {
         if !self.config.delta_sync_enabled {
             debug!(
                 "[delta] 收到 OpsRequest 但 delta_sync_enabled=false，忽略: peer={}",
@@ -2584,7 +2577,7 @@ impl SyncManager {
     ///
     /// 幂等应用 ops（走既有 `handle_sync_batch`，**不写回 oplog**），推进本地版本向量；
     /// `has_more=true` 时立即续拉下一批，直到对端返回空批。
-    pub async fn handle_ops_batch(self: Arc<Self>, conn: Arc<Connection>, batch: OpsBatchMessage) {
+    pub async fn handle_ops_batch(self: Arc<Self>, conn: Arc<PeerConn>, batch: OpsBatchMessage) {
         if !self.config.delta_sync_enabled {
             return;
         }
@@ -2644,7 +2637,7 @@ impl SyncManager {
             return;
         }
         let interval = std::time::Duration::from_secs(self.config.delta_sync_interval_secs.max(1));
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         if conns.is_empty() {
             return;
         }
@@ -2701,7 +2694,7 @@ impl SyncManager {
     /// P1-4：处理对端的 RangeReconcile 请求（应答方）。
     pub async fn handle_range_reconcile_request(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         req: RangeReconcileRequestMessage,
     ) {
         if !self.config.range_reconcile_enabled {
@@ -2779,7 +2772,7 @@ impl SyncManager {
     /// - 否则按对端分界点继续下钻（`depth+1`，受 `range_reconcile_max_depth` 约束）。
     pub async fn handle_range_reconcile_response(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         resp: RangeReconcileResponseMessage,
     ) {
         if !self.config.range_reconcile_enabled {
@@ -2952,7 +2945,7 @@ impl SyncManager {
     /// P1-4：处理 Range 反熵推送（接收方）—— 将推送的节点数据写入本地数据库。
     pub async fn handle_range_reconcile_push(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         msg: crate::federation::protocol::RangeReconcilePushMessage,
     ) {
         if msg.repo != repo_type::NODE {
@@ -3004,7 +2997,7 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         if conns.is_empty() {
             return;
         }
@@ -3118,7 +3111,7 @@ impl SyncManager {
     /// 取水位 `w0 = oplog_max_seq()`，按有序 key 区间流式分块，缓存清单供后续分块请求使用。
     pub async fn handle_bootstrap_manifest_request(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         req: BootstrapManifestRequestMessage,
     ) {
         if !self.config.bootstrap_enabled {
@@ -3166,7 +3159,7 @@ impl SyncManager {
     /// P2-1：处理对端的 bootstrap 分块请求（应答方）—— 按清单边界取条目回发（令牌桶限流）。
     pub async fn handle_bootstrap_chunk_request(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         req: BootstrapChunkRequestMessage,
     ) {
         if !self.config.bootstrap_enabled {
@@ -3269,7 +3262,7 @@ impl SyncManager {
     /// P2-1：处理对端的 bootstrap 清单响应（请求方）—— 落进度并开始拉第一块。
     pub async fn handle_bootstrap_manifest_response(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         resp: BootstrapManifestResponseMessage,
     ) {
         if !self.config.bootstrap_enabled {
@@ -3312,7 +3305,7 @@ impl SyncManager {
     /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉或切追尾。
     pub async fn handle_bootstrap_chunk_response(
         self: Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         resp: BootstrapChunkResponseMessage,
     ) {
         if !self.config.bootstrap_enabled {
@@ -3376,7 +3369,7 @@ impl SyncManager {
     /// 请求清单中第 `index` 块。
     async fn request_bootstrap_chunk(
         &self,
-        conn: &Connection,
+        conn: &PeerConn,
         repo: u8,
         index: u32,
         manifest: &bootstrap::BootstrapManifest,
@@ -3395,7 +3388,7 @@ impl SyncManager {
     }
 
     /// 完成 ③④ 后进入 ⑤ 追尾（复用 P1-3 delta 通道拉 `seq > w0`）。
-    async fn finish_bootstrap(self: &Arc<Self>, conn: &Connection, repo: u8, w0_seq: u64) {
+    async fn finish_bootstrap(self: &Arc<Self>, conn: &PeerConn, repo: u8, w0_seq: u64) {
         let now = chrono::Utc::now().timestamp_millis();
         if let Ok(Some((mut p, mf))) = self.delta_storage().bootstrap_load(repo) {
             p.phase = bootstrap::BootstrapPhase::Done;
@@ -3428,7 +3421,7 @@ impl SyncManager {
             let peer = NodeId(arr);
             match self.delta_storage().bootstrap_load(p.repo) {
                 Ok(Some((_, Some(mf)))) if (mf.chunks.len() as u64) > p.done_chunks => {
-                    if let Some(conn) = self.connection_manager.get_connection(&peer) {
+                    if let Some(conn) = self.sessions.get_connection(&peer) {
                         debug!(
                             "[bootstrap] 恢复续传: peer={}, repo={}, 从块 {} 继续",
                             peer, p.repo, p.done_chunks
@@ -3511,7 +3504,7 @@ impl SyncManager {
                 local_node_count, remote_node_count, ratio * 100.0, peer
             );
 
-            if let Some(conn) = self.connection_manager.get_connection(&peer) {
+            if let Some(conn) = self.sessions.get_connection(&peer) {
                 self.clone()
                     .start_bootstrap(conn.node_id, repo_type::NODE)
                     .await;
@@ -3528,7 +3521,7 @@ impl SyncManager {
         if repo != repo_type::NODE {
             return;
         }
-        let conn = match self.connection_manager.get_connection(&peer) {
+        let conn = match self.sessions.get_connection(&peer) {
             Some(c) => c,
             None => {
                 warn!("[bootstrap] 目标 {} 无连接，取消", peer);
@@ -3657,7 +3650,7 @@ impl SyncManager {
     /// 3. 对比 L2，收集差异 L2
     /// 4. 启动 ShardSyncEngine 推送差异 L2
     pub async fn trigger_layered_sync(self: Arc<Self>, peer: NodeId, repo_type: u8) {
-        let conn = match self.connection_manager.get_connection(&peer) {
+        let conn = match self.sessions.get_connection(&peer) {
             Some(c) => c,
             None => {
                 warn!("[shard-sync] trigger_layered_sync: 无连接 peer={}", peer);
@@ -3668,8 +3661,7 @@ impl SyncManager {
         if !conn.supports_layered_merkle() {
             warn!(
                 "[shard-sync] 对端不支持分层 Merkle (version={}), 回退 DiffSync",
-                conn.peer_protocol_version
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                conn.protocol_version()
             );
             self.trigger_diff_sync(peer, repo_type).await;
             return;
@@ -3721,7 +3713,7 @@ impl SyncManager {
     /// - diff_l2_shards: 差异 L2 分片列表
     pub fn start_shard_sync(
         self: &Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         repo_type: u8,
         diff_l2_shards: Vec<u32>,
     ) {
@@ -4053,8 +4045,6 @@ impl MerkleProvider for SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::node_id::NodeIdentity;
-    use crate::federation::node_table::NodeTable;
     use crate::storage::Storage;
 
     fn make_config() -> FederationConfig {
@@ -4092,17 +4082,8 @@ mod tests {
     #[test]
     fn test_apply_node_sync() {
         let node_repo = make_node_repo();
-        let identity = NodeIdentity::generate();
-        let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
             cm.clone(),
@@ -4145,17 +4126,8 @@ mod tests {
     #[test]
     fn test_handle_sync_batch_unknown_type() {
         let node_repo = make_node_repo();
-        let identity = NodeIdentity::generate();
-        let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
             cm.clone(),
@@ -4189,17 +4161,8 @@ mod tests {
     #[test]
     fn test_node_merkle_digest() {
         let node_repo = make_node_repo();
-        let identity = NodeIdentity::generate();
-        let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let gossip = Arc::new(GossipEngine::new(
             cm.clone(),

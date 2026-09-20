@@ -183,6 +183,22 @@ impl MessageType {
     }
 }
 
+/// 本节点联邦协议版本（`Hello`/`HelloAck` 的 `version` 字段）。
+/// 1：旧版本（仅全量推送差异分片）。
+/// 2：支持 DiffSync key 列表交换（先交换 key 列表，只推送对方缺失条目，重复率 ~90%→<5%）。
+/// 3：支持分层 Merkle 对比 + 分片并行同步（L0→L1→L2 三层定位差异，只同步差异 L2 分片，支持并行+断点续传+流式加载）。
+/// 4：支持增量（delta）同步通道（OpsRequest/OpsBatch，基于本地 oplog 的 O(Δ) 稳态同步）。
+/// 5：支持 Range-based（有序区间 + 分界点下钻）反熵（RangeReconcileRequest/Response）。
+/// 6：支持 bootstrap 专用通道（BootstrapManifest*/BootstrapChunk*，与在线反熵解耦的全量引导）。
+/// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle；
+/// version >= 4 且 `federation.delta_sync_enabled=true` 时启用 delta 通道；
+/// version >= 5 且 `federation.range_reconcile_enabled=true` 时启用 range 反熵；
+/// version >= 6 且 `federation.bootstrap_enabled=true` 时启用 bootstrap 通道。
+///
+/// G4 迁移：原定义在 `federation/connection.rs`，随握手实现一并归位到协议层
+/// （`connection.rs` 保留 `pub use` 转发）。
+pub const HELLO_PROTOCOL_VERSION: u32 = 6;
+
 /// 握手消息（阶段2：Ed25519 签名认证）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloMessage {

@@ -11,11 +11,11 @@ use rustc_hash::FxHashMap;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::federation::connection::ConnectionManager;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::{NodeId, NodeIdentity};
 use crate::federation::node_table::NodeTable;
 use crate::federation::protocol::*;
+use crate::federation::session::SessionsHandle;
 use crate::federation::transport::UdpTransport;
 
 /// UDP 打洞持续时间
@@ -54,7 +54,7 @@ struct SignalingSession {
 
 /// 打洞信令服务
 pub struct SignalingService {
-    connection_manager: Arc<ConnectionManager>,
+    sessions: Arc<SessionsHandle>,
     node_table: Arc<NodeTable>,
     identity: Arc<NodeIdentity>,
     pending_sessions: RwLock<FxHashMap<u64, SignalingSession>>,
@@ -66,7 +66,7 @@ pub struct SignalingService {
 
 impl SignalingService {
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        sessions: Arc<SessionsHandle>,
         node_table: Arc<NodeTable>,
         identity: Arc<NodeIdentity>,
         udp_transport: Arc<UdpTransport>,
@@ -74,7 +74,7 @@ impl SignalingService {
         shutdown: broadcast::Sender<()>,
     ) -> Self {
         Self {
-            connection_manager,
+            sessions,
             node_table,
             identity,
             pending_sessions: RwLock::new(FxHashMap::default()),
@@ -144,8 +144,8 @@ impl SignalingService {
         // 通过中继或直接连接发送
         if let Some(relay_id) = relay_node_id {
             self.forward_to(&relay_id, &msg);
-        } else if let Some(conn) = self.connection_manager.get_connection(&target_node_id) {
-            let _cm = self.connection_manager.clone();
+        } else if let Some(conn) = self.sessions.get_connection(&target_node_id) {
+            let _cm = self.sessions.clone();
             let msg_clone = msg.clone();
             tokio::spawn(async move {
                 if let Err(e) = conn.send_message(MessageType::Signaling, &msg_clone).await {
@@ -225,8 +225,8 @@ impl SignalingService {
                     action: signaling_action::RESPONSE,
                 };
 
-                if let Some(conn) = self.connection_manager.get_connection(&from_node) {
-                    let _cm = self.connection_manager.clone();
+                if let Some(conn) = self.sessions.get_connection(&from_node) {
+                    let _cm = self.sessions.clone();
                     tokio::spawn(async move {
                         let _ = conn.send_message(MessageType::Signaling, &response).await;
                     });
@@ -278,12 +278,12 @@ impl SignalingService {
     fn maybe_forward(&self, from_node: NodeId, msg: SignalingMessage) {
         let target = NodeId(msg.to_node);
         // 如果自己和目标有连接，转发
-        if let Some(conn) = self.connection_manager.get_connection(&target) {
+        if let Some(conn) = self.sessions.get_connection(&target) {
             debug!(
                 "[federation] 中继转发信令 session={}, {} -> {}",
                 msg.session_id, from_node, target
             );
-            let _cm = self.connection_manager.clone();
+            let _cm = self.sessions.clone();
             tokio::spawn(async move {
                 let _ = conn.send_message(MessageType::Signaling, &msg).await;
             });
@@ -292,8 +292,8 @@ impl SignalingService {
 
     /// 转发到指定节点
     fn forward_to(&self, node_id: &NodeId, msg: &SignalingMessage) {
-        if let Some(conn) = self.connection_manager.get_connection(node_id) {
-            let _cm = self.connection_manager.clone();
+        if let Some(conn) = self.sessions.get_connection(node_id) {
+            let _cm = self.sessions.clone();
             let msg_clone = msg.clone();
             tokio::spawn(async move {
                 let _ = conn.send_message(MessageType::Signaling, &msg_clone).await;
@@ -336,30 +336,13 @@ impl SignalingService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::config::FederationConfig;
-
-    fn make_config() -> FederationConfig {
-        FederationConfig {
-            enabled: true,
-            listen_port: 0,
-            max_connections: 10,
-            ..Default::default()
-        }
-    }
 
     #[tokio::test]
     async fn test_signaling_service_creation() {
         let identity = Arc::new(NodeIdentity::generate());
         let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table.clone(),
-            identity.clone(),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();

@@ -1,4 +1,4 @@
-﻿//! 联邦网络配置
+//! 联邦网络配置
 //!
 //! 控制 PDC 联邦网络的所有行为参数，包括监听端口、连接数、心跳、NAT 映射、同步等。
 
@@ -25,9 +25,17 @@ pub struct FederationConfig {
     /// API/HTTP 监控端口（LPD 广播时告知对端，端口自动探测后为实际值）
     #[serde(default = "default_api_port")]
     pub api_port: u16,
-    /// LPD 多播端口（局域网零配置发现，默认 6771，与 BitTorrent LPD 对齐）
-    #[serde(default = "default_lpd_multicast_port")]
-    pub lpd_multicast_port: u16,
+    /// 联邦层 LPD 多播端口（局域网零配置发现；SDK 联邦公告使用，默认 6772）
+    ///
+    /// ⚠️ 与 `crate::config::DiscoverersConfig::lpd_multicast_port`（业务层 BEP14 LPD，
+    /// 默认 **6771**）**同名不同用途、默认值也不同**，改错会导致局域网发现静默失效。
+    /// 此处刻意改名为 `federation_lpd_multicast_port` 以消除歧义；
+    /// `alias` 保留对旧配置键 `lpd_multicast_port` 的兼容。
+    #[serde(
+        default = "default_federation_lpd_multicast_port",
+        alias = "lpd_multicast_port"
+    )]
+    pub federation_lpd_multicast_port: u16,
     /// 最大连接数
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -299,7 +307,7 @@ fn default_api_port() -> u16 {
 fn default_transport_mode() -> String {
     "auto".to_string()
 }
-fn default_lpd_multicast_port() -> u16 {
+fn default_federation_lpd_multicast_port() -> u16 {
     6772
 }
 fn default_max_connections() -> usize {
@@ -501,7 +509,7 @@ impl Default for FederationConfig {
             listen_port: default_listen_port(),
             transport_mode: default_transport_mode(),
             api_port: default_api_port(),
-            lpd_multicast_port: default_lpd_multicast_port(),
+            federation_lpd_multicast_port: default_federation_lpd_multicast_port(),
             max_connections: default_max_connections(),
             target_neighbors: default_target_neighbors(),
             heartbeat_timeout_secs: default_heartbeat_timeout(),
@@ -590,7 +598,9 @@ mod tests {
         assert_eq!(cfg.listen_port, 6885);
         assert_eq!(cfg.max_connections, 32);
         assert_eq!(cfg.target_neighbors, 8);
-        assert_eq!(cfg.heartbeat_timeout_secs, 90);
+        // 300 是 2026-09-20「连接稳定性修复」的有意调参（90→300）：放宽空闲断连窗口
+        // 以降低慢链路 / NAT 抖动下的误杀。该断言当时漏同步，长期 FAIL，此处对齐实现。
+        assert_eq!(cfg.heartbeat_timeout_secs, 300);
         assert!(cfg.nat_mapping_enabled);
         assert!(cfg.enable_relay);
         assert_eq!(cfg.relay_bandwidth_limit_mbps, 10);
@@ -656,5 +666,38 @@ max_connections: 64
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         assert!(yaml.contains("listen_port: 6885"));
         assert!(yaml.contains("enabled: true"));
+    }
+
+    /// 联邦层 LPD 多播端口：默认值应为 6772（与业务层 BEP14 LPD 的 6771 区分），
+    /// 且必须同时接受新键 `federation_lpd_multicast_port` 与遗留键 `lpd_multicast_port`。
+    #[test]
+    fn test_federation_lpd_multicast_port_default_and_alias() {
+        // 1) 默认值
+        let cfg = FederationConfig::default();
+        assert_eq!(cfg.federation_lpd_multicast_port, 6772);
+
+        // 2) 省略该键 → 回落到默认值（而非 0）
+        let cfg_omitted: FederationConfig = serde_yaml::from_str("listen_port: 7000").unwrap();
+        assert_eq!(cfg_omitted.federation_lpd_multicast_port, 6772);
+
+        // 3) 新键
+        let cfg_new: FederationConfig =
+            serde_yaml::from_str("federation_lpd_multicast_port: 7001").unwrap();
+        assert_eq!(cfg_new.federation_lpd_multicast_port, 7001);
+
+        // 4) 遗留键（旧部署的配置文件）仍必须生效
+        let cfg_legacy: FederationConfig =
+            serde_yaml::from_str("lpd_multicast_port: 7002").unwrap();
+        assert_eq!(
+            cfg_legacy.federation_lpd_multicast_port, 7002,
+            "旧配置键 lpd_multicast_port 应通过 serde alias 继续生效"
+        );
+
+        // 5) 两个键不同时以最长前缀匹配？serde alias 下新键优先；
+        //    这里只确保互不干扰：只用旧键时不报错、值正确。
+        assert_ne!(
+            cfg_legacy.federation_lpd_multicast_port, 6771,
+            "不应误取业务层 LPD 的 6771"
+        );
     }
 }

@@ -626,7 +626,11 @@ async fn async_main(
             (config.crawler.tcp_pex_port, "TCP", "tcp-pex"),
             (config.federation.listen_port, "TCP", "federation"),
             (config.federation.listen_port, "UDP", "federation-udp"),
-            (config.federation.lpd_multicast_port, "UDP", "lpd"),
+            (
+                config.federation.federation_lpd_multicast_port,
+                "UDP",
+                "lpd",
+            ),
         ];
         match fw_manager.add_rules(&fw_ports) {
             Ok(result) => {
@@ -1789,7 +1793,7 @@ async fn async_main(
     // 8.8 联邦任务注册（4个：心跳/节点同步/DHT发现/Merkle反熵）
     if let Some(ref fed) = federation_service {
         // fed_heartbeat
-        let cm = fed.connection_manager.clone();
+        let cm = fed.sessions.clone();
         task_scheduler.register(
             TaskMetadata::new(
                 "fed_heartbeat",
@@ -2342,7 +2346,7 @@ async fn async_main(
         }
 
         // fed_gossip_flush: Gossip批量flush（50ms）
-        let cm_flush = fed.connection_manager.clone();
+        let cm_flush = fed.dispatcher.clone();
         task_scheduler.register(
             TaskMetadata::new(
                 "fed_gossip_flush",

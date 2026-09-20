@@ -14,11 +14,12 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::{Connection, ConnectionManager};
 use crate::federation::merkle::MerkleProvider;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
+use crate::federation::peer_conn::PeerConn;
 use crate::federation::protocol::*;
+use crate::federation::session::SessionsHandle;
 use crate::federation::sharded_lru::ShardedLruCache;
 
 /// wait_outbox_empty 轮询间隔
@@ -36,7 +37,7 @@ pub struct GossipEngine {
     /// 分片 LRU：按 key 哈希分片，消除多 repo 并行 flush 时的全局写锁竞争。
     seen_msgs: ShardedLruCache<(NodeId, u64), ()>,
     /// 连接管理器
-    connection_manager: Arc<ConnectionManager>,
+    sessions: Arc<SessionsHandle>,
     /// 配置
     config: FederationConfig,
     /// 消息 ID 计数器
@@ -103,7 +104,7 @@ const SEEN_MSGS_TOTAL_CAPACITY: usize = 100_000;
 impl GossipEngine {
     /// 创建 Gossip 引擎
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        sessions: Arc<SessionsHandle>,
         config: FederationConfig,
         local_node_id: NodeId,
         metrics: Arc<FederationMetrics>,
@@ -115,7 +116,7 @@ impl GossipEngine {
             outbox: RwLock::new(Vec::new()),
             outbox_msg_ids: RwLock::new(FxHashSet::default()),
             seen_msgs: ShardedLruCache::new(shards, cap_per_shard),
-            connection_manager,
+            sessions,
             config,
             next_msg_id: AtomicU64::new(1),
             local_node_id,
@@ -352,7 +353,7 @@ impl GossipEngine {
                 return;
             }
             // 单连接场景：一次性取出所有消息，加快传播速度
-            let conn_count = self.connection_manager.connection_count();
+            let conn_count = self.sessions.connection_count();
             let batch_size = if conn_count <= 1 { 500 } else { 100 };
             let count = outbox.len().min(batch_size);
             let drained: Vec<GossipBatchMessage> = outbox.drain(..count).collect();
@@ -372,11 +373,11 @@ impl GossipEngine {
         }
 
         // 随机选择 fanout 个已连接邻居（先完成所有随机选择，避免 rng 跨 await）
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         if conns.is_empty() {
             // 无连接，把消息放回 outbox（下次重试），并尝试重连已知节点（带冷却）
             self.extend_outbox_unique(batches);
-            self.connection_manager.clone().reconnect_discovered().await;
+            self.sessions.clone().reconnect_discovered().await;
             return;
         }
 
@@ -397,7 +398,7 @@ impl GossipEngine {
 
         // 收集所有待发送的 (connection, batch_index) 对，按连接分组。
         // 使用索引而非引用，便于后续按连接分组和 bulk 合并。
-        let mut by_conn: FxHashMap<NodeId, (Arc<Connection>, Vec<usize>)> = FxHashMap::default();
+        let mut by_conn: FxHashMap<NodeId, (Arc<PeerConn>, Vec<usize>)> = FxHashMap::default();
         {
             // 全量同步期间：接收端设置了 receiving_full_sync=true（不转发），
             // 流行病传播链断裂。此时必须广播到所有连接，否则未被随机 fanout 选中的
@@ -536,7 +537,7 @@ impl GossipEngine {
                 "[federation] 节点 {} Gossip 连续失败 {} 次，主动断开连接",
                 node_id, max_failures
             );
-            self.connection_manager.remove_connection(&node_id);
+            self.sessions.remove_connection(&node_id);
         }
 
         // === batch 回退决策 ===
@@ -659,7 +660,7 @@ impl GossipEngine {
     /// 并行化后每个连接一个 task；限流计数器为原子，多 task 并发安全。
     async fn send_to_conn(
         self: &Arc<Self>,
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         batch_indices: Vec<usize>,
         batches: Arc<Vec<GossipBatchMessage>>,
         bulk_max_batches: usize,
@@ -727,7 +728,7 @@ impl GossipEngine {
     #[allow(clippy::too_many_arguments)]
     async fn send_bulk_or_single(
         self: &Arc<Self>,
-        conn: &Connection,
+        conn: &PeerConn,
         batches: &[GossipBatchMessage],
         indices: &[usize],
         total_batch_bytes: u64,
@@ -768,7 +769,7 @@ impl GossipEngine {
                     || err_str.contains("closed")
                 {
                     warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
-                    self.connection_manager.remove_connection(&node_id);
+                    self.sessions.remove_connection(&node_id);
                 }
             } else {
                 self.metrics.record_gossip_propagation();
@@ -797,7 +798,7 @@ impl GossipEngine {
                     || err_str.contains("closed")
                 {
                     warn!("[federation] 检测到连接 {} 已关闭，立即移除", node_id);
-                    self.connection_manager.remove_connection(&node_id);
+                    self.sessions.remove_connection(&node_id);
                 }
             } else {
                 // 每个 batch 计一次传播指标
@@ -842,12 +843,12 @@ impl GossipEngine {
         // 关键：只看 receiving_full_sync；sending_full_sync（本节点在向外推）不影响接收端转发，
         // 否则发送方会被误伤、暂停 Gossip 转发。接收结束后自动恢复正常转发。
         // 超级节点不受影响：它通过 submit_gossip/submit_gossip_batch 直接写 outbox，不走本路径。
-        let conn_count = self.connection_manager.connection_count();
+        let conn_count = self.sessions.connection_count();
         let should_propagate = if self.is_receiving_full_sync() {
             // 接收全量期间：只本地写入，不转发
             false
         } else if conn_count <= 1 {
-            let conns = self.connection_manager.all_connections();
+            let conns = self.sessions.all_connections();
             if conns.len() == 1 {
                 // 消息origin不是唯一连接的node_id时才需要传播（本地产生的消息）
                 NodeId(batch.origin) != conns[0].node_id
@@ -918,7 +919,7 @@ impl GossipEngine {
 
     /// 单次反熵：随机选1个邻居，发送所有 repo_type 的 MerkleDigest（由 TaskScheduler 调度）
     pub async fn anti_entropy_tick<M: MerkleProvider>(self: Arc<Self>, merkle_provider: Arc<M>) {
-        let conns = self.connection_manager.all_connections();
+        let conns = self.sessions.all_connections();
         if conns.is_empty() {
             debug!("[federation] 反熵跳过：无连接");
             return;
@@ -1054,8 +1055,6 @@ impl GossipEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::node_id::NodeIdentity;
-    use crate::federation::node_table::NodeTable;
 
     fn make_config() -> FederationConfig {
         FederationConfig {
@@ -1070,17 +1069,8 @@ mod tests {
 
     #[test]
     fn test_submit_and_handle_gossip() {
-        let identity = NodeIdentity::generate();
-        let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let engine = GossipEngine::new(cm, make_config(), NodeId([1; 20]), metrics, shutdown_tx);
 
@@ -1121,17 +1111,8 @@ mod tests {
 
     #[test]
     fn test_submit_empty_entries() {
-        let identity = NodeIdentity::generate();
-        let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let engine = GossipEngine::new(cm, make_config(), NodeId([1; 20]), metrics, shutdown_tx);
 
@@ -1141,17 +1122,8 @@ mod tests {
 
     #[test]
     fn test_msg_id_increment() {
-        let identity = NodeIdentity::generate();
-        let node_table = Arc::new(NodeTable::new(100));
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (cm_shutdown, _) = broadcast::channel(1);
-        let cm = Arc::new(ConnectionManager::new(
-            node_table,
-            Arc::new(identity),
-            make_config(),
-            cm_shutdown,
-            Arc::new(FederationMetrics::new()),
-        ));
+        let cm = SessionsHandle::new_for_test();
         let metrics = Arc::new(FederationMetrics::new());
         let engine = GossipEngine::new(cm, make_config(), NodeId([1; 20]), metrics, shutdown_tx);
 

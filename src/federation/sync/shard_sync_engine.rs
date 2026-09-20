@@ -45,9 +45,9 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::connection::Connection;
 use crate::federation::merkle::MerkleTree;
 use crate::federation::node_id::NodeId;
+use crate::federation::peer_conn::PeerConn;
 use crate::federation::protocol::*;
 
 /// 分片同步 hash 列表单条消息最大条目数（避免超大帧，参考 DiffSync key 分片策略）。
@@ -110,7 +110,7 @@ pub struct ShardSyncStats {
 /// 每个 (peer, repo_type) 组合同一时刻只允许一个引擎实例（由 SyncManager 互斥保证）。
 pub struct ShardSyncEngine {
     /// 目标对端连接
-    conn: Arc<Connection>,
+    conn: Arc<PeerConn>,
     /// 对端节点 ID
     peer: NodeId,
     /// 仓库类型
@@ -159,7 +159,7 @@ impl ShardSyncEngine {
     /// - `merkle`: 对应 repo 的 Merkle 树
     /// - `config`: 联邦配置
     pub fn new(
-        conn: Arc<Connection>,
+        conn: Arc<PeerConn>,
         peer: NodeId,
         repo_type: u8,
         merkle: Arc<MerkleTree>,
