@@ -405,7 +405,7 @@ impl FederationService {
                 derp_enabled: true,
                 derp_urls: Vec::new(),
                 connect_timeout: IROH_CONNECT_TIMEOUT,
-                alpn: b"pdc-federation/1.0".to_vec(),
+                alpn: b"pnos/federation/1".to_vec(),
             })
         } else {
             None
