@@ -1,4 +1,4 @@
-//! 联邦网络配置
+﻿//! 联邦网络配置
 //!
 //! 控制 PDC 联邦网络的所有行为参数，包括监听端口、连接数、心跳、NAT 映射、同步等。
 
@@ -309,7 +309,7 @@ fn default_target_neighbors() -> usize {
     8
 }
 fn default_heartbeat_timeout() -> u64 {
-    90
+    300
 }
 fn default_true() -> bool {
     true
@@ -369,7 +369,7 @@ fn default_reconnect_cooldown_secs() -> u64 {
     30
 }
 fn default_heavy_task_max_concurrency() -> usize {
-    8
+    32
 }
 fn default_gossip_max_bytes_per_second() -> u64 {
     5 * 1024 * 1024

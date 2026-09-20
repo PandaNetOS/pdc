@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use crate::federation::gossip::GossipEngine;
 use crate::federation::merkle::MerkleTree;
@@ -16,25 +16,14 @@ use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::{InfohashRow, Storage};
 use crate::storage::repo_traits::InfohashRepository;
+use crate::storage::sharded_map::ShardedHashMap;
 use crate::storage::tiered_cache::TieredCacheConfig;
 use crate::storage::write_queue::WriteQueue;
 use crate::types::Infohash;
 
-struct InfohashCacheInner {
-    /// infohash -> (寮曠敤璁℃暟, 棣栨鍙戠幇鏉ユ簮, 鐑棬搴﹁瘎鍒?
-    entries: FxHashMap<Infohash, (u32, String, f64, u64)>,
-}
-
-impl InfohashCacheInner {
-    fn new() -> Self {
-        Self {
-            entries: FxHashMap::default(),
-        }
-    }
-}
-
 pub struct InfohashRepoImpl {
-    cache: RwLock<InfohashCacheInner>,
+    /// infohash -> (ref_count, first_source, score, last_seen), sharded lock
+    entries: ShardedHashMap<Infohash, (u32, String, f64, u64)>,
     storage: Arc<Storage>,
     /// 寰呮寔涔呭寲鐨勬柊 infohash 缂撳啿鍖猴紙鎵归噺鍐欏叆锛岄伩鍏嶉绻?SQLite IO锛?
     pending: RwLock<Vec<(Infohash, String)>>,
@@ -58,7 +47,7 @@ impl InfohashRepoImpl {
         _tier_enabled: bool,
     ) -> Self {
         Self {
-            cache: RwLock::new(InfohashCacheInner::new()),
+            entries: ShardedHashMap::new(16),
             storage,
             pending: RwLock::new(Vec::new()),
             dirty: RwLock::new(FxHashSet::default()),
@@ -171,14 +160,13 @@ impl InfohashRepoImpl {
 
     /// 鍚屾鑾峰彇 infohash 鏁伴噺
     pub fn count_sync(&self) -> usize {
-        self.cache.read().entries.len()
+        self.entries.len()
     }
 
     /// 鍚屾鑾峰彇鎵€鏈?infohash
     pub fn all_sync(&self) -> Vec<(Infohash, u64)> {
-        self.cache
-            .read()
-            .entries
+        self.entries
+            .read_all()
             .iter()
             .map(|(k, v)| (*k, v.3))
             .collect()
@@ -194,30 +182,25 @@ impl InfohashRepoImpl {
         if items.is_empty() {
             return Vec::new();
         }
-        let mut cache = self.cache.write();
+        let mut view = self.entries.write_all();
         let mut new_items: Vec<(Infohash, String)> = Vec::new();
         for (infohash, source, last_seen) in items {
-            // LWW: 濡傛灉鏈湴宸叉湁涓斿绔?last_seen 杈冩棫锛屽垯璺宠繃
-            if let Some(existing) = cache.entries.get(infohash) {
-                if *last_seen < existing.3 {
+            // LWW: if local exists and remote last_seen is older, skip
+            if let Some(entry) = view.get_mut(infohash) {
+                if *last_seen < entry.3 {
                     continue;
                 }
-            }
-            let entry =
-                cache
-                    .entries
-                    .entry(*infohash)
-                    .or_insert((0, source.clone(), 0.0, *last_seen));
-            entry.0 += 1;
-            // 鏇存柊 last_seen锛堝彇杈冨ぇ鍊硷級
-            if *last_seen > entry.3 {
-                entry.3 = *last_seen;
-            }
-            if entry.0 == 1 {
+                entry.0 += 1;
+                // update last_seen (take max)
+                if *last_seen > entry.3 {
+                    entry.3 = *last_seen;
+                }
+            } else {
+                view.insert(*infohash, (1, source.clone(), 0.0, *last_seen));
                 new_items.push((*infohash, source.clone()));
             }
         }
-        drop(cache);
+        drop(view);
 
         // 鏂?infohash 鎵归噺鍐欏叆 pending 缂撳啿鍖猴紝鐢?flush_pending 鎵归噺鍐欏叆 SQLite
         if !new_items.is_empty() {
@@ -322,9 +305,8 @@ impl InfohashRepoImpl {
         self.flush_pending().await?;
 
         let entries: Vec<InfohashRow> = self
-            .cache
-            .read()
             .entries
+            .read_all()
             .iter()
             .map(|(ih, (count, src, score, _ls))| InfohashRow {
                 infohash: *ih,
@@ -384,10 +366,10 @@ impl InfohashRepoImpl {
     }
 
     fn ingest_rows(&self, rows: Vec<crate::storage::db::InfohashRow>) -> usize {
-        let mut cache = self.cache.write();
+        let mut view = self.entries.write_all();
         let mut count = 0;
         for row in rows {
-            cache.entries.insert(
+            view.insert(
                 row.infohash,
                 (row.ref_count, row.first_source, row.score, 0),
             );
@@ -404,27 +386,24 @@ impl InfohashRepository for InfohashRepoImpl {
     }
 
     async fn unregister(&self, infohash: &Infohash) {
-        let mut cache = self.cache.write();
-        if let Some((count, _, _, _)) = cache.entries.get_mut(infohash) {
-            *count = count.saturating_sub(1);
-        }
+        self.entries.with_mut(infohash, |(count, _, _, _)| {
+            *count = count.saturating_sub(1)
+        });
     }
 
     async fn ref_count(&self, infohash: &Infohash) -> u32 {
-        self.cache
-            .read()
-            .entries
+        self.entries
             .get(infohash)
-            .map(|(c, _, _, _)| *c)
+            .map(|(c, _, _, _)| c)
             .unwrap_or(0)
     }
 
     async fn all_infohashes(&self) -> Vec<Infohash> {
-        self.cache.read().entries.keys().cloned().collect()
+        self.entries.read_all().keys().cloned().collect()
     }
 
     async fn count(&self) -> usize {
-        self.cache.read().entries.len()
+        self.entries.len()
     }
 
     async fn cleanup_zero_ref(&self) -> usize {
@@ -435,10 +414,7 @@ impl InfohashRepository for InfohashRepoImpl {
     async fn update_score(&self, infohash: &Infohash, score: f64) {
         // 鏇存柊鍐呭瓨缂撳瓨
         {
-            let mut cache = self.cache.write();
-            if let Some((_, _, s, _)) = cache.entries.get_mut(infohash) {
-                *s = score;
-            }
+            self.entries.with_mut(infohash, |(_, _, s, _)| *s = score);
         }
         // 寮傛鎸佷箙鍖栧埌 SQLite
         if let Some(wq) = &self.write_queue {
@@ -459,9 +435,9 @@ impl InfohashRepository for InfohashRepoImpl {
         }
         // 鏇存柊鍐呭瓨缂撳瓨
         {
-            let mut cache = self.cache.write();
+            let mut view = self.entries.write_all();
             for (infohash, score) in scores {
-                if let Some((_, _, s, _)) = cache.entries.get_mut(infohash) {
+                if let Some((_, _, s, _)) = view.get_mut(infohash) {
                     *s = *score;
                 }
             }
@@ -479,19 +455,16 @@ impl InfohashRepository for InfohashRepoImpl {
     }
 
     async fn get_score(&self, infohash: &Infohash) -> f64 {
-        self.cache
-            .read()
-            .entries
+        self.entries
             .get(infohash)
-            .map(|(_, _, s, _)| *s)
+            .map(|(_, _, s, _)| s)
             .unwrap_or(0.0)
     }
 
     async fn top_infohashes(&self, n: usize) -> Vec<(Infohash, f64)> {
         let mut entries: Vec<(Infohash, f64)> = self
-            .cache
-            .read()
             .entries
+            .read_all()
             .iter()
             .map(|(ih, (_, _, score, _))| (*ih, *score))
             .collect();

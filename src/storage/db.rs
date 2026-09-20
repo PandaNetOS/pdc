@@ -1767,6 +1767,55 @@ impl Storage {
         Ok(out)
     }
 
+    /// 根据 key 列表（ip:port）批量加载节点完整数据，用于 Range 反熵推送。
+    pub fn load_nodes_by_keys(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> anyhow::Result<Vec<crate::storage::db::DhtNodeRow>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT id, ip, port, score, state, query_count, success_count,              total_latency_ms, consecutive_failures, nodes_returned              FROM dht_nodes              WHERE deleted_at IS NULL AND (ip || ':' || port) IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        // 把 keys 转成 ip:port 字符串
+        let key_strs: Vec<String> = keys
+            .iter()
+            .map(|k| String::from_utf8_lossy(k).to_string())
+            .collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            key_strs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let id: Vec<u8> = row.get(0)?;
+            let mut id_arr = [0u8; 20];
+            if id.len() == 20 {
+                id_arr.copy_from_slice(&id);
+            }
+            Ok(DhtNodeRow {
+                id: id_arr,
+                ip: row.get(1)?,
+                port: row.get::<_, i64>(2)? as u16,
+                score: row.get(3)?,
+                state: row.get(4)?,
+                query_count: row.get::<_, i64>(5)? as u64,
+                success_count: row.get::<_, i64>(6)? as u64,
+                total_latency_ms: row.get::<_, i64>(7)? as u64,
+                consecutive_failures: row.get::<_, i64>(8)? as u32,
+                nodes_returned: row.get::<_, i64>(9)? as u64,
+                last_query_time: None,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// P1-4：均匀抽取 `n` 个 NODE key 作为区间分界（用 rowid 伪随机探针，避免全表扫描）。
     ///
     /// 返回**已排序去重**的 key 列表。`MAX(rowid)` 为 O(1)，每个探针为 O(log N) 的 rowid 查找，

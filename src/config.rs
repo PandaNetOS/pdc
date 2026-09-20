@@ -1119,18 +1119,17 @@ fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
         // 主流公共 DHT 路由器
         ("router.bittorrent.com".to_string(), 6881),
-        ("dht.transmissionbt.com".to_string(), 6881),
         ("router.utorrent.com".to_string(), 6881),
-        ("dht.aelitis.com".to_string(), 6881),
-        ("router.bitcomet.com".to_string(), 6881),
+        ("dht.transmissionbt.com".to_string(), 6881),
         ("dht.libtorrent.org".to_string(), 25401),
-        // 额外公共节点
-        ("dht.aria2.net".to_string(), 6881),
-        ("router.magnet2torrent.com".to_string(), 6881),
-        ("dht.download.free.fr".to_string(), 6881),
-        ("dht.cdnbye.com".to_string(), 6881),
-        ("dht.pps001.cn".to_string(), 6881),
-        ("tracker1.itzmx.com".to_string(), 6881),
+        ("router.bitcomet.com".to_string(), 6881),
+        ("dht.aelitis.com".to_string(), 6881),
+        ("router.silotis.us".to_string(), 6881),
+        ("dht.anacrolix.link".to_string(), 6881),
+        ("dht.vuze.com".to_string(), 6881),
+        ("router.nuh.dev".to_string(), 6881),
+        ("dht.bitcomet.com".to_string(), 6881),
+        ("router.transmissionbt.com".to_string(), 6881),
     ]
 }
 

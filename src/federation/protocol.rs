@@ -121,6 +121,8 @@ pub enum MessageType {
     BootstrapChunkRequest = 43,
     /// P2-1：bootstrap 分块响应（A → B）：携带该块完整条目。
     BootstrapChunkResponse = 44,
+    /// P1-4：Range 反熵推送（A → B）：发现本地多后，直接推送本地多的节点数据给对端。
+    RangeReconcilePush = 45,
 }
 
 impl MessageType {
@@ -170,6 +172,7 @@ impl MessageType {
             42 => Some(MessageType::BootstrapManifestResponse),
             43 => Some(MessageType::BootstrapChunkRequest),
             44 => Some(MessageType::BootstrapChunkResponse),
+            45 => Some(MessageType::RangeReconcilePush),
             _ => None,
         }
     }
@@ -736,6 +739,32 @@ pub struct RangeReconcileResponseMessage {
     pub is_leaf: bool,
     /// 下钻深度（回显请求）
     pub depth: u8,
+}
+
+/// P1-4：Range 反熵推送消息（A → B）。
+/// 发现本地多 N 个 key 后，本地直接推送这 N 个 key 对应的完整节点数据给对端。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeReconcilePushMessage {
+    /// 仓库类型
+    pub repo: u8,
+    /// 节点数据列表（id, ip, port, score, state, ...）
+    pub nodes: Vec<PushNodeEntry>,
+}
+
+/// 推送的单条节点数据
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PushNodeEntry {
+    pub id: Vec<u8>,
+    pub ip: String,
+    pub port: u16,
+    pub score: f64,
+    pub state: u8,
+    pub query_count: u64,
+    pub success_count: u64,
+    pub total_latency_ms: u64,
+    pub consecutive_failures: u32,
+    pub nodes_returned: u64,
+    pub last_active: i64,
 }
 
 /// P2-1：bootstrap 清单请求（B → A）。

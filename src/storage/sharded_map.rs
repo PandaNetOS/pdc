@@ -1,9 +1,9 @@
-//! 锁分片 HashMap（Sharded HashMap）
+﻿//! 锁分片 HashMap（Sharded HashMap）
 //!
 //! 用于高并发场景，将 HashMap 按 key 哈希分片到多个独立的 RwLock，
 //! 读写只锁对应分片，避免全局锁竞争。
 //!
-//! 千万级数据下，64 分片可将锁竞争减少 90%+。
+//! 千万级数据下，16 分片可将锁竞争减少 90%+。
 
 use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
@@ -16,6 +16,24 @@ pub struct ShardedHashMap<K, V, S = rustc_hash::FxBuildHasher> {
     shards: Vec<RwLock<FxHashMap<K, V>>>,
     shard_count: usize,
     hasher: S,
+}
+
+/// 读取所有分片的读守卫（持有全部读锁，提供统一 HashMap 视图）
+///
+/// 用于批量遍历/统计操作。热点单 key 操作应直接使用
+/// `ShardedHashMap` 的分片方法，避免持有全部分片锁。
+pub struct ShardedReadGuard<'a, K: Eq + Hash, V> {
+    guards: Vec<parking_lot::RwLockReadGuard<'a, FxHashMap<K, V>>>,
+    shard_count: usize,
+}
+
+/// 写入所有分片的写守卫（持有全部写锁，提供统一 HashMap 视图）
+///
+/// 用于批量插入/删除/遍历修改操作。热点单 key 写操作应使用
+/// `ShardedHashMap::with_mut` 或 `insert`/`remove` 等分片方法。
+pub struct ShardedWriteGuard<'a, K: Eq + Hash, V> {
+    guards: Vec<parking_lot::RwLockWriteGuard<'a, FxHashMap<K, V>>>,
+    shard_count: usize,
 }
 
 impl<K, V> ShardedHashMap<K, V>
@@ -70,6 +88,16 @@ where
         self.shards[idx].write().remove(key)
     }
 
+    /// 对单 key 执行可变操作（只锁对应分片，热点路径用）
+    ///
+    /// 闭包接收 `&mut V`，返回闭包返回值。
+    /// 用于 update_score / set_node_state 等单 key 写操作，
+    /// 避免 `write_all()` 持有全部 16 把锁。
+    pub fn with_mut<R>(&self, key: &K, f: impl FnOnce(&mut V) -> R) -> Option<R> {
+        let idx = self.shard_index(key);
+        self.shards[idx].write().get_mut(key).map(f)
+    }
+
     /// 总元素数
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
@@ -117,6 +145,134 @@ where
     pub fn clear(&self) {
         for shard in &self.shards {
             shard.write().clear();
+        }
+    }
+
+    /// 锁定全部分片读锁，返回统一读视图
+    ///
+    /// 用于批量遍历/统计操作。热点单 key 读取请直接用 `get()` / `contains_key()`。
+    pub fn read_all(&self) -> ShardedReadGuard<'_, K, V> {
+        let guards = self.shards.iter().map(|s| s.read()).collect();
+        ShardedReadGuard {
+            guards,
+            shard_count: self.shard_count,
+        }
+    }
+
+    /// 锁定全部分片写锁，返回统一写视图
+    ///
+    /// 用于批量插入/删除/遍历修改操作。热点单 key 写入请用
+    /// `insert()` / `remove()` / `with_mut()` 等分片方法。
+    pub fn write_all(&self) -> ShardedWriteGuard<'_, K, V> {
+        let guards = self.shards.iter().map(|s| s.write()).collect();
+        ShardedWriteGuard {
+            guards,
+            shard_count: self.shard_count,
+        }
+    }
+}
+
+impl<'a, K: Eq + Hash, V> ShardedReadGuard<'a, K, V> {
+    #[inline]
+    fn shard_idx(&self, key: &K) -> usize {
+        let h = rustc_hash::FxBuildHasher;
+        (h.hash_one(key) as usize) & (self.shard_count - 1)
+    }
+
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let i = self.shard_idx(key);
+        self.guards[i].get(key)
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        let i = self.shard_idx(key);
+        self.guards[i].contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.guards.iter().map(|g| g.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.guards.iter().all(|g| g.is_empty())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        self.guards.iter().flat_map(|g| g.iter())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
+        self.guards.iter().flat_map(|g| g.values())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> + '_ {
+        self.guards.iter().flat_map(|g| g.keys())
+    }
+}
+
+impl<'a, K: Eq + Hash, V> ShardedWriteGuard<'a, K, V> {
+    #[inline]
+    fn shard_idx(&self, key: &K) -> usize {
+        let h = rustc_hash::FxBuildHasher;
+        (h.hash_one(key) as usize) & (self.shard_count - 1)
+    }
+
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let i = self.shard_idx(key);
+        self.guards[i].get(key)
+    }
+
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let i = self.shard_idx(key);
+        self.guards[i].get_mut(key)
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        let i = self.shard_idx(key);
+        self.guards[i].contains_key(key)
+    }
+
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let i = self.shard_idx(&key);
+        self.guards[i].insert(key, value)
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let i = self.shard_idx(key);
+        self.guards[i].remove(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.guards.iter().map(|g| g.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.guards.iter().all(|g| g.is_empty())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        self.guards.iter().flat_map(|g| g.iter())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
+        self.guards.iter().flat_map(|g| g.values())
+    }
+
+    /// 对所有值执行可变闭包（避免返回迭代器的生命周期问题）
+    pub fn for_values_mut<F: FnMut(&mut V)>(&mut self, mut f: F) {
+        for g in self.guards.iter_mut() {
+            for v in g.values_mut() {
+                f(v);
+            }
+        }
+    }
+
+    /// 对所有 (key, value) 对执行可变闭包
+    pub fn for_each_mut<F: FnMut(&K, &mut V)>(&mut self, mut f: F) {
+        for g in self.guards.iter_mut() {
+            for (k, v) in g.iter_mut() {
+                f(k, v);
+            }
         }
     }
 }

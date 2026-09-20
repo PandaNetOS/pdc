@@ -1,4 +1,4 @@
-//! 同步管理器
+﻿//! 同步管理器
 //!
 //! 阶段2扩展：集成 Gossip 引擎、PeerRepo 同步、InfohashRepo 同步。
 //! 阶段1的 NodeRepo 同步保留。
@@ -2847,14 +2847,62 @@ impl SyncManager {
                         n_remote
                     );
                 }
-                // F3：非诊断模式下真正执行修复 —— 触发该 (对端, repo) 的 delta 拉取，
-                // 由 oplog 通道按 seq 补齐本机缺失的条目（O(Δ)）；
-                // 反向的「本地多」由本机 gossip 推送路径负责，无需在此写入。
-                // 诊断模式（默认）保持只读，仅累计统计。
+                // F3：非诊断模式下真正执行修复
                 if !self.config.range_reconcile_diagnostic_only && (n_local > 0 || n_remote > 0) {
                     self.range_repair_triggers
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.trigger_delta_sync(conn.node_id, resp.repo).await;
+                    // 对端多 → 触发 delta 拉取（本地从对端拉）
+                    if n_remote > 0 {
+                        self.trigger_delta_sync(conn.node_id, resp.repo).await;
+                    }
+                    // 本地多 → 直接推送数据给对端（不等 gossip）
+                    if n_local > 0 && !local_only.is_empty() {
+                        match self.delta_storage().load_nodes_by_keys(&local_only) {
+                            Ok(nodes) => {
+                                if nodes.is_empty() {
+                                    debug!(
+                                        "[range] 本地多 {} 个 key，但加载到 0 条节点数据",
+                                        local_only.len()
+                                    );
+                                } else {
+                                    let push_msg =
+                                        crate::federation::protocol::RangeReconcilePushMessage {
+                                            repo: resp.repo,
+                                            nodes: nodes
+                                                .iter()
+                                                .map(|n| {
+                                                    crate::federation::protocol::PushNodeEntry {
+                                                        id: n.id.to_vec(),
+                                                        ip: n.ip.clone(),
+                                                        port: n.port,
+                                                        score: n.score,
+                                                        state: n.state.as_bytes()[0],
+                                                        query_count: n.query_count,
+                                                        success_count: n.success_count,
+                                                        total_latency_ms: n.total_latency_ms,
+                                                        consecutive_failures: n
+                                                            .consecutive_failures,
+                                                        nodes_returned: n.nodes_returned,
+                                                        last_active: 0,
+                                                    }
+                                                })
+                                                .collect(),
+                                        };
+                                    if let Err(e) = conn.send_message(
+                                        crate::federation::protocol::MessageType::RangeReconcilePush,
+                                        &push_msg,
+                                    ).await {
+                                        warn!("[range] 推送本地多节点数据失败 to={}: {}", conn.node_id, e);
+                                    } else {
+                                        debug!("[range] 推送本地多节点数据 to={}: {} 条", conn.node_id, nodes.len());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[range] 加载本地多节点数据失败: {}", e);
+                            }
+                        }
+                    }
                 }
             }
             range_reconcile::RangeDecision::Descend => {
@@ -2897,6 +2945,52 @@ impl SyncManager {
                     }
                     self.metrics.record_message_sent();
                 }
+            }
+        }
+    }
+
+    /// P1-4：处理 Range 反熵推送（接收方）—— 将推送的节点数据写入本地数据库。
+    pub async fn handle_range_reconcile_push(
+        self: Arc<Self>,
+        conn: Arc<Connection>,
+        msg: crate::federation::protocol::RangeReconcilePushMessage,
+    ) {
+        if msg.repo != repo_type::NODE {
+            return;
+        }
+        let count = msg.nodes.len();
+        if count == 0 {
+            return;
+        }
+        // 批量写入本地数据库
+        let repo = self.node_repo.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut inserted = 0;
+            for n in &msg.nodes {
+                let mut id_arr = [0u8; 20];
+                if n.id.len() == 20 {
+                    id_arr.copy_from_slice(&n.id);
+                }
+                let addr = std::net::SocketAddr::new(
+                    n.ip.parse()
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
+                    n.port,
+                );
+                repo.add_node_sync(id_arr, addr);
+                inserted += 1;
+            }
+            inserted
+        })
+        .await;
+        match result {
+            Ok(inserted) => {
+                debug!(
+                    "[range] 收到推送节点数据 from={}: {} 条，写入成功",
+                    conn.node_id, inserted
+                );
+            }
+            Err(e) => {
+                warn!("[range] 处理推送节点数据失败 from={}: {}", conn.node_id, e);
             }
         }
     }
@@ -3361,7 +3455,19 @@ impl SyncManager {
         }
 
         let local_counts = self.local_entry_counts();
-        let digests = self.peer_digests.read();
+        // 先 clone 出 digest 数据，立即释放读锁，避免读锁 guard 跨 await 导致 Send 不满足
+        let digests: Vec<(NodeId, u32)> = {
+            let d = self.peer_digests.read();
+            d.iter()
+                .filter_map(|(peer, counts)| {
+                    if counts.is_empty() {
+                        None
+                    } else {
+                        Some((*peer, counts[0]))
+                    }
+                })
+                .collect()
+        };
 
         // 只检查 NODE repo（bootstrap 目前只支持 NODE）
         let local_node_count = local_counts[0] as u64;
@@ -3370,8 +3476,8 @@ impl SyncManager {
             return;
         }
 
-        for (peer, remote_counts) in digests.iter() {
-            let remote_node_count = remote_counts[0] as u64;
+        for (peer, remote_node_count) in digests {
+            let remote_node_count = remote_node_count as u64;
             if remote_node_count == 0 || local_node_count == 0 {
                 continue;
             }
@@ -3388,7 +3494,7 @@ impl SyncManager {
                     p.peer.len() == 20 && {
                         let mut arr = [0u8; 20];
                         arr.copy_from_slice(&p.peer);
-                        NodeId(arr) == *peer
+                        NodeId(arr) == peer
                             && p.repo == repo_type::NODE
                             && p.phase != bootstrap::BootstrapPhase::Done
                     }
@@ -3405,8 +3511,7 @@ impl SyncManager {
                 local_node_count, remote_node_count, ratio * 100.0, peer
             );
 
-            if let Some(conn) = self.connection_manager.get_connection(peer) {
-                drop(digests);
+            if let Some(conn) = self.connection_manager.get_connection(&peer) {
                 self.clone()
                     .start_bootstrap(conn.node_id, repo_type::NODE)
                     .await;

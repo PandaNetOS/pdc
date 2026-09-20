@@ -20,6 +20,7 @@ use crate::federation::protocol::{operation, repo_type, SyncEntry};
 use crate::dht::kbucket::{KBucketEntry, NodeState};
 use crate::storage::db::{DhtNodeRow, Storage};
 use crate::storage::repo_traits::{NodeId, NodeRepository};
+use crate::storage::sharded_map::ShardedHashMap;
 use crate::storage::tiered_cache::TieredCacheConfig;
 use crate::storage::write_queue::WriteQueue;
 
@@ -36,7 +37,7 @@ pub struct NodeStats {
 
 pub struct NodeRepoImpl {
     /// 鐙珛鑺傜偣瀛樺偍锛堟棤瀹归噺闄愬埗锛屾寜 addr 鍘婚噸锛夆€?FxHashMap 楂樻€ц兘
-    nodes: RwLock<FxHashMap<SocketAddr, KBucketEntry>>,
+    nodes: ShardedHashMap<SocketAddr, KBucketEntry>,
     /// 鑴忚妭鐐归泦鍚堬紙缁熻鏁版嵁宸插彉鍖栵紝闇€瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖栵級
     dirty: RwLock<FxHashSet<SocketAddr>>,
     /// /24 缃戞绱㈠紩锛圛Pv4 鍓?3 瀛楄妭 -> 璇ョ綉娈靛唴鑺傜偣 ID 鍒楄〃锛夛紝鐢ㄤ簬 O(1) 鍙栫綉娈?
@@ -65,7 +66,7 @@ impl NodeRepoImpl {
         _tier_enabled: bool,
     ) -> Self {
         Self {
-            nodes: RwLock::new(FxHashMap::default()),
+            nodes: ShardedHashMap::new(16),
             dirty: RwLock::new(FxHashSet::default()),
             subnet_index: RwLock::new(FxHashMap::default()),
             hot_addrs: RwLock::new(FxHashSet::default()),
@@ -100,7 +101,7 @@ impl NodeRepoImpl {
     /// NodeRepo 全量驻内存，全部计入 hot。
     pub async fn load_initial(&self, limit: usize) -> anyhow::Result<usize> {
         let rows = self.storage.load_hot_warm_nodes(7200, 0.0, limit)?;
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut count = 0;
         for row in rows {
@@ -126,6 +127,12 @@ impl NodeRepoImpl {
             }
             count += 1;
         }
+        // 预热加载的节点全部标记为热节点，供爬虫直接选取
+        let mut hot_addrs = self.hot_addrs.write();
+        for (_addr, entry) in nodes.iter() {
+            hot_addrs.insert(entry.addr);
+        }
+        drop(hot_addrs);
         Ok(count)
     }
 
@@ -243,7 +250,7 @@ impl NodeRepoImpl {
         if items.is_empty() {
             return Vec::new();
         }
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut new_pairs: Vec<(NodeId, SocketAddr)> = Vec::new();
         for (id, addr) in items {
@@ -291,7 +298,7 @@ impl NodeRepoImpl {
         if addrs.is_empty() {
             return 0;
         }
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut removed = 0usize;
         for addr in addrs {
@@ -379,11 +386,11 @@ impl NodeRepoImpl {
     }
 
     pub fn contains_sync(&self, addr: SocketAddr) -> bool {
-        self.nodes.read().contains_key(&addr)
+        self.nodes.contains_key(&addr)
     }
 
     pub fn len_sync(&self) -> usize {
-        self.nodes.read().len()
+        self.nodes.len()
     }
 
     // 鈹€鈹€ /24 缃戞绱㈠紩鏌ヨ锛圤(1) 瀹氫綅缃戞锛屼緵鑺傜偣閫夋嫨/鐩戞帶浣跨敤锛夆攢鈹€
@@ -409,7 +416,7 @@ impl NodeRepoImpl {
 
     /// 鑺傜偣缁熻淇℃伅锛堥伩鍏嶅叏閲忓厠闅嗭紝鐢ㄤ簬鍋ュ悍搴﹁绠楀拰鐩戞帶锛?
     pub fn stats_sync(&self) -> NodeStats {
-        let nodes = self.nodes.read();
+        let nodes = self.nodes.read_all();
         let mut good = 0;
         let mut questionable = 0;
         let mut bad = 0;
@@ -441,7 +448,7 @@ impl NodeRepoImpl {
     }
 
     pub fn top_nodes_sync(&self, n: usize) -> Vec<KBucketEntry> {
-        let mut all: Vec<KBucketEntry> = self.nodes.read().values().cloned().collect();
+        let mut all: Vec<KBucketEntry> = self.nodes.read_all().values().cloned().collect();
         all.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -452,11 +459,11 @@ impl NodeRepoImpl {
     }
 
     pub fn all_nodes_sync(&self) -> Vec<KBucketEntry> {
-        self.nodes.read().values().cloned().collect()
+        self.nodes.read_all().values().cloned().collect()
     }
 
     pub fn record_query_sync(&self, addr: SocketAddr, success: bool, latency_ms: u64) {
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         if let Some(entry) = nodes.get_mut(&addr) {
             entry.query_count += 1;
             entry.last_query_time = Some(Instant::now());
@@ -485,7 +492,7 @@ impl NodeRepoImpl {
         latency_ms: u64,
         nodes_returned: u64,
     ) {
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         if let Some(entry) = nodes.get_mut(&addr) {
             entry.query_count += 1;
             entry.success_count += 1;
@@ -503,10 +510,10 @@ impl NodeRepoImpl {
 
     /// 鍒锋柊鎵€鏈夎妭鐐圭姸鎬侊紙鍩轰簬鏈€鍚庢椿璺冩椂闂存洿鏂?Good/Questionable锛?
     pub fn refresh_all_states_sync(&self) {
-        let mut nodes = self.nodes.write();
-        for entry in nodes.values_mut() {
+        let mut nodes = self.nodes.write_all();
+        nodes.for_values_mut(|entry| {
             entry.refresh_state();
-        }
+        });
     }
 
     // 鈹€鈹€ 鍐风儹鍒嗗眰绱㈠紩锛堝唴瀛樼储寮曟鏋讹紝涓嶆惉鏁版嵁锛岀敱澶栭儴 TaskScheduler 璋冨害杩佺Щ锛夆攢鈹€
@@ -514,7 +521,7 @@ impl NodeRepoImpl {
     /// 鏍囪鑺傜偣琚闂紙鏇存柊 last_accessed锛岀Щ鍏?hot 闆嗗悎锛屼粠 cold 绉婚櫎锛?
     pub fn mark_accessed_sync(&self, addr: SocketAddr) {
         let found = {
-            let mut nodes = self.nodes.write();
+            let mut nodes = self.nodes.write_all();
             if let Some(entry) = nodes.get_mut(&addr) {
                 entry.last_accessed = Some(Instant::now());
                 true
@@ -530,7 +537,7 @@ impl NodeRepoImpl {
 
     /// 杩斿洖鐑妭鐐瑰垪琛紙hot 闆嗗悎涓殑鑺傜偣锛屾寜璇勫垎闄嶅簭鐢辫皟鐢ㄦ柟鎺掑簭锛?
     pub fn hot_nodes_sync(&self) -> Vec<KBucketEntry> {
-        let nodes = self.nodes.read();
+        let nodes = self.nodes.read_all();
         self.hot_addrs
             .read()
             .iter()
@@ -542,7 +549,7 @@ impl NodeRepoImpl {
     /// 杩斿洖鏈杩佺Щ鐨勮妭鐐规暟
     pub fn migrate_hot_to_cold_sync(&self, threshold_secs: u64) -> usize {
         let cutoff = crate::utils::cutoff_before(Duration::from_secs(threshold_secs));
-        let nodes = self.nodes.read();
+        let nodes = self.nodes.read_all();
         let mut hot = self.hot_addrs.write();
         let mut cold = self.cold_addrs.write();
         let to_move: Vec<SocketAddr> = hot
@@ -626,7 +633,7 @@ impl NodeRepoImpl {
 
     /// 鏍规嵁 dirty 鍦板潃鍒楄〃鏋勫缓 DhtNodeRow 鎵归噺锛堜粠鍐呭瓨 nodes 璇诲彇锛屼笉淇敼浠讳綍鐘舵€侊級
     fn build_dirty_batch(&self, dirty_addrs: &[SocketAddr]) -> Vec<DhtNodeRow> {
-        let nodes = self.nodes.read();
+        let nodes = self.nodes.read_all();
         dirty_addrs
             .iter()
             .filter_map(|addr| nodes.get(addr))
@@ -655,7 +662,7 @@ impl NodeRepoImpl {
 
     /// 鎵归噺鏇存柊璇勫垎锛堜竴娆″啓閿侊紝閬垮厤閫愪釜鏇存柊鐨勯攣绔炰簤锛?
     pub fn update_scores_batch_sync(&self, scores: &[(SocketAddr, f64)]) {
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut dirty = self.dirty.write();
         for (addr, score) in scores {
             if let Some(entry) = nodes.get_mut(addr) {
@@ -673,7 +680,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn remove_node(&self, addr: &SocketAddr) -> bool {
-        let removed_entry = self.nodes.write().remove(addr);
+        let removed_entry = self.nodes.remove(addr);
         let Some(entry) = removed_entry else {
             return false;
         };
@@ -719,7 +726,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn get_node(&self, addr: &SocketAddr) -> Option<KBucketEntry> {
-        self.nodes.read().get(addr).cloned()
+        self.nodes.get(addr)
     }
 
     async fn all_nodes(&self) -> Vec<KBucketEntry> {
@@ -731,7 +738,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
+        self.nodes.is_empty()
     }
 
     async fn top_nodes(&self, n: usize) -> Vec<KBucketEntry> {
@@ -771,9 +778,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn update_score(&self, addr: &SocketAddr, score: f64) {
-        if let Some(entry) = self.nodes.write().get_mut(addr) {
-            entry.score = score;
-        }
+        self.nodes.with_mut(addr, |entry| entry.score = score);
     }
 
     async fn update_scores_batch(&self, scores: &[(SocketAddr, f64)]) {
@@ -785,9 +790,7 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn set_node_state(&self, addr: &SocketAddr, state: NodeState) {
-        if let Some(entry) = self.nodes.write().get_mut(addr) {
-            entry.state = state;
-        }
+        self.nodes.with_mut(addr, |entry| entry.state = state);
         // 鐘舵€佸彉鍖栦篃鏍囪涓鸿剰
         self.dirty.write().insert(*addr);
     }
@@ -890,7 +893,7 @@ impl NodeRepository for NodeRepoImpl {
 
     async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_dht_nodes()?;
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut count = 0;
         for row in rows {
@@ -941,7 +944,7 @@ impl NodeRepository for NodeRepoImpl {
 
         // 绗竴閬嶏細璇婚攣鍐呭揩鐓у€欓€夊湴鍧€锛堥伩鍏嶆寔鍐欓攣闀挎椂闂撮亶鍘嗭級
         let candidates: Vec<(SocketAddr, NodeId)> = {
-            let nodes = self.nodes.read();
+            let nodes = self.nodes.read_all();
             nodes
                 .iter()
                 .filter(|(_, e)| e.last_active < cutoff)
@@ -954,7 +957,7 @@ impl NodeRepository for NodeRepoImpl {
 
         // 绗簩閬嶏細鎸佸啓閿佹壒閲忕Щ闄わ紝鍚屾娓呯悊 /24 绱㈠紩銆佺儹/鍐烽泦鍚堜笌鑴忔爣璁般€?
         // 娉ㄦ剰锛氫笉鎶婅绉婚櫎鑺傜偣鍔犲叆 dirty 闆嗗悎鈥斺€擠B 琛屾案涔呬繚鐣欙紝鍒犻櫎浠呬綔鐢ㄤ簬鍐呭瓨銆?
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut hot = self.hot_addrs.write();
         let mut cold = self.cold_addrs.write();
@@ -981,7 +984,7 @@ impl NodeRepository for NodeRepoImpl {
 
     /// 按数量驱逐：内存中节点数超过 max_count 时，驱逐最久未活跃的节点。
     fn evict_by_count(&self, max_count: usize) -> usize {
-        let total = self.nodes.read().len();
+        let total = self.nodes.len();
         if total <= max_count {
             return 0;
         }
@@ -989,7 +992,7 @@ impl NodeRepository for NodeRepoImpl {
 
         // 第一遍：读锁内收集候选地址（按 last_active 升序，最久未活跃的在前）
         let candidates: Vec<SocketAddr> = {
-            let nodes = self.nodes.read();
+            let nodes = self.nodes.read_all();
             let mut entries: Vec<(SocketAddr, Instant)> = nodes
                 .iter()
                 .map(|(addr, e)| (*addr, e.last_active))
@@ -1003,7 +1006,7 @@ impl NodeRepository for NodeRepoImpl {
         };
 
         // 第二遍：写锁批量移除
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut hot = self.hot_addrs.write();
         let mut cold = self.cold_addrs.write();
@@ -1067,8 +1070,8 @@ mod tests {
         // 鎶?warm 鎺ㄥ埌闃堝€煎唴鍋忎箙銆乧old 鎺ㄥ埌瓒呰繃 warm 闃堝€硷紙7200s锛?
         let warm_cutoff = crate::utils::cutoff_before(Duration::from_secs(3600));
         let cold_cutoff = crate::utils::cutoff_before(Duration::from_secs(10_000));
-        repo.nodes.write().get_mut(&warm).unwrap().last_active = warm_cutoff;
-        repo.nodes.write().get_mut(&cold).unwrap().last_active = cold_cutoff;
+        repo.nodes.with_mut(&warm, |e| e.last_active = warm_cutoff);
+        repo.nodes.with_mut(&cold, |e| e.last_active = cold_cutoff);
 
         // warm_threshold = 7200s: only cold should be evicted
         let removed = repo.remove_cold_nodes(7200).await.unwrap();

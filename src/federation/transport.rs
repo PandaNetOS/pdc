@@ -183,6 +183,38 @@ impl TcpTransport {
         Ok(())
     }
 
+    /// 高优先级发送：短时间内自旋 try_lock，避免心跳消息排在大同步消息后面
+    pub async fn send_message_high_priority<T: Serialize>(
+        &self,
+        msg_type: MessageType,
+        msg: &T,
+    ) -> anyhow::Result<()> {
+        let frame = encode_message(msg_type, msg)?;
+        let frame_len = frame.len();
+        // 高优先级：最多自旋 20ms，拿不到锁再正常排队
+        let mut writer = {
+            let mut attempts = 0;
+            loop {
+                match self.writer.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(_) => {
+                        attempts += 1;
+                        if attempts >= 20 {
+                            break self.writer.lock().await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        };
+        self.write_frame_with_retry(&mut writer.writer, &frame)
+            .await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_bytes_sent(frame_len as u64);
+        }
+        Ok(())
+    }
+
     /// 发送原始帧字节
     pub async fn send_raw(&self, frame: &[u8]) -> anyhow::Result<()> {
         let mut writer = self.writer.lock().await;

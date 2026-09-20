@@ -28,7 +28,7 @@ pub const DEFAULT_MAX_DEPTH: u8 = 16;
 /// 单条响应携带的最大叶子条数（防止超大帧）。
 pub const MAX_LEAF_ENTRIES: usize = 4096;
 /// 单轮诊断抽样的区间数。
-pub const DEFAULT_SAMPLE_RANGES: u32 = 8;
+pub const DEFAULT_SAMPLE_RANGES: u32 = 160;
 
 /// 区间摘要：对按 key 升序的 `(key, data_hash)` 列表拼接后取 blake3。
 ///

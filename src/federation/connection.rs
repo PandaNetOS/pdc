@@ -123,7 +123,17 @@ impl Connection {
         msg_type: MessageType,
         msg: &T,
     ) -> anyhow::Result<()> {
-        self.transport.send_message(msg_type, msg).await?;
+        // Ping/Pong 走高优先级通道，避免排在大同步消息后面导致心跳超时
+        match msg_type {
+            MessageType::Ping | MessageType::Pong => {
+                self.transport
+                    .send_message_high_priority(msg_type, msg)
+                    .await?;
+            }
+            _ => {
+                self.transport.send_message(msg_type, msg).await?;
+            }
+        }
         *self.last_active.write() = Instant::now();
         Ok(())
     }
@@ -186,6 +196,11 @@ pub struct ConnectionManager {
     metrics: Arc<FederationMetrics>,
     /// 重连冷却到期时间（NodeId -> 冷却截止时刻），断开后在此时间内不主动重连
     cooldown_until: RwLock<FxHashMap<NodeId, Instant>>,
+    /// 地址级重连冷却（SocketAddr -> 冷却截止时刻）
+    /// 重连时用 temp_id 还不知道 node_id，所以按地址冷却，防止连续建连死循环
+    cooldown_addr: RwLock<FxHashMap<SocketAddr, Instant>>,
+    /// 禁止出站的 node_id 集合（NodeId 仲裁后，大 node_id 不主动出站）
+    no_outbound: RwLock<FxHashSet<NodeId>>,
     /// 重量级消息处理的有界并发信号量（GossipBatch/MerkleRepair 经 spawn_blocking 执行，
     /// 先 acquire permit 再 spawn，避免无界生成阻塞任务导致内存暴涨）
     heavy_task_semaphore: Arc<Semaphore>,
@@ -230,6 +245,8 @@ impl ConnectionManager {
             net_agent: OnceCell::new(),
             metrics,
             cooldown_until: RwLock::new(FxHashMap::default()),
+            cooldown_addr: RwLock::new(FxHashMap::default()),
+            no_outbound: RwLock::new(FxHashSet::default()),
             heavy_task_semaphore: Arc::new(Semaphore::new(
                 config.heavy_task_max_concurrency.max(1),
             )),
@@ -398,7 +415,7 @@ impl ConnectionManager {
             // 这样两边用同一规则，不会同时 drop 导致重连循环
             if self.connections.read().contains_key(&node_id) {
                 let local_id = self.identity.node_id;
-                if local_id < node_id {
+                if local_id.0 < node_id.0 {
                     // 本节点 node_id 更小：保留已有的出站连接，关闭入站
                     debug!(
                         "[federation] 双向连接仲裁：本节点 {} < 对端 {}，保留出站，关闭入站",
@@ -408,10 +425,12 @@ impl ConnectionManager {
                 } else {
                     // 本节点 node_id 更大：保留入站，关闭已有的出站连接
                     info!(
-                        "[federation] 双向连接仲裁：本节点 {} > 对端 {}，关闭出站，保留入站",
+                        "[federation] 双向连接仲裁：本节点 {} > 对端 {}，关闭出站，保留入站，加入禁止出站",
                         local_id, node_id
                     );
                     self.connections.write().remove(&node_id);
+                    // 记录禁止出站：以后不主动连这个节点（我是大的，应该等入站）
+                    self.no_outbound.write().insert(node_id);
                 }
             }
 
@@ -533,6 +552,15 @@ impl ConnectionManager {
             return Ok(conn);
         }
 
+        // 检查是否在禁止出站列表（NodeId 仲裁后，大 node_id 不主动出站）
+        if self.no_outbound.read().contains(&node_id) {
+            debug!(
+                "[federation] 节点 {} 在禁止出站列表（仲裁后本节点更大），跳过出站",
+                node_id
+            );
+            anyhow::bail!("节点 {} 在禁止出站列表，不主动出站", node_id);
+        }
+
         // per-node 连接锁：持有至连接建立/失败，串行化出站与入站方向的握手
         let lock = self.get_connecting_lock(node_id);
         let _guard = lock.lock().await;
@@ -542,8 +570,20 @@ impl ConnectionManager {
             return Ok(conn);
         }
 
-        // 检查重连冷却期：断开后 N 秒内不主动重连同一节点
+        // 检查地址级重连冷却（比 node_id 冷却更早，因为重连用 temp_id 还不知道 node_id）
         let now = Instant::now();
+        if let Some(until) = self.cooldown_addr.read().get(&addr) {
+            if now < *until {
+                let remaining = *until - now;
+                debug!(
+                    "[federation] 地址 {} 在重连冷却期内（剩余 {:?}），跳过连接",
+                    addr, remaining
+                );
+                anyhow::bail!("地址 {} 在重连冷却期内", addr);
+            }
+        }
+
+        // 检查 node_id 级重连冷却期：断开后 N 秒内不主动重连同一节点
         if let Some(until) = self.cooldown_until.read().get(&node_id) {
             if now < *until {
                 let remaining = *until - now;
@@ -885,9 +925,15 @@ impl ConnectionManager {
     pub fn remove_connection(&self, node_id: &NodeId) {
         // 记录重连冷却到期时间，防止立即重连形成循环
         let cooldown = Duration::from_secs(self.config.reconnect_cooldown_secs);
-        self.cooldown_until
-            .write()
-            .insert(*node_id, Instant::now() + cooldown);
+        let now = Instant::now();
+        self.cooldown_until.write().insert(*node_id, now + cooldown);
+
+        // 同时记录地址级冷却（从连接里拿 addr）
+        if let Some(conn) = self.connections.read().get(node_id) {
+            if let Ok(addr) = conn.transport.peer_addr() {
+                self.cooldown_addr.write().insert(addr, now + cooldown);
+            }
+        }
 
         // 清理该节点的连接锁，防止 connecting_locks 无界增长
         self.connecting_locks.write().remove(node_id);
@@ -911,6 +957,7 @@ impl ConnectionManager {
     fn prune_cooldowns(&self) {
         let now = Instant::now();
         self.cooldown_until.write().retain(|_, until| now < *until);
+        self.cooldown_addr.write().retain(|_, until| now < *until);
     }
 
     /// 清理未被持有的连接锁（仅 map 持有强引用者），防止 connecting_locks 无界增长。
@@ -964,27 +1011,55 @@ impl ConnectionManager {
     async fn spawn_message_handler(self: Arc<Self>, connection: Arc<Connection>) {
         let mut shutdown_rx = self.shutdown.subscribe();
         let conn_id = connection.node_id;
+        let pending_threshold = self.config.receive_pending_threshold;
 
-        // Gossip flush 已迁移到 TaskScheduler：由 flush_all_gossip_buffers() 定期遍历所有连接 flush
+        // 接收和处理分离：接收循环只管收，丢到队列；后台 worker 线程慢慢处理
+        // 这样收消息永远不阻塞，Ping 心跳能及时收到
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(MessageType, Vec<u8>)>(256);
 
+        // 接收循环：只收消息，丢到队列
+        let recv_self = self.clone();
+        let recv_conn = connection.clone();
+        let recv_shutdown = self.shutdown.subscribe();
         tokio::spawn(async move {
-            // [ALLOWED-INTERVAL] 协议级网络接收循环（每条连接一个），阻塞在 recv_message，非定时任务，不迁移
-            let pending_threshold = self.config.receive_pending_threshold;
+            let mut shutdown_rx = recv_shutdown;
             loop {
                 tokio::select! {
-                    result = connection.recv_message() => {
+                    result = recv_conn.recv_message() => {
                         match result {
                             Ok((msg_type, payload)) => {
-                                // 接收端背压监控：计入待处理消息
-                                connection.pending.fetch_add(1, Ordering::Relaxed);
-                                // dispatch 返回 true 表示已异步卸载（重量级任务），
-                                // pending 计数由卸载任务完成后自行递减；
-                                // 返回 false 表示同步处理已完成，此处立即递减。
+                                recv_conn.pending.fetch_add(1, Ordering::Relaxed);
+                                // 丢到处理队列，立即继续收
+                                if tx.send((msg_type, payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                debug!("[federation] 连接 {} 读取失败: {}", conn_id, e);
+                                recv_self.remove_connection(&conn_id);
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 处理循环：从队列取消息，后台慢慢处理
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_msg = rx.recv() => {
+                        match maybe_msg {
+                            Some((msg_type, payload)) => {
                                 let offloaded = self.clone().dispatch_message(connection.clone(), msg_type, payload).await;
                                 if !offloaded {
                                     connection.pending.fetch_sub(1, Ordering::Relaxed);
                                 }
-                                // 背压告警：单连接待处理积压超过阈值
+                                // 背压告警
                                 let pending = connection.pending.load(Ordering::Relaxed);
                                 if pending > pending_threshold {
                                     warn!(
@@ -993,11 +1068,7 @@ impl ConnectionManager {
                                     );
                                 }
                             }
-                            Err(e) => {
-                                debug!("[federation] 连接 {} 读取失败: {}", conn_id, e);
-                                self.remove_connection(&conn_id);
-                                break;
-                            }
+                            None => break,
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -1492,6 +1563,24 @@ impl ConnectionManager {
                     }
                 }
                 false
+            }
+            MessageType::RangeReconcilePush => {
+                // P1-4：Range 反熵推送（接收方）—— 写入本地数据库
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<RangeReconcilePushMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_range_reconcile_push(conn, msg).await;
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
             }
             MessageType::BootstrapManifestRequest => {
                 // P2-1：bootstrap 清单请求（应答方）—— 建 w0 水位 + 有序逻辑分块清单（异步）
