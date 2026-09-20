@@ -98,6 +98,37 @@ impl NodeRepoImpl {
 
     /// 分层缓存统计（与 TrackerRepo 接口一致：(hot, warm, cold_loaded)）。
     /// NodeRepo 全量驻内存，全部计入 hot。
+    pub async fn load_initial(&self, limit: usize) -> anyhow::Result<usize> {
+        let rows = self.storage.load_hot_warm_nodes(7200, 0.0, limit)?;
+        let mut nodes = self.nodes.write();
+        let mut subnet_index = self.subnet_index.write();
+        let mut count = 0;
+        for row in rows {
+            let addr = SocketAddr::new(row.ip.parse().unwrap_or([127, 0, 0, 1].into()), row.port);
+            let mut entry = KBucketEntry::new(row.id, addr);
+            entry.score = row.score;
+            entry.query_count = row.query_count;
+            entry.success_count = row.success_count;
+            entry.total_latency_ms = row.total_latency_ms;
+            entry.consecutive_failures = row.consecutive_failures;
+            entry.nodes_returned = row.nodes_returned;
+            entry.last_query_time = row
+                .last_query_time
+                .map(|secs| crate::utils::cutoff_before(Duration::from_secs(secs.max(0) as u64)));
+            entry.state = match row.state.as_str() {
+                "Good" => NodeState::Good,
+                "Questionable" => NodeState::Questionable,
+                _ => NodeState::Bad,
+            };
+            nodes.insert(addr, entry);
+            if let Some(subnet) = Self::subnet_key(addr) {
+                Self::index_subnet(&mut subnet_index, subnet, row.id);
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
     pub fn cache_stats(&self) -> (usize, usize, u64) {
         (self.len_sync(), 0, 0)
     }
@@ -946,6 +977,64 @@ impl NodeRepository for NodeRepoImpl {
             }
         }
         Ok(removed)
+    }
+
+    /// 按数量驱逐：内存中节点数超过 max_count 时，驱逐最久未活跃的节点。
+    fn evict_by_count(&self, max_count: usize) -> usize {
+        let total = self.nodes.read().len();
+        if total <= max_count {
+            return 0;
+        }
+        let to_remove = total - max_count;
+
+        // 第一遍：读锁内收集候选地址（按 last_active 升序，最久未活跃的在前）
+        let candidates: Vec<SocketAddr> = {
+            let nodes = self.nodes.read();
+            let mut entries: Vec<(SocketAddr, Instant)> = nodes
+                .iter()
+                .map(|(addr, e)| (*addr, e.last_active))
+                .collect();
+            entries.sort_by_key(|(_, last)| *last);
+            entries
+                .into_iter()
+                .take(to_remove)
+                .map(|(addr, _)| addr)
+                .collect()
+        };
+
+        // 第二遍：写锁批量移除
+        let mut nodes = self.nodes.write();
+        let mut subnet_index = self.subnet_index.write();
+        let mut hot = self.hot_addrs.write();
+        let mut cold = self.cold_addrs.write();
+        let mut dirty = self.dirty.write();
+        let mut removed = 0;
+        for addr in &candidates {
+            if nodes.remove(addr).is_some() {
+                removed += 1;
+                if let Some(subnet) = Self::subnet_key(*addr) {
+                    if let Some(bucket) = subnet_index.get_mut(&subnet) {
+                        bucket.retain(|x| !nodes.contains_key(addr));
+                        if bucket.is_empty() {
+                            subnet_index.remove(&subnet);
+                        }
+                    }
+                }
+                hot.remove(addr);
+                cold.remove(addr);
+                dirty.remove(addr);
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                "[node_repo] 按数量驱逐: {} 个节点（内存 {}→{}，上限 {}）",
+                removed,
+                total,
+                total - removed,
+                max_count
+            );
+        }
+        removed
     }
 }
 

@@ -1491,6 +1491,58 @@ impl Storage {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// 限量加载 peers（按最近活跃降序 + LIMIT），供启动预加载
+    pub fn load_limited_peers(&self, limit: usize) -> anyhow::Result<Vec<PeerRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active
+             FROM peers WHERE deleted_at IS NULL
+             ORDER BY last_active DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let ih: Vec<u8> = row.get(0)?;
+            let mut arr = [0u8; 20];
+            if ih.len() == 20 {
+                arr.copy_from_slice(&ih);
+            }
+            Ok(PeerRow {
+                infohash: arr,
+                ip: row.get(1)?,
+                port: row.get::<_, i64>(2)? as u16,
+                source: row.get(3)?,
+                score: row.get(4)?,
+                connection_attempts: row.get::<_, i64>(5)? as u32,
+                connection_successes: row.get::<_, i64>(6)? as u32,
+                last_active: row.get(7)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// 限量加载 infohashes（按引用数降序 + LIMIT），供启动预加载
+    pub fn load_limited_infohashes(&self, limit: usize) -> anyhow::Result<Vec<InfohashRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT infohash, ref_count, first_source, score
+             FROM infohashes WHERE deleted_at IS NULL
+             ORDER BY ref_count DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let ih: Vec<u8> = row.get(0)?;
+            let mut arr = [0u8; 20];
+            if ih.len() == 20 {
+                arr.copy_from_slice(&ih);
+            }
+            Ok(InfohashRow {
+                infohash: arr,
+                ref_count: row.get::<_, i64>(1)? as u32,
+                first_source: row.get(2)?,
+                score: row.get::<_, f64>(3).unwrap_or(0.0),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// 按 (ip, port) 加载单个 DHT 节点（缓存未命中时按需加载）。
     pub fn load_dht_node_by_addr(&self, ip: &str, port: u16) -> anyhow::Result<Option<DhtNodeRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());

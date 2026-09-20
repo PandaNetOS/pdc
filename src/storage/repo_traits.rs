@@ -90,6 +90,10 @@ pub trait NodeRepository: Send + Sync {
     /// 冷数据驱逐：从内存表移除 last_active 超过 `older_than_secs` 的节点，返回实际移除数。
     /// DB 中永久保留（不删除行）；驱逐前实现会先确保脏数据落库，避免丢失未持久化更新。
     async fn remove_cold_nodes(&self, older_than_secs: u64) -> anyhow::Result<usize>;
+
+    /// 按数量驱逐：内存中节点数超过 max_count 时，驱逐最久未活跃的节点，直到剩余 max_count 个。
+    /// 返回实际移除数。DB 中永久保留。
+    fn evict_by_count(&self, max_count: usize) -> usize;
 }
 
 // ---------------------------------------------------------------------------

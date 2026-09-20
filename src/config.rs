@@ -609,6 +609,9 @@ pub struct TierConfig {
     /// 紧急驱逐触发阈值（内存占比，默认 0.90=90%）
     #[serde(default = "default_tier_emergency_threshold")]
     pub emergency_threshold: f64,
+    /// 启动预加载条目数（默认 100000；其余数据保留在 DB 中按需迁移）
+    #[serde(default = "default_tier_preload_top_n")]
+    pub preload_top_n: usize,
 }
 
 impl Default for TierConfig {
@@ -624,6 +627,7 @@ impl Default for TierConfig {
             evict_interval_secs: default_tier_evict_interval_secs(),
             memory_monitor_interval_secs: default_tier_memory_monitor_interval_secs(),
             emergency_threshold: default_tier_emergency_threshold(),
+            preload_top_n: default_tier_preload_top_n(),
         }
     }
 }
@@ -657,6 +661,9 @@ fn default_tier_memory_monitor_interval_secs() -> u64 {
 }
 fn default_tier_emergency_threshold() -> f64 {
     0.90
+}
+fn default_tier_preload_top_n() -> usize {
+    100_000
 }
 
 impl Default for PdcConfig {

@@ -372,8 +372,18 @@ impl InfohashRepoImpl {
         self.save_all().await
     }
 
+    /// 启动时限量加载：按引用数降序加载最多 limit 个 infohash。
+    pub async fn load_initial(&self, limit: usize) -> anyhow::Result<usize> {
+        let rows = self.storage.load_limited_infohashes(limit)?;
+        Ok(self.ingest_rows(rows))
+    }
+
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_infohashes()?;
+        Ok(self.ingest_rows(rows))
+    }
+
+    fn ingest_rows(&self, rows: Vec<crate::storage::db::InfohashRow>) -> usize {
         let mut cache = self.cache.write();
         let mut count = 0;
         for row in rows {
@@ -383,7 +393,7 @@ impl InfohashRepoImpl {
             );
             count += 1;
         }
-        Ok(count)
+        count
     }
 }
 

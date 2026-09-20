@@ -567,11 +567,22 @@ impl PeerRepoImpl {
         self.save_all().await
     }
 
+    /// 启动时限量加载：按最近活跃降序加载最多 limit 个 peer。
+    pub async fn load_initial(&self, limit: usize) -> anyhow::Result<usize> {
+        let rows = self.storage.load_limited_peers(limit)?;
+        Ok(self.ingest_rows(&rows))
+    }
+
     pub async fn load_all(&self) -> anyhow::Result<usize> {
         let rows = self.storage.load_peers()?;
+        Ok(self.ingest_rows(&rows))
+    }
+
+    /// 将 DB 行批量写入内存缓存（load_initial / load_all 共用）
+    fn ingest_rows(&self, rows: &[crate::storage::db::PeerRow]) -> usize {
         let mut cache = self.cache.write();
         let mut count = 0;
-        for row in &rows {
+        for row in rows {
             let addr = SocketAddr::new(row.ip.parse().unwrap_or([127, 0, 0, 1].into()), row.port);
             let source = match row.source.as_str() {
                 "tracker" => PeerSource::Tracker,
@@ -605,7 +616,7 @@ impl PeerRepoImpl {
                 .insert(row.infohash);
             count += 1;
         }
-        Ok(count)
+        count
     }
 }
 

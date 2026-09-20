@@ -1500,7 +1500,7 @@ impl SyncManager {
     /// 只有通过 Gossip 收到的少量条目会被计入，导致 super_node 报告的条目数远低于实际）。
     pub(crate) fn local_entry_counts(&self) -> Vec<u32> {
         vec![
-            self.node_repo.len_sync() as u32,
+            self.node_repo.total_count_sync() as u32,
             self.peer_repo.as_ref().map(|r| r.len() as u32).unwrap_or(0),
             self.infohash_repo
                 .as_ref()
@@ -3347,6 +3347,70 @@ impl SyncManager {
                     // 无清单或已到末尾：重拉清单
                     self.clone().start_bootstrap(peer, p.repo).await;
                 }
+            }
+        }
+
+        // 定期检查：对比本地与对端各 repo 总数，差 20% 以上自动触发 bootstrap
+        self.check_and_trigger_bootstrap().await;
+    }
+
+    /// 定期检查本地与对端各 repo 总数差异，差 20% 以上自动触发 bootstrap
+    async fn check_and_trigger_bootstrap(self: &Arc<Self>) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+
+        let local_counts = self.local_entry_counts();
+        let digests = self.peer_digests.read();
+
+        // 只检查 NODE repo（bootstrap 目前只支持 NODE）
+        let local_node_count = local_counts[0] as u64;
+        if local_node_count < 1000 {
+            // 本地数据太少（启动初期），不触发
+            return;
+        }
+
+        for (peer, remote_counts) in digests.iter() {
+            let remote_node_count = remote_counts[0] as u64;
+            if remote_node_count == 0 || local_node_count == 0 {
+                continue;
+            }
+
+            // 对端比本地多 20% 以上才触发
+            let ratio = remote_node_count as f64 / local_node_count as f64;
+            if ratio < 1.2 {
+                continue;
+            }
+
+            // 检查是否已有进行中的 bootstrap
+            let already_running = if let Ok(list) = self.delta_storage().bootstrap_list() {
+                list.iter().any(|p| {
+                    p.peer.len() == 20 && {
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(&p.peer);
+                        NodeId(arr) == *peer
+                            && p.repo == repo_type::NODE
+                            && p.phase != bootstrap::BootstrapPhase::Done
+                    }
+                })
+            } else {
+                false
+            };
+            if already_running {
+                continue;
+            }
+
+            info!(
+                "[bootstrap] 检测到差异: local={}, remote={}, ratio={:.1}%, 触发 bootstrap: peer={}",
+                local_node_count, remote_node_count, ratio * 100.0, peer
+            );
+
+            if let Some(conn) = self.connection_manager.get_connection(peer) {
+                drop(digests);
+                self.clone()
+                    .start_bootstrap(conn.node_id, repo_type::NODE)
+                    .await;
+                return; // 一次只触发一个
             }
         }
     }

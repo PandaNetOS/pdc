@@ -1,4 +1,4 @@
-﻿//! 爬虫引擎实现
+//! 爬虫引擎实现
 //!
 //! 主动 + 被动混合 DHT 爬虫：
 //! 1. 加入 DHT 网络（通过 bootstrap 节点发 find_node 获取初始路由）
@@ -487,30 +487,26 @@ impl CrawlerEngine {
     /// 从 NodeRepo(SQLite) 加载路由表（启动时调用）
     /// 优先从 SQLite 加载，兼容旧版 JSON 文件
     async fn load_routing_table(&self) -> usize {
-        // 从 NodeRepo(SQLite) 加载到 NodeRepo（无容量限制，主候选池）
+        // NodeRepo 已由 main.rs 的 load_initial() 预加载到内存，
+        // crawler 直接使用内存中的节点，不再全量从 SQLite 加载。
         if let Some(repo) = &self.node_repo {
-            match repo.load_all().await {
-                Ok(count) => {
-                    if count > 0 {
-                        info!("[crawler] 从 SQLite(NodeRepo) 加载了 {} 个节点", count);
-                        // 同时把 top 节点加入路由表（用于 DHT 路由响应，K限制可能拒绝部分）
-                        let top_nodes = repo.top_nodes_sync(128);
-                        let mut rt = self.known_nodes.write();
-                        let mut rt_added = 0;
-                        for entry in &top_nodes {
-                            if rt.add_node(entry.id, entry.addr) {
-                                rt_added += 1;
-                            }
-                        }
-                        info!(
-                            "[crawler] 路由表加入 {}/{} 个 top 节点（K=16限制）",
-                            rt_added,
-                            top_nodes.len()
-                        );
-                        return count;
+            let count = repo.len_sync();
+            if count > 0 {
+                info!("[crawler] 使用 NodeRepo 内存中 {} 个节点", count);
+                let top_nodes = repo.top_nodes_sync(128);
+                let mut rt = self.known_nodes.write();
+                let mut rt_added = 0;
+                for entry in &top_nodes {
+                    if rt.add_node(entry.id, entry.addr) {
+                        rt_added += 1;
                     }
                 }
-                Err(e) => warn!("[crawler] 从 SQLite 加载失败: {}", e),
+                info!(
+                    "[crawler] 路由表加入 {}/{} 个 top 节点（K=16限制）",
+                    rt_added,
+                    top_nodes.len()
+                );
+                return count;
             }
         }
         info!("[crawler] 无路由表持久化数据，冷启动");
@@ -2337,39 +2333,8 @@ impl Crawler for CrawlerEngine {
             state.started_at = Some(Instant::now());
         }
 
-        // 从 SQLite 加载路由表
-        if let Some(storage) = &self.storage {
-            match storage.load_dht_nodes() {
-                Ok(rows) if !rows.is_empty() => {
-                    let mut table = self.known_nodes.write();
-                    for row in &rows {
-                        let addr =
-                            format!("{}:{}", row.ip, row.port)
-                                .parse()
-                                .unwrap_or_else(|_| {
-                                    std::net::SocketAddr::new(
-                                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                                        0,
-                                    )
-                                });
-                        let mut entry = crate::dht::kbucket::KBucketEntry::new(row.id, addr);
-                        entry.score = row.score;
-                        entry.query_count = row.query_count;
-                        entry.success_count = row.success_count;
-                        entry.total_latency_ms = row.total_latency_ms;
-                        entry.consecutive_failures = row.consecutive_failures;
-                        table.add_entry(entry);
-                    }
-                    info!("[crawler] 从 SQLite 加载了 {} 个 DHT 节点", rows.len());
-                }
-                Ok(_) => {
-                    info!("[crawler] SQLite 中无 DHT 节点记录，使用 bootstrap 节点");
-                }
-                Err(e) => {
-                    warn!("[crawler] 从 SQLite 加载 DHT 节点失败: {}", e);
-                }
-            }
-        }
+        // 路由表加载：使用 NodeRepo 内存中已预加载的节点（不再全量从 SQLite 加载）
+        self.load_routing_table().await;
 
         let engine = self.clone_for_async();
         tokio::spawn(async move {

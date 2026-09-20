@@ -482,16 +482,20 @@ async fn async_main(
         Ok(n) if n > 0 => info!("[main] 从 SQLite 加载了 {} 个 Tracker", n),
         _ => {}
     }
-    match infohash_repo.load_all().await {
-        Ok(n) if n > 0 => info!("[main] 从 SQLite 加载了 {} 个 Infohash", n),
+    let preload = config.tier.preload_top_n;
+    match infohash_repo.load_initial(preload).await {
+        Ok(n) if n > 0 => info!("[main] 预加载 {} 个 Infohash（上限 {}）", n, preload),
         _ => {}
     }
-    match node_repo.load_all().await {
-        Ok(n) if n > 0 => info!("[main] 从 SQLite 加载了 {} 个 DHT 节点", n),
+    match node_repo.load_initial(preload).await {
+        Ok(n) if n > 0 => info!(
+            "[main] 从 SQLite 预加载了 {} 个 DHT 节点（上限 {}）",
+            n, preload
+        ),
         _ => {}
     }
-    match peer_repo.load_all().await {
-        Ok(n) if n > 0 => info!("[main] 从 SQLite 加载了 {} 个 Peer", n),
+    match peer_repo.load_initial(preload).await {
+        Ok(n) if n > 0 => info!("[main] 预加载 {} 个 Peer（上限 {}）", n, preload),
         _ => {}
     }
 
@@ -1543,12 +1547,19 @@ async fn async_main(
     {
         use PeerDiscoveryCenter::intelligence::TierManager;
         let tier_mgr = Arc::new(
-            TierManager::new(Default::default())
-                .with_storage(storage.clone())
-                .with_peer_repo(peer_repo.clone()
-                    as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::PeerRepository>)
-                .with_node_repo(node_repo.clone()
-                    as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>),
+            TierManager::new(
+                PeerDiscoveryCenter::intelligence::tier_manager::TierConfig {
+                    hot_threshold_secs: config.tier.hot_threshold_secs,
+                    warm_threshold_secs: config.tier.warm_threshold_secs,
+                    max_hot_in_memory: config.tier.hot_max_count,
+                    check_interval_secs: config.tier.evict_interval_secs,
+                },
+            )
+            .with_storage(storage.clone())
+            .with_peer_repo(peer_repo.clone()
+                as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::PeerRepository>)
+            .with_node_repo(node_repo.clone()
+                as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>),
         );
         let tm = tier_mgr.clone();
         let io_sched = io_scheduler.clone();

@@ -394,9 +394,25 @@ impl ConnectionManager {
             let _guard = lock.lock().await;
 
             // 获取锁后再次检查，避免竞态窗口内重复创建
+            // node_id 仲裁：本节点 node_id 小的保留出站连接，大的保留入站连接
+            // 这样两边用同一规则，不会同时 drop 导致重连循环
             if self.connections.read().contains_key(&node_id) {
-                debug!("[federation] 节点 {} 已存在连接，拒绝重复连接", node_id);
-                return Ok(());
+                let local_id = self.identity.node_id;
+                if local_id < node_id {
+                    // 本节点 node_id 更小：保留已有的出站连接，关闭入站
+                    debug!(
+                        "[federation] 双向连接仲裁：本节点 {} < 对端 {}，保留出站，关闭入站",
+                        local_id, node_id
+                    );
+                    return Ok(());
+                } else {
+                    // 本节点 node_id 更大：保留入站，关闭已有的出站连接
+                    info!(
+                        "[federation] 双向连接仲裁：本节点 {} > 对端 {}，关闭出站，保留入站",
+                        local_id, node_id
+                    );
+                    self.connections.write().remove(&node_id);
+                }
             }
 
             // 检查连接数上限

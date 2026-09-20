@@ -232,6 +232,21 @@ impl TierManageable for NodeTierManager {
             }
         }
 
+        // 按数量驱逐：超过 hot_max_count 时驱逐最久未活跃的节点
+        let current = self.node_repo.len_sync();
+        if current > self.config.max_hot_in_memory {
+            let removed = self.node_repo.evict_by_count(self.config.max_hot_in_memory);
+            if removed > 0 {
+                tracing::info!(
+                    "[tier_manager] NodeRepo 按数量驱逐: {} 个（{}→{}，上限 {}）",
+                    removed,
+                    current,
+                    current - removed,
+                    self.config.max_hot_in_memory
+                );
+            }
+        }
+
         let stats = TierStats {
             hot_count,
             warm_count,
