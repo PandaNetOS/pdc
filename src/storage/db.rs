@@ -33,6 +33,12 @@ pub struct WriteStats {
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
     write_stats: Arc<Mutex<WriteStats>>,
+    /// oplog 行数缓存（-1 = 未初始化）。
+    /// `SELECT COUNT(*) FROM feed_oplog` 在大表上要扫整个 B-tree，冷缓存 + 慢盘实测可达
+    /// 数十秒（2026-09-21：51 节点 58 万行 oplog 冷查询 28s，盘吞吐仅 ~4MB/s），
+    /// 而 `MIN/MAX(seq)` 走主键索引端点恒为 O(log n) 不需要缓存。
+    /// 由 oplog 写入/裁剪点增量维护（见 `storage/oplog.rs`），首次读取时 COUNT 校准。
+    pub(crate) oplog_len_cache: std::sync::atomic::AtomicI64,
 }
 
 impl Storage {
@@ -72,6 +78,7 @@ impl Storage {
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
+            oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
         };
         storage.init_tables()?;
         info!("[storage] 数据库已打开: {:?}", path_ref);
@@ -84,6 +91,7 @@ impl Storage {
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
+            oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
         };
         storage.init_tables()?;
         Ok(storage)

@@ -84,6 +84,14 @@ pub struct FederationStatus {
     pub relay_channels: usize,
     /// Tracker 同步是否启用
     pub tracker_sync_enabled: bool,
+    /// oplog 当前行数（内存缓存，O(1)；与 `/sync-observability` 的 `oplog.len` 同源）
+    pub oplog_len: u64,
+    /// 反熵 tick 已执行次数（有连接时的有效对账轮数）
+    pub anti_entropy_ticks: u64,
+    /// 反熵累计发出的 MerkleDigest 数
+    pub anti_entropy_digests_sent: u64,
+    /// 反熵因无连接而跳过的 tick 数
+    pub anti_entropy_no_conn_skips: u64,
     /// 指标快照
     pub metrics: FederationMetricsSnapshot,
     /// NodeRepo 实际总条目数（非联邦同步累计）
@@ -143,6 +151,19 @@ pub struct FederationSnapshot {
     pub nodes: Vec<NodeInfo>,
     pub sync_stats: SyncStats,
     pub relay_stats: RelayStats,
+}
+
+/// 轻量同步摘要（`/federation/status` 快接口用，毫秒级；不触碰重查询）。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SyncBrief {
+    /// oplog 当前行数（内存缓存）
+    pub oplog_len: u64,
+    /// 反熵 tick 已执行次数
+    pub anti_entropy_ticks: u64,
+    /// 反熵累计发出 MerkleDigest 数
+    pub anti_entropy_digests_sent: u64,
+    /// 反熵因无连接跳过的 tick 数
+    pub anti_entropy_no_conn_skips: u64,
 }
 
 /// 联邦服务主入口
@@ -625,6 +646,7 @@ impl FederationService {
             .map(|a| a.reachability.to_string())
             .unwrap_or_else(|| "Unknown".to_string());
 
+        let brief = self.sync_manager.sync_brief();
         FederationStatus {
             enabled: self.config.enabled,
             node_id: self.identity.node_id.to_hex(),
@@ -635,6 +657,10 @@ impl FederationService {
             gossip_queue_size: self.gossip_engine.outbox_size(),
             relay_channels: self.relay_manager.active_channel_count(),
             tracker_sync_enabled: self.config.sync_tracker_enabled,
+            oplog_len: brief.oplog_len,
+            anti_entropy_ticks: brief.anti_entropy_ticks,
+            anti_entropy_digests_sent: brief.anti_entropy_digests_sent,
+            anti_entropy_no_conn_skips: brief.anti_entropy_no_conn_skips,
             metrics: self.metrics.snapshot(),
             // Repo 实际总数由 handler 从 AppState 填充，此处先置 0
             node_repo_total: 0,
@@ -889,6 +915,10 @@ mod tests {
             gossip_queue_size: 3,
             relay_channels: 0,
             tracker_sync_enabled: false,
+            oplog_len: 0,
+            anti_entropy_ticks: 0,
+            anti_entropy_digests_sent: 0,
+            anti_entropy_no_conn_skips: 0,
             metrics: FederationMetricsSnapshot::default(),
             node_repo_total: 0,
             peer_repo_total: 0,

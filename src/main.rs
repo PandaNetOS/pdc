@@ -19,6 +19,9 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// oplog 行数缓存预热的延迟（秒）：让进程先完成基础启动，再做一次 COUNT 校准。
+const OPLOG_LEN_PREWARM_DELAY_SECS: u64 = 5;
+
 use parking_lot::RwLock;
 use rand::Rng;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2884,6 +2887,21 @@ async fn async_main(
                     }
                 },
             );
+        }
+
+        // oplog 行数缓存预热：首次 COUNT(feed_oplog) 在大表慢盘节点上可达数十秒
+        // （2026-09-21 实测 51 节点 58 万行冷查询 28s，曾把首个 /sync-observability 请求拖到超时）。
+        // 启动 5 秒后在后台完成一次校准，此后 `oplog_len()` 恒为 O(1)。
+        {
+            let st = storage.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(OPLOG_LEN_PREWARM_DELAY_SECS))
+                    .await;
+                match st.oplog_len() {
+                    Ok(n) => info!("[oplog] 行数缓存预热完成: {} 条", n),
+                    Err(e) => warn!("[oplog] 行数缓存预热失败: {}", e),
+                }
+            });
         }
     }
 

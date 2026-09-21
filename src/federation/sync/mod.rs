@@ -2469,6 +2469,21 @@ impl SyncManager {
         self.node_repo.storage()
     }
 
+    /// 轻量同步摘要（供 `/federation/status` 快接口；不触碰任何 SQLite 重查询）。
+    ///
+    /// 背景：`/sync-observability` 的 `oplog_len` 在大表慢盘节点上冷缓存可达数十秒
+    /// （2026-09-21 实测 51 节点 28s），不适合作为巡检入口；oplog 行数已有内存缓存
+    /// （`storage/oplog.rs`），加上 tick 计数即可让运维在毫秒级接口上看到反熵是否在跑。
+    pub fn sync_brief(&self) -> crate::federation::SyncBrief {
+        let s = self.metrics.snapshot();
+        crate::federation::SyncBrief {
+            oplog_len: self.delta_storage().oplog_len().unwrap_or(0),
+            anti_entropy_ticks: s.anti_entropy_ticks,
+            anti_entropy_digests_sent: s.anti_entropy_digests_sent,
+            anti_entropy_no_conn_skips: s.anti_entropy_no_conn,
+        }
+    }
+
     /// 对某对端某 repo 发起增量拉取（发送首个 OpsRequest）。
     ///
     /// 断点来自本地持久化的版本向量 `delta_peer_seq`（重启后续传，不重来）。
@@ -3612,6 +3627,28 @@ impl SyncManager {
         });
         // F1：当前被节流表跟踪的 (对端, repo) 对数 ≈ 活跃的 delta 拉取通道数
         let delta_tracked = self.delta_request_at.read().len();
+        // P3-C：反熵周期任务可观测性 —— tick 执行次数 / 每个 repo 距上次对账多久。
+        // 之前只靠 merkle_repairs 判断，两个都看不到时无法区分「没跑」和「跑了但无差异」。
+        let m_snap = self.metrics.snapshot();
+        let ae_last = self.anti_entropy_last.read();
+        let ae_repos: Vec<serde_json::Value> = [
+            (repo_type::NODE, "node"),
+            (repo_type::PEER, "peer"),
+            (repo_type::INFOHASH, "infohash"),
+            (repo_type::TRACKER, "tracker"),
+        ]
+        .iter()
+        .map(|(rt, name)| {
+            serde_json::json!({
+                "repo": *name,
+                "repo_type": *rt,
+                "last_tick_age_secs": ae_last.get(rt).map(|i| i.elapsed().as_secs()),
+                "owned_by_range_reconcile": self.config.range_reconcile_enabled
+                    && *rt == repo_type::NODE,
+            })
+        })
+        .collect();
+        drop(ae_last);
         serde_json::json!({
             "oplog": {
                 "len": oplog_len,
@@ -3637,6 +3674,10 @@ impl SyncManager {
             "anti_entropy": {
                 "node_interval_secs": self.config.anti_entropy_node_interval_secs,
                 "other_interval_secs": self.config.anti_entropy_other_interval_secs,
+                "ticks_total": m_snap.anti_entropy_ticks,
+                "digests_sent_total": m_snap.anti_entropy_digests_sent,
+                "no_conn_skips_total": m_snap.anti_entropy_no_conn,
+                "repos": ae_repos,
             },
         })
     }

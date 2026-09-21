@@ -20,6 +20,7 @@
 //! 任何 oplog 写入失败都只告警，**绝不阻断业务写入**。
 
 use rusqlite::{params, Connection};
+use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 use crate::federation::protocol::{operation, SyncEntry};
@@ -101,7 +102,10 @@ impl super::db::Storage {
     pub fn append_op(&self, repo: u8, op: &str, key: &[u8], value: &[u8]) -> anyhow::Result<i64> {
         let conn = self.connection();
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        Self::append_op_in_tx(&conn, repo, op, key, value)
+        let seq = Self::append_op_in_tx(&conn, repo, op, key, value)?;
+        drop(conn);
+        self.bump_oplog_len(1);
+        Ok(seq)
     }
 
     /// 把一批**本地产生的**联邦变更（`SyncEntry`）追加进 oplog（一次锁 + 一个事务）。
@@ -133,6 +137,8 @@ impl super::db::Storage {
             }
         }
         tx.commit()?;
+        drop(conn);
+        self.bump_oplog_len(n as i64);
         Ok(n)
     }
 
@@ -234,17 +240,39 @@ impl super::db::Storage {
             "DELETE FROM feed_oplog WHERE ts_ms < ?1",
             params![older_than_ms],
         )?;
+        drop(conn);
         if n > 0 {
             debug!("[oplog] 裁剪 {} 条（ts_ms < {}）", n, older_than_ms);
+            self.bump_oplog_len(-(n as i64));
         }
         Ok(n)
     }
 
+    /// 仅当 oplog 行数缓存已初始化（>= 0）时增量调整它。
+    ///
+    /// 未初始化时不动 —— 首次 [`Self::oplog_len`] 会用 COUNT(*) 校准真值。
+    /// 正确性：COUNT 与写路径都持有同一把连接锁，互斥序列化；已初始化后的
+    /// 增减与事务提交顺序一致，缓存永不漂移。
+    fn bump_oplog_len(&self, delta: i64) {
+        if self.oplog_len_cache.load(Ordering::Relaxed) >= 0 {
+            self.oplog_len_cache.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
     /// oplog 行数（可观测性用）。
+    ///
+    /// 首次调用执行 COUNT(*) 并缓存（大表慢盘上这一次可能较慢，启动时由后台预热任务
+    /// 提前完成）；此后走内存缓存，由写入/裁剪点增量维护，恒为 O(1)。
     pub fn oplog_len(&self) -> anyhow::Result<u64> {
+        let cached = self.oplog_len_cache.load(Ordering::Relaxed);
+        if cached >= 0 {
+            return Ok(cached as u64);
+        }
         let conn = self.connection();
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
         let v: i64 = conn.query_row("SELECT COUNT(*) FROM feed_oplog", [], |r| r.get(0))?;
+        drop(conn);
+        self.oplog_len_cache.store(v, Ordering::Relaxed);
         Ok(v.max(0) as u64)
     }
 
