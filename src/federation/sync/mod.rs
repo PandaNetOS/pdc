@@ -56,8 +56,10 @@ const MERKLE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const NEGOTIATE_RESEND_SECS: u64 = 60;
 /// v7：协商发出后无 Ack 的降级放行等待（秒）—— 视为协商失败回落旧行为，防永久卡死。
 const NEGOTIATE_FALLBACK_SECS: u64 = 120;
-/// v7：看门狗触发后的暂停时长（× delta 拉取周期）。
-const DELTA_WATCHDOG_PAUSE_MULT: u32 = 10;
+/// v8 F3：看门狗触发后的暂停时长（× delta 拉取周期）。原 10 周期停摆 10 分钟过久，缩到 2。
+const DELTA_WATCHDOG_PAUSE_MULT: u32 = 2;
+/// v8 F4：in-flight 请求视为存活的时长（秒）——超过后允许重发（覆盖写超时与短暂失联）。
+const DELTA_INFLIGHT_TIMEOUT_SECS: u64 = 30;
 /// v7：bootstrap 快照触发的最小行数（对端该 repo 为空且本端 ≥ 此量才走快照）。
 const SNAPSHOT_MIN_ROWS: u64 = 1_000;
 /// v7：快照分流比例阈值（本端比对端多出该比例且差值超阈值 → 快照）。
@@ -161,6 +163,9 @@ pub struct SyncManager {
     /// F1：每个 (对端, repo) 最近一次 delta 拉取发起时刻。
     /// 周期 tick 据此节流（间隔内不重发）并在无响应时超时重试。
     delta_request_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v8 F4：每个 (对端, repo) 的 in-flight 请求发起时刻（DELTA_INFLIGHT_TIMEOUT_SECS 超时兜底）。
+    /// 同一 (peer, repo) 未完成前不重发，消灭「tick + 续拉 + 重复应用再续拉」重试风暴。
+    delta_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// F2：对端最近一次回报的 oplog 水位（与本地 synced_seq 同序列空间，用于算真实 lag）。
     delta_peer_max: RwLock<FxHashMap<(NodeId, u8), u64>>,
     /// P2-5：反熵按 repo 差异化的上次执行时刻。
@@ -316,6 +321,7 @@ impl SyncManager {
             range_remote_only_total: std::sync::atomic::AtomicU64::new(0),
             range_repair_triggers: std::sync::atomic::AtomicU64::new(0),
             delta_request_at: RwLock::new(FxHashMap::default()),
+            delta_inflight: RwLock::new(FxHashMap::default()),
             delta_peer_max: RwLock::new(FxHashMap::default()),
             anti_entropy_last: RwLock::new(FxHashMap::default()),
             negotiation_sent_at: RwLock::new(FxHashMap::default()),
@@ -2554,6 +2560,22 @@ impl SyncManager {
             );
             return;
         }
+        // v8 F4：in-flight 去重 —— 同一 (peer, repo) 存在未完成请求（30s 内）时不重发。
+        // 否则 tick + 续拉 + 重复应用再续拉叠加出重试风暴：每请求服务端都发 2MB 重复帧，
+        // 单连接 writer 锁串行排队后乱序到达，实测 70s 内同一 since_seq 发起 15+ 次。
+        {
+            let mut w = self.delta_inflight.write();
+            if let Some(t) = w.get(&(peer, repo)) {
+                if t.elapsed() < Duration::from_secs(DELTA_INFLIGHT_TIMEOUT_SECS) {
+                    debug!(
+                        "[delta] in-flight 请求未完成，跳过本轮: peer={}, repo={}",
+                        peer, repo
+                    );
+                    return;
+                }
+            }
+            w.insert((peer, repo), Instant::now());
+        }
         let since = self
             .delta_storage()
             .get_peer_seq(&peer.0, repo)
@@ -2576,7 +2598,11 @@ impl SyncManager {
                     peer, repo, since
                 );
             }
-            Err(e) => warn!("[delta] 发送 OpsRequest 失败 peer={}: {}", peer, e),
+            Err(e) => {
+                warn!("[delta] 发送 OpsRequest 失败 peer={}: {}", peer, e);
+                // v8 F4：发送失败不会有响应回来，立即解除 in-flight 以便下轮重试
+                self.delta_inflight.write().remove(&(peer, repo));
+            }
         }
     }
 
@@ -2664,6 +2690,34 @@ impl SyncManager {
         if !self.config.delta_sync_enabled {
             return;
         }
+        // v8 F4：请求往返完成，清除 in-flight 标记（此后 tick 可发下一轮请求）。
+        self.delta_inflight
+            .write()
+            .remove(&(conn.node_id, batch.repo));
+        // F2：记录对端在本 repo 的 oplog 水位。它与本机记录的 synced_seq 同属对端 seq
+        // 空间，二者相减才是「真实落后量」；无此值时 lag 报 null（不跨空间相减）。
+        // v8：即使批已过期，水位也是最新信息，始终记录。
+        if batch.server_max_seq > 0 {
+            self.delta_peer_max
+                .write()
+                .insert((conn.node_id, batch.repo), batch.server_max_seq);
+        }
+        // v8 F5：游标单调保护 —— 过期/重复批（next_seq ≤ 当前游标）直接丢弃：
+        // 不重复应用、不推进、不续拉。否则重试风暴下乱序到达的旧批会把游标
+        // 打回去（实测 1016764 → 1015764），再触发同区间无限重拉。
+        let cur = self
+            .delta_storage()
+            .get_peer_seq(&conn.node_id.0, batch.repo)
+            .unwrap_or(0)
+            .max(0) as u64;
+        let next = delta::seq_to_i64(batch.next_seq).max(0) as u64;
+        if next <= cur {
+            debug!(
+                "[delta] 丢弃过期/重复批: peer={}, repo={}, next_seq={} ≤ 当前 {}（单调保护）",
+                conn.node_id, batch.repo, batch.next_seq, cur
+            );
+            return;
+        }
         let entries = delta::ops_to_sync_entries(&batch.ops);
         if !entries.is_empty() {
             self.handle_sync_batch(batch.repo, &entries);
@@ -2675,13 +2729,6 @@ impl SyncManager {
             delta::seq_to_i64(batch.next_seq),
         ) {
             warn!("[delta] 推进版本向量失败 peer={}: {}", conn.node_id, e);
-        }
-        // F2：记录对端在本 repo 的 oplog 水位。它与本机记录的 synced_seq 同属对端 seq
-        // 空间，二者相减才是「真实落后量」；无此值时 lag 报 null（不跨空间相减）。
-        if batch.server_max_seq > 0 {
-            self.delta_peer_max
-                .write()
-                .insert((conn.node_id, batch.repo), batch.server_max_seq);
         }
         // 拉取往返成功：把节流计时推后，避免同一轮里 tick 立刻重发
         self.delta_request_at
@@ -2702,6 +2749,10 @@ impl SyncManager {
                 warn!("[delta] 续拉 OpsRequest 失败 to={}: {}", conn.node_id, e);
             } else {
                 self.metrics.record_message_sent();
+                // v8 F4：续拉同样标记 in-flight（防与下一轮 tick 叠加）
+                self.delta_inflight
+                    .write()
+                    .insert((conn.node_id, batch.repo), Instant::now());
             }
         }
     }
@@ -2761,17 +2812,17 @@ impl SyncManager {
     fn build_negotiate_message(&self) -> SyncNegotiateMessage {
         let counts = self.local_entry_counts();
         let st = self.delta_storage();
-        let max_seq = st.oplog_max_seq().unwrap_or(0).max(0) as u64;
-        let min_seq = st.oplog_min_seq().unwrap_or(0).max(0) as u64;
         let retention = self.config.oplog_retention_secs;
+        // v8 F1：水位必须按 repo 取 —— 原来填全局 oplog 水位（同值 × 4 repo），
+        // oplog 稀疏 repo 的欠账在协商里完全失真（假数据）。
         let repos = (repo_type::NODE..=repo_type::TRACKER)
             .map(|repo| {
                 let idx = (repo - repo_type::NODE) as usize;
                 RepoSyncState {
                     repo,
                     row_count: counts.get(idx).copied().unwrap_or(0) as u64,
-                    max_seq,
-                    min_seq,
+                    max_seq: st.oplog_max_seq_for_repo(repo).unwrap_or(0).max(0) as u64,
+                    min_seq: st.oplog_min_seq_for_repo(repo).unwrap_or(0).max(0) as u64,
                     retention_secs: retention,
                 }
             })
@@ -3019,11 +3070,29 @@ impl SyncManager {
                 repo_type::INFOHASH,
                 repo_type::TRACKER,
             ] {
-                // v7：bootstrap 策略执行（大差集/冷启动走快照通道，不走 delta 硬拉）
-                if self.config.bootstrap_enabled
-                    && self.strategy_for(&conn.node_id, rt) == Some(protocol::STRATEGY_BOOTSTRAP)
-                    && conn.connected_secs() >= self.config.strategy_min_conn_secs
-                {
+                // v7/v8：bootstrap 判定 —— 协商裁定 BOOTSTRAP，或 v8 拉取侧本地改判：
+                // 对端 per-repo 水位（delta_peer_max，来自 OpsBatch server_max_seq）与本地
+                // synced_seq 同序列空间，欠账 > range_bulk_threshold_rows 时 delta 硬拉
+                // 已无意义（大批量慢 + 风暴），直接走快照通道（实测 38 万欠账被误判 DELTA）。
+                let peer_max = *self
+                    .delta_peer_max
+                    .read()
+                    .get(&(conn.node_id, rt))
+                    .unwrap_or(&0);
+                let synced_seq = self
+                    .delta_storage()
+                    .get_peer_seq(&conn.node_id.0, rt)
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let lag = peer_max.saturating_sub(synced_seq);
+                let lag_over = peer_max > 0
+                    && lag > self.config.range_bulk_threshold_rows.max(1)
+                    && self.strategy_for(&conn.node_id, rt) != Some(protocol::STRATEGY_NONE);
+                let use_bootstrap = self.config.bootstrap_enabled
+                    && (self.strategy_for(&conn.node_id, rt) == Some(protocol::STRATEGY_BOOTSTRAP)
+                        || lag_over)
+                    && conn.connected_secs() >= self.config.strategy_min_conn_secs;
+                if use_bootstrap {
                     let running = self
                         .delta_storage()
                         .bootstrap_list()
@@ -3034,8 +3103,12 @@ impl SyncManager {
                         .unwrap_or(false);
                     if !running {
                         info!(
-                            "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}",
-                            conn.node_id, rt
+                            "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}（协商裁定={}，欠账={}）",
+                            conn.node_id,
+                            rt,
+                            self.strategy_for(&conn.node_id, rt)
+                                == Some(protocol::STRATEGY_BOOTSTRAP),
+                            lag
                         );
                         let sm = self.clone();
                         let peer = conn.node_id;
@@ -3044,11 +3117,6 @@ impl SyncManager {
                     continue;
                 }
                 // v7：看门狗（暂停期跳过；触发时已清协商）
-                let peer_max = *self
-                    .delta_peer_max
-                    .read()
-                    .get(&(conn.node_id, rt))
-                    .unwrap_or(&0);
                 if !self.delta_watchdog_ok(conn.node_id, rt, interval, peer_max) {
                     continue;
                 }

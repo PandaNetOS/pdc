@@ -248,6 +248,21 @@ impl super::db::Storage {
         Ok(v)
     }
 
+    /// 指定 repo 的最小 seq（保留窗口内该 repo 最早一条变更；无记录时 0）。
+    ///
+    /// v8 F1：协商消息按 repo 上报水位；min_seq 供对端判断欠账是否仍在保留窗口内
+    ///（可 delta 续拉）还是已被裁剪（必须 bootstrap）。走 `idx_feed_oplog_repo_seq` 索引。
+    pub fn oplog_min_seq_for_repo(&self, repo: u8) -> anyhow::Result<i64> {
+        let conn = self.connection();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let v: i64 = conn.query_row(
+            "SELECT COALESCE(MIN(seq), 0) FROM feed_oplog WHERE repo = ?1",
+            params![repo as i64],
+            |r| r.get(0),
+        )?;
+        Ok(v)
+    }
+
     /// 裁剪 `ts_ms < older_than_ms` 的 op，返回删除条数。
     pub fn trim_oplog(&self, older_than_ms: i64) -> anyhow::Result<usize> {
         let conn = self.connection();
