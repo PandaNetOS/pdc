@@ -112,7 +112,9 @@ impl Default for CategoryConcurrency {
             persistence: 1,
             monitor: 2,
             network: 4,
-            federation: 4,
+            // v9: 联邦专用并发 4→8（20+ fed_* 周期任务 + 慢 IO 任务如 delta 拉取/bootstrap，
+            // 4 槽在欠账大时会被慢任务占满导致联邦内部饿死；federation runtime 本身 ≥4 线程）
+            federation: 8,
             tracker: 2,
         }
     }

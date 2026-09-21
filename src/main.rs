@@ -1803,7 +1803,7 @@ async fn async_main(
                 "联邦心跳",
                 std::time::Duration::from_secs(get_interval_secs(intervals, "fed_heartbeat", 30)),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1834,7 +1834,7 @@ async fn async_main(
                 "联邦节点同步",
                 std::time::Duration::from_secs(get_interval_secs(intervals, "fed_node_sync", 300)),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1875,7 +1875,7 @@ async fn async_main(
                         300,
                     )),
                 )
-                .with_category(TaskCategory::Network)
+                .with_category(TaskCategory::Federation)
                 .with_priority(TaskPriority::Normal)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -1918,7 +1918,7 @@ async fn async_main(
                     ae_tick_secs,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -1962,7 +1962,7 @@ async fn async_main(
                     delta_tick_secs,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2003,7 +2003,7 @@ async fn async_main(
                     60,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2043,7 +2043,7 @@ async fn async_main(
                     60,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2078,7 +2078,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2113,7 +2113,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2148,7 +2148,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2183,7 +2183,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2218,7 +2218,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2253,7 +2253,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2288,7 +2288,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2324,7 +2324,7 @@ async fn async_main(
                         3600,
                     )),
                 )
-                .with_category(TaskCategory::Network)
+                .with_category(TaskCategory::Federation)
                 .with_priority(TaskPriority::Background)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -2360,7 +2360,7 @@ async fn async_main(
                     50,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2390,7 +2390,7 @@ async fn async_main(
                     100,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -2420,7 +2420,7 @@ async fn async_main(
                     1000,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
