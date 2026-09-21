@@ -962,7 +962,9 @@ async fn async_main(
                 persistence: config.task_scheduler.persistence_concurrency,
                 monitor: config.task_scheduler.monitor_concurrency,
                 network: config.task_scheduler.network_concurrency,
-                federation: 4,
+                // v9 fix: 与 CategoryConcurrency::default() 对齐（此前字面量 4 覆盖 Default 8，
+                // 导致 C3「联邦并发 4→8」实际不生效）
+                federation: 8,
                 tracker: 2,
             })
             .with_runtime_handles(RuntimeHandles {
