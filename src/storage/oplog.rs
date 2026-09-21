@@ -144,54 +144,70 @@ impl super::db::Storage {
 
     /// 按 `repo` 增量拉取 `seq > since_seq` 的 op（升序，最多 `limit` 条）。
     /// `repo = u8::MAX` 表示不限 repo。
+    ///
+    /// 分片读取（v7 保命项）：每片 `OPLOG_READ_SHARD_ROWS` 条，片间**释放连接锁**并短暂
+    /// sleep 让出 —— 否则慢盘（~4MB/s）上一次 `LIMIT 10000` 全扫会持锁数十秒，
+    /// 把 apply 写路径与全部 API handler 饿死（2026-09-21 51 事故根因）。
     pub fn load_ops_since(
         &self,
         repo: u8,
         since_seq: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<OpRecord>> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let limit = limit.max(1) as i64;
-        let mut out: Vec<OpRecord> = Vec::new();
-        if repo == u8::MAX {
-            let mut stmt = conn.prepare(
-                "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
-                 WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![since_seq, limit], |row| {
-                Ok(OpRecord {
-                    seq: row.get(0)?,
-                    op: row.get(1)?,
-                    repo: row.get::<_, i64>(2)? as u8,
-                    key: row.get(3)?,
-                    value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                    ts_ms: row.get(5)?,
-                    origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
-                })
-            })?;
-            for r in rows {
-                out.push(r?);
+        const SHARD_ROWS: usize = 512;
+        const SHARD_YIELD_MS: u64 = 5;
+        let limit = limit.max(1);
+        let mut out: Vec<OpRecord> = Vec::with_capacity(limit.min(4096));
+        let mut last = since_seq;
+        while out.len() < limit {
+            let shard = SHARD_ROWS.min(limit - out.len());
+            let rows: Vec<OpRecord> = {
+                let conn = self.connection();
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = if repo == u8::MAX {
+                    conn.prepare(
+                        "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
+                         WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+                    )?
+                } else {
+                    conn.prepare(
+                        "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
+                         WHERE repo = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+                    )?
+                };
+                let map = |row: &rusqlite::Row| {
+                    Ok(OpRecord {
+                        seq: row.get(0)?,
+                        op: row.get(1)?,
+                        repo: row.get::<_, i64>(2)? as u8,
+                        key: row.get(3)?,
+                        value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                        ts_ms: row.get(5)?,
+                        origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
+                    })
+                };
+                let rows = if repo == u8::MAX {
+                    stmt.query_map(params![last, shard as i64], map)?
+                } else {
+                    stmt.query_map(params![repo as i64, last, shard as i64], map)?
+                };
+                let mut v = Vec::with_capacity(shard);
+                for r in rows {
+                    v.push(r?);
+                }
+                v
+            }; // ← 锁在此 drop
+            if rows.is_empty() {
+                break;
             }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
-                 WHERE repo = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![repo as i64, since_seq, limit], |row| {
-                Ok(OpRecord {
-                    seq: row.get(0)?,
-                    op: row.get(1)?,
-                    repo: row.get::<_, i64>(2)? as u8,
-                    key: row.get(3)?,
-                    value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                    ts_ms: row.get(5)?,
-                    origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
-                })
-            })?;
-            for r in rows {
-                out.push(r?);
+            last = rows[rows.len() - 1].seq;
+            let full_shard = rows.len() >= shard;
+            out.extend(rows);
+            if !full_shard {
+                break;
             }
+            // 片间让锁：给 apply / API 一个窗口（短 sleep，非周期热路径）
+            std::thread::sleep(std::time::Duration::from_millis(SHARD_YIELD_MS));
         }
         Ok(out)
     }

@@ -259,6 +259,24 @@ pub fn build_node_manifest(
     w0_seq: u64,
     version: u32,
 ) -> anyhow::Result<BootstrapManifest> {
+    build_repo_manifest_impl(
+        storage,
+        crate::federation::sync::repo_type::NODE,
+        chunk_rows,
+        w0_seq,
+        version,
+    )
+}
+
+/// v7：全 repo 通用清单构建（与 [`build_node_manifest`] 同算法，
+/// 区间读取换成 `load_repo_key_hashes_in_range(repo, …)`）。
+pub fn build_repo_manifest_impl(
+    storage: &Storage,
+    repo: u8,
+    chunk_rows: u32,
+    w0_seq: u64,
+    version: u32,
+) -> anyhow::Result<BootstrapManifest> {
     let chunk_rows = chunk_rows.max(1) as usize;
     let mut chunks: Vec<ManifestChunk> = Vec::new();
     let mut cursor: Option<Vec<u8>> = None; // -∞ 起
@@ -267,7 +285,7 @@ pub fn build_node_manifest(
 
     loop {
         let fetch = chunk_rows + 1;
-        let rows = storage.load_node_key_hashes_in_range(cursor.as_deref(), None, fetch)?;
+        let rows = storage.load_repo_key_hashes_in_range(repo, cursor.as_deref(), None, fetch)?;
         if rows.is_empty() {
             break;
         }

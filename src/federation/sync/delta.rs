@@ -25,8 +25,16 @@ use crate::storage::oplog::OpRecord;
 /// 支持 delta 通道的协议版本（用于握手能力协商）。
 pub const DELTA_SYNC_PROTOCOL_VERSION: u32 = 4;
 
-/// 单批默认上限（条）。
-pub const DELTA_BATCH_LIMIT_DEFAULT: u32 = 10_000;
+/// 单批默认上限（条）。1万条批在慢盘上会造成读/apply 长时间持锁（51 事故根因），
+/// 降到千级使单批持锁时间从数十秒降到亚秒级。
+pub const DELTA_BATCH_LIMIT_DEFAULT: u32 = 1_000;
+
+/// 单批字节上限（不含帧头）：OpsBatch 组装时按 key+payload 累计估算，超过即截断本批。
+/// 与 `gossip_bulk_max_bytes` 同量级，防止大 value 场景下批帧失控。
+pub const DELTA_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 支持建连协商（SyncNegotiate/Ack）的协议版本。
+pub const NEGOTIATION_PROTOCOL_VERSION: u32 = 7;
 
 /// 建 delta 版本向量表（幂等）。
 pub fn init_delta_tables(conn: &Connection) -> anyhow::Result<()> {

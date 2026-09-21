@@ -123,6 +123,10 @@ pub enum MessageType {
     BootstrapChunkResponse = 44,
     /// P1-4：Range 反熵推送（A → B）：发现本地多后，直接推送本地多的节点数据给对端。
     RangeReconcilePush = 45,
+    /// v7 建连协商（双向互发）：互报各 repo 数据量 / 收发能力 / 吞吐提示。
+    SyncNegotiate = 46,
+    /// v7 建连协商确认：按 repo 下发同步策略（DELTA / BOOTSTRAP / NONE）。
+    SyncNegotiateAck = 47,
 }
 
 impl MessageType {
@@ -173,6 +177,8 @@ impl MessageType {
             43 => Some(MessageType::BootstrapChunkRequest),
             44 => Some(MessageType::BootstrapChunkResponse),
             45 => Some(MessageType::RangeReconcilePush),
+            46 => Some(MessageType::SyncNegotiate),
+            47 => Some(MessageType::SyncNegotiateAck),
             _ => None,
         }
     }
@@ -190,14 +196,18 @@ impl MessageType {
 /// 4：支持增量（delta）同步通道（OpsRequest/OpsBatch，基于本地 oplog 的 O(Δ) 稳态同步）。
 /// 5：支持 Range-based（有序区间 + 分界点下钻）反熵（RangeReconcileRequest/Response）。
 /// 6：支持 bootstrap 专用通道（BootstrapManifest*/BootstrapChunk*，与在线反熵解耦的全量引导）。
+/// 7：支持建连协商（SyncNegotiate/SyncNegotiateAck）：连接建立后先互报数据量/能力并协商
+///    per-repo 同步策略，稳定性门控（连接存活 ≥ `strategy_min_conn_secs`）通过后才开大通道。
 /// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle；
 /// version >= 4 且 `federation.delta_sync_enabled=true` 时启用 delta 通道；
 /// version >= 5 且 `federation.range_reconcile_enabled=true` 时启用 range 反熵；
-/// version >= 6 且 `federation.bootstrap_enabled=true` 时启用 bootstrap 通道。
+/// version >= 6 且 `federation.bootstrap_enabled=true` 时启用 bootstrap 通道；
+/// version >= 7 且 `federation.negotiation_enabled=true` 时 delta/bootstrap 大通道需协商通过后才启动
+/// （对端 < v7 回落旧行为：不协商直接按既有开关运行）。
 ///
 /// G4 迁移：原定义在 `federation/connection.rs`，随握手实现一并归位到协议层
 /// （`connection.rs` 保留 `pub use` 转发）。
-pub const HELLO_PROTOCOL_VERSION: u32 = 6;
+pub const HELLO_PROTOCOL_VERSION: u32 = 7;
 
 /// 握手消息（阶段2：Ed25519 签名认证）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +398,77 @@ pub struct SyncEntry {
     pub version: u64,
     /// 负载数据
     pub payload: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// v7 建连协商（SyncNegotiate / SyncNegotiateAck）
+// ---------------------------------------------------------------------------
+
+/// 协商策略：该 repo 在两端之间不做大迁移（数据已同步 / 双方皆空）。
+pub const STRATEGY_NONE: u8 = 0;
+/// 协商策略：稳态增量（oplog 水位续拉，受批量/间隔约束）。
+pub const STRATEGY_DELTA: u8 = 1;
+/// 协商策略：大差集 / 冷启动 —— 由缺数据一方通过 bootstrap 分块通道拉取快照。
+pub const STRATEGY_BOOTSTRAP: u8 = 2;
+
+/// v7 协商：单 repo 状态摘要（发送方本地实况）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoSyncState {
+    /// repo 类型（0=NODE 1=PEER 2=INFOHASH 3=TRACKER）
+    pub repo: u8,
+    /// 本 repo 当前行数
+    pub row_count: u64,
+    /// 本 repo oplog 最大 seq（0 = 无记录）
+    pub max_seq: u64,
+    /// oplog 保留窗口内最小 seq（0 = 无记录）
+    pub min_seq: u64,
+    /// oplog 保留窗口（秒；0 = 永不裁剪）
+    pub retention_secs: u64,
+}
+
+/// v7 协商：发送方能力（收发限速 / 吞吐提示 / 建议批量）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SyncCaps {
+    /// 发送能力上限（字节/秒；0 = 不限）
+    pub send_rate_bytes_per_sec: u64,
+    /// 接收能力上限（字节/秒；0 = 不限）
+    pub recv_rate_bytes_per_sec: u64,
+    /// 本地磁盘顺序读吞吐提示（字节/秒；启动时自测，0 = 未知）
+    pub disk_throughput_hint: u64,
+    /// 建议的单批条数上限
+    pub batch_limit: u32,
+}
+
+/// v7 建连协商请求（建连后双方互发一次；对端回 Ack）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNegotiateMessage {
+    /// 各 repo 本地状态
+    pub repos: Vec<RepoSyncState>,
+    /// 发送方能力
+    pub caps: SyncCaps,
+    /// 发送时间戳（UNIX 毫秒，仅观测用）
+    pub timestamp_ms: u64,
+}
+
+/// v7 协商：单 repo 策略（Ack 发送方为「接收方应如何从我这取数」给出的裁定）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RepoStrategy {
+    pub repo: u8,
+    /// `STRATEGY_NONE` / `STRATEGY_DELTA` / `STRATEGY_BOOTSTRAP`
+    pub strategy: u8,
+    /// 建议速率上限（字节/秒；= min(双方 caps)，0 = 不限）
+    pub rate_bytes_per_sec: u64,
+    /// 建议单批条数上限
+    pub batch_limit: u32,
+}
+
+/// v7 建连协商确认。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNegotiateAckMessage {
+    /// 各 repo 协商出的策略
+    pub repos: Vec<RepoStrategy>,
+    /// 发送时间戳（UNIX 毫秒，仅观测用）
+    pub timestamp_ms: u64,
 }
 
 /// Gossip 批量消息
