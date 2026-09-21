@@ -1132,6 +1132,60 @@ async fn async_main(
         );
     }
 
+    // 8.5.2b1b F9: 实体表 DB 级统计周期校准（唯一权威口径 = DB deleted_at IS NULL）。
+    // 内存 repo 是热/温数据，冷数据在本 DB；重算结果写入 stats_aggregate db_* 指标
+    // （修复 DB 统计字段）与 stats_history。
+    {
+        let storage_entity = storage.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "db_entity_stats_refresh",
+                "实体表 DB 级统计校准",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "db_entity_stats_interval_secs",
+                    300,
+                )),
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Medium,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            }),
+            move || {
+                let storage = storage_entity.clone();
+                async move {
+                    match tokio::task::spawn_blocking(move || {
+                        let c = storage.refresh_entity_counts();
+                        let names = [
+                            "db_dht_nodes",
+                            "db_peers",
+                            "db_peers_archive",
+                            "db_infohashes",
+                            "db_trackers",
+                        ];
+                        for (name, v) in names.iter().zip(c.iter()) {
+                            if *v >= 0 {
+                                let _ = storage.record_stats(name, *v as f64);
+                                let _ = storage.update_aggregate(name, *v as f64);
+                            }
+                        }
+                    })
+                    .await
+                    {
+                        Ok(_) => debug!("[persistence] 实体统计校准完成"),
+                        Err(e) => warn!("[persistence] 实体统计校准失败: {}", e),
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
     // 8.5.2b2 WAL checkpoint 高频任务（每100ms，Persistence，PASSIVE模式不阻塞写入）
     {
         let storage_clone = storage.clone();

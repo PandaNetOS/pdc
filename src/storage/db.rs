@@ -40,6 +40,10 @@ pub struct Storage {
     /// 而 `MIN/MAX(seq)` 走主键索引端点恒为 O(log n) 不需要缓存。
     /// 由 oplog 写入/裁剪点增量维护（见 `storage/oplog.rs`），首次读取时 COUNT 校准。
     pub(crate) oplog_len_cache: std::sync::atomic::AtomicI64,
+    /// F9: 实体表有效行数缓存（[dht_nodes, peers, peers_archive, infohashes, trackers]，-1 = 未校准）。
+    /// 统计口径 = `deleted_at IS NULL`（软删墓碑不入数）。内存 repo 为热/温数据，
+    /// 冷数据在本 DB；总数以 DB 为唯一权威口径，由周期任务校准（见 main.rs db_entity_stats）。
+    pub(crate) entity_counts_cache: [std::sync::atomic::AtomicI64; 5],
 }
 
 impl Storage {
@@ -80,6 +84,7 @@ impl Storage {
             conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
+            entity_counts_cache: Default::default(),
         };
         storage.init_tables()?;
         info!("[storage] 数据库已打开: {:?}", path_ref);
@@ -93,6 +98,7 @@ impl Storage {
             conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
+            entity_counts_cache: Default::default(),
         };
         storage.init_tables()?;
         Ok(storage)
@@ -104,6 +110,45 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    // ---- F9: 实体表 DB 级统计（唯一权威口径：deleted_at IS NULL，内存 repo 为热/温子集）----
+
+    /// 各实体表有效行数：[dht_nodes, peers, peers_archive, infohashes, trackers]。
+    /// 软删墓碑（deleted_at 非 NULL）不计入。
+    pub fn valid_entity_counts(&self) -> [i64; 5] {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-2) };
+        [
+            count("SELECT COUNT(*) FROM dht_nodes WHERE deleted_at IS NULL"),
+            count("SELECT COUNT(*) FROM peers WHERE deleted_at IS NULL"),
+            count("SELECT COUNT(*) FROM peers_archive"),
+            count("SELECT COUNT(*) FROM infohashes WHERE deleted_at IS NULL"),
+            count("SELECT COUNT(*) FROM trackers WHERE deleted_at IS NULL"),
+        ]
+    }
+
+    /// 重算并写回缓存（周期任务调用；COUNT 较重，调用方应放阻塞线程）。
+    pub fn refresh_entity_counts(&self) -> [i64; 5] {
+        use std::sync::atomic::Ordering;
+        let c = self.valid_entity_counts();
+        for (i, v) in c.iter().enumerate() {
+            self.entity_counts_cache[i].store(*v, Ordering::Relaxed);
+        }
+        c
+    }
+
+    /// 读取缓存计数；未校准（-1）时先 COUNT 校准（仅一次，后续走缓存）。
+    pub fn entity_counts_cached(&self) -> [i64; 5] {
+        use std::sync::atomic::Ordering;
+        if self.entity_counts_cache[0].load(Ordering::Relaxed) < 0 {
+            return self.refresh_entity_counts();
+        }
+        let mut out = [0i64; 5];
+        for (i, a) in self.entity_counts_cache.iter().enumerate() {
+            out[i] = a.load(Ordering::Relaxed);
+        }
+        out
     }
 
     /// 获取底层连接的 Arc<Mutex<Connection>>（用于 WriteQueue）

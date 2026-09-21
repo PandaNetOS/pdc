@@ -94,10 +94,16 @@ pub struct FederationStatus {
     pub anti_entropy_no_conn_skips: u64,
     /// 指标快照
     pub metrics: FederationMetricsSnapshot,
-    /// NodeRepo 实际总条目数（非联邦同步累计）
+    /// NodeRepo 实际总条目数（F9: = DB 冷数据有效行数 + 内存未落库写队列，唯一权威口径）
     pub node_repo_total: u64,
-    /// PeerRepo 实际总条目数（非联邦同步累计）
+    /// NodeRepo 内存热/温条目数（DB 权威总数的子集，仅观测用）
+    #[serde(default)]
+    pub node_repo_hot_total: u64,
+    /// PeerRepo 实际总条目数（F9: = DB peers 有效行数 + peers_archive 冷归档）
     pub peer_repo_total: u64,
+    /// PeerRepo 内存热/温条目数（仅观测用）
+    #[serde(default)]
+    pub peer_repo_hot_total: u64,
     /// PeerRepo 活跃 peer 数（最近1小时内有活跃）
     pub peer_repo_active: u64,
     /// InfohashRepo 实际总条目数（非联邦同步累计）
@@ -664,7 +670,9 @@ impl FederationService {
             metrics: self.metrics.snapshot(),
             // Repo 实际总数由 handler 从 AppState 填充，此处先置 0
             node_repo_total: 0,
+            node_repo_hot_total: 0,
             peer_repo_total: 0,
+            peer_repo_hot_total: 0,
             peer_repo_active: 0,
             infohash_repo_total: 0,
             tracker_repo_total: 0,
@@ -921,7 +929,9 @@ mod tests {
             anti_entropy_no_conn_skips: 0,
             metrics: FederationMetricsSnapshot::default(),
             node_repo_total: 0,
+            node_repo_hot_total: 0,
             peer_repo_total: 0,
+            peer_repo_hot_total: 0,
             peer_repo_active: 0,
             infohash_repo_total: 0,
             tracker_repo_total: 0,
