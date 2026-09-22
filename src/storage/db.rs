@@ -4,6 +4,7 @@
 
 #![allow(clippy::type_complexity)]
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +34,16 @@ pub struct WriteStats {
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
     write_stats: Arc<Mutex<WriteStats>>,
+    /// oplog 行数缓存（-1 = 未初始化）。
+    /// `SELECT COUNT(*) FROM feed_oplog` 在大表上要扫整个 B-tree，冷缓存 + 慢盘实测可达
+    /// 数十秒（2026-09-21：51 节点 58 万行 oplog 冷查询 28s，盘吞吐仅 ~4MB/s），
+    /// 而 `MIN/MAX(seq)` 走主键索引端点恒为 O(log n) 不需要缓存。
+    /// 由 oplog 写入/裁剪点增量维护（见 `storage/oplog.rs`），首次读取时 COUNT 校准。
+    pub(crate) oplog_len_cache: std::sync::atomic::AtomicI64,
+    /// F9: 实体表有效行数缓存（[dht_nodes, peers, peers_archive, infohashes, trackers]，-1 = 未校准）。
+    /// 统计口径 = `deleted_at IS NULL`（软删墓碑不入数）。内存 repo 为热/温数据，
+    /// 冷数据在本 DB；总数以 DB 为唯一权威口径，由周期任务校准（见 main.rs db_entity_stats）。
+    pub(crate) entity_counts_cache: [std::sync::atomic::AtomicI64; 5],
 }
 
 impl Storage {
@@ -72,6 +83,8 @@ impl Storage {
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
+            oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
+            entity_counts_cache: Default::default(),
         };
         storage.init_tables()?;
         info!("[storage] 数据库已打开: {:?}", path_ref);
@@ -84,6 +97,8 @@ impl Storage {
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
+            oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
+            entity_counts_cache: Default::default(),
         };
         storage.init_tables()?;
         Ok(storage)
@@ -95,6 +110,45 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    // ---- F9: 实体表 DB 级统计（唯一权威口径：deleted_at IS NULL，内存 repo 为热/温子集）----
+
+    /// 各实体表有效行数：[dht_nodes, peers, peers_archive, infohashes, trackers]。
+    /// 软删墓碑（deleted_at 非 NULL）不计入。
+    pub fn valid_entity_counts(&self) -> [i64; 5] {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-2) };
+        [
+            count("SELECT COUNT(*) FROM dht_nodes WHERE deleted_at IS NULL"),
+            count("SELECT COUNT(*) FROM peers WHERE deleted_at IS NULL"),
+            count("SELECT COUNT(*) FROM peers_archive"),
+            count("SELECT COUNT(*) FROM infohashes WHERE deleted_at IS NULL"),
+            count("SELECT COUNT(*) FROM trackers WHERE deleted_at IS NULL"),
+        ]
+    }
+
+    /// 重算并写回缓存（周期任务调用；COUNT 较重，调用方应放阻塞线程）。
+    pub fn refresh_entity_counts(&self) -> [i64; 5] {
+        use std::sync::atomic::Ordering;
+        let c = self.valid_entity_counts();
+        for (i, v) in c.iter().enumerate() {
+            self.entity_counts_cache[i].store(*v, Ordering::Relaxed);
+        }
+        c
+    }
+
+    /// 读取缓存计数；未校准（-1）时先 COUNT 校准（仅一次，后续走缓存）。
+    pub fn entity_counts_cached(&self) -> [i64; 5] {
+        use std::sync::atomic::Ordering;
+        if self.entity_counts_cache[0].load(Ordering::Relaxed) < 0 {
+            return self.refresh_entity_counts();
+        }
+        let mut out = [0i64; 5];
+        for (i, a) in self.entity_counts_cache.iter().enumerate() {
+            out[i] = a.load(Ordering::Relaxed);
+        }
+        out
     }
 
     /// 获取底层连接的 Arc<Mutex<Connection>>（用于 WriteQueue）
@@ -1853,6 +1907,303 @@ impl Storage {
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    // ---- v7：统一 range 反熵（全 repo 支持）----
+
+    /// v7：按 repo 加载 `(key, data_hash)`，范围 `[lo, hi)`（`None` = ±∞），最多 `limit` 条。
+    ///
+    /// key 编码与各 repo 的 Merkle / `load_all_*_keys_hashes` 严格一致：
+    /// NODE=`ip:port`、PEER=`hex(ih):ip:port`、INFOHASH=原始 20B、TRACKER=url 字节。
+    pub fn load_repo_key_hashes_in_range(
+        &self,
+        repo: u8,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
+        const NODE: u8 = 1;
+        const PEER: u8 = 2;
+        const INFOHASH: u8 = 3;
+        const TRACKER: u8 = 4;
+        match repo {
+            NODE => self.load_node_key_hashes_in_range(lo, hi, limit),
+            PEER => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT infohash, ip, port FROM peers \
+                     WHERE deleted_at IS NULL \
+                       AND (?1 IS NULL OR {key_expr} >= ?1) \
+                       AND (?2 IS NULL OR {key_expr} < ?2) \
+                     ORDER BY {key_expr} ASC LIMIT ?3"
+                ))?;
+                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let (ih, ip, port) = r?;
+                    let mut arr = [0u8; 20];
+                    if ih.len() == 20 {
+                        arr.copy_from_slice(&ih);
+                    }
+                    let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                    let key = format!("{}:{}:{}", ih_hex, ip, port).into_bytes();
+                    let mut buf = Vec::with_capacity(ih.len() + ip.len() + 2);
+                    buf.extend_from_slice(&ih);
+                    buf.extend_from_slice(ip.as_bytes());
+                    buf.extend_from_slice(&port.to_le_bytes());
+                    out.push((key, blake3::hash(&buf).as_bytes().to_vec()));
+                }
+                Ok(out)
+            }
+            INFOHASH => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT infohash FROM infohashes \
+                     WHERE deleted_at IS NULL \
+                       AND (?1 IS NULL OR infohash >= ?1) \
+                       AND (?2 IS NULL OR infohash < ?2) \
+                     ORDER BY infohash ASC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let ih = r?;
+                    out.push((ih.clone(), blake3::hash(&ih).as_bytes().to_vec()));
+                }
+                Ok(out)
+            }
+            TRACKER => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                let mut stmt = conn.prepare(
+                    "SELECT url FROM trackers \
+                     WHERE deleted_at IS NULL \
+                       AND (?1 IS NULL OR url >= ?1) \
+                       AND (?2 IS NULL OR url < ?2) \
+                     ORDER BY url ASC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let url = r?;
+                    out.push((
+                        url.clone().into_bytes(),
+                        blake3::hash(url.as_bytes()).as_bytes().to_vec(),
+                    ));
+                }
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// v7：按 repo 随机抽样 `n` 个分界 key（LCG 探 rowid，同 [`Self::sample_node_range_keys`]）。
+    pub fn sample_repo_range_keys(&self, repo: u8, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // (表名, key 表达式)：key 表达式须与 load_repo_key_hashes_in_range 的排序键一致
+        // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
+        const NODE: u8 = 1;
+        const PEER: u8 = 2;
+        const INFOHASH: u8 = 3;
+        const TRACKER: u8 = 4;
+        let (table, key_sql): (&str, &str) = match repo {
+            NODE => ("dht_nodes", "(ip || ':' || port)"),
+            PEER => (
+                "peers",
+                "(lower(hex(infohash)) || ':' || ip || ':' || port)",
+            ),
+            INFOHASH => ("infohashes", "infohash"),
+            TRACKER => ("trackers", "url"),
+            _ => return Ok(Vec::new()),
+        };
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let max_rowid: i64 = conn.query_row(
+            &format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", table),
+            [],
+            |r| r.get(0),
+        )?;
+        if max_rowid <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut state: u64 = (chrono::Utc::now().timestamp_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        let sql = format!(
+            "SELECT {key_sql} FROM {table} WHERE deleted_at IS NULL AND rowid >= ?1 \
+             ORDER BY rowid ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let probe = ((state >> 33) % (max_rowid as u64)) as i64;
+            // key 可能是 TEXT（NODE/PEER/TRACKER）或 BLOB（INFOHASH），用 Value 中转
+            if let Ok(v) = stmt.query_row(params![probe], |row| {
+                row.get::<_, rusqlite::types::Value>(0)
+            }) {
+                let k = match v {
+                    rusqlite::types::Value::Text(s) => s.into_bytes(),
+                    rusqlite::types::Value::Blob(b) => b,
+                    _ => continue,
+                };
+                keys.push(k);
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    /// v7：按 repo 加载 `[lo, hi)` 区间内的完整 `SyncEntry`（bootstrap 分块服务用）。
+    ///
+    /// 条目编码与各 repo 的 gossip 同步条目严格一致（复用 `build_*_sync_entry` 系列函数）。
+    pub fn load_repo_sync_entries_in_range(
+        &self,
+        repo: u8,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::federation::protocol::SyncEntry>> {
+        use crate::federation::protocol::{operation, SyncEntry};
+        const NODE: u8 = 1;
+        const PEER: u8 = 2;
+        const INFOHASH: u8 = 3;
+        const TRACKER: u8 = 4;
+        let to_entry = |t: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>| {
+            t.map(|(key, payload, _dh)| SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: 0,
+                payload,
+            })
+        };
+        match repo {
+            NODE => {
+                let rows = self.load_node_rows_in_range(lo, hi, limit)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (id, ip, port) in rows {
+                    let mut arr = [0u8; 20];
+                    if id.len() == 20 {
+                        arr.copy_from_slice(&id);
+                    }
+                    if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                        if let Some(e) =
+                            to_entry(crate::federation::sync::build_node_sync_entry(arr, addr))
+                        {
+                            out.push(e);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            PEER => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT infohash, ip, port FROM peers \
+                     WHERE deleted_at IS NULL \
+                       AND (?1 IS NULL OR {key_expr} >= ?1) \
+                       AND (?2 IS NULL OR {key_expr} < ?2) \
+                     ORDER BY {key_expr} ASC LIMIT ?3"
+                ))?;
+                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let (ih, ip, port) = r?;
+                    let mut arr = [0u8; 20];
+                    if ih.len() == 20 {
+                        arr.copy_from_slice(&ih);
+                    }
+                    if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                        if let Some(e) = to_entry(
+                            crate::federation::sync::peer_sync::build_peer_sync_entry(arr, addr),
+                        ) {
+                            out.push(e);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            INFOHASH => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT infohash FROM infohashes \
+                     WHERE deleted_at IS NULL \
+                       AND (?1 IS NULL OR infohash >= ?1) \
+                       AND (?2 IS NULL OR infohash < ?2) \
+                     ORDER BY infohash ASC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let ih = r?;
+                    if ih.len() != 20 {
+                        continue;
+                    }
+                    let mut arr = [0u8; 20];
+                    arr.copy_from_slice(&ih);
+                    if let Some(e) = to_entry(
+                        crate::federation::sync::infohash_sync::build_infohash_sync_entry(arr),
+                    ) {
+                        out.push(e);
+                    }
+                }
+                Ok(out)
+            }
+            TRACKER => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                let mut stmt = conn.prepare(
+                    "SELECT url FROM trackers \
+                     WHERE deleted_at IS NULL \
+                       AND (?1 IS NULL OR url >= ?1) \
+                       AND (?2 IS NULL OR url < ?2) \
+                     ORDER BY url ASC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    let url = r?;
+                    if let Some(e) = to_entry(
+                        crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url),
+                    ) {
+                        out.push(e);
+                    }
+                }
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// 按 L2 二级分片加载 Peer (key, data_hash)，用于 Merkle 增量重算。

@@ -64,6 +64,21 @@ impl SubscriptionService {
         self
     }
 
+    /// 挂载内置 DNS 解析池（重建 HTTP 客户端，不再走系统 DNS）
+    ///
+    /// 在 [`Self::new`] 之后调用；`pool` 为 `None` 时保持 reqwest 默认解析器。
+    pub fn with_dns_pool(mut self, pool: Option<&Arc<pnos_net::DnsPool>>) -> Self {
+        self.client = crate::dns_resolve::apply_dns_pool(
+            reqwest::Client::builder()
+                .timeout(SUBSCRIPTION_HTTP_TIMEOUT)
+                .user_agent("PandaNetOS-PDC/0.2.0"),
+            pool,
+        )
+        .build()
+        .expect("failed to build reqwest client");
+        self
+    }
+
     /// 执行一次订阅源拉取（由 TaskScheduler 按间隔调度）
     pub async fn run_once(&self) {
         if self.config.feeds.is_empty() {

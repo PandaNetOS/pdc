@@ -162,6 +162,21 @@ impl ScrapeService {
         self
     }
 
+    /// 挂载内置 DNS 解析池（重建 HTTP 客户端，不再走系统 DNS）
+    ///
+    /// 在 [`Self::new`] 之后调用；`pool` 为 `None` 时保持 reqwest 默认解析器。
+    pub fn with_dns_pool(mut self, pool: Option<&Arc<pnos_net::DnsPool>>) -> Self {
+        self.http_client = crate::dns_resolve::apply_dns_pool(
+            Client::builder()
+                .timeout(SCRAPE_REQUEST_TIMEOUT)
+                .user_agent("PeerDiscoveryCenter/1.0"),
+            pool,
+        )
+        .build()
+        .unwrap_or_default();
+        self
+    }
+
     /// 获取某个 infohash 的 scrape 结果（优先用缓存）
     pub fn get_scrape_result(&self, infohash: &Infohash) -> Option<ScrapeResult> {
         let result = self.cache.get(infohash)?;

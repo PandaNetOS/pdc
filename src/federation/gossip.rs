@@ -921,9 +921,12 @@ impl GossipEngine {
     pub async fn anti_entropy_tick<M: MerkleProvider>(self: Arc<Self>, merkle_provider: Arc<M>) {
         let conns = self.sessions.all_connections();
         if conns.is_empty() {
+            self.metrics.record_anti_entropy_no_conn();
             debug!("[federation] 反熵跳过：无连接");
             return;
         }
+        // P3-C：本轮反熵确实执行了（可观测性：此前无法证明周期任务被调用过）
+        self.metrics.record_anti_entropy_tick();
 
         use rand::seq::SliceRandom;
         let mut rng = rand::rngs::StdRng::from_entropy();
@@ -956,6 +959,7 @@ impl GossipEngine {
                 );
             } else {
                 self.metrics.record_message_sent();
+                self.metrics.record_anti_entropy_digest();
                 sent += 1;
             }
         }

@@ -180,12 +180,25 @@ pub struct FederationConfig {
     /// 关闭时完全不发这些消息，行为与改造前一致。
     #[serde(default)]
     pub delta_sync_enabled: bool,
-    /// P1-3：delta 增量拉取周期（秒）。默认 15。
+    /// P1-3：delta 增量拉取周期（秒）。默认 60（稳态足够，欠账期配合批量 1 千条防慢盘打死）。
     ///
     /// 建连时的首次拉取之外，还需该周期任务持续向每个已连接对端追问「有没有新 op」，
     /// 否则稳态新写入只能靠 gossip 传播，delta 通道会退化成一次性拉取（F1）。
     #[serde(default = "default_delta_sync_interval_secs")]
     pub delta_sync_interval_secs: u64,
+    /// v7：是否启用建连协商（SyncNegotiate/Ack）。默认 true。
+    /// 协商通过前，v7+ 对端的 delta/bootstrap 大通道不启动（稳定性门控）；对端 < v7 回落旧行为。
+    #[serde(default = "default_negotiation_enabled")]
+    pub negotiation_enabled: bool,
+    /// v7：稳定性门控 —— 连接存活达到该秒数后才允许大通道启动。默认 30。
+    #[serde(default = "default_strategy_min_conn_secs")]
+    pub strategy_min_conn_secs: u64,
+    /// v7：delta 看门狗 —— 连续 N 个拉取周期零进展且 lag>0 时暂停并触发重协商。默认 5。
+    #[serde(default = "default_delta_watchdog_stall_ticks")]
+    pub delta_watchdog_stall_ticks: u32,
+    /// v7：range 叶级差集大差集阈值（行数）。默认 10000。
+    #[serde(default = "default_range_bulk_threshold_rows")]
+    pub range_bulk_threshold_rows: u64,
     /// P1-4：是否启用 Range-based（有序区间 + 分界点下钻）反熵作为 NODE repo 的反熵主链。
     /// 默认 false：行为与改造前一致（既有分层 Merkle 反熵），必须两端同版本（>= v5）后开启。
     #[serde(default)]
@@ -422,7 +435,24 @@ fn default_oplog_trim_interval_secs() -> u64 {
     3_600
 }
 fn default_delta_sync_interval_secs() -> u64 {
-    15
+    // 60s：稳态足够；欠账期配合批量 1 千条，避免慢盘节点被高频大拉取打死（51 事故）。
+    60
+}
+/// v7：建连协商默认开启（协议版本门控保护旧对端；两端同版本时协商生效）。
+fn default_negotiation_enabled() -> bool {
+    true
+}
+/// v7：稳定性门控 —— 连接存活达到该秒数后才允许启动 delta/bootstrap 大通道。
+fn default_strategy_min_conn_secs() -> u64 {
+    30
+}
+/// v7：delta 看门狗 —— 连续 N 个 interval 零进展且 lag>0 时暂停拉取并触发重协商。
+fn default_delta_watchdog_stall_ticks() -> u32 {
+    5
+}
+/// v7：range 叶级差集超过该行数即视为「大差集」，按协商策略走 bootstrap 快照通道。
+fn default_range_bulk_threshold_rows() -> u64 {
+    10_000
 }
 fn default_range_leaf_rows() -> u32 {
     crate::federation::sync::range_reconcile::DEFAULT_LEAF_ROWS
@@ -583,6 +613,10 @@ impl Default for FederationConfig {
             shard_sync_consecutive_fail_threshold: default_shard_sync_consecutive_fail_threshold(),
             shard_sync_engine_poll_interval_secs: default_shard_sync_engine_poll_interval_secs(),
             shard_sync_window_flow_sleep_ms: default_shard_sync_window_flow_sleep_ms(),
+            negotiation_enabled: default_negotiation_enabled(),
+            strategy_min_conn_secs: default_strategy_min_conn_secs(),
+            delta_watchdog_stall_ticks: default_delta_watchdog_stall_ticks(),
+            range_bulk_threshold_rows: default_range_bulk_threshold_rows(),
         }
     }
 }

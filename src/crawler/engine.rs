@@ -282,6 +282,15 @@ impl CrawlerEngine {
         self
     }
 
+    /// 覆盖 DNS 解析池
+    ///
+    /// 默认在构造时用 [`crate::dns_pool::DnsPool::new`]（即内置公共 DNS，
+    /// 不读系统 DNS）；此处用于换成启动时按 `config.dns` 初始化的进程级实例。
+    pub fn with_dns_pool(mut self, pool: Arc<crate::dns_pool::DnsPool>) -> Self {
+        self.dns_pool = pool;
+        self
+    }
+
     /// 随机返回一个虚拟节点 ID（多虚拟节点，覆盖更多 DHT ID 空间）
     fn random_virtual_node_id(&self) -> [u8; 20] {
         let idx = rand::random::<usize>() % self.virtual_node_ids.len();

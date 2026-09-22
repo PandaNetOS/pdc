@@ -84,12 +84,26 @@ pub struct FederationStatus {
     pub relay_channels: usize,
     /// Tracker 同步是否启用
     pub tracker_sync_enabled: bool,
+    /// oplog 当前行数（内存缓存，O(1)；与 `/sync-observability` 的 `oplog.len` 同源）
+    pub oplog_len: u64,
+    /// 反熵 tick 已执行次数（有连接时的有效对账轮数）
+    pub anti_entropy_ticks: u64,
+    /// 反熵累计发出的 MerkleDigest 数
+    pub anti_entropy_digests_sent: u64,
+    /// 反熵因无连接而跳过的 tick 数
+    pub anti_entropy_no_conn_skips: u64,
     /// 指标快照
     pub metrics: FederationMetricsSnapshot,
-    /// NodeRepo 实际总条目数（非联邦同步累计）
+    /// NodeRepo 实际总条目数（F9: = DB 冷数据有效行数 + 内存未落库写队列，唯一权威口径）
     pub node_repo_total: u64,
-    /// PeerRepo 实际总条目数（非联邦同步累计）
+    /// NodeRepo 内存热/温条目数（DB 权威总数的子集，仅观测用）
+    #[serde(default)]
+    pub node_repo_hot_total: u64,
+    /// PeerRepo 实际总条目数（F9: = DB peers 有效行数 + peers_archive 冷归档）
     pub peer_repo_total: u64,
+    /// PeerRepo 内存热/温条目数（仅观测用）
+    #[serde(default)]
+    pub peer_repo_hot_total: u64,
     /// PeerRepo 活跃 peer 数（最近1小时内有活跃）
     pub peer_repo_active: u64,
     /// InfohashRepo 实际总条目数（非联邦同步累计）
@@ -145,6 +159,19 @@ pub struct FederationSnapshot {
     pub relay_stats: RelayStats,
 }
 
+/// 轻量同步摘要（`/federation/status` 快接口用，毫秒级；不触碰重查询）。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SyncBrief {
+    /// oplog 当前行数（内存缓存）
+    pub oplog_len: u64,
+    /// 反熵 tick 已执行次数
+    pub anti_entropy_ticks: u64,
+    /// 反熵累计发出 MerkleDigest 数
+    pub anti_entropy_digests_sent: u64,
+    /// 反熵因无连接跳过的 tick 数
+    pub anti_entropy_no_conn_skips: u64,
+}
+
 /// 联邦服务主入口
 pub struct FederationService {
     /// 节点身份
@@ -189,6 +216,8 @@ pub struct FederationService {
     shutdown: broadcast::Sender<()>,
     /// 启动时间
     started_at: Instant,
+    /// DNS 解析配置（默认走 pnos-net 内置公共 DNS，不读系统 DNS）
+    dns: pnos_net::dns::DnsConfig,
 }
 
 impl FederationService {
@@ -373,7 +402,17 @@ impl FederationService {
             data_dir: data_dir.to_path_buf(),
             shutdown: shutdown_tx,
             started_at: Instant::now(),
+            dns: pnos_net::dns::DnsConfig::default(),
         })
+    }
+
+    /// 注入 DNS 解析配置
+    ///
+    /// 决定 iroh 端点用哪个解析器解析 pkarr / DnsAddressLookup / DERP 主机名。
+    /// 不调用时使用内置公共 DNS（不读宿主系统 DNS 配置）。
+    pub fn with_dns(mut self, dns: pnos_net::dns::DnsConfig) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// 初始化 NetAgent（Iroh+TCP 传输层）并绑定 SDK 会话层
@@ -405,7 +444,10 @@ impl FederationService {
                 derp_enabled: true,
                 derp_urls: Vec::new(),
                 connect_timeout: IROH_CONNECT_TIMEOUT,
-                alpn: b"pdc-federation/1.0".to_vec(),
+                alpn: b"pnos/federation/1".to_vec(),
+                // 注入内置 DNS 配置：iroh 默认解析器会读宿主系统 DNS 配置，
+                // 宿主解析器不可用时 pkarr / DnsAddressLookup / DERP 全部握不上。
+                dns: self.dns.clone(),
             })
         } else {
             None
@@ -480,9 +522,12 @@ impl FederationService {
         // 4.1 启动时先执行一次 STUN 探测，确保 setup_mapping 能拿到 STUN 结果
         //     否则首次 setup_mapping 时 last_stun 为 None，reachability 会误判为 Unknown
         //     使用 spawn_blocking + 3秒超时，避免 STUN 无响应时阻塞 tokio 运行时
+        //     先在异步侧用内置 DNS 池把服务器域名解析成 ip:port（不读系统 DNS），
+        //     再把字面量交给阻塞线程，阻塞线程内部不再做任何解析。
+        let stun_servers = self.nat_integration.resolved_stun_servers().await;
         let nat_clone = self.nat_integration.clone();
         let stun_handle = tokio::task::spawn_blocking(move || {
-            nat_clone.stun_probe();
+            nat_clone.stun_probe_with(&stun_servers);
         });
         let _ = tokio::time::timeout(STUN_PROBE_STARTUP_TIMEOUT, stun_handle).await;
 
@@ -625,6 +670,7 @@ impl FederationService {
             .map(|a| a.reachability.to_string())
             .unwrap_or_else(|| "Unknown".to_string());
 
+        let brief = self.sync_manager.sync_brief();
         FederationStatus {
             enabled: self.config.enabled,
             node_id: self.identity.node_id.to_hex(),
@@ -635,10 +681,16 @@ impl FederationService {
             gossip_queue_size: self.gossip_engine.outbox_size(),
             relay_channels: self.relay_manager.active_channel_count(),
             tracker_sync_enabled: self.config.sync_tracker_enabled,
+            oplog_len: brief.oplog_len,
+            anti_entropy_ticks: brief.anti_entropy_ticks,
+            anti_entropy_digests_sent: brief.anti_entropy_digests_sent,
+            anti_entropy_no_conn_skips: brief.anti_entropy_no_conn_skips,
             metrics: self.metrics.snapshot(),
             // Repo 实际总数由 handler 从 AppState 填充，此处先置 0
             node_repo_total: 0,
+            node_repo_hot_total: 0,
             peer_repo_total: 0,
+            peer_repo_hot_total: 0,
             peer_repo_active: 0,
             infohash_repo_total: 0,
             tracker_repo_total: 0,
@@ -889,9 +941,15 @@ mod tests {
             gossip_queue_size: 3,
             relay_channels: 0,
             tracker_sync_enabled: false,
+            oplog_len: 0,
+            anti_entropy_ticks: 0,
+            anti_entropy_digests_sent: 0,
+            anti_entropy_no_conn_skips: 0,
             metrics: FederationMetricsSnapshot::default(),
             node_repo_total: 0,
+            node_repo_hot_total: 0,
             peer_repo_total: 0,
+            peer_repo_hot_total: 0,
             peer_repo_active: 0,
             infohash_repo_total: 0,
             tracker_repo_total: 0,

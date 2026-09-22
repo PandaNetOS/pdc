@@ -20,6 +20,7 @@
 //! 任何 oplog 写入失败都只告警，**绝不阻断业务写入**。
 
 use rusqlite::{params, Connection};
+use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 use crate::federation::protocol::{operation, SyncEntry};
@@ -101,7 +102,10 @@ impl super::db::Storage {
     pub fn append_op(&self, repo: u8, op: &str, key: &[u8], value: &[u8]) -> anyhow::Result<i64> {
         let conn = self.connection();
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        Self::append_op_in_tx(&conn, repo, op, key, value)
+        let seq = Self::append_op_in_tx(&conn, repo, op, key, value)?;
+        drop(conn);
+        self.bump_oplog_len(1);
+        Ok(seq)
     }
 
     /// 把一批**本地产生的**联邦变更（`SyncEntry`）追加进 oplog（一次锁 + 一个事务）。
@@ -133,59 +137,77 @@ impl super::db::Storage {
             }
         }
         tx.commit()?;
+        drop(conn);
+        self.bump_oplog_len(n as i64);
         Ok(n)
     }
 
     /// 按 `repo` 增量拉取 `seq > since_seq` 的 op（升序，最多 `limit` 条）。
     /// `repo = u8::MAX` 表示不限 repo。
+    ///
+    /// 分片读取（v7 保命项）：每片 `OPLOG_READ_SHARD_ROWS` 条，片间**释放连接锁**并短暂
+    /// sleep 让出 —— 否则慢盘（~4MB/s）上一次 `LIMIT 10000` 全扫会持锁数十秒，
+    /// 把 apply 写路径与全部 API handler 饿死（2026-09-21 51 事故根因）。
     pub fn load_ops_since(
         &self,
         repo: u8,
         since_seq: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<OpRecord>> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let limit = limit.max(1) as i64;
-        let mut out: Vec<OpRecord> = Vec::new();
-        if repo == u8::MAX {
-            let mut stmt = conn.prepare(
-                "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
-                 WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![since_seq, limit], |row| {
-                Ok(OpRecord {
-                    seq: row.get(0)?,
-                    op: row.get(1)?,
-                    repo: row.get::<_, i64>(2)? as u8,
-                    key: row.get(3)?,
-                    value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                    ts_ms: row.get(5)?,
-                    origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
-                })
-            })?;
-            for r in rows {
-                out.push(r?);
+        const SHARD_ROWS: usize = 512;
+        const SHARD_YIELD_MS: u64 = 5;
+        let limit = limit.max(1);
+        let mut out: Vec<OpRecord> = Vec::with_capacity(limit.min(4096));
+        let mut last = since_seq;
+        while out.len() < limit {
+            let shard = SHARD_ROWS.min(limit - out.len());
+            let rows: Vec<OpRecord> = {
+                let conn = self.connection();
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = if repo == u8::MAX {
+                    conn.prepare(
+                        "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
+                         WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+                    )?
+                } else {
+                    conn.prepare(
+                        "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
+                         WHERE repo = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+                    )?
+                };
+                let map = |row: &rusqlite::Row| {
+                    Ok(OpRecord {
+                        seq: row.get(0)?,
+                        op: row.get(1)?,
+                        repo: row.get::<_, i64>(2)? as u8,
+                        key: row.get(3)?,
+                        value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                        ts_ms: row.get(5)?,
+                        origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
+                    })
+                };
+                let rows = if repo == u8::MAX {
+                    stmt.query_map(params![last, shard as i64], map)?
+                } else {
+                    stmt.query_map(params![repo as i64, last, shard as i64], map)?
+                };
+                let mut v = Vec::with_capacity(shard);
+                for r in rows {
+                    v.push(r?);
+                }
+                v
+            }; // ← 锁在此 drop
+            if rows.is_empty() {
+                break;
             }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
-                 WHERE repo = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![repo as i64, since_seq, limit], |row| {
-                Ok(OpRecord {
-                    seq: row.get(0)?,
-                    op: row.get(1)?,
-                    repo: row.get::<_, i64>(2)? as u8,
-                    key: row.get(3)?,
-                    value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                    ts_ms: row.get(5)?,
-                    origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
-                })
-            })?;
-            for r in rows {
-                out.push(r?);
+            last = rows[rows.len() - 1].seq;
+            let full_shard = rows.len() >= shard;
+            out.extend(rows);
+            if !full_shard {
+                break;
             }
+            // 片间让锁：给 apply / API 一个窗口（短 sleep，非周期热路径）
+            std::thread::sleep(std::time::Duration::from_millis(SHARD_YIELD_MS));
         }
         Ok(out)
     }
@@ -226,6 +248,21 @@ impl super::db::Storage {
         Ok(v)
     }
 
+    /// 指定 repo 的最小 seq（保留窗口内该 repo 最早一条变更；无记录时 0）。
+    ///
+    /// v8 F1：协商消息按 repo 上报水位；min_seq 供对端判断欠账是否仍在保留窗口内
+    ///（可 delta 续拉）还是已被裁剪（必须 bootstrap）。走 `idx_feed_oplog_repo_seq` 索引。
+    pub fn oplog_min_seq_for_repo(&self, repo: u8) -> anyhow::Result<i64> {
+        let conn = self.connection();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let v: i64 = conn.query_row(
+            "SELECT COALESCE(MIN(seq), 0) FROM feed_oplog WHERE repo = ?1",
+            params![repo as i64],
+            |r| r.get(0),
+        )?;
+        Ok(v)
+    }
+
     /// 裁剪 `ts_ms < older_than_ms` 的 op，返回删除条数。
     pub fn trim_oplog(&self, older_than_ms: i64) -> anyhow::Result<usize> {
         let conn = self.connection();
@@ -234,17 +271,39 @@ impl super::db::Storage {
             "DELETE FROM feed_oplog WHERE ts_ms < ?1",
             params![older_than_ms],
         )?;
+        drop(conn);
         if n > 0 {
             debug!("[oplog] 裁剪 {} 条（ts_ms < {}）", n, older_than_ms);
+            self.bump_oplog_len(-(n as i64));
         }
         Ok(n)
     }
 
+    /// 仅当 oplog 行数缓存已初始化（>= 0）时增量调整它。
+    ///
+    /// 未初始化时不动 —— 首次 [`Self::oplog_len`] 会用 COUNT(*) 校准真值。
+    /// 正确性：COUNT 与写路径都持有同一把连接锁，互斥序列化；已初始化后的
+    /// 增减与事务提交顺序一致，缓存永不漂移。
+    fn bump_oplog_len(&self, delta: i64) {
+        if self.oplog_len_cache.load(Ordering::Relaxed) >= 0 {
+            self.oplog_len_cache.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
     /// oplog 行数（可观测性用）。
+    ///
+    /// 首次调用执行 COUNT(*) 并缓存（大表慢盘上这一次可能较慢，启动时由后台预热任务
+    /// 提前完成）；此后走内存缓存，由写入/裁剪点增量维护，恒为 O(1)。
     pub fn oplog_len(&self) -> anyhow::Result<u64> {
+        let cached = self.oplog_len_cache.load(Ordering::Relaxed);
+        if cached >= 0 {
+            return Ok(cached as u64);
+        }
         let conn = self.connection();
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
         let v: i64 = conn.query_row("SELECT COUNT(*) FROM feed_oplog", [], |r| r.get(0))?;
+        drop(conn);
+        self.oplog_len_cache.store(v, Ordering::Relaxed);
         Ok(v.max(0) as u64)
     }
 

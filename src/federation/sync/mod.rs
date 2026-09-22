@@ -32,6 +32,7 @@ use crate::federation::merkle::{MerkleProvider, MerkleTree};
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::peer_conn::PeerConn;
+use crate::federation::protocol;
 use crate::federation::protocol::*;
 use crate::federation::relay::RelayManager;
 use crate::federation::session::SessionsHandle;
@@ -50,6 +51,30 @@ const GOSSIP_RESUME_DELAY: Duration = Duration::from_secs(30);
 const FULL_SYNC_FLOW_CONTROL_INTERVAL: Duration = Duration::from_millis(10);
 /// 反熵对账前等待 Merkle 更新队列排空的上限
 const MERKLE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// v7：协商重发节流（秒）。
+const NEGOTIATE_RESEND_SECS: u64 = 60;
+/// v7：协商发出后无 Ack 的降级放行等待（秒）—— 视为协商失败回落旧行为，防永久卡死。
+const NEGOTIATE_FALLBACK_SECS: u64 = 120;
+/// v8 F3：看门狗触发后的暂停时长（× delta 拉取周期）。原 10 周期停摆 10 分钟过久，缩到 2。
+const DELTA_WATCHDOG_PAUSE_MULT: u32 = 2;
+/// v8 F4：in-flight 请求视为存活的时长（秒）——超过后允许重发（覆盖写超时与短暂失联）。
+const DELTA_INFLIGHT_TIMEOUT_SECS: u64 = 30;
+/// v7：bootstrap 快照触发的最小行数（对端该 repo 为空且本端 ≥ 此量才走快照）。
+const SNAPSHOT_MIN_ROWS: u64 = 1_000;
+/// v7：快照分流比例阈值（本端比对端多出该比例且差值超阈值 → 快照）。
+const SNAPSHOT_RATIO_THRESHOLD: f64 = 1.2;
+/// v7：range 反熵 per-repo 周期（秒）：NODE churn 最高用短周期，TRACKER 小库最长。
+const RANGE_INTERVAL_SECS: [(u8, u64); 4] = [
+    (repo_type::NODE, 30),
+    (repo_type::PEER, 120),
+    (repo_type::INFOHASH, 300),
+    (repo_type::TRACKER, 600),
+];
+/// v7：TRACKER（小库）叶级行数阈值。
+const RANGE_LEAF_ROWS_TRACKER: u32 = 512;
+/// v7：PEER / INFOHASH（中库）叶级行数阈值。
+const RANGE_LEAF_ROWS_MID: u32 = 2048;
 
 /// 节点同步负载
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,10 +163,21 @@ pub struct SyncManager {
     /// F1：每个 (对端, repo) 最近一次 delta 拉取发起时刻。
     /// 周期 tick 据此节流（间隔内不重发）并在无响应时超时重试。
     delta_request_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v8 F4：每个 (对端, repo) 的 in-flight 请求发起时刻（DELTA_INFLIGHT_TIMEOUT_SECS 超时兜底）。
+    /// 同一 (peer, repo) 未完成前不重发，消灭「tick + 续拉 + 重复应用再续拉」重试风暴。
+    delta_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// F2：对端最近一次回报的 oplog 水位（与本地 synced_seq 同序列空间，用于算真实 lag）。
     delta_peer_max: RwLock<FxHashMap<(NodeId, u8), u64>>,
     /// P2-5：反熵按 repo 差异化的上次执行时刻。
     anti_entropy_last: RwLock<FxHashMap<u8, Instant>>,
+    /// v7：已向对端发起建连协商的时刻（重发节流）。
+    negotiation_sent_at: RwLock<FxHashMap<NodeId, Instant>>,
+    /// v7：协商结果（对端 → 各 repo 策略表，来自对端 Ack）。
+    negotiated: RwLock<FxHashMap<NodeId, Vec<RepoStrategy>>>,
+    /// v7：delta 看门狗：(peer, repo) → (上次 synced_seq, 连续零进展 tick 数, 暂停截止)。
+    delta_watchdog: RwLock<FxHashMap<(NodeId, u8), (u64, u32, Option<Instant>)>>,
+    /// v7：range 反熵按 repo 的上次执行时刻（per-repo interval 节流）。
+    range_tick_last: RwLock<FxHashMap<u8, Instant>>,
 }
 
 /// DiffSync key 列表请求累计缓冲（请求方侧）
@@ -285,8 +321,13 @@ impl SyncManager {
             range_remote_only_total: std::sync::atomic::AtomicU64::new(0),
             range_repair_triggers: std::sync::atomic::AtomicU64::new(0),
             delta_request_at: RwLock::new(FxHashMap::default()),
+            delta_inflight: RwLock::new(FxHashMap::default()),
             delta_peer_max: RwLock::new(FxHashMap::default()),
             anti_entropy_last: RwLock::new(FxHashMap::default()),
+            negotiation_sent_at: RwLock::new(FxHashMap::default()),
+            negotiated: RwLock::new(FxHashMap::default()),
+            delta_watchdog: RwLock::new(FxHashMap::default()),
+            range_tick_last: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -1003,6 +1044,12 @@ impl SyncManager {
     /// 由 Merkle 反熵驱动：当检测到与某对端的某 repo 差异分片≥20%时调用。
     /// 每 repo 最多1个差量同步并发，全局最多4个并行。
     async fn trigger_diff_sync(self: Arc<Self>, peer: NodeId, repo_type: u8) {
+        // v7 退役开关：range 反熵已统一接管全部 repo，DiffSync（无续传/无限速，亿级下
+        // 会陷入「60s settle → 整仓重发」循环）永久停用；差异迁移由 range 修复 +
+        // delta 追平 + bootstrap 快照承担。`range_reconcile_enabled=false` 时保留旧行为。
+        if self.config.range_reconcile_enabled {
+            return;
+        }
         if !self.try_start_diff_sync(peer, repo_type) {
             info!(
                 "[federation] 差异全量同步被跳过：repo={} 已有同步进行中（请求对端={}）",
@@ -2469,6 +2516,21 @@ impl SyncManager {
         self.node_repo.storage()
     }
 
+    /// 轻量同步摘要（供 `/federation/status` 快接口；不触碰任何 SQLite 重查询）。
+    ///
+    /// 背景：`/sync-observability` 的 `oplog_len` 在大表慢盘节点上冷缓存可达数十秒
+    /// （2026-09-21 实测 51 节点 28s），不适合作为巡检入口；oplog 行数已有内存缓存
+    /// （`storage/oplog.rs`），加上 tick 计数即可让运维在毫秒级接口上看到反熵是否在跑。
+    pub fn sync_brief(&self) -> crate::federation::SyncBrief {
+        let s = self.metrics.snapshot();
+        crate::federation::SyncBrief {
+            oplog_len: self.delta_storage().oplog_len().unwrap_or(0),
+            anti_entropy_ticks: s.anti_entropy_ticks,
+            anti_entropy_digests_sent: s.anti_entropy_digests_sent,
+            anti_entropy_no_conn_skips: s.anti_entropy_no_conn,
+        }
+    }
+
     /// 对某对端某 repo 发起增量拉取（发送首个 OpsRequest）。
     ///
     /// 断点来自本地持久化的版本向量 `delta_peer_seq`（重启后续传，不重来）。
@@ -2487,6 +2549,32 @@ impl SyncManager {
                 peer, repo
             );
             return;
+        }
+        // v7：协商 + 稳定性门控 + 策略裁定（对端 < v7 时恒放行）
+        if !self.delta_channel_allowed(&conn, repo) {
+            debug!(
+                "[delta] 协商未通过/被门控，跳过 repo={} peer={}（连接存活 {}s）",
+                repo,
+                peer,
+                conn.connected_secs()
+            );
+            return;
+        }
+        // v8 F4：in-flight 去重 —— 同一 (peer, repo) 存在未完成请求（30s 内）时不重发。
+        // 否则 tick + 续拉 + 重复应用再续拉叠加出重试风暴：每请求服务端都发 2MB 重复帧，
+        // 单连接 writer 锁串行排队后乱序到达，实测 70s 内同一 since_seq 发起 15+ 次。
+        {
+            let mut w = self.delta_inflight.write();
+            if let Some(t) = w.get(&(peer, repo)) {
+                if t.elapsed() < Duration::from_secs(DELTA_INFLIGHT_TIMEOUT_SECS) {
+                    debug!(
+                        "[delta] in-flight 请求未完成，跳过本轮: peer={}, repo={}",
+                        peer, repo
+                    );
+                    return;
+                }
+            }
+            w.insert((peer, repo), Instant::now());
         }
         let since = self
             .delta_storage()
@@ -2510,7 +2598,11 @@ impl SyncManager {
                     peer, repo, since
                 );
             }
-            Err(e) => warn!("[delta] 发送 OpsRequest 失败 peer={}: {}", peer, e),
+            Err(e) => {
+                warn!("[delta] 发送 OpsRequest 失败 peer={}: {}", peer, e);
+                // v8 F4：发送失败不会有响应回来，立即解除 in-flight 以便下轮重试
+                self.delta_inflight.write().remove(&(peer, repo));
+            }
         }
     }
 
@@ -2540,8 +2632,25 @@ impl SyncManager {
             }
         };
         let ops = delta::records_to_entries(&records);
+        // v7：字节上限 —— 大 value 场景防批帧失控（对齐 gossip_bulk_max_bytes 量级）。
+        // 截断时 has_more 仍为 true，下一批从同一 seq 续拉（不丢数据，不空转：至少保留 1 条）。
+        let mut truncated = false;
+        let mut total = 0usize;
+        let mut cut = ops.len();
+        for (i, o) in ops.iter().enumerate() {
+            total += o.key.len() + o.value.len() + 32;
+            if total > delta::DELTA_BATCH_MAX_BYTES {
+                cut = i;
+                truncated = true;
+                break;
+            }
+        }
+        let mut ops = ops;
+        if truncated {
+            ops.truncate(cut.max(1));
+        }
         let next_seq = ops.last().map(|o| o.seq).unwrap_or(req.since_seq);
-        let has_more = !ops.is_empty() && ops.len() >= limit;
+        let has_more = !ops.is_empty() && (ops.len() >= limit || truncated);
         // F2：回带「本机在该 repo 上的」oplog 水位（= 该 repo 最后一条变更的 seq；无则 0）。
         // 必须**按 repo** 取水位：请求方的断点是按 repo 独立维护的，若用全局水位相减，
         // op 稀疏的 repo（如 TRACKER）会被算成「落后上千条」的虚高值。
@@ -2581,6 +2690,34 @@ impl SyncManager {
         if !self.config.delta_sync_enabled {
             return;
         }
+        // v8 F4：请求往返完成，清除 in-flight 标记（此后 tick 可发下一轮请求）。
+        self.delta_inflight
+            .write()
+            .remove(&(conn.node_id, batch.repo));
+        // F2：记录对端在本 repo 的 oplog 水位。它与本机记录的 synced_seq 同属对端 seq
+        // 空间，二者相减才是「真实落后量」；无此值时 lag 报 null（不跨空间相减）。
+        // v8：即使批已过期，水位也是最新信息，始终记录。
+        if batch.server_max_seq > 0 {
+            self.delta_peer_max
+                .write()
+                .insert((conn.node_id, batch.repo), batch.server_max_seq);
+        }
+        // v8 F5：游标单调保护 —— 过期/重复批（next_seq ≤ 当前游标）直接丢弃：
+        // 不重复应用、不推进、不续拉。否则重试风暴下乱序到达的旧批会把游标
+        // 打回去（实测 1016764 → 1015764），再触发同区间无限重拉。
+        let cur = self
+            .delta_storage()
+            .get_peer_seq(&conn.node_id.0, batch.repo)
+            .unwrap_or(0)
+            .max(0) as u64;
+        let next = delta::seq_to_i64(batch.next_seq).max(0) as u64;
+        if next <= cur {
+            debug!(
+                "[delta] 丢弃过期/重复批: peer={}, repo={}, next_seq={} ≤ 当前 {}（单调保护）",
+                conn.node_id, batch.repo, batch.next_seq, cur
+            );
+            return;
+        }
         let entries = delta::ops_to_sync_entries(&batch.ops);
         if !entries.is_empty() {
             self.handle_sync_batch(batch.repo, &entries);
@@ -2592,13 +2729,6 @@ impl SyncManager {
             delta::seq_to_i64(batch.next_seq),
         ) {
             warn!("[delta] 推进版本向量失败 peer={}: {}", conn.node_id, e);
-        }
-        // F2：记录对端在本 repo 的 oplog 水位。它与本机记录的 synced_seq 同属对端 seq
-        // 空间，二者相减才是「真实落后量」；无此值时 lag 报 null（不跨空间相减）。
-        if batch.server_max_seq > 0 {
-            self.delta_peer_max
-                .write()
-                .insert((conn.node_id, batch.repo), batch.server_max_seq);
         }
         // 拉取往返成功：把节流计时推后，避免同一轮里 tick 立刻重发
         self.delta_request_at
@@ -2619,8 +2749,289 @@ impl SyncManager {
                 warn!("[delta] 续拉 OpsRequest 失败 to={}: {}", conn.node_id, e);
             } else {
                 self.metrics.record_message_sent();
+                // v8 F4：续拉同样标记 in-flight（防与下一轮 tick 叠加）
+                self.delta_inflight
+                    .write()
+                    .insert((conn.node_id, batch.repo), Instant::now());
             }
         }
+    }
+
+    // ========================================================================
+    // v7：建连协商（SyncNegotiate / SyncNegotiateAck）
+    //
+    // 连接建立后双方互发一次 SyncNegotiate（互报各 repo 数据量 + 能力），
+    // 收到对端 Negotiate 的一方按纯函数策略回 Ack（per-repo：DELTA / BOOTSTRAP / NONE）。
+    // 稳定性门控：连接存活 ≥ strategy_min_conn_secs 才发协商；协商通过前 v7+ 对端的
+    // delta/bootstrap 大通道不启动（range 只读对账不受限）。对端 < v7 回落旧行为。
+    // ========================================================================
+
+    /// v7：per-repo 叶级行数阈值（TRACKER 小库用小叶，PEER/INFOHASH 中库，NODE 走配置）。
+    fn leaf_rows_for_repo(&self, repo: u8) -> u32 {
+        match repo {
+            repo_type::TRACKER => RANGE_LEAF_ROWS_TRACKER,
+            repo_type::PEER | repo_type::INFOHASH => RANGE_LEAF_ROWS_MID,
+            _ => self.config.range_reconcile_leaf_rows.max(1),
+        }
+    }
+
+    /// v7：确保对端协商已发起/未过期（由 delta tick 周期调用；60s 重发节流）。
+    async fn ensure_negotiation(self: &Arc<Self>, conn: &Arc<PeerConn>) {
+        let needs = {
+            let sent = self.negotiation_sent_at.read();
+            match sent.get(&conn.node_id) {
+                Some(t) => t.elapsed() >= Duration::from_secs(NEGOTIATE_RESEND_SECS),
+                None => true,
+            }
+        };
+        if !needs {
+            return;
+        }
+        // 稳定性门控：连接存活不足则等下一轮
+        if conn.connected_secs() < self.config.strategy_min_conn_secs {
+            return;
+        }
+        self.negotiation_sent_at
+            .write()
+            .insert(conn.node_id, Instant::now());
+        let msg = self.build_negotiate_message();
+        match conn.send_message(MessageType::SyncNegotiate, &msg).await {
+            Ok(()) => {
+                self.metrics.record_message_sent();
+                info!(
+                    "[negotiate] 已发送协商请求 to={}（存活 {}s）",
+                    conn.node_id,
+                    conn.connected_secs()
+                );
+            }
+            Err(e) => warn!("[negotiate] 发送协商请求失败 to={}: {}", conn.node_id, e),
+        }
+    }
+
+    /// v7：构造本端协商载荷（各 repo 状态 + 能力）。
+    fn build_negotiate_message(&self) -> SyncNegotiateMessage {
+        let counts = self.local_entry_counts();
+        let st = self.delta_storage();
+        let retention = self.config.oplog_retention_secs;
+        // v8 F1：水位必须按 repo 取 —— 原来填全局 oplog 水位（同值 × 4 repo），
+        // oplog 稀疏 repo 的欠账在协商里完全失真（假数据）。
+        let repos = (repo_type::NODE..=repo_type::TRACKER)
+            .map(|repo| {
+                let idx = (repo - repo_type::NODE) as usize;
+                RepoSyncState {
+                    repo,
+                    row_count: counts.get(idx).copied().unwrap_or(0) as u64,
+                    max_seq: st.oplog_max_seq_for_repo(repo).unwrap_or(0).max(0) as u64,
+                    min_seq: st.oplog_min_seq_for_repo(repo).unwrap_or(0).max(0) as u64,
+                    retention_secs: retention,
+                }
+            })
+            .collect();
+        SyncNegotiateMessage {
+            repos,
+            caps: SyncCaps {
+                send_rate_bytes_per_sec: self.config.bootstrap_rate_bytes_per_sec,
+                recv_rate_bytes_per_sec: 0,
+                disk_throughput_hint: 0,
+                batch_limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
+            },
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        }
+    }
+
+    /// v7：协商策略决策（Ack 发送方视角：为「对端应如何从我这里取数」裁定）。
+    ///
+    /// 规则（对齐架构评审稿 §追平分流）：
+    /// - 对端该 repo 为空且本端有量 → `BOOTSTRAP`（冷启动走快照）；
+    /// - 本端比对端多 20% 以上且差 > `range_bulk_threshold_rows` → `BOOTSTRAP`（大差集走快照）；
+    /// - 其余 → `DELTA`（稳态水位续拉）；双方皆空 → `NONE`。
+    fn decide_strategies(&self, remote: &SyncNegotiateMessage) -> Vec<RepoStrategy> {
+        let counts = self.local_entry_counts();
+        let remote_of = |repo: u8| -> u64 {
+            remote
+                .repos
+                .iter()
+                .find(|r| r.repo == repo)
+                .map(|r| r.row_count)
+                .unwrap_or(0)
+        };
+        (repo_type::NODE..=repo_type::TRACKER)
+            .map(|repo| {
+                let idx = (repo - repo_type::NODE) as usize;
+                let local = counts.get(idx).copied().unwrap_or(0) as u64;
+                let peer = remote_of(repo);
+                let strategy = if local == 0 && peer == 0 {
+                    protocol::STRATEGY_NONE
+                } else if (peer == 0 && local >= SNAPSHOT_MIN_ROWS)
+                    || (local as f64 / peer.max(1) as f64 > SNAPSHOT_RATIO_THRESHOLD
+                        && local.saturating_sub(peer) > self.config.range_bulk_threshold_rows)
+                {
+                    // 冷启动（对端为空且本端有量）或大差集 → 走 bootstrap 快照通道
+                    protocol::STRATEGY_BOOTSTRAP
+                } else {
+                    protocol::STRATEGY_DELTA
+                };
+                RepoStrategy {
+                    repo,
+                    strategy,
+                    rate_bytes_per_sec: if strategy == protocol::STRATEGY_BOOTSTRAP {
+                        self.config.bootstrap_rate_bytes_per_sec
+                    } else {
+                        0
+                    },
+                    batch_limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
+                }
+            })
+            .collect()
+    }
+
+    /// v7：处理对端协商请求（应答方）—— 回 Ack，并记住对端状态摘要。
+    pub async fn handle_sync_negotiate(
+        self: Arc<Self>,
+        conn: Arc<PeerConn>,
+        msg: SyncNegotiateMessage,
+    ) {
+        let strategies = self.decide_strategies(&msg);
+        for s in &strategies {
+            info!(
+                "[negotiate] 策略裁定 repo={} strategy={} rate={}（对端行数 {}）",
+                s.repo,
+                s.strategy,
+                s.rate_bytes_per_sec,
+                msg.repos
+                    .iter()
+                    .find(|r| r.repo == s.repo)
+                    .map(|r| r.row_count)
+                    .unwrap_or(0)
+            );
+        }
+        let ack = SyncNegotiateAckMessage {
+            repos: strategies,
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        };
+        match conn.send_message(MessageType::SyncNegotiateAck, &ack).await {
+            Ok(()) => self.metrics.record_message_sent(),
+            Err(e) => warn!("[negotiate] 发送 Ack 失败 to={}: {}", conn.node_id, e),
+        }
+    }
+
+    /// v7：处理对端协商确认（请求方）—— 存策略表，大通道随后放行。
+    pub async fn handle_sync_negotiate_ack(
+        self: Arc<Self>,
+        conn: Arc<PeerConn>,
+        msg: SyncNegotiateAckMessage,
+    ) {
+        let mut summary = String::new();
+        for s in &msg.repos {
+            summary.push_str(&format!("r{}={:?} ", s.repo, s.strategy));
+        }
+        info!(
+            "[negotiate] 收到协商结果 from={}: {}",
+            conn.node_id,
+            summary.trim()
+        );
+        self.negotiated
+            .write()
+            .insert(conn.node_id, msg.repos.clone());
+    }
+
+    /// v7：查 (peer, repo) 的协商策略；未协商返回 `None`。
+    pub fn strategy_for(&self, peer: &NodeId, repo: u8) -> Option<u8> {
+        self.negotiated
+            .read()
+            .get(peer)?
+            .iter()
+            .find(|s| s.repo == repo)
+            .map(|s| s.strategy)
+    }
+
+    /// v7：delta 大通道是否放行（协商 + 门控 + 策略）。
+    ///
+    /// v7+ 对端：需协商通过且策略为 DELTA（NONE/BOOTSTRAP 不走 delta）；
+    /// 协商发出 120s 仍无 Ack → 视为协商失败降级放行（防永久卡死）。
+    /// < v7 对端：回落旧行为（true）。
+    fn delta_channel_allowed(&self, conn: &Arc<PeerConn>, repo: u8) -> bool {
+        if !self.config.negotiation_enabled
+            || conn.protocol_version() < delta::NEGOTIATION_PROTOCOL_VERSION
+        {
+            return true;
+        }
+        // 稳定性门控
+        if conn.connected_secs() < self.config.strategy_min_conn_secs {
+            return false;
+        }
+        match self.strategy_for(&conn.node_id, repo) {
+            Some(protocol::STRATEGY_DELTA) => true,
+            Some(_) => false,
+            None => self
+                .negotiation_sent_at
+                .read()
+                .get(&conn.node_id)
+                .map(|t| t.elapsed() >= Duration::from_secs(NEGOTIATE_FALLBACK_SECS))
+                .unwrap_or(false),
+        }
+    }
+
+    /// v7：delta 看门狗。连续 N 个周期零进展且 lag>0 → 暂停 + 清除协商（触发重协商）。
+    /// 返回 false 表示当前被暂停，跳过本轮拉取。
+    fn delta_watchdog_ok(&self, peer: NodeId, repo: u8, interval: Duration, max_seq: u64) -> bool {
+        let cur = self
+            .delta_storage()
+            .get_peer_seq(&peer.0, repo)
+            .unwrap_or(0)
+            .max(0) as u64;
+        let stall_limit = self.config.delta_watchdog_stall_ticks.max(1);
+        let mut pause = false;
+        let mut ok = true;
+        {
+            let mut w = self.delta_watchdog.write();
+            let e = w.entry((peer, repo)).or_insert((cur, 0, None));
+            if let Some(until) = e.2 {
+                if Instant::now() < until {
+                    ok = false;
+                } else {
+                    e.2 = None;
+                    e.0 = cur;
+                    e.1 = 0;
+                }
+            }
+            if ok {
+                if cur > e.0 {
+                    e.0 = cur;
+                    e.1 = 0;
+                } else if max_seq > cur {
+                    // 有欠账但水位零进展
+                    e.1 += 1;
+                    if e.1 >= stall_limit {
+                        warn!(
+                            "[watchdog] delta 零进展 {} 周期 peer={} repo={} synced_seq={}（暂停并重协商）",
+                            e.1, peer, repo, cur
+                        );
+                        pause = true;
+                    }
+                } else {
+                    e.1 = 0;
+                }
+            }
+        }
+        if pause {
+            let mut w = self.delta_watchdog.write();
+            if let Some(e) = w.get_mut(&(peer, repo)) {
+                e.1 = 0;
+                e.2 = Some(Instant::now() + interval * DELTA_WATCHDOG_PAUSE_MULT);
+            }
+            // 清除协商结果 → 大通道全停，下一轮 ensure_negotiation 重发 → 重新裁定
+            self.negotiated.write().remove(&peer);
+            self.negotiation_sent_at.write().remove(&peer);
+            return false;
+        }
+        ok
     }
 
     /// F1：delta 通道的周期驱动（由 TaskScheduler 周期调用）。
@@ -2647,12 +3058,68 @@ impl SyncManager {
             if !conn.supports_delta_sync() {
                 continue;
             }
+            // v7：协商维护（节流重发；<v7 对端 no-op）
+            if self.config.negotiation_enabled
+                && conn.protocol_version() >= delta::NEGOTIATION_PROTOCOL_VERSION
+            {
+                self.ensure_negotiation(&conn).await;
+            }
             for &rt in &[
                 repo_type::NODE,
                 repo_type::PEER,
                 repo_type::INFOHASH,
                 repo_type::TRACKER,
             ] {
+                // v7/v8：bootstrap 判定 —— 协商裁定 BOOTSTRAP，或 v8 拉取侧本地改判：
+                // 对端 per-repo 水位（delta_peer_max，来自 OpsBatch server_max_seq）与本地
+                // synced_seq 同序列空间，欠账 > range_bulk_threshold_rows 时 delta 硬拉
+                // 已无意义（大批量慢 + 风暴），直接走快照通道（实测 38 万欠账被误判 DELTA）。
+                let peer_max = *self
+                    .delta_peer_max
+                    .read()
+                    .get(&(conn.node_id, rt))
+                    .unwrap_or(&0);
+                let synced_seq = self
+                    .delta_storage()
+                    .get_peer_seq(&conn.node_id.0, rt)
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let lag = peer_max.saturating_sub(synced_seq);
+                let lag_over = peer_max > 0
+                    && lag > self.config.range_bulk_threshold_rows.max(1)
+                    && self.strategy_for(&conn.node_id, rt) != Some(protocol::STRATEGY_NONE);
+                let use_bootstrap = self.config.bootstrap_enabled
+                    && (self.strategy_for(&conn.node_id, rt) == Some(protocol::STRATEGY_BOOTSTRAP)
+                        || lag_over)
+                    && conn.connected_secs() >= self.config.strategy_min_conn_secs;
+                if use_bootstrap {
+                    let running = self
+                        .delta_storage()
+                        .bootstrap_list()
+                        .map(|list| {
+                            list.iter()
+                                .any(|p| p.repo == rt && p.phase != bootstrap::BootstrapPhase::Done)
+                        })
+                        .unwrap_or(false);
+                    if !running {
+                        info!(
+                            "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}（协商裁定={}，欠账={}）",
+                            conn.node_id,
+                            rt,
+                            self.strategy_for(&conn.node_id, rt)
+                                == Some(protocol::STRATEGY_BOOTSTRAP),
+                            lag
+                        );
+                        let sm = self.clone();
+                        let peer = conn.node_id;
+                        tokio::spawn(async move { sm.start_bootstrap(peer, rt).await });
+                    }
+                    continue;
+                }
+                // v7：看门狗（暂停期跳过；触发时已清协商）
+                if !self.delta_watchdog_ok(conn.node_id, rt, interval, peer_max) {
+                    continue;
+                }
                 let due = {
                     let last = self.delta_request_at.read();
                     match last.get(&(conn.node_id, rt)) {
@@ -2700,8 +3167,8 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
-        // 当前仅 NODE 走 range 通道；其他 repo 不响应（由对端回退兼容路径）。
-        if req.repo != repo_type::NODE {
+        // v7：统一 range 反熵 —— 4 个 repo 全部走 range 通道（key 编码与各 repo Merkle 一致）。
+        if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
         let leaf_rows = if req.leaf_rows == 0 {
@@ -2710,7 +3177,8 @@ impl SyncManager {
             req.leaf_rows as usize
         };
         // 多取 1 条以判断是否超过叶级阈值
-        let rows = match self.delta_storage().load_node_key_hashes_in_range(
+        let rows = match self.delta_storage().load_repo_key_hashes_in_range(
+            req.repo,
             Self::range_bound(&req.lo),
             Self::range_bound(&req.hi),
             leaf_rows + 1,
@@ -2778,13 +3246,15 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
-        if resp.repo != repo_type::NODE {
+        // v7：4 个 repo 全部走 range 通道
+        if resp.repo < repo_type::NODE || resp.repo > repo_type::TRACKER {
             return;
         }
-        let leaf_rows = self.config.range_reconcile_leaf_rows.max(1) as usize;
+        let leaf_rows = self.leaf_rows_for_repo(resp.repo) as usize;
         let lo = Self::range_bound(&resp.lo);
         let hi = Self::range_bound(&resp.hi);
-        let local = match self.delta_storage().load_node_key_hashes_in_range(
+        let local = match self.delta_storage().load_repo_key_hashes_in_range(
+            resp.repo,
             lo,
             hi,
             range_reconcile::MAX_LEAF_ENTRIES + 1,
@@ -2844,12 +3314,14 @@ impl SyncManager {
                 if !self.config.range_reconcile_diagnostic_only && (n_local > 0 || n_remote > 0) {
                     self.range_repair_triggers
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // 对端多 → 触发 delta 拉取（本地从对端拉）
+                    // 对端多 → 触发 delta 拉取（本地从对端拉；delta 按repo通用）
                     if n_remote > 0 {
                         self.trigger_delta_sync(conn.node_id, resp.repo).await;
                     }
-                    // 本地多 → 直接推送数据给对端（不等 gossip）
-                    if n_local > 0 && !local_only.is_empty() {
+                    // 本地多 → 直接推送数据给对端（不等 gossip）。
+                    // v7：NODE 走专用 Push 通道；其余 repo 由对端自己的 delta 从我方 oplog
+                    // 追平（本地多的 key 必有对应 oplog 条目），无需专用推送。
+                    if n_local > 0 && !local_only.is_empty() && resp.repo == repo_type::NODE {
                         match self.delta_storage().load_nodes_by_keys(&local_only) {
                             Ok(nodes) => {
                                 if nodes.is_empty() {
@@ -2912,7 +3384,8 @@ impl SyncManager {
                     if sub_lo == sub_hi {
                         continue;
                     }
-                    let rows = match self.delta_storage().load_node_key_hashes_in_range(
+                    let rows = match self.delta_storage().load_repo_key_hashes_in_range(
+                        resp.repo,
                         Self::range_bound(&sub_lo),
                         Self::range_bound(&sub_hi),
                         leaf_rows + 1,
@@ -2990,13 +3463,33 @@ impl SyncManager {
 
     /// P1-4：单轮 range-based 反熵（请求方驱动，由 TaskScheduler 周期调用）。
     ///
-    /// 抽样 `range_reconcile_sample_ranges + 1` 个分界 key 形成若干区间（首尾接 ±∞），
-    /// 对每个区间发一个 depth=0 的 RangeReconcileRequest。
+    /// v7：统一 range 通道 —— 4 个 repo 全部参与，per-repo 周期节流
+    /// （NODE 30s / PEER 120s / INFOHASH 300s / TRACKER 600s）。
+    /// 每个 repo 抽样 `range_reconcile_sample_ranges + 1` 个分界 key 形成若干区间
+    /// （首尾接 ±∞），对每个区间发一个 depth=0 的 RangeReconcileRequest。
     /// 默认 `range_reconcile_enabled=false` 时为 no-op（行为与改造前一致）。
     pub async fn range_reconcile_tick(self: Arc<Self>) {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        for (repo, interval) in RANGE_INTERVAL_SECS {
+            let due = {
+                let last = self.range_tick_last.read();
+                match last.get(&repo) {
+                    Some(t) => t.elapsed().as_secs() >= interval,
+                    None => true,
+                }
+            };
+            if !due {
+                continue;
+            }
+            self.range_tick_last.write().insert(repo, Instant::now());
+            self.clone().range_reconcile_tick_repo(repo).await;
+        }
+    }
+
+    /// v7：单 repo 的 range 反熵抽样对账（原 NODE 专属逻辑通用化）。
+    async fn range_reconcile_tick_repo(self: Arc<Self>, repo: u8) {
         let conns = self.sessions.all_connections();
         if conns.is_empty() {
             return;
@@ -3017,28 +3510,29 @@ impl SyncManager {
             return;
         }
         let n = self.config.range_reconcile_sample_ranges.max(1) as usize;
-        let keys = match self.delta_storage().sample_node_range_keys(n + 1) {
+        let keys = match self.delta_storage().sample_repo_range_keys(repo, n + 1) {
             Ok(k) => k,
             Err(e) => {
-                warn!("[range] 抽样分界 key 失败: {}", e);
+                warn!("[range] 抽样分界 key 失败 repo={}: {}", repo, e);
                 return;
             }
         };
         if keys.len() < 2 {
-            debug!("[range] 本地 NODE 数据不足，跳过抽样对账");
+            debug!("[range] repo={} 本地数据不足，跳过抽样对账", repo);
             return;
         }
         let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(keys.len() + 2);
         bounds.push(Vec::new()); // -∞
         bounds.extend(keys);
         bounds.push(Vec::new()); // +∞
-        let leaf_rows = self.config.range_reconcile_leaf_rows.max(1);
+        let leaf_rows = self.leaf_rows_for_repo(repo);
         let storage = self.delta_storage();
         let mut sent = 0u32;
         for w in bounds.windows(2) {
             let lo = w[0].clone();
             let hi = w[1].clone();
-            let rows = match storage.load_node_key_hashes_in_range(
+            let rows = match storage.load_repo_key_hashes_in_range(
+                repo,
                 Self::range_bound(&lo),
                 Self::range_bound(&hi),
                 leaf_rows as usize + 1,
@@ -3048,7 +3542,7 @@ impl SyncManager {
             };
             let digest = range_reconcile::range_digest(&rows);
             let req = RangeReconcileRequestMessage {
-                repo: repo_type::NODE,
+                repo,
                 lo,
                 hi,
                 digest,
@@ -3082,7 +3576,8 @@ impl SyncManager {
             .range_repair_triggers
             .load(std::sync::atomic::Ordering::Relaxed);
         info!(
-            "[range] 抽样对账发送到 {}（{} 个区间，连接数={}）| 累计 叶级对账={} 本地多={} 对端多={} 触发修复={} 模式={}",
+            "[range] repo={} 抽样对账发送到 {}（{} 个区间，连接数={}）| 累计 叶级对账={} 本地多={} 对端多={} 触发修复={} 模式={}",
+            repo,
             conn.node_id,
             sent,
             conns.len(),
@@ -3117,21 +3612,22 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
-        if req.repo != repo_type::NODE {
+        if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
         let storage = self.delta_storage();
         let w0 = storage.oplog_max_seq().unwrap_or(0).max(0) as u64;
         let version = w0.wrapping_add(1) as u32; // 以 w0 派生：重新打清单即换版本
-        let manifest = match bootstrap::build_node_manifest(
+        let manifest = match bootstrap::build_repo_manifest_impl(
             &storage,
+            req.repo,
             self.config.bootstrap_chunk_rows,
             w0,
             version,
         ) {
             Ok(m) => m,
             Err(e) => {
-                warn!("[bootstrap] 建清单失败: {}", e);
+                warn!("[bootstrap] 建清单失败 repo={}: {}", req.repo, e);
                 return;
             }
         };
@@ -3165,7 +3661,7 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
-        if req.repo != repo_type::NODE {
+        if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
         let manifest = match self.bootstrap_manifests.read().get(&conn.node_id).cloned() {
@@ -3192,9 +3688,13 @@ impl SyncManager {
         let lo = Self::range_bound(&chunk.lo);
         let hi = Self::range_bound(&chunk.hi);
         let storage = self.delta_storage();
-        // ① 内容哈希：与建清单同源（(key, data_hash) 有序流）
-        let hash_rows = match storage.load_node_key_hashes_in_range(lo, hi, chunk.rows as usize + 1)
-        {
+        // ① 内容哈希：与建清单同源（(key, data_hash) 有序流）—— v7 全 repo 通用
+        let hash_rows = match storage.load_repo_key_hashes_in_range(
+            req.repo,
+            lo,
+            hi,
+            chunk.rows as usize + 1,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!("[bootstrap] 取块哈希失败 index={}: {}", req.index, e);
@@ -3203,32 +3703,19 @@ impl SyncManager {
         };
         let take = hash_rows.len().min(chunk.rows as usize);
         let hash = bootstrap::chunk_hash(&hash_rows[..take]);
-        // ② 完整条目（含 payload，供接收方批量 upsert）
-        let entries: Vec<SyncEntry> =
-            match storage.load_node_rows_in_range(lo, hi, chunk.rows as usize + 1) {
-                Ok(rows) => rows
-                    .into_iter()
-                    .take(chunk.rows as usize)
-                    .filter_map(|(id, ip, port)| {
-                        let mut arr = [0u8; 20];
-                        if id.len() == 20 {
-                            arr.copy_from_slice(&id);
-                        }
-                        let addr: SocketAddr = format!("{}:{}", ip, port).parse().ok()?;
-                        let (key, payload, _dh) = build_node_sync_entry(arr, addr)?;
-                        Some(SyncEntry {
-                            key,
-                            operation: operation::UPSERT,
-                            version: 0,
-                            payload,
-                        })
-                    })
-                    .collect(),
-                Err(e) => {
-                    warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
-                    return;
-                }
-            };
+        // ② 完整条目（含 payload，供接收方批量 upsert）—— v7 全 repo 通用
+        let entries: Vec<SyncEntry> = match storage.load_repo_sync_entries_in_range(
+            req.repo,
+            lo,
+            hi,
+            chunk.rows as usize + 1,
+        ) {
+            Ok(rows) => rows.into_iter().take(chunk.rows as usize).collect(),
+            Err(e) => {
+                warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
+                return;
+            }
+        };
         // ③ 令牌桶限流（不跨 await 持锁）
         let bytes: u64 = entries
             .iter()
@@ -3335,7 +3822,7 @@ impl SyncManager {
         let hi = Self::range_bound(&chunk.hi);
         let rows = self
             .delta_storage()
-            .load_node_key_hashes_in_range(lo, hi, chunk.rows as usize + 1)
+            .load_repo_key_hashes_in_range(resp.repo, lo, hi, chunk.rows as usize + 1)
             .unwrap_or_default();
         let take = rows.len().min(chunk.rows as usize);
         let ok = bootstrap::verify_chunk(&chunk.hash, &rows[..take]);
@@ -3612,6 +4099,28 @@ impl SyncManager {
         });
         // F1：当前被节流表跟踪的 (对端, repo) 对数 ≈ 活跃的 delta 拉取通道数
         let delta_tracked = self.delta_request_at.read().len();
+        // P3-C：反熵周期任务可观测性 —— tick 执行次数 / 每个 repo 距上次对账多久。
+        // 之前只靠 merkle_repairs 判断，两个都看不到时无法区分「没跑」和「跑了但无差异」。
+        let m_snap = self.metrics.snapshot();
+        let ae_last = self.anti_entropy_last.read();
+        let ae_repos: Vec<serde_json::Value> = [
+            (repo_type::NODE, "node"),
+            (repo_type::PEER, "peer"),
+            (repo_type::INFOHASH, "infohash"),
+            (repo_type::TRACKER, "tracker"),
+        ]
+        .iter()
+        .map(|(rt, name)| {
+            serde_json::json!({
+                "repo": *name,
+                "repo_type": *rt,
+                "last_tick_age_secs": ae_last.get(rt).map(|i| i.elapsed().as_secs()),
+                "owned_by_range_reconcile": self.config.range_reconcile_enabled
+                    && *rt == repo_type::NODE,
+            })
+        })
+        .collect();
+        drop(ae_last);
         serde_json::json!({
             "oplog": {
                 "len": oplog_len,
@@ -3637,6 +4146,10 @@ impl SyncManager {
             "anti_entropy": {
                 "node_interval_secs": self.config.anti_entropy_node_interval_secs,
                 "other_interval_secs": self.config.anti_entropy_other_interval_secs,
+                "ticks_total": m_snap.anti_entropy_ticks,
+                "digests_sent_total": m_snap.anti_entropy_digests_sent,
+                "no_conn_skips_total": m_snap.anti_entropy_no_conn,
+                "repos": ae_repos,
             },
         })
     }

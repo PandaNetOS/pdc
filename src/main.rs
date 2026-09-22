@@ -19,6 +19,9 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// oplog 行数缓存预热的延迟（秒）：让进程先完成基础启动，再做一次 COUNT 校准。
+const OPLOG_LEN_PREWARM_DELAY_SECS: u64 = 5;
+
 use parking_lot::RwLock;
 use rand::Rng;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -559,6 +562,29 @@ async fn async_main(
         });
     }
 
+    // 6.75 初始化进程级 DNS 解析池（内置公共 DNS，不读宿主系统 DNS 配置）
+    //
+    // 必须早于 federation / crawler 构造：iroh 端点（pkarr 发布/解析、
+    // DnsAddressLookup TXT、DERP 主机名）、联邦种子解析、tracker/scrape/
+    // subscription 的 HTTP 客户端都从这里取解析器，保证全进程共用一份。
+    let dns_pool = match PeerDiscoveryCenter::dns_pool::init_global(&config.dns) {
+        Ok(pool) => {
+            info!(
+                "[main] DNS 解析池已就绪: servers={:?}, 系统 DNS 回退={}",
+                pool.servers()
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>(),
+                pool.allow_system_fallback()
+            );
+            pool
+        }
+        Err(e) => {
+            warn!("[main] DNS 解析池初始化失败（回退惰性默认值）: {}", e);
+            PeerDiscoveryCenter::dns_pool::global()
+        }
+    };
+
     // 6.8 创建联邦网络服务（如果启用）
     let federation_service: Option<Arc<FederationService>> = if config.federation.enabled {
         // 联邦数据目录从配置存储路径的父目录获取（零配置：不再硬编码 target/data）
@@ -577,7 +603,8 @@ async fn async_main(
             Some(tracker_repo.clone()),
         ) {
             Ok(svc) => {
-                let svc = Arc::new(svc);
+                // 注入 DNS 配置：iroh 端点解析器（不读宿主系统 DNS）
+                let svc = Arc::new(svc.with_dns(config.dns.clone()));
                 info!("[main] 联邦网络服务已创建");
                 Some(svc)
             }
@@ -679,6 +706,7 @@ async fn async_main(
     // 7. 创建爬虫引擎（如果启用），在 AppState 之前创建以便共享状态
     let (crawler_state, crawler_routing_table, crawler_ref) = if config.crawler.enabled {
         let crawler = CrawlerEngine::new(config.crawler.clone(), event_bus.clone())
+            .with_dns_pool(dns_pool.clone())
             .with_sockets(crawler_sockets)
             .with_peer_repo(peer_repo.clone())
             .with_storage(storage.clone())
@@ -733,6 +761,7 @@ async fn async_main(
     let fetcher_ref: Option<Arc<PeerDiscoveryCenter::services::TrackerPeerFetcher>> = {
         let tracker_discoverer = Arc::new(
             PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::with_default_config()
+                .with_dns_pool(Some(&dns_pool))
                 .with_tracker_repo(tracker_repo.clone()),
         );
         let fetcher =
@@ -753,6 +782,7 @@ async fn async_main(
     let subscription_config = PeerDiscoveryCenter::services::SubscriptionConfig::default();
     let subscription_service =
         PeerDiscoveryCenter::services::SubscriptionService::new(subscription_config)
+            .with_dns_pool(Some(&dns_pool))
             .with_infohash_repo(infohash_repo.clone());
     let subscription_service = Arc::new(subscription_service);
     tokio::spawn(async move {
@@ -959,7 +989,9 @@ async fn async_main(
                 persistence: config.task_scheduler.persistence_concurrency,
                 monitor: config.task_scheduler.monitor_concurrency,
                 network: config.task_scheduler.network_concurrency,
-                federation: 4,
+                // v9 fix: 与 CategoryConcurrency::default() 对齐（此前字面量 4 覆盖 Default 8，
+                // 导致 C3「联邦并发 4→8」实际不生效）
+                federation: 8,
                 tracker: 2,
             })
             .with_runtime_handles(RuntimeHandles {
@@ -1121,6 +1153,60 @@ async fn async_main(
                 let wq = wq.clone();
                 async move {
                     wq.flush();
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.5.2b1b F9: 实体表 DB 级统计周期校准（唯一权威口径 = DB deleted_at IS NULL）。
+    // 内存 repo 是热/温数据，冷数据在本 DB；重算结果写入 stats_aggregate db_* 指标
+    // （修复 DB 统计字段）与 stats_history。
+    {
+        let storage_entity = storage.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "db_entity_stats_refresh",
+                "实体表 DB 级统计校准",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "db_entity_stats_interval_secs",
+                    300,
+                )),
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Medium,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            }),
+            move || {
+                let storage = storage_entity.clone();
+                async move {
+                    match tokio::task::spawn_blocking(move || {
+                        let c = storage.refresh_entity_counts();
+                        let names = [
+                            "db_dht_nodes",
+                            "db_peers",
+                            "db_peers_archive",
+                            "db_infohashes",
+                            "db_trackers",
+                        ];
+                        for (name, v) in names.iter().zip(c.iter()) {
+                            if *v >= 0 {
+                                let _ = storage.record_stats(name, *v as f64);
+                                let _ = storage.update_aggregate(name, *v as f64);
+                            }
+                        }
+                    })
+                    .await
+                    {
+                        Ok(_) => debug!("[persistence] 实体统计校准完成"),
+                        Err(e) => warn!("[persistence] 实体统计校准失败: {}", e),
+                    }
                     Ok(())
                 }
             },
@@ -1369,8 +1455,12 @@ async fn async_main(
 
         let dht_activity = Arc::new(DhtActivityTracker::new());
         let peer_history = Arc::new(PeerHistoryManager::new());
-        let scrape_service = Arc::new(ScrapeService::new().with_tracker_repo(tracker_repo.clone()
-            as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>));
+        let scrape_service = Arc::new(
+            ScrapeService::new()
+                .with_dns_pool(Some(&dns_pool))
+                .with_tracker_repo(tracker_repo.clone()
+                    as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>),
+        );
         let metadata_service = Arc::new(MetadataService::new());
         let availability_calculator = Arc::new(AvailabilityCalculator::new());
 
@@ -1800,7 +1890,7 @@ async fn async_main(
                 "联邦心跳",
                 std::time::Duration::from_secs(get_interval_secs(intervals, "fed_heartbeat", 30)),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1831,7 +1921,7 @@ async fn async_main(
                 "联邦节点同步",
                 std::time::Duration::from_secs(get_interval_secs(intervals, "fed_node_sync", 300)),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1872,7 +1962,7 @@ async fn async_main(
                         300,
                     )),
                 )
-                .with_category(TaskCategory::Network)
+                .with_category(TaskCategory::Federation)
                 .with_priority(TaskPriority::Normal)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -1915,7 +2005,7 @@ async fn async_main(
                     ae_tick_secs,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -1959,7 +2049,7 @@ async fn async_main(
                     delta_tick_secs,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2000,7 +2090,7 @@ async fn async_main(
                     60,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2040,7 +2130,7 @@ async fn async_main(
                     60,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2075,7 +2165,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2110,7 +2200,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2145,7 +2235,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2180,7 +2270,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2215,7 +2305,7 @@ async fn async_main(
                     30,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2250,7 +2340,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2285,7 +2375,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2321,7 +2411,7 @@ async fn async_main(
                         3600,
                     )),
                 )
-                .with_category(TaskCategory::Network)
+                .with_category(TaskCategory::Federation)
                 .with_priority(TaskPriority::Background)
                 .with_resource(ResourceProfile {
                     cpu: ResourceLevel::Low,
@@ -2357,7 +2447,7 @@ async fn async_main(
                     50,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2387,7 +2477,7 @@ async fn async_main(
                     100,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Medium,
@@ -2417,7 +2507,7 @@ async fn async_main(
                     1000,
                 )),
             )
-            .with_category(TaskCategory::Network)
+            .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2884,6 +2974,21 @@ async fn async_main(
                     }
                 },
             );
+        }
+
+        // oplog 行数缓存预热：首次 COUNT(feed_oplog) 在大表慢盘节点上可达数十秒
+        // （2026-09-21 实测 51 节点 58 万行冷查询 28s，曾把首个 /sync-observability 请求拖到超时）。
+        // 启动 5 秒后在后台完成一次校准，此后 `oplog_len()` 恒为 O(1)。
+        {
+            let st = storage.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(OPLOG_LEN_PREWARM_DELAY_SECS))
+                    .await;
+                match st.oplog_len() {
+                    Ok(n) => info!("[oplog] 行数缓存预热完成: {} 条", n),
+                    Err(e) => warn!("[oplog] 行数缓存预热失败: {}", e),
+                }
+            });
         }
     }
 

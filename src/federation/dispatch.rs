@@ -830,6 +830,34 @@ impl FederationDispatcher {
                     false
                 }
             }
+            MessageType::SyncNegotiate => {
+                // v7：建连协商请求（应答方）—— 按策略裁定回 Ack（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<SyncNegotiateMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_sync_negotiate(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::SyncNegotiateAck => {
+                // v7：建连协商确认（请求方）—— 存策略表，大通道放行（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<SyncNegotiateAckMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_sync_negotiate_ack(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
             MessageType::BootstrapManifestRequest => {
                 // P2-1：bootstrap 清单请求（应答方）—— 建 w0 水位 + 有序逻辑分块清单（异步）
                 self.metrics.record_message_recv();

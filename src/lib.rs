@@ -68,6 +68,7 @@ pub mod data_plane;
 pub mod dht;
 pub mod discoverers;
 pub mod dns_pool;
+pub mod dns_resolve;
 pub mod event_bus;
 pub mod federation;
 pub mod firewall;

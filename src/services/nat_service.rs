@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use tracing::warn;
+
 use crate::nat::{NatManager, NatStatus, NatType, ReachabilityResult};
 
 /// STUN UDP 可达性检测超时
@@ -67,15 +69,44 @@ impl NatService {
     }
 
     /// 手动检测 UDP 端口可达性（通过 STUN）
-    pub fn check_udp_port(&self, port: u16) -> Option<ReachabilityResult> {
-        let config = self.manager.config();
-        if !config.enable_reachability_check {
+    ///
+    /// 服务器列表先经内置 [`crate::dns_pool`] 预解析成 `ip:port` 字面量，再交给
+    /// 同步 STUN 探测 —— 同步 Binding 内部走 `to_socket_addrs()`（即系统 DNS），
+    /// 直接把域名递下去会在宿主解析器不可用时把**全部**服务器误判为不可达。
+    ///
+    /// 返回 `None` 表示**无法检测**：可达性自检被关闭，或 STUN 服务器列表全部
+    /// 解析失败（此时不能得出「不可达」的结论，只能说不具备检测条件）。
+    pub async fn check_udp_port(&self, port: u16) -> Option<ReachabilityResult> {
+        // 先取出所需配置，避免持有 &NatConfig 跨越 await
+        let (enabled, stun_servers) = {
+            let config = self.manager.config();
+            (
+                config.enable_reachability_check,
+                config.stun_servers.clone(),
+            )
+        };
+        if !enabled {
             return None;
         }
-        let servers = config.stun_servers.clone();
-        let result =
-            crate::nat::stun::check_udp_reachability(&servers, port, STUN_REACHABILITY_TIMEOUT);
-        Some(result)
+
+        let servers = crate::dns_pool::global()
+            .resolve_endpoints(&stun_servers, 3478)
+            .await;
+        if servers.is_empty() {
+            warn!(
+                "[nat_service] STUN 服务器（配置 {} 项）全部解析失败，跳过 UDP {} 可达性检测",
+                stun_servers.len(),
+                port
+            );
+            return None;
+        }
+
+        // 同步 STUN 最长阻塞 STUN_REACHABILITY_TIMEOUT × 服务器数，挪到阻塞线程池
+        tokio::task::spawn_blocking(move || {
+            crate::nat::stun::check_udp_reachability(&servers, port, STUN_REACHABILITY_TIMEOUT)
+        })
+        .await
+        .ok()
     }
 
     /// 获取映射统计摘要

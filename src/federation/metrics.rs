@@ -51,6 +51,16 @@ pub struct FederationMetrics {
     pub connections_established: AtomicU64,
     /// 杩炴帴鏂紑娆℃暟
     pub connections_closed: AtomicU64,
+    /// P3-C: how many anti-entropy rounds actually executed
+    /// (TaskScheduler -> `GossipNetwork::anti_entropy_tick`).
+    /// Before this counter existed there was no way to prove the periodic
+    /// anti-entropy task was ever invoked.
+    pub anti_entropy_ticks: AtomicU64,
+    /// P3-C: how many MerkleDigest messages anti-entropy actually sent
+    /// (one per due repo per tick).
+    pub anti_entropy_digests_sent: AtomicU64,
+    /// P3-C: ticks that returned early because no peer connection existed.
+    pub anti_entropy_no_conn: AtomicU64,
 }
 
 impl FederationMetrics {
@@ -151,6 +161,19 @@ impl FederationMetrics {
         self.connections_closed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_anti_entropy_tick(&self) {
+        self.anti_entropy_ticks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_anti_entropy_digest(&self) {
+        self.anti_entropy_digests_sent
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_anti_entropy_no_conn(&self) {
+        self.anti_entropy_no_conn.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 鐢熸垚蹇収锛堝皢 AtomicU64 杞负鏅€氬瓧娈碉級
     pub fn snapshot(&self) -> FederationMetricsSnapshot {
         FederationMetricsSnapshot {
@@ -177,6 +200,9 @@ impl FederationMetrics {
                 .load(Ordering::Relaxed),
             connections_established: self.connections_established.load(Ordering::Relaxed),
             connections_closed: self.connections_closed.load(Ordering::Relaxed),
+            anti_entropy_ticks: self.anti_entropy_ticks.load(Ordering::Relaxed),
+            anti_entropy_digests_sent: self.anti_entropy_digests_sent.load(Ordering::Relaxed),
+            anti_entropy_no_conn: self.anti_entropy_no_conn.load(Ordering::Relaxed),
         }
     }
 }
@@ -205,6 +231,9 @@ pub struct FederationMetricsSnapshot {
     pub signature_verification_failures: u64,
     pub connections_established: u64,
     pub connections_closed: u64,
+    pub anti_entropy_ticks: u64,
+    pub anti_entropy_digests_sent: u64,
+    pub anti_entropy_no_conn: u64,
 }
 
 #[cfg(test)]

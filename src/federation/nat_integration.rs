@@ -49,12 +49,29 @@ impl NatIntegration {
         }
     }
 
-    /// 执行 STUN 探测
+    /// 用内置 DnsPool 把 STUN 服务器列表预解析成 `ip:port`（异步）
+    ///
+    /// `crate::nat::stun` 的同步 Binding 内部走 `to_socket_addrs()`（即系统
+    /// DNS），宿主解析器不可用时会让**所有** STUN 服务器看起来都不可达。
+    /// 先在这里换成 IP 即可彻底脱离系统 DNS；已是 ip:port 的项直通，
+    /// 解析失败的项保留原值。
+    pub async fn resolved_stun_servers(&self) -> Vec<String> {
+        crate::dns_pool::global()
+            .resolve_endpoints(&self.config.stun_servers, 3478)
+            .await
+    }
+
+    /// 执行 STUN 探测（同步阻塞）
+    ///
+    /// `stun_servers` 必须是**已解析好的 `ip:port` 列表**（见
+    /// [`Self::resolved_stun_servers`]）—— 本函数内部不再做任何 DNS 解析，
+    /// 因此不会触碰宿主系统 DNS。同步阻塞最长约 `STUN_PROBE_TIMEOUT`，
+    /// 调用方若处在异步上下文，应包在 `tokio::task::spawn_blocking` 里。
     ///
     /// 使用多服务器绑定请求获取公网映射地址，并用双服务器对比检测 NAT 类型。
     /// 如果所有 STUN 服务器都不可达，返回 None。
-    pub fn stun_probe(&self) -> Option<StunResult> {
-        if self.config.stun_servers.is_empty() {
+    pub fn stun_probe_with(&self, stun_servers: &[String]) -> Option<StunResult> {
+        if stun_servers.is_empty() {
             warn!("[federation] 未配置 STUN 服务器，跳过探测，可达性将保持 Unknown");
             return None;
         }
@@ -68,26 +85,26 @@ impl NatIntegration {
 
         info!(
             "[federation] STUN 探测开始: 服务器数={}, 列表={:?}, 本地绑定={}",
-            self.config.stun_servers.len(),
-            self.config.stun_servers,
+            stun_servers.len(),
+            stun_servers,
             local_addr
         );
 
         // 1. 多服务器绑定请求：获取公网映射地址（第一个成功的服务器）
-        let binding = stun_binding_request_multi(&self.config.stun_servers, local_addr, timeout);
+        let binding = stun_binding_request_multi(stun_servers, local_addr, timeout);
         let binding = match binding {
             Some(b) => b,
             None => {
                 warn!(
                     "[federation] STUN 探测失败: 所有 {} 个服务器均无响应（检查网络/防火墙/服务器列表）",
-                    self.config.stun_servers.len()
+                    stun_servers.len()
                 );
                 return None;
             }
         };
 
         // 2. 双服务器 NAT 类型检测：区分 Full Cone / Symmetric / Open Internet
-        let nat_type = detect_nat_type_multi(&self.config.stun_servers, local_addr, timeout);
+        let nat_type = detect_nat_type_multi(stun_servers, local_addr, timeout);
 
         info!(
             "[federation] STUN 探测成功: mapped={:?}, nat_type={:?}, rtt={}ms, server={}",
@@ -295,8 +312,10 @@ impl NatIntegration {
     /// 包含：STUN 绑定请求 + NAT 类型检测、UPnP 端口映射刷新、公网地址变化检测。
     /// STUN 探测内部有 5s 超时，单次 tick 最长阻塞约 10s。
     pub async fn refresh_tick(&self) {
-        // 执行 STUN 探测
-        let _ = self.stun_probe();
+        // 执行 STUN 探测：先用内置 DNS 池异步解析服务器（脱离系统 DNS），
+        // 再把 ip:port 字面量交给同步探测（内部不再解析，最长阻塞 STUN_PROBE_TIMEOUT）
+        let stun_servers = self.resolved_stun_servers().await;
+        let _ = self.stun_probe_with(&stun_servers);
 
         let old_addrs = self.identity.addresses_snapshot();
         let old_public = old_addrs.iter().find_map(|a| a.ipv4_addr);
@@ -482,6 +501,6 @@ mod tests {
         let integration = NatIntegration::new(nat, identity, config, shutdown_tx);
 
         // 无 STUN 服务器时应返回 None
-        assert!(integration.stun_probe().is_none());
+        assert!(integration.stun_probe_with(&[]).is_none());
     }
 }

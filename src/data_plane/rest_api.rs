@@ -874,13 +874,22 @@ async fn federation_status_handler(State(state): State<AppState>) -> Response {
         }
     };
 
-    // 填充各 Repo 实际总条目数（区分于联邦同步累计数）
-    status.node_repo_total = state
+    // F9: 统计字段以 DB 为唯一权威口径（内存 repo = 热/温子集）。
+    // total = 冷 DB 有效行数（deleted_at IS NULL）+ 内存未落库部分；hot_* = 纯内存计数。
+    let db_counts = state.storage.entity_counts_cached();
+    status.node_repo_total = (db_counts[0].max(0) as u64)
+        + state
+            .node_repo
+            .as_ref()
+            .map(|r| r.write_queue_len_sync() as u64)
+            .unwrap_or(0);
+    status.node_repo_hot_total = state
         .node_repo
         .as_ref()
         .map(|r| r.len_sync() as u64)
         .unwrap_or(0);
-    status.peer_repo_total = state.peer_repo.len() as u64;
+    status.peer_repo_total = (db_counts[1].max(0) as u64) + (db_counts[2].max(0) as u64);
+    status.peer_repo_hot_total = state.peer_repo.len() as u64;
     // 计算活跃 peer 数（最近1小时内有活跃）
     {
         let all = state.peer_repo.all_peers_sync();
@@ -894,16 +903,8 @@ async fn federation_status_handler(State(state): State<AppState>) -> Response {
             })
             .count() as u64;
     }
-    status.infohash_repo_total = state
-        .infohash_repo
-        .as_ref()
-        .map(|r| r.count_sync() as u64)
-        .unwrap_or(0);
-    status.tracker_repo_total = state
-        .tracker_repo
-        .as_ref()
-        .map(|r| r.count_sync() as u64)
-        .unwrap_or(0);
+    status.infohash_repo_total = db_counts[3].max(0) as u64;
+    status.tracker_repo_total = db_counts[4].max(0) as u64;
 
     Json(status).into_response()
 }

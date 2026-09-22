@@ -96,6 +96,13 @@ pub struct PdcConfig {
     /// 冷热分层缓存配置
     #[serde(default)]
     pub tier: TierConfig,
+    /// DNS 解析配置
+    ///
+    /// 默认使用 pnos-net 内置的 5 个公共 DNS，**不读宿主系统 DNS 配置**。
+    /// 现场曾出现整台机的唯一解析器不响应 DNS 查询，导致 iroh 端点发现
+    /// （pkarr / DnsAddressLookup / DERP）全线超时并把联邦任务长时间阻塞。
+    #[serde(default)]
+    pub dns: pnos_net::dns::DnsConfig,
 }
 
 /// TaskScheduler 各分类并发度配置
@@ -697,6 +704,7 @@ impl Default for PdcConfig {
             runtime_shutdown_timeout_secs: default_runtime_shutdown_timeout_secs(),
             adaptive: AdaptiveConfig::default(),
             tier: TierConfig::default(),
+            dns: pnos_net::dns::DnsConfig::default(),
         }
     }
 }
@@ -1076,10 +1084,15 @@ fn default_nat_lease() -> u32 {
 }
 
 fn default_stun_servers() -> Vec<String> {
+    // 与 federation.stun_servers 同口径：国内可达优先（小米/B站/腾讯），
+    // 再补 Cloudflare / Google —— 原默认值全是 Google STUN，在国内网段
+    // （尤其宿主 DNS 不可用的现场）恒不可达，可达性自检会恒判失败。
     vec![
+        "stun.miwifi.com:3478".to_string(),
+        "stun.chat.bilibili.com:3478".to_string(),
+        "stun.qq.com:3478".to_string(),
+        "stun.cloudflare.com:3478".to_string(),
         "stun.l.google.com:19302".to_string(),
-        "stun1.l.google.com:19302".to_string(),
-        "stun.ekiga.net:3478".to_string(),
     ]
 }
 
