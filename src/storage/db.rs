@@ -404,6 +404,28 @@ impl Storage {
             "#,
         )?;
 
+        // v9：range 反熵 / bootstrap 分块都按**表达式键**做 `ORDER BY` 与区间比较
+        // （NODE `(ip||':'||port)`、PEER `(lower(hex(infohash))||':'||ip||':'||port)`），
+        // 而此前没有任何匹配索引 ⇒ 每次调用都是「全表扫描 + 全量排序」，且全程持有连接锁
+        // （实测 bootstrap 建一次清单 = 74~93 次全表排序，单次重建 >131s，把 HTTP API 与
+        // 写队列一起拖垮）。表达式索引让这两条路径退化为索引有序扫描。
+        // 配合 v9 查询侧「按需拼谓词」（见 `node_range_sql`），索引才真正被用于区间定位。
+        // 幂等；首次启动会在 165 万行的 dht_nodes 上同步建索引（一次性、数十秒量级），
+        // 失败必须可见（旧写法 `let _ =` 会静默退化为全表排序）。
+        if let Err(e) = conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_dht_nodes_ip_port_expr
+                ON dht_nodes((ip || ':' || port));
+            CREATE INDEX IF NOT EXISTS idx_peers_key_expr
+                ON peers((lower(hex(infohash)) || ':' || ip || ':' || port));
+            "#,
+        ) {
+            tracing::warn!(
+                "[storage] 表达式索引创建失败（interval 查询将退化为全表排序，性能下降）: {}",
+                e
+            );
+        }
+
         // P1-2：变更日志表（联邦 delta 同步的权威来源）
         crate::storage::oplog::init_oplog_table(&conn)?;
 
@@ -1587,14 +1609,19 @@ impl Storage {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
         let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-        let mut stmt = conn.prepare(
-            "SELECT id, ip, port FROM dht_nodes \
-             WHERE deleted_at IS NULL \
-               AND (?1 IS NULL OR (ip || ':' || port) >= ?1) \
-               AND (?2 IS NULL OR (ip || ':' || port) < ?2) \
-             ORDER BY (ip || ':' || port) ASC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+        // v9：按需拼谓词，使新增的表达式索引 `idx_dht_nodes_ip_port_expr` 能被用于
+        // **区间定位**。旧写法 `(?1 IS NULL OR (ip||':'||port) >= ?1)` 让 SQLite 无法做
+        // 索引范围扫描，只能退化为「索引有序全扫 + 逐行过滤」—— 建一次清单要跑 93 个块查询，
+        // 每个都从表头扫到 `lo`，合计上亿次探测（实测单次重建 >131s，持锁期间拖垮 API/写队列）。
+        let (sql, binds) = Self::node_range_sql(
+            "SELECT id, ip, port FROM dht_nodes",
+            &lo_s,
+            &hi_s,
+            limit.max(1) as i64,
+        );
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,
@@ -1606,6 +1633,37 @@ impl Storage {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// v9：为 NODE 的区间查询拼装 SQL 与绑定参数（共用于原始行查询与 (key,data_hash) 查询）。
+    ///
+    /// 只在**确实需要**时生成边界谓词（`?1 IS NULL OR ...` 这类写法会阻断索引范围扫描）。
+    /// `hi = None` 时直接省略上界；`lo = None` 时省略下界（-∞）。占位符按实际使用情况编号，
+    /// 避免 rusqlite 的「参数个数不匹配」错误。
+    fn node_range_sql(
+        select: &str,
+        lo_s: &Option<String>,
+        hi_s: &Option<String>,
+        limit: i64,
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut sql = String::from(select);
+        sql.push_str(" WHERE deleted_at IS NULL");
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(3);
+        let mut n = 0usize;
+        if let Some(ref v) = lo_s {
+            n += 1;
+            sql.push_str(&format!(" AND (ip || ':' || port) >= ?{}", n));
+            binds.push(Box::new(v.clone()));
+        }
+        if let Some(ref v) = hi_s {
+            n += 1;
+            sql.push_str(&format!(" AND (ip || ':' || port) < ?{}", n));
+            binds.push(Box::new(v.clone()));
+        }
+        n += 1;
+        sql.push_str(&format!(" ORDER BY (ip || ':' || port) ASC LIMIT ?{}", n));
+        binds.push(Box::new(limit));
+        (sql, binds)
     }
 
     /// P1-4：按 key（"ip:port" 字符串）升序加载 NODE 的 (key, data_hash)，范围 `[lo, hi)`，最多 `limit` 条。
@@ -1622,14 +1680,16 @@ impl Storage {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
         let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-        let mut stmt = conn.prepare(
-            "SELECT id, ip, port FROM dht_nodes \
-             WHERE deleted_at IS NULL \
-               AND (?1 IS NULL OR (ip || ':' || port) >= ?1) \
-               AND (?2 IS NULL OR (ip || ':' || port) < ?2) \
-             ORDER BY (ip || ':' || port) ASC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+        // v9：与 `load_node_rows_in_range` 同一套「按需谓词」拼装（使表达式索引可用于区间定位）。
+        let (sql, binds) = Self::node_range_sql(
+            "SELECT id, ip, port FROM dht_nodes",
+            &lo_s,
+            &hi_s,
+            limit.max(1) as i64,
+        );
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,

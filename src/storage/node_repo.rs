@@ -184,7 +184,9 @@ impl NodeRepoImpl {
             .collect();
         // P1-2：本地新增/更新记入 oplog（delta 同步来源）；失败只告警。
         crate::storage::oplog::record_local_ops(&self.storage, rt, &entries);
-        gossip.submit_gossip(rt, entries);
+        // v9：改走攒批提交 —— 被动收集路径每次常常只有 1~8 条，逐条提交会让出口限流
+        // （按帧计）把联邦出口钉死在 gossip_max_messages_per_second 条 entry/s。
+        gossip.submit_gossip_coalesced(rt, entries);
     }
 
     // 鈹€鈹€ 鍚屾渚挎嵎鏂规硶锛堢埇铏珮棰戣皟鐢紝閬垮厤 async 寮€閿€锛夆攢鈹€
@@ -375,6 +377,16 @@ impl NodeRepoImpl {
 
     pub fn contains_sync(&self, addr: SocketAddr) -> bool {
         self.nodes.contains_key(&addr)
+    }
+
+    /// v9：读取内存中该地址当前的 node_id（供联邦入站的确定性裁决使用）。
+    ///
+    /// 联邦同步里同一 `ip:port` 在两端的 node_id 常常不同（DHT 节点重启/重新 announce），
+    /// 而 NODE 的区间摘要 `blake3(node_id‖ip‖port)` 对 id 敏感 —— 若不裁决，两端会对同一
+    /// key 永久互判「内容不同」，反熵反复推拉却永远抹不平。裁决规则由调用方（`apply_node_sync`）
+    /// 统一为「取字典序较小者」，本方法只负责提供本地当前值。
+    pub fn node_id_sync(&self, addr: SocketAddr) -> Option<NodeId> {
+        self.nodes.get(&addr).map(|e| e.id)
     }
 
     pub fn len_sync(&self) -> usize {

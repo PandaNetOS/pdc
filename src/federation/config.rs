@@ -245,6 +245,63 @@ pub struct FederationConfig {
     /// 超过此时长自动恢复正常转发（Gossip 拉取无显式完成信号，用可配置时长兜底）。
     #[serde(default = "default_full_sync_receiving_settle_ms")]
     pub full_sync_receiving_settle_ms: u64,
+    // ========================================================================
+    // v9 收敛修复：bootstrap 生命周期 / delta 兜底 / range 预算 / gossip 丢批
+    // ========================================================================
+    /// v9：bootstrap 停滞判定（秒）。该 (peer,repo) 的 `updated_ms` 超过此时长未推进，
+    /// 即视为卡死 —— 不再阻塞 delta，并把进度重置为 Idle 以便重打清单。
+    ///
+    /// 背景：旧实现里 `running = 存在 phase != Done 的行`（无超时、无 peer 维度），
+    /// 一行卡在 Transfer 就能让该 repo 的 delta 永久停摆（实测 repo1/2/3 零进展 25 分钟）。
+    #[serde(default = "default_bootstrap_stall_secs")]
+    pub bootstrap_stall_secs: u64,
+    /// v9：同一 index 的分块请求「无响应」达到该次数后重拉清单（自愈）。
+    #[serde(default = "default_bootstrap_chunk_max_attempts")]
+    pub bootstrap_chunk_max_attempts: u32,
+    /// v9：同一 index 的分块请求保持无响应的最长时间（秒），超时同样重拉清单。
+    #[serde(default = "default_bootstrap_chunk_timeout_secs")]
+    pub bootstrap_chunk_timeout_secs: u64,
+    /// v9：bootstrap 是否阻断同 repo 的 delta。默认 **false**（两通道并行）。
+    ///
+    /// 旧实现无条件 `continue` 跳过 delta，与「bootstrap 卡死」构成互锁闭环；
+    /// 置 true 可退回旧行为（仅供对照排查）。
+    #[serde(default)]
+    pub bootstrap_blocks_delta: bool,
+    /// v9：应答方「清单重建」租约（秒）。租约内到达的块请求直接回显式空块（NAK），
+    /// 让请求方按失败计数自愈，而不是静默不回帧。
+    #[serde(default = "default_bootstrap_rebuild_lease_secs")]
+    pub bootstrap_rebuild_lease_secs: u64,
+    /// v9：单轮 range 反熵最多处理的 repo 数（1 = 每轮只做一个 repo）。
+    /// 旧实现一轮串行处理 4 个 repo（合计约 505 帧、实测单次占槽 166~226s），
+    /// 会把同分类的 delta/bootstrap/心跳一起饿死。
+    #[serde(default = "default_range_repos_per_tick")]
+    pub range_repos_per_tick: u32,
+    /// v9：同一 (peer,repo) 叶区间修复的最小间隔（秒），避免同一批差异每轮重复推拉。
+    #[serde(default = "default_range_repair_min_interval_secs")]
+    pub range_repair_min_interval_secs: u64,
+    /// v9：Gossip 批次重试时间预算（秒）。0 = 不按时间丢弃（仅靠 outbox 上限兜底）。
+    ///
+    /// 旧实现硬编码 30s：对端慢或被分类槽饿死时，批次会在 30s 内被判「重试超预算」永久丢弃。
+    #[serde(default = "default_gossip_retry_budget_secs")]
+    pub gossip_retry_budget_secs: u64,
+    /// v9：本地写入的 Gossip 攒批阈值（条）。达到即提交一个 GossipBatch。
+    ///
+    /// 旧实现每条 entry 一个独立 batch（被动收集路径），出口限流按「帧数」计 ⇒
+    /// 出口被钉死在 `gossip_max_messages_per_second` 条 entry/s。
+    #[serde(default = "default_gossip_coalesce_batch_size")]
+    pub gossip_coalesce_batch_size: usize,
+    /// v9：delta 续拉（has_more）发送失败后是否立即重试（不等待周期间隔）。
+    #[serde(default = "default_true")]
+    pub delta_retry_immediately: bool,
+    /// v9：oplog 裁剪是否尊重「最小对端已同步水位」，避免裁出对端永远拉不到的空洞。
+    ///
+    /// 背景（假收敛根因）：`trim_oplog` 只看时间不看对端进度，`min_seq` 生产出来后无人消费，
+    /// 请求方游标会一步跨过被裁掉的段并把 lag 归零 —— 实测 repo1 有 442,290 个 op 结构性不可达。
+    #[serde(default = "default_true")]
+    pub oplog_trim_respect_peer_floor: bool,
+    /// v9：上述 floor 的硬上限倍数 —— 超过 `retention × 该倍数` 仍强制裁剪，防 oplog 无界增长。
+    #[serde(default = "default_oplog_hard_retention_multiplier")]
+    pub oplog_hard_retention_multiplier: u64,
 }
 
 fn default_listen_port() -> u16 {
@@ -424,6 +481,35 @@ fn default_parallel_propagation() -> bool {
 fn default_full_sync_receiving_settle_ms() -> u64 {
     60_000
 }
+/// v9：bootstrap 停滞判定（秒）。3 分钟足够覆盖百万行库的一次分块往返（实测单块 2 万行）。
+fn default_bootstrap_stall_secs() -> u64 {
+    180
+}
+fn default_bootstrap_chunk_max_attempts() -> u32 {
+    3
+}
+fn default_bootstrap_chunk_timeout_secs() -> u64 {
+    90
+}
+/// v9：清单重建租约（秒）。旧值 900 过长：租约内所有块请求被静默丢弃（实测卡死主因之一）。
+fn default_bootstrap_rebuild_lease_secs() -> u64 {
+    60
+}
+fn default_range_repos_per_tick() -> u32 {
+    1
+}
+fn default_range_repair_min_interval_secs() -> u64 {
+    60
+}
+fn default_gossip_retry_budget_secs() -> u64 {
+    300
+}
+fn default_gossip_coalesce_batch_size() -> usize {
+    256
+}
+fn default_oplog_hard_retention_multiplier() -> u64 {
+    4
+}
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
@@ -493,6 +579,18 @@ impl Default for FederationConfig {
             strategy_min_conn_secs: default_strategy_min_conn_secs(),
             delta_watchdog_stall_ticks: default_delta_watchdog_stall_ticks(),
             range_bulk_threshold_rows: default_range_bulk_threshold_rows(),
+            bootstrap_stall_secs: default_bootstrap_stall_secs(),
+            bootstrap_chunk_max_attempts: default_bootstrap_chunk_max_attempts(),
+            bootstrap_chunk_timeout_secs: default_bootstrap_chunk_timeout_secs(),
+            bootstrap_blocks_delta: false,
+            bootstrap_rebuild_lease_secs: default_bootstrap_rebuild_lease_secs(),
+            range_repos_per_tick: default_range_repos_per_tick(),
+            range_repair_min_interval_secs: default_range_repair_min_interval_secs(),
+            gossip_retry_budget_secs: default_gossip_retry_budget_secs(),
+            gossip_coalesce_batch_size: default_gossip_coalesce_batch_size(),
+            delta_retry_immediately: true,
+            oplog_trim_respect_peer_floor: true,
+            oplog_hard_retention_multiplier: default_oplog_hard_retention_multiplier(),
         }
     }
 }

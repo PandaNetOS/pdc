@@ -944,10 +944,11 @@ async fn async_main(
                 persistence: config.task_scheduler.persistence_concurrency,
                 monitor: config.task_scheduler.monitor_concurrency,
                 network: config.task_scheduler.network_concurrency,
-                // v9 fix: 与 CategoryConcurrency::default() 对齐（此前字面量 4 覆盖 Default 8，
-                // 导致 C3「联邦并发 4→8」实际不生效）
-                federation: 8,
-                tracker: 2,
+                // v9 fix: 联邦/Tracker 并发度改为配置驱动（此前为字面量 8 / 2，属硬编码）。
+                // 现场实测联邦 8 槽被 Range 反熵（单次 166~226s）与 Gossip 传播（max 311s）
+                // 占满，把 fed_bootstrap_resume / fed_delta_sync / 联邦心跳饿死。
+                federation: config.task_scheduler.federation_concurrency,
+                tracker: config.task_scheduler.tracker_concurrency,
             })
             .with_runtime_handles(RuntimeHandles {
                 crawler: crawler_handle.clone(),
@@ -2380,6 +2381,8 @@ async fn async_main(
         {
             let st = storage.clone();
             let retention = config.federation.oplog_retention_secs;
+            let trim_respect_peer_floor = config.federation.oplog_trim_respect_peer_floor;
+            let trim_hard_retention_multiplier = config.federation.oplog_hard_retention_multiplier;
             task_scheduler.register(
                 TaskMetadata::new(
                     "oplog_trim",
@@ -2406,8 +2409,12 @@ async fn async_main(
                 ))),
                 move || {
                     let st = st.clone();
+                    let respect_floor = trim_respect_peer_floor;
+                    let hard_mult = trim_hard_retention_multiplier;
                     async move {
-                        match st.trim_oplog_by_retention(retention) {
+                        // v9：裁剪必须感知对端进度，否则会裁出对端永远拉不到的空洞
+                        // （请求方游标跨过空洞后 lag 归零 = 假收敛）。
+                        match st.trim_oplog_guarded(retention, respect_floor, hard_mult) {
                             Ok(n) if n > 0 => {
                                 debug!("[oplog] 裁剪 {} 条（保留窗口 {}s）", n, retention)
                             }

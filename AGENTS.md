@@ -201,6 +201,36 @@ Federation 分类并发上限 = 8
 | 2026-09-16 | v1.0 | 初始版本，记录 8 socket、预测式自适应、TaskScheduler 纳管 |
 | 2026-09-21 | v1.1 | 追加联邦同步诊断报告：DB 权威口径收敛数据、F6/F7/F8 落地状态、Federation 槽饥饿根因、F8a 回滚建议 |
 | 2026-09-22 | v1.2 | **联邦同步去 Merkle 化（协议 v8）**：Merkle 反熵全退场，Range 反熵成为唯一兜底通道（详见下节与 ADR-007）。v1.1 诊断报告中的 Federation 槽饥饿分析里，Merkle 相关任务（联邦Merkle反熵/联邦Merkle批量flush/Merkle增量×4/Merkle冷重算×4）已随本次重构整体消失 |
+| 2026-09-22 | v1.3 | **联邦同步收敛修复（v9，按通道）**：解除 delta↔bootstrap 互锁、oplog 空洞可检测+裁剪感知对端进度、NODE 反熵确定性收敛、gossip 取消安全+攒批、bootstrap 生命周期护栏、表达式索引消除全表排序。**未改线网格式**，两端可分别升级。详见下节 |
+
+## 联邦同步架构 v9（2026-09-22，收敛修复）
+
+**本节为最新基准。** v8 的通道划分不变（delta + Gossip + Range 反熵 + bootstrap），v9 修的是"跑起来但收敛不了/占槽不返回"的一类缺陷。协议版本号未变（无字段变更），但**行为有变**：两端无需锁步升级，服务端收益（per-repo gap 检测、对端 ack、清单对齐）需同版本。
+
+### 修复的六条主线
+
+1. **通道互锁（停摆）**：`lag > 1万` 时 `delta_sync_tick` 无条件 `continue` 关停该 repo 的 delta，而 bootstrap 又永久卡在 `transfer/done=0`（清单路径每次全表重排、分块路径租约内静默不回帧、请求方无 attempt/超时）⇒ 两通道互锁。现在：delta 与 bootstrap **并行**（`federation.bootstrap_blocks_delta` 可回退旧行为）；`delta_channel_allowed` 中 `STRATEGY_BOOTSTRAP` 不再拒绝 delta（策略只决定"优先怎么追"）。
+2. **假收敛**：oplog 只按时间裁剪、`min_seq` 无人消费 ⇒ 请求方游标跨过被裁掉的空洞、lag 归零。现在：`handle_ops_batch` 用**对端自报的 per-repo `min_seq`** 判空洞（`cur+1 < peer_min_seq`）并置 `delta_gap` 强制走快照；新增 `oplog_peer_ack` 表记录**请求方对本机 oplog 的游标**（与本机 seq 同空间），裁剪按"最小对端 ack − 安全余量"执行（`oplog_trim_respect_peer_floor`），hard_cutoff 兜住无界增长。
+3. **反熵空转**：NODE 的 `data_hash` 含 `node_id`，而同 key 不同 id 在 DHT 是常态；入站 `version==0 && contains_sync ⇒ 跳过` 让三条入站通道都无法修复它 ⇒ 每轮重新发现、每轮推拉、每轮丢弃。现在：`apply_node_sync` 对同 key 取**字典序较小 node_id** 为规范值（对所有 version 生效），两端规则对称 ⇒ 一轮交换即收敛。
+4. **bootstrap 无生命周期**：`bootstrap_state` 主键 `repo` → **`(peer, repo)`**（旧库自动事务化迁移）；`running` 判定加 peer + `updated_ms` 新鲜度，停滞超 `bootstrap_stall_secs` 置 Idle 并放行 delta；清单**缓存复用 + 单飞**；缓存缺失时**只回清单不回块**（消除 index↔区间错位造成的静默空洞）；所有早退路径回**显式 NAK**；请求方分块尝试计数 + 超时升级重拉清单；失败重发同块（不再跳过）；`w0` 改 per-repo 且 `set_peer_seq` 推迟到竣工；空清单不落库；同 version 清单保留已完成进度。
+5. **gossip 丢批**：`PropagationGuard` —— 传播 tick 被 300s 超时截断时**回灌已出队批次**并归还 in-flight；本地写入**攒批**（`gossip_coalesce_batch_size`，默认 256，DELETE 走顺序屏障）；丢弃路径全部补计数（`/sync-observability.gossip_drops`）；重试预算改为可配 `gossip_retry_budget_secs`（默认 300s）。
+6. **放大器**：`task_scheduler.federation_concurrency` / `tracker_concurrency` 入配置（原硬编码 8/2）；range 单轮按"最久未处理优先"限 `range_repos_per_tick` 个 repo + 按 `(peer,repo)` 公平轮转 + 同叶区间修复冷却；新增表达式索引 `idx_dht_nodes_ip_port_expr` / `idx_peers_key_expr`，NODE 区间查询改**按需拼谓词**（让索引真正可用于区间定位，消除 bootstrap 的 74~93 次全表排序）。
+
+### 诊断方法（可复用）
+
+- 会话死因看 `[session] sX 空闲超时（… > N ms）` 与 `[session] sX 关闭 对端=… 原因=…`；
+- "任务占槽久"先看 `调度器心跳 … 最老在飞=…` 与 `槽位泄漏：任务 … 已在飞 Ns`，**不要先怀疑该任务本身的逻辑**（v9 实测 `fed_delta_sync` 450s 的真因是别的任务长期占用全局 SQLite 连接锁）；
+- DB 侧看 `WAL checkpoint 高频稳态` / `WAL TRUNCATE` 的单次耗时（远端实测 435s / 1244s）——它们与 IOScheduler、所有只读查询**共用同一把 `Arc<Mutex<Connection>>`**。
+
+### 已知遗留（v9 未修，下一轮优先级）
+
+1. **全局单连接 + 长 PRAGMA 是"IO 慢 → 全节点停摆"的根**：`checkpoint`/`checkpoint_truncate` 在共享连接上执行且无超时（慢盘单次 435~1244s）；100ms 的 `wal_checkpoint_steady` 与 `wal_autocheckpoint=1000` 重复且是最长持锁者。方案：独立连接 + 硬超时 + 降频；读写连接分离（WAL 支持 1 writer + N readers）。
+2. **统计字段直查库、频率过高**：`stats_snapshot` 任务默认 **1 秒** × 4 个 `SELECT COUNT(*)`（1.7M 行表，且非 `spawn_blocking`）；WS 状态推送每 5s × 4 个 COUNT × 客户端数；`实体表 DB 级统计校准` 每 300s × 5 个 COUNT（远端 32.6s）。方案：行数改写路径增量计数；统计只留一个低频快照任务（独立只读连接）；`entity_counts_cached()` 未校准不再同步 COUNT。
+3. **会话层**：teardown 不发 `Goodbye`（对端仍持陈旧会话 → 新握手被判重复而关闭）；同 node_id 新会话应**接管**而非拒绝；`pnos-net` 冷却粒度是**地址级**（应 `(node_id, addr)`）；pdc peer 缓存对同一地址保留多个互斥身份（现场 4 个），应只留最近身份。
+4. `send_range_push` 无字节上限（单帧可含数千条）；delta tick 内 `send_message` 串行等待写锁，无预算/让出；控制帧（心跳/OpsRequest）与批量帧（GossipBulk/RangePush2）无优先级区分。
+5. PEER/INFOHASH 入站 DELETE 不落软删墓碑；PEER 收敛口径把 `peers_archive` 计入（指标虚高于同步范围）；bootstrap 块内容校验（`resp.hash`）未启用（一致性交给 range）。
+6. gossip 接收端背压：`gossip_flush_max_batches` 形参未用、semaphore 无超时、`receive_pending_threshold` 无消费方。
+
 
 ## 联邦同步架构 v8（2026-09-22，去 Merkle 化）
 

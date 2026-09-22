@@ -120,6 +120,16 @@ pub struct TaskSchedulerConfig {
     /// 网络类并发度
     #[serde(default = "default_network_concurrency")]
     pub network_concurrency: u32,
+    /// v9：联邦类并发度。
+    ///
+    /// 此前由 `CategoryConcurrency::default()` 硬编码为 8（`main.rs` 里也是字面量 8），
+    /// 属「硬编码可配置参数」违规；现场实测该 8 个槽被 Range 反熵（单次占槽 166~226s）
+    /// 与 Gossip 传播（max 311s）占满，把 fed_bootstrap_resume / fed_delta_sync 饿死。
+    #[serde(default = "default_federation_concurrency")]
+    pub federation_concurrency: u32,
+    /// v9：Tracker 类并发度（原同样为硬编码字面量 2）。
+    #[serde(default = "default_tracker_concurrency")]
+    pub tracker_concurrency: u32,
     /// 各任务调度间隔覆盖表。
     ///
     /// key 为 TaskScheduler.register 的任务名（如 `"crawler_tick"`），value 为间隔数值。
@@ -206,6 +216,17 @@ fn default_monitor_concurrency() -> u32 {
 
 fn default_network_concurrency() -> u32 {
     4
+}
+
+/// v9：联邦类并发度默认值，与历史 `CategoryConcurrency::default()` 的 federation=8 对齐
+/// （不改变现网默认行为，只把「不可配」变成「可配」）。
+fn default_federation_concurrency() -> u32 {
+    8
+}
+
+/// v9：Tracker 类并发度默认值，与历史字面量 2 对齐。
+fn default_tracker_concurrency() -> u32 {
+    2
 }
 
 fn default_admission_control_enabled() -> bool {
@@ -310,6 +331,8 @@ impl Default for TaskSchedulerConfig {
             persistence_concurrency: default_persistence_concurrency(),
             monitor_concurrency: default_monitor_concurrency(),
             network_concurrency: default_network_concurrency(),
+            federation_concurrency: default_federation_concurrency(),
+            tracker_concurrency: default_tracker_concurrency(),
             intervals: default_task_scheduler_intervals(),
             admission_control_enabled: default_admission_control_enabled(),
             admission_cpu_threshold: default_admission_cpu_threshold(),

@@ -70,6 +70,24 @@ pub struct GossipEngine {
     /// 缩短传播 tick、跳过 outbox 截断。不影响接收端是否转发。
     /// 用 Arc 包装以便 pause_gate() 向 crawler/dht/健康检查等外部模块共享同一信号。
     sending_full_sync: Arc<AtomicBool>,
+    // ========================================================================
+    // v9 丢批修复：可见性 + 攒批 + 取消安全
+    // ========================================================================
+    /// v9：本地写入的待攒批缓冲（repo → entries）。达到 `gossip_coalesce_batch_size`
+    /// 或传播 tick 触发时刷新为一个 GossipBatch。
+    ///
+    /// 旧实现把每次 `propagate()`（被动收集路径常常只有 1 条）直接提交为**一个独立 batch**，
+    /// 而出口限流按「帧数」计 ⇒ 出口被钉死在 `gossip_max_messages_per_second`（默认 100）
+    /// 条 entry/s，与对端欠账规模完全脱钩。
+    coalesce_pending: RwLock<FxHashMap<u8, Vec<SyncEntry>>>,
+    /// v9：outbox 溢出丢弃计数（旧实现只打 debug，生产 info 级别下完全不可见）。
+    dropped_outbox_overflow: AtomicU64,
+    /// v9：过期（timestamp 超 300s）丢弃计数。
+    dropped_expired: AtomicU64,
+    /// v9：重试时间预算耗尽丢弃计数（旧实现只有一行 error，无指标）。
+    dropped_retry_budget: AtomicU64,
+    /// v9：传播 tick 被取消/超时后回灌的批次数（衡量 300s 超时截断的实际发生量）。
+    requeued_on_cancel: AtomicU64,
 }
 
 /// 单个连接的发送结果集合（并行 spawn 后由主任务合并）
@@ -84,11 +102,75 @@ struct ConnSendResult {
     successful_nodes: FxHashSet<NodeId>,
 }
 
-/// P1-1：单个 batch 的重试**时间预算**，超过则丢弃。
+/// v9：传播 tick 的取消安全守卫。
 ///
-/// 取代旧的「按 tick 计数 MAX_RETRIES=3」（1 秒/tick，≈3 秒就连人带批丢弃）：
-/// 大批量推送或对端瞬时抖动根本等不到恢复窗口，等于静默丢数据。
-const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// 背景：`propagation_tick` 先把 batch 从 outbox `drain` 出来（并同步重建
+/// `outbox_msg_ids`），之后在多个 await 点（写连接 / 并行 spawn / 等待句柄）才把
+/// 「零成功」的批次放回 outbox。TaskScheduler 给任务包了 `tokio::time::timeout`
+/// （默认 300s，实测「联邦Gossip传播 max 311.43s」已越过该阈值），到点 **drop future**
+/// ⇒ 这批已出队的 batch 既不在 outbox、也不在重试表，**永久消失**，且 `in_flight_count`
+/// 不递减（`wait_outbox_empty` 会永久误判未排空）。
+///
+/// 本守卫保证：无论正常返回还是被取消，都 (1) 回灌未确认批次，(2) 归还 in-flight 计数。
+struct PropagationGuard {
+    engine: Arc<GossipEngine>,
+    batches: Arc<Vec<GossipBatchMessage>>,
+    /// 已被正常路径处理完毕（成功/已回灌/已按预算丢弃）的 msg_id，Drop 时不再干预。
+    confirmed: FxHashSet<u64>,
+    in_flight: usize,
+    settled: bool,
+}
+
+impl PropagationGuard {
+    fn new(engine: Arc<GossipEngine>, batches: Arc<Vec<GossipBatchMessage>>) -> Self {
+        let in_flight = batches.len();
+        Self {
+            engine,
+            batches,
+            confirmed: FxHashSet::default(),
+            in_flight,
+            settled: false,
+        }
+    }
+
+    /// 标记该 msg_id 已由正常路径处理完毕。
+    fn confirm(&mut self, msg_id: u64) {
+        self.confirmed.insert(msg_id);
+    }
+
+    /// 正常收尾：此后 Drop 只负责归还 in-flight 计数。
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for PropagationGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            let pending: Vec<GossipBatchMessage> = self
+                .batches
+                .iter()
+                .filter(|b| !self.confirmed.contains(&b.msg_id))
+                .cloned()
+                .collect();
+            if !pending.is_empty() {
+                let n = pending.len() as u64;
+                self.engine
+                    .requeued_on_cancel
+                    .fetch_add(n, Ordering::Relaxed);
+                warn!(
+                    "[federation] Gossip 传播被取消/超时，回灌 {} 条未确认 batch（v9 防丢批）",
+                    n
+                );
+                self.engine.extend_outbox_unique(pending);
+            }
+        }
+        // v9：in-flight 计数统一由守卫归还（旧实现既漏减，也在末尾手工减，容易双计/漏计）。
+        self.engine
+            .in_flight_count
+            .fetch_sub(self.in_flight, Ordering::Relaxed);
+    }
+}
 
 /// 本地序列化辅助结构：与线网格式 GossipBatchBulkMessage 字段布局完全一致，
 /// 但持有引用而非所有权，避免发送 bulk 时深拷贝 batch 数据。
@@ -136,6 +218,11 @@ impl GossipEngine {
             in_flight_count: AtomicUsize::new(0),
             receiving_full_sync: AtomicBool::new(false),
             sending_full_sync: Arc::new(AtomicBool::new(false)),
+            coalesce_pending: RwLock::new(FxHashMap::default()),
+            dropped_outbox_overflow: AtomicU64::new(0),
+            dropped_expired: AtomicU64::new(0),
+            dropped_retry_budget: AtomicU64::new(0),
+            requeued_on_cancel: AtomicU64::new(0),
         }
     }
 
@@ -256,6 +343,109 @@ impl GossipEngine {
         debug!("[federation] Gossip 批量提交完成: 接受 {} 条", accepted);
     }
 
+    /// v9：**攒批提交**本地写入（替代「每条 entry 一个 batch」）。
+    ///
+    /// 被动收集路径（每个入站 DHT query 的新节点、探测结果）此前都走 `submit_gossip`，
+    /// 一条 entry 独占一个 msg_id 与一帧；而出口限流按帧计 ⇒ 出口被钉死在
+    /// `gossip_max_messages_per_second` entry/s。这里先把 entry 累积到
+    /// `gossip_coalesce_batch_size`（默认 256），再一次性提交为一个 batch。
+    /// 未达阈值的部分由传播 tick 的 `flush_coalesced()` 兜底刷新（最坏延迟一个 tick）。
+    pub fn submit_gossip_coalesced(&self, repo_type: u8, entries: Vec<SyncEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        // v9 顺序屏障：DELETE 与 upsert 必须保持同一顺序。
+        // 若把 tombstone 也塞进缓冲，而缓冲里已有更早的 upsert，顺序仍是对的；但**反向**
+        // 不成立 —— 若 delete 走直发而 upsert 还在缓冲里，t0 upsert → t1 delete 会在接收端
+        // 变成「先 delete 后 upsert」（outbox FIFO + 同批先 upsert 后 delete），最终复活已删条目。
+        // 因此遇到 DELETE：先刷出同 repo 缓冲（更早的写入），再把 DELETE 直发。
+        let has_tombstone = entries
+            .iter()
+            .any(|e| e.operation == crate::federation::protocol::operation::DELETE);
+        if has_tombstone {
+            let pending = {
+                let mut p = self.coalesce_pending.write();
+                p.get_mut(&repo_type)
+                    .map(std::mem::take)
+                    .unwrap_or_default()
+            };
+            if !pending.is_empty() {
+                let batch_size = self.config.gossip_coalesce_batch_size.max(1);
+                self.submit_gossip_batch(repo_type, pending, batch_size);
+            }
+            self.submit_gossip(repo_type, entries);
+            return;
+        }
+        let threshold = self.config.gossip_coalesce_batch_size.max(1);
+        let mut ready: Option<Vec<SyncEntry>> = None;
+        {
+            let mut pending = self.coalesce_pending.write();
+            let buf = pending.entry(repo_type).or_default();
+            buf.extend(entries);
+            // 缓冲天然有界：每次追加后立即检查阈值，达到即整批取走，
+            // 因此上界 = threshold + 单次调用条目数（不需要额外的容量保护）。
+            if buf.len() >= threshold {
+                ready = Some(std::mem::take(buf));
+            }
+        }
+        if let Some(all) = ready {
+            self.submit_gossip_batch(repo_type, all, threshold);
+        }
+    }
+
+    /// v9：当前攒批缓冲的条目深度（可观测性；`(repo, entries)` 列表）。
+    pub fn coalesce_pending_depth(&self) -> Vec<(u8, usize)> {
+        let p = self.coalesce_pending.read();
+        let mut out: Vec<(u8, usize)> = p
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (*k, v.len()))
+            .collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    /// v9：刷新所有未达阈值的攒批缓冲（传播 tick 每轮调用，保证最坏一个 tick 的延迟）。
+    pub fn flush_coalesced(&self) {
+        let drained: Vec<(u8, Vec<SyncEntry>)> = {
+            let mut pending = self.coalesce_pending.write();
+            if pending.is_empty() {
+                return;
+            }
+            pending
+                .iter_mut()
+                .filter_map(|(rt, buf)| {
+                    if buf.is_empty() {
+                        None
+                    } else {
+                        Some((*rt, std::mem::take(buf)))
+                    }
+                })
+                .collect()
+        };
+        let batch_size = self.config.gossip_coalesce_batch_size.max(1);
+        for (rt, entries) in drained {
+            let n = entries.len();
+            self.submit_gossip_batch(rt, entries, batch_size);
+            debug!(
+                "[federation] Gossip 攒批刷新: repo_type={}, entries={}（未达阈值的兜底提交）",
+                rt, n
+            );
+        }
+    }
+
+    /// v9：丢批与取消回灌计数（供 `/sync-observability` 暴露）。
+    ///
+    /// 返回 `(outbox 溢出丢弃, 过期丢弃, 重试预算丢弃, 取消回灌 batch 数)`。
+    pub fn drop_stats(&self) -> (u64, u64, u64, u64) {
+        (
+            self.dropped_outbox_overflow.load(Ordering::Relaxed),
+            self.dropped_expired.load(Ordering::Relaxed),
+            self.dropped_retry_budget.load(Ordering::Relaxed),
+            self.requeued_on_cancel.load(Ordering::Relaxed),
+        )
+    }
+
     /// 启动 Gossip 传播后台任务（已迁移到 TaskScheduler）
     ///
     /// 周期性传播由 TaskScheduler 调用 `gossip_propagation_tick()` 驱动。
@@ -269,6 +459,9 @@ impl GossipEngine {
     /// 全量同步期间连续处理多批（原动态间隔 10ms 的等效行为），
     /// 非全量期处理一批。方法内部根据 `is_sending_full_sync()` 自适应处理量。
     pub async fn gossip_propagation_tick(self: Arc<Self>) {
+        // v9：先把未达攒批阈值的本地写入兜底刷出（最坏延迟一个 tick），
+        // 否则单条提交的 entry 会在缓冲里等到下一批才被提交。
+        self.flush_coalesced();
         let fanout = self.config.gossip_fanout;
         if self.is_sending_full_sync() {
             // 全量同步期间：连续排空 outbox，等效原 10ms 极短间隔连续 tick。
@@ -350,10 +543,30 @@ impl GossipEngine {
                 if outbox.len() > MAX_OUTBOX_LEN {
                     let drop_count = outbox.len() - MAX_OUTBOX_LEN;
                     outbox.drain(..drop_count);
-                    debug!("[federation] outbox 队列过长，丢弃 {} 条旧消息", drop_count);
+                    // v9：溢出丢弃必须可见（旧实现只有 debug，生产不可见、无指标）
+                    self.dropped_outbox_overflow
+                        .fetch_add(drop_count as u64, Ordering::Relaxed);
+                    warn!(
+                        "[federation] outbox 超上限（{} > {}），丢弃最老 {} 条消息（累计 {}）",
+                        outbox.len() + drop_count,
+                        MAX_OUTBOX_LEN,
+                        drop_count,
+                        self.dropped_outbox_overflow.load(Ordering::Relaxed)
+                    );
                 }
                 // 过滤过期消息（超过 300 秒的消息不再传播，避免 2 节点场景下队列积压）
+                let before = outbox.len();
                 outbox.retain(|b| now.saturating_sub(b.timestamp) < 300);
+                let expired = before - outbox.len();
+                if expired > 0 {
+                    self.dropped_expired
+                        .fetch_add(expired as u64, Ordering::Relaxed);
+                    debug!(
+                        "[federation] outbox 丢弃 {} 条过期消息（累计 {}）",
+                        expired,
+                        self.dropped_expired.load(Ordering::Relaxed)
+                    );
+                }
             }
             if outbox.is_empty() {
                 return;
@@ -391,10 +604,11 @@ impl GossipEngine {
         let batches = Arc::new(batches);
 
         // 标记 in-flight：这些 batch 已从 outbox 取出但发送尚未完成（含阻塞中的 write_all）。
-        // 此处之后无 early return，函数末尾统一 fetch_sub，保证配对。
+        // v9：in-flight 的**归还**与「取消时回灌」统一交给 PropagationGuard（见其文档）。
         let in_flight_added = batches.len();
         self.in_flight_count
             .fetch_add(in_flight_added, Ordering::Relaxed);
+        let mut guard = PropagationGuard::new(self.clone(), batches.clone());
         debug!(
             "[federation][DIAG] propagation_tick: took={} batches, outbox_remaining={}, in_flight_after_add={}",
             batches.len(),
@@ -584,6 +798,9 @@ impl GossipEngine {
 
         // 将需要重试的 batch 放回 outbox，带重试**时间预算**限制
         if !retry_ids.is_empty() {
+            // v9：预算来自配置（`gossip_retry_budget_secs`，默认 300s）；0 = 不按时间丢弃。
+            let budget = Duration::from_secs(self.config.gossip_retry_budget_secs.max(1));
+            let budget_disabled = self.config.gossip_retry_budget_secs == 0;
             let mut retry_guard = self.retry_counts.write();
             let mut first_guard = self.retry_first_at.write();
             let now = std::time::Instant::now();
@@ -600,17 +817,19 @@ impl GossipEngine {
                 let count = retry_guard.entry(batch.msg_id).or_insert(0);
                 *count += 1;
                 let elapsed = now.duration_since(started);
-                if elapsed >= RETRY_BUDGET {
+                if !budget_disabled && elapsed >= budget {
+                    self.dropped_retry_budget.fetch_add(1, Ordering::Relaxed);
                     error!(
-                        "[federation] Gossip 批次 msg_id={} 重试 {} 次 / {}s 仍未成功，丢弃",
+                        "[federation] Gossip 批次 msg_id={} 重试 {} 次 / {}s 仍未成功，丢弃（累计丢弃 {}）",
                         batch.msg_id,
                         count,
-                        elapsed.as_secs()
+                        elapsed.as_secs(),
+                        self.dropped_retry_budget.load(Ordering::Relaxed)
                     );
                     retry_guard.remove(&batch.msg_id);
                     first_guard.remove(&batch.msg_id);
                 } else {
-                    warn!(
+                    debug!(
                         "[federation] Gossip 批次 msg_id={} 第 {} 次发送未成功，放回 outbox 重试",
                         batch.msg_id, count
                     );
@@ -673,8 +892,12 @@ impl GossipEngine {
             retry_ids.len(),
             self.in_flight_count.load(Ordering::Relaxed)
         );
-        self.in_flight_count
-            .fetch_sub(in_flight_added, Ordering::Relaxed);
+        // v9：正常路径已把每个批次处理完毕（成功 / 已回灌 / 已按预算丢弃），
+        // 标记为 confirmed 后 settle，使守卫只负责归还 in-flight 计数、不再重复回灌。
+        for b in batches.iter() {
+            guard.confirm(b.msg_id);
+        }
+        guard.settle();
     }
 
     /// 向单个连接串行发送该连接的所有 batch（内部按 bulk 分组，保证单连接顺序）。

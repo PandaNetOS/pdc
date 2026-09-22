@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -45,11 +45,6 @@ const NEGOTIATE_FALLBACK_SECS: u64 = 120;
 const DELTA_WATCHDOG_PAUSE_MULT: u32 = 2;
 /// v8 F4：in-flight 请求视为存活的时长（秒）——超过后允许重发（覆盖写超时与短暂失联）。
 const DELTA_INFLIGHT_TIMEOUT_SECS: u64 = 30;
-
-/// 批次 3：应答方「清单现场重建」的租约时长（秒）。
-/// 重建 = DB 全表扫描（百万行级，实测数分钟）；请求方每 60s resume 一次会反复触发，
-/// 并发/高频重复重建会把 DB IO 与 Federation 分类槽吃光（双端互请 → 双向重建循环）。
-const BOOTSTRAP_REBUILD_LEASE_SECS: u64 = 900;
 
 /// 批次 3：全量差异巡检（本地 vs 对端各 repo 总数比对）的最小间隔（秒）。
 /// 该巡检要做 DB 级全表 COUNT，不能挂在秒级返回的 bootstrap 续传任务里每轮都跑 ——
@@ -136,9 +131,10 @@ pub struct SyncManager {
     delta_watchdog: RwLock<FxHashMap<(NodeId, u8), (u64, u32, Option<Instant>)>>,
     /// v7：range 反熵按 repo 的上次执行时刻（per-repo interval 节流）。
     range_tick_last: RwLock<FxHashMap<u8, Instant>>,
-    /// F7：bootstrap 块校验连续失败计数（repo → 次数）。
-    /// 连续 ≥3 次判定清单漂移（对端重启后清单已重建/数据已前进），重拉清单自愈。
-    bootstrap_verify_fails: RwLock<FxHashMap<u8, u32>>,
+    /// F7：bootstrap 块校验连续失败计数（(对端, repo) → 次数）。
+    /// 连续 ≥ `bootstrap_chunk_max_attempts` 次判定清单漂移（对端重启后清单已重建/数据已前进），
+    /// 重拉清单自愈。v9 起按 (peer, repo) 计数 —— 旧实现只按 repo，多对端时会互相污染。
+    bootstrap_verify_fails: RwLock<FxHashMap<(NodeId, u8), u32>>,
     /// 批次 3：应答方「清单现场重建」（F6）的进行中标记（node_id → 起始时刻）。
     /// 重建是 DB 全表扫描（百万行级，实测数分钟）；请求方每 60s resume 一次会反复触发，
     /// 双端互请时形成**双向重建循环**，把 DB IO 与 Federation 分类槽吃光。
@@ -147,6 +143,35 @@ pub struct SyncManager {
     /// 该巡检要做 DB 级全表计数比对，挂在 `bootstrap_resume_tick` 里会让本该秒级返回的
     /// 续传任务占住 Federation 槽上百秒（实测 max 164.36s），把其它联邦任务一起饿死。
     bootstrap_check_at: RwLock<Option<Instant>>,
+    // ========================================================================
+    // v9 收敛修复新增状态
+    // ========================================================================
+    /// v9：对端最近一次协商里自报的 per-repo 水位（连接早期即获得，不依赖 OpsBatch）。
+    /// `delta_peer_max` 只在收到 OpsBatch 后才有值，重启后的一段时间里是空的 ——
+    /// 而「对端静默 + 历史欠账巨大」恰恰是这段时间最需要判定的场景。
+    peer_negotiate_state: RwLock<FxHashMap<NodeId, Vec<RepoSyncState>>>,
+    /// v9：缓存清单的构建时刻（(peer, repo) → Instant）。
+    /// 租约期内重复到达的清单请求**直接复用缓存**，不再全表重排 —— 旧实现每次请求都重建，
+    /// 请求方每 60s 一次即形成「自持 DB 风暴」（实测单次重建 >131s，期间块请求被静默丢弃）。
+    bootstrap_manifest_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v9：分块请求的在途/失败跟踪 —— (peer, repo) → (当前 index, 连续尝试次数, 首次尝试时刻)。
+    ///
+    /// 旧实现只会在 resume 周期里重发同一个 index，**没有次数与时间上限**，也不会升级；
+    /// 应答方一旦静默（租约跳过 / index 越界 / DB 读失败），`done_chunks` 就永远停在原处
+    /// （实测：`phase=transfer, done=0` 持续存在，两天内 `收到清单` 仅 1 次）。
+    bootstrap_chunk_attempt: RwLock<FxHashMap<(NodeId, u8), (u32, u32, Instant)>>,
+    /// v9：Range 修复去重 —— (peer, repo, lo, hi) → 上次修复时刻。
+    /// 同一批差异在多个 tick 里被重复推拉（叠加 NODE 内容差异无法收敛时）会白白吃带宽。
+    range_repair_recent: RwLock<FxHashMap<(NodeId, u8, Vec<u8>, Vec<u8>), Instant>>,
+    /// v9：Range 每 repo 的下一个待对账连接下标（轮转），取代「按时间取模挑一条」。
+    range_rr: RwLock<FxHashMap<u8, usize>>,
+    /// v9：(peer, repo) → 本周期内最近一次对账时刻，用于多对端公平轮转。
+    range_peer_tick_last: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
+    delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
+    /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
+    /// 置位后该 repo 优先走 bootstrap/反熵，并在可观测性里暴露（旧实现是静默跳过 + lag 归零）。
+    delta_gap: RwLock<FxHashSet<(NodeId, u8)>>,
 }
 
 impl SyncManager {
@@ -262,6 +287,14 @@ impl SyncManager {
             bootstrap_verify_fails: RwLock::new(FxHashMap::default()),
             bootstrap_rebuild_at: RwLock::new(FxHashMap::default()),
             bootstrap_check_at: RwLock::new(None),
+            bootstrap_chunk_attempt: RwLock::new(FxHashMap::default()),
+            bootstrap_manifest_at: RwLock::new(FxHashMap::default()),
+            peer_negotiate_state: RwLock::new(FxHashMap::default()),
+            range_repair_recent: RwLock::new(FxHashMap::default()),
+            range_rr: RwLock::new(FxHashMap::default()),
+            range_peer_tick_last: RwLock::new(FxHashMap::default()),
+            delta_has_more: RwLock::new(FxHashSet::default()),
+            delta_gap: RwLock::new(FxHashSet::default()),
         }
     }
 
@@ -368,11 +401,25 @@ impl SyncManager {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            // LWW 检查：本地已存在该节点且 entry 版本未知（==0，旧版/未知）时跳过，
-            // 避免版本缺失的旧数据覆盖本地较新数据。version>0 的条目走 upsert 语义
-            // （真正的时间戳对比需 DB 存 version 字段，当前不修改 schema）。
-            if self.node_repo.contains_sync(payload.addr) && entry.version == 0 {
-                continue;
+            // v9 收敛修复：NODE 的 data_hash = blake3(node_id ‖ ip ‖ port)，
+            // 而 DHT 里同一 ip:port 被重新 announce 换成新 id 是常态 ⇒ 两端会对**同一个 key**
+            // 长期判出「内容不同」。旧实现「本地已存在 且 version==0 ⇒ 跳过」让 delta /
+            // bootstrap / Range-Push2 三条入站通道都无法修复它，于是反熵每轮重新发现、
+            // 每轮推拉、每轮丢弃（实测 repair_triggers == leaf_ranges，差异量长期停在数百）。
+            //
+            // 现在改为**确定性裁决**：同一 key 两端 node_id 不一致时，统一取字典序较小者
+            // 作为规范值。两端规则一致 ⇒ 一轮交换后即收敛，且不会来回翻覆（双向 LWW 会）。
+            // v9 修正：裁决对**所有**入站条目生效（不再只对 version==0）—— gossip 的本地变更
+            // 携带秒级时间戳（version>0）且会无条件覆盖内存 id，若绕过裁决，反熵刚把两端收敛到
+            // 规范值就会被下一次 gossip 重新拉开，差异永不消失。
+            if let Some(local_id) = self.node_repo.node_id_sync(payload.addr) {
+                if local_id == payload.node_id {
+                    continue;
+                }
+                if payload.node_id > local_id {
+                    // 本地 id 更小 → 保留本地（对端下一轮会收敛到我们的值）
+                    continue;
+                }
             }
             items.push((payload.node_id, payload.addr));
             applied += 1;
@@ -665,6 +712,15 @@ impl SyncManager {
             req.limit as usize
         };
         let since = delta::seq_to_i64(req.since_seq);
+        // v9：记录「该对端已消费本机该 repo 的 oplog 到 since」——这是本机 seq 空间里的位点，
+        // 供 `trim_oplog_guarded` 按「最小对端进度」裁剪，避免裁出对端永远拉不到的空洞
+        // （空洞会被请求方游标跨过并把 lag 抹平 = 假收敛）。失败不影响服务。
+        if let Err(e) = self
+            .delta_storage()
+            .set_peer_ack(&conn.node_id.0, req.repo, since)
+        {
+            debug!("[delta] 记录对端 ack 失败（不影响服务）: {}", e);
+        }
         let records = match self.delta_storage().load_ops_since(req.repo, since, limit) {
             Ok(r) => r,
             Err(e) => {
@@ -757,7 +813,41 @@ impl SyncManager {
                 "[delta] 丢弃过期/重复批: peer={}, repo={}, next_seq={} ≤ 当前 {}（单调保护）",
                 conn.node_id, batch.repo, batch.next_seq, cur
             );
+            // v9：单调保护分支同样要清「续拉未完成」标记 —— 否则竣工后的空批
+            // （next_seq == cur）会让标记永久粘滞，使 tick 永久绕过配置的拉取间隔。
+            self.delta_has_more
+                .write()
+                .remove(&(conn.node_id, batch.repo));
             return;
+        }
+        // v9：**oplog 空洞检测**（判据必须用对端的 per-repo `min_seq`，不能用 seq 间距）。
+        //
+        // 背景：`feed_oplog.seq` 是**全局** AUTOINCREMENT、4 个 repo 共用，因此
+        // 「本批首条 seq 与本地游标的差值」衡量的是跨 repo 的全局间距，而不是该 repo
+        // 被裁掉的 op 数 —— 稀疏 repo（TRACKER 仅数百条 / INFOHASH / PEER）连续两条同 repo
+        // op 的全局间距动辄上万，用它判洞会把稀疏 repo **长期**误判为「已被裁剪」，
+        // 于是每来一条稀疏 op 就触发一次整仓快照。
+        //
+        // 正确判据：对端在协商里自报的**该 repo** oplog 最小 seq（`RepoSyncState.min_seq`，
+        // 与本地游标 `cur` 同属对端 seq 空间）。真实空洞当且仅当 `cur + 1 < peer_min_seq`。
+        // 置位后 `delta_sync_tick` 让该 repo 一定走 bootstrap 补齐，并在观测接口暴露。
+        let peer_min_seq = self
+            .peer_negotiate_state
+            .read()
+            .get(&conn.node_id)
+            .and_then(|v| v.iter().find(|s| s.repo == batch.repo).map(|s| s.min_seq))
+            .unwrap_or(0);
+        if peer_min_seq > 0 && cur.saturating_add(1) < peer_min_seq {
+            let missing = peer_min_seq.saturating_sub(cur).saturating_sub(1);
+            warn!(
+                "[delta] 检测到 oplog 空洞: peer={}, repo={}, 缺口约 {} 条（本地游标 {} < 对端 min_seq {}）→ 转 bootstrap 补齐",
+                conn.node_id, batch.repo, missing, cur, peer_min_seq
+            );
+            self.delta_gap.write().insert((conn.node_id, batch.repo));
+        } else if batch.ops.is_empty() {
+            // 空批 = 对端该 repo 已无更新可给 ⇒ 不存在待补空洞，清除标记
+            // （旧写法只在「本批非空且间距小」时清除，空批会让标记永久粘滞）。
+            self.delta_gap.write().remove(&(conn.node_id, batch.repo));
         }
         let entries = delta::ops_to_sync_entries(&batch.ops);
         if !entries.is_empty() {
@@ -771,10 +861,14 @@ impl SyncManager {
         ) {
             warn!("[delta] 推进版本向量失败 peer={}: {}", conn.node_id, e);
         }
-        // 拉取往返成功：把节流计时推后，避免同一轮里 tick 立刻重发
+        // 拉取往返成功：把节流计时推后，避免同一轮里 tick 立刻重发；
+        // v9：清掉「续拉未完成」标记（本轮已收到响应）。
         self.delta_request_at
             .write()
             .insert((conn.node_id, batch.repo), Instant::now());
+        self.delta_has_more
+            .write()
+            .remove(&(conn.node_id, batch.repo));
         if !entries.is_empty() || batch.has_more {
             delta::log_applied(batch.repo, entries.len(), batch.next_seq);
         }
@@ -788,12 +882,26 @@ impl SyncManager {
             };
             if let Err(e) = conn.send_message(MessageType::OpsRequest, &req).await {
                 warn!("[delta] 续拉 OpsRequest 失败 to={}: {}", conn.node_id, e);
+                // v9：续拉失败必须留下待续标记 —— 旧实现只 warn，而唯一的补救路径
+                // （tick 的节流重发）此前又被 `use_bootstrap → continue` 关闭，
+                // 于是任何一次写超时都会把该 (peer,repo) 的游标永久冻结。
+                if self.config.delta_retry_immediately {
+                    self.delta_request_at
+                        .write()
+                        .remove(&(conn.node_id, batch.repo));
+                    self.delta_has_more
+                        .write()
+                        .insert((conn.node_id, batch.repo));
+                }
             } else {
                 self.metrics.record_message_sent();
                 // v8 F4：续拉同样标记 in-flight（防与下一轮 tick 叠加）
                 self.delta_inflight
                     .write()
                     .insert((conn.node_id, batch.repo), Instant::now());
+                self.delta_has_more
+                    .write()
+                    .insert((conn.node_id, batch.repo));
             }
         }
     }
@@ -964,6 +1072,10 @@ impl SyncManager {
         msg: SyncNegotiateMessage,
     ) {
         let strategies = self.decide_strategies(&msg);
+        // v9：记住对端自报的 per-repo 水位（连接早期即可用于判定欠账，不必等 OpsBatch）。
+        self.peer_negotiate_state
+            .write()
+            .insert(conn.node_id, msg.repos.clone());
         for s in &strategies {
             info!(
                 "[negotiate] 策略裁定 repo={} strategy={} rate={}（对端行数 {}）",
@@ -1022,8 +1134,13 @@ impl SyncManager {
 
     /// v7：delta 大通道是否放行（协商 + 门控 + 策略）。
     ///
-    /// v7+ 对端：需协商通过且策略为 DELTA（NONE/BOOTSTRAP 不走 delta）；
-    /// 协商发出 120s 仍无 Ack → 视为协商失败降级放行（防永久卡死）。
+    /// v9 语义修正：**策略只决定「优先怎么追」，不再决定「能不能追」**。
+    /// 旧实现只放行 `STRATEGY_DELTA`，于是「因为欠账大被裁定 BOOTSTRAP」直接导致 delta 也被
+    /// 拒绝 —— 与「bootstrap 卡死」叠加就是永久停摆（实测 repo1/2/3 零进展 25 分钟）。
+    /// 现在 `BOOTSTRAP` 与 `DELTA` 一样放行 delta（快照与增量并行，快照只负责补历史空洞）；
+    /// 只有 `NONE`（双方皆空）不放行。
+    ///
+    /// v7+ 对端：需协商通过；协商发出 120s 仍无 Ack → 视为协商失败降级放行（防永久卡死）。
     /// < v7 对端：回落旧行为（true）。
     fn delta_channel_allowed(&self, conn: &Arc<PeerConn>, repo: u8) -> bool {
         if !self.config.negotiation_enabled
@@ -1036,7 +1153,7 @@ impl SyncManager {
             return false;
         }
         match self.strategy_for(&conn.node_id, repo) {
-            Some(protocol::STRATEGY_DELTA) => true,
+            Some(protocol::STRATEGY_DELTA) | Some(protocol::STRATEGY_BOOTSTRAP) => true,
             Some(_) => false,
             None => self
                 .negotiation_sent_at
@@ -1135,6 +1252,20 @@ impl SyncManager {
         self.delta_inflight
             .write()
             .retain(|(p, _), _| alive.contains(p));
+        // v9：协商表/协商时刻表/续拉标记/gap 标记同样按存活对端清理 ——
+        // 旧实现不清 `negotiated`，重连后会沿用陈旧策略（可能把 delta 误门控），
+        // 且内存随历史对端数单调增长。
+        self.negotiated.write().retain(|p, _| alive.contains(p));
+        self.negotiation_sent_at
+            .write()
+            .retain(|p, _| alive.contains(p));
+        self.delta_has_more
+            .write()
+            .retain(|(p, _)| alive.contains(p));
+        self.delta_gap.write().retain(|(p, _)| alive.contains(p));
+        self.bootstrap_chunk_attempt
+            .write()
+            .retain(|(p, _), _| alive.contains(p));
         if pruned > 0 {
             debug!("[delta] 清理失联对端陈旧水位 {} 项", pruned);
         }
@@ -1161,6 +1292,10 @@ impl SyncManager {
         let n_conns = conns.len();
         // P1-5：清理失联对端的陈旧水位 / 看门狗 / in-flight（见方法注释）
         self.prune_stale_delta_state(&conns);
+        // v9：本轮只读一次 bootstrap 进度表，供所有 (peer, repo) 复用
+        // （旧写法在 peer×repo 双层循环里逐个调用 `bootstrap_list()`，对端多时是
+        // O(peers²) 次全表读 + JSON 反序列化，且每次都抢全局 SQLite 连接锁）。
+        let bootstrap_rows = self.delta_storage().bootstrap_list().unwrap_or_default();
         let mut triggered = 0u32;
         for conn in conns {
             if !conn.supports_delta_sync() {
@@ -1182,20 +1317,34 @@ impl SyncManager {
                 // 对端 per-repo 水位（delta_peer_max，来自 OpsBatch server_max_seq）与本地
                 // synced_seq 同序列空间，欠账 > range_bulk_threshold_rows 时 delta 硬拉
                 // 已无意义（大批量慢 + 风暴），直接走快照通道（实测 38 万欠账被误判 DELTA）。
-                let peer_max = *self
-                    .delta_peer_max
-                    .read()
-                    .get(&(conn.node_id, rt))
-                    .unwrap_or(&0);
+                let peer_max = {
+                    let from_ops = *self
+                        .delta_peer_max
+                        .read()
+                        .get(&(conn.node_id, rt))
+                        .unwrap_or(&0);
+                    // v9：OpsBatch 还没到过时回落到协商里对端自报的水位（重启后也能立即判欠账）。
+                    let from_neg = self
+                        .peer_negotiate_state
+                        .read()
+                        .get(&conn.node_id)
+                        .and_then(|v| v.iter().find(|s| s.repo == rt).map(|s| s.max_seq))
+                        .unwrap_or(0);
+                    from_ops.max(from_neg)
+                };
                 let synced_seq = self
                     .delta_storage()
                     .get_peer_seq(&conn.node_id.0, rt)
                     .unwrap_or(0)
                     .max(0) as u64;
                 let lag = peer_max.saturating_sub(synced_seq);
-                let lag_over = peer_max > 0
+                // v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」时，该 repo 必须走快照补齐，
+                // 无论 lag 大小（`handle_ops_batch` 在识别到 seq 跳变时置位 delta_gap）。
+                let gap_flagged = self.delta_gap.read().contains(&(conn.node_id, rt));
+                let lag_over = (peer_max > 0
                     && lag > self.config.range_bulk_threshold_rows.max(1)
-                    && self.strategy_for(&conn.node_id, rt) != Some(protocol::STRATEGY_NONE);
+                    && self.strategy_for(&conn.node_id, rt) != Some(protocol::STRATEGY_NONE))
+                    || gap_flagged;
                 // A1：全 repo 统一策略。bootstrap 通道已对四个 repo 打通（清单构建
                 // build_repo_manifest_impl、应答取数 load_repo_sync_entries_in_range、
                 // 落地 handle_sync_batch 均为 repo 通用），因此不再按 repo 特判：
@@ -1207,34 +1356,39 @@ impl SyncManager {
                     && bootstrap_decided
                     && conn.connected_secs() >= self.config.strategy_min_conn_secs;
                 if use_bootstrap {
-                    let running = self
-                        .delta_storage()
-                        .bootstrap_list()
-                        .map(|list| {
-                            list.iter()
-                                .any(|p| p.repo == rt && p.phase != bootstrap::BootstrapPhase::Done)
-                        })
-                        .unwrap_or(false);
+                    // v9：running 判定改为「同 peer 同 repo 且**仍在推进**」（见
+                    // bootstrap_running_fresh）：旧实现不含 peer、无超时，一行卡在 Transfer
+                    // 就让该 repo 对所有对端的 delta 永久停摆。
+                    let running = self.bootstrap_running_fresh(&bootstrap_rows, conn.node_id, rt);
                     if !running {
                         info!(
-                            "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}（协商裁定={}，欠账={}）",
+                            "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}（协商裁定={}，欠账={}，gap={}）",
                             conn.node_id,
                             rt,
                             self.strategy_for(&conn.node_id, rt)
                                 == Some(protocol::STRATEGY_BOOTSTRAP),
-                            lag
+                            lag,
+                            gap_flagged
                         );
                         let sm = self.clone();
                         let peer = conn.node_id;
                         tokio::spawn(async move { sm.start_bootstrap(peer, rt).await });
                     }
-                    continue;
+                    // v9：**不再无条件 `continue` 跳过 delta**。旧实现与「bootstrap 卡死」
+                    // 构成互锁闭环：lag>1万 → 关 delta → bootstrap 永不完成 → delta 永不恢复
+                    // （实测 repo1/2/3 的 lag 25 分钟逐位不变）。现在两通道并行；
+                    // 需要退回旧行为可置 federation.bootstrap_blocks_delta=true。
+                    if self.config.bootstrap_blocks_delta {
+                        continue;
+                    }
                 }
                 // v7：看门狗（暂停期跳过；触发时已清协商）
                 if !self.delta_watchdog_ok(conn.node_id, rt, interval, peer_max) {
                     continue;
                 }
-                let due = {
+                // v9：续拉未完成（has_more 发送失败）时不等间隔立即补发，避免游标永久冻结。
+                let has_more = self.delta_has_more.read().contains(&(conn.node_id, rt));
+                let due = has_more || {
                     let last = self.delta_request_at.read();
                     match last.get(&(conn.node_id, rt)) {
                         Some(t) => t.elapsed() >= interval,
@@ -1446,23 +1600,55 @@ impl SyncManager {
                     && (n_local > 0 || n_remote > 0)
                     && !forced_leaf
                 {
-                    self.range_repair_triggers
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // v8：4 repo 通用的 Pull/Push2 修复通道。不再依赖「对端 oplog 必有对应 op」
-                    // 的假设——入站/bootstrap 来源的数据在 oplog 里没有 op，delta 拉不到，
-                    // 那是此前 3 个非 NODE repo 修复死路的根因。
-                    if conn.supports_range_v2() {
-                        // 对端多 → 把缺失 key 列表发给对端，对端按 key 加载完整条目回推
-                        if n_remote > 0 {
-                            self.send_range_pull(&conn, resp.repo, &remote_only).await;
+                    // v9：同一 (peer, repo, lo, hi) 的修复在 `range_repair_min_interval_secs`
+                    // 内只做一次。旧实现是 fire-and-forget、无去重：同一批差异会被每个 tick
+                    // 重新推拉一遍（叠加「入站条目被 version==0 早退丢弃」时就是纯无效流量）。
+                    let dedupe_key = (conn.node_id, resp.repo, resp.lo.clone(), resp.hi.clone());
+                    let skip = {
+                        let dedupe = self.range_repair_recent.read();
+                        match dedupe.get(&dedupe_key) {
+                            Some(t) => {
+                                t.elapsed().as_secs()
+                                    < self.config.range_repair_min_interval_secs.max(1)
+                            }
+                            None => false,
                         }
-                        // 本地多 → 按 key 加载本地完整条目直接推给对端
-                        if n_local > 0 {
-                            self.send_range_push(&conn, resp.repo, &local_only).await;
+                    };
+                    if skip {
+                        debug!(
+                            "[range] 同一叶区间修复冷却中，跳过本轮: repo={} [{}, {})",
+                            resp.repo,
+                            String::from_utf8_lossy(&resp.lo),
+                            String::from_utf8_lossy(&resp.hi)
+                        );
+                    } else {
+                        if self.range_repair_recent.read().len() > 4096 {
+                            let cutoff = self.config.range_repair_min_interval_secs.max(1) * 2;
+                            self.range_repair_recent
+                                .write()
+                                .retain(|_, t| t.elapsed().as_secs() < cutoff);
                         }
-                    } else if n_remote > 0 {
-                        // < v8 对端：回落 delta 委托（仅对 oplog 窗口内、对端本地 origin 的数据有效）
-                        self.trigger_delta_sync(conn.node_id, resp.repo).await;
+                        self.range_repair_recent
+                            .write()
+                            .insert(dedupe_key, Instant::now());
+                        self.range_repair_triggers
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // v8：4 repo 通用的 Pull/Push2 修复通道。不再依赖「对端 oplog 必有对应 op」
+                        // 的假设——入站/bootstrap 来源的数据在 oplog 里没有 op，delta 拉不到，
+                        // 那是此前 3 个非 NODE repo 修复死路的根因。
+                        if conn.supports_range_v2() {
+                            // 对端多 → 把缺失 key 列表发给对端，对端按 key 加载完整条目回推
+                            if n_remote > 0 {
+                                self.send_range_pull(&conn, resp.repo, &remote_only).await;
+                            }
+                            // 本地多 → 按 key 加载本地完整条目直接推给对端
+                            if n_local > 0 {
+                                self.send_range_push(&conn, resp.repo, &local_only).await;
+                            }
+                        } else if n_remote > 0 {
+                            // < v8 对端：回落 delta 委托（仅对 oplog 窗口内、对端本地 origin 的数据有效）
+                            self.trigger_delta_sync(conn.node_id, resp.repo).await;
+                        }
                     }
                 }
             }
@@ -1687,6 +1873,15 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // v9：单轮最多处理 `range_repos_per_tick` 个 repo（默认 1）。
+        // 旧实现一轮把 4 个 repo 全部串行跑完（各 160+ 个区间、合计约 505 帧），
+        // 实测单次占槽 166~226s，把同分类的 delta / bootstrap / 心跳一起饿死。
+        //
+        // ⚠️ 预算必须按「**最久未处理优先**」发放，不能按 repo 编号顺序：NODE 的周期只有 30s
+        // 而本任务每 60s 触发一次，按编号顺序取 N 个会让 NODE 每轮都吃掉全部预算，
+        // PEER/INFOHASH/TRACKER 永远轮不到（它们自 v8 起只有 Range 这一条兜底通道）。
+        let budget = self.config.range_repos_per_tick.max(1) as usize;
+        let mut due_repos: Vec<(u8, u64)> = Vec::with_capacity(4);
         for repo in repo_type::NODE..=repo_type::TRACKER {
             let idx = (repo - repo_type::NODE) as usize;
             let interval = self
@@ -1696,19 +1891,68 @@ impl SyncManager {
                 .copied()
                 .unwrap_or(60)
                 .max(1);
-            let due = {
+            let last_age = {
                 let last = self.range_tick_last.read();
-                match last.get(&repo) {
-                    Some(t) => t.elapsed().as_secs() >= interval,
-                    None => true,
-                }
+                last.get(&repo).map(|t| t.elapsed().as_secs())
             };
-            if !due {
-                continue;
+            // 从未处理过的 repo 视为最紧急（u64::MAX）
+            let age = last_age.unwrap_or(u64::MAX);
+            if age >= interval {
+                due_repos.push((repo, age));
             }
+        }
+        // 最久未处理优先（age 越大越紧急；从未处理过记 u64::MAX）
+        due_repos.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+        for (repo, _) in due_repos.into_iter().take(budget) {
             self.range_tick_last.write().insert(repo, Instant::now());
             self.clone().range_reconcile_tick_repo(repo).await;
         }
+    }
+
+    /// v9：为某 repo 轮转挑一条「尚未到本轮周期」的连接（多对端时逐个覆盖，而非随机撞一条）。
+    ///
+    /// 旧实现按 `now.as_nanos() % conns.len()` 随机挑一条，且 `range_tick_last` 只按 repo 记时间
+    /// ⇒ 多对端（`target_neighbors` 默认 8）时每个 repo 每轮只对账一条连接，
+    /// 其余对端要靠运气被抽中，覆盖率被摊薄 N 倍。
+    fn pick_range_conn(
+        &self,
+        repo: u8,
+        interval_secs: u64,
+        conns: &[Arc<PeerConn>],
+    ) -> Option<Arc<PeerConn>> {
+        if conns.is_empty() {
+            return None;
+        }
+        let fresh = |t: Option<&Instant>| -> bool {
+            t.map(|x| x.elapsed().as_secs() < interval_secs)
+                .unwrap_or(false)
+        };
+        let mut rr = self.range_rr.write();
+        let start = *rr.get(&repo).unwrap_or(&0) % conns.len();
+        for offset in 0..conns.len() {
+            let i = (start + offset) % conns.len();
+            let cand = &conns[i];
+            if !cand.supports_range_reconcile() {
+                continue;
+            }
+            let seen = fresh(self.range_peer_tick_last.read().get(&(cand.node_id, repo)));
+            if !seen {
+                rr.insert(repo, (i + 1) % conns.len());
+                return Some(cand.clone());
+            }
+        }
+        // 全部对端本轮都做过了：轮转到下一条（下个周期再对账）。
+        // 兜底分支同样只返回**支持 range** 的连接，否则调用方直接 return、白耗本轮预算。
+        let supported: Vec<&Arc<PeerConn>> = conns
+            .iter()
+            .filter(|c| c.supports_range_reconcile())
+            .collect();
+        if supported.is_empty() {
+            return None;
+        }
+        let pick = supported[start % supported.len()].clone();
+        rr.insert(repo, (start + 1) % conns.len());
+        Some(pick)
     }
 
     /// v7：单 repo 的 range 反熵抽样对账（原 NODE 专属逻辑通用化）。
@@ -1717,13 +1961,25 @@ impl SyncManager {
         if conns.is_empty() {
             return;
         }
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let idx = (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as usize)
-            % conns.len();
-        let conn = &conns[idx];
+        let idx = (repo - repo_type::NODE) as usize;
+        let interval_secs = self
+            .config
+            .range_reconcile_interval_secs
+            .get(idx)
+            .copied()
+            .unwrap_or(60)
+            .max(1);
+        // 定期清理过期的「本轮已对账」标记（防多对端 × 4 repo 的表无界增长）
+        if self.range_peer_tick_last.read().len() > conns.len() * 4 + 8 {
+            let cutoff = interval_secs.saturating_mul(2);
+            self.range_peer_tick_last
+                .write()
+                .retain(|_, t| t.elapsed().as_secs() < cutoff);
+        }
+        let conn = match self.pick_range_conn(repo, interval_secs, &conns) {
+            Some(c) => c,
+            None => return,
+        };
         if !conn.supports_range_reconcile() {
             debug!(
                 "[range] 对端 {} 不支持 range 反熵（version<{}），跳过",
@@ -1732,6 +1988,10 @@ impl SyncManager {
             );
             return;
         }
+        // v9：本轮已对账的连接：本 repo 周期内不再重复抽到它（多对端公平轮转）。
+        self.range_peer_tick_last
+            .write()
+            .insert((conn.node_id, repo), Instant::now());
         let n = self.config.range_reconcile_sample_ranges.max(1) as usize;
         let keys = match self.delta_storage().sample_repo_range_keys(repo, n + 1) {
             Ok(k) => k,
@@ -1838,8 +2098,74 @@ impl SyncManager {
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
+        let key = (conn.node_id, req.repo);
+        let lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
+        // v9：① 缓存复用 —— 租约期内重复到达的清单请求直接回缓存清单，不再全表重排。
+        // 注意：读锁守卫必须在语句内释放（不得跨 await），否则 handler future 不是 Send。
+        let cached = self.bootstrap_manifests.read().get(&key).cloned();
+        if let Some(m) = cached {
+            let built_age = {
+                let at = self.bootstrap_manifest_at.read();
+                at.get(&key).map(|t| t.elapsed())
+            };
+            let fresh = matches!(built_age, Some(age) if age < lease);
+            if fresh {
+                debug!(
+                    "[bootstrap] 复用缓存清单 from={} repo={}（块数={}，构建于 {}s 前）",
+                    conn.node_id,
+                    req.repo,
+                    m.chunks.len(),
+                    built_age.map(|a| a.as_secs()).unwrap_or(0)
+                );
+                let resp = BootstrapManifestResponseMessage { manifest: m };
+                if conn
+                    .send_message(MessageType::BootstrapManifestResponse, &resp)
+                    .await
+                    .is_ok()
+                {
+                    self.metrics.record_message_sent();
+                }
+                return;
+            }
+        }
+        // v9：② 单飞 —— 已有一次重建在途时不再并发铺开全表扫描；
+        // 有旧缓存就回旧缓存（边界仍然自洽），没有就回空清单让请求方稍后重试。
+        let rebuilding_age = {
+            let g = self.bootstrap_rebuild_at.read();
+            g.get(&key).map(|t| t.elapsed())
+        };
+        if let Some(age) = rebuilding_age {
+            if age < lease {
+                warn!(
+                    "[bootstrap] 清单重建进行中（已 {}s），本轮回退旧缓存/空清单: peer={} repo={}",
+                    age.as_secs(),
+                    conn.node_id,
+                    req.repo
+                );
+                let manifest = self
+                    .bootstrap_manifests
+                    .read()
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| bootstrap::BootstrapManifest {
+                        repo: req.repo,
+                        ..Default::default()
+                    });
+                let resp = BootstrapManifestResponseMessage { manifest };
+                let _ = conn
+                    .send_message(MessageType::BootstrapManifestResponse, &resp)
+                    .await;
+                return;
+            }
+        }
+        self.bootstrap_rebuild_at
+            .write()
+            .insert(key, Instant::now());
         let storage = self.delta_storage();
-        let w0 = storage.oplog_max_seq().unwrap_or(0).max(0) as u64;
+        // v9：w0 必须取**该 repo** 的水位。旧实现用全局 `oplog_max_seq()`，而 delta 断点是
+        // per-repo 空间 ⇒ 稀疏 repo（如 TRACKER）的游标会被一次性抬到全局水位，
+        // 中间该 repo 的历史 op 被永久跳过。
+        let w0 = storage.oplog_max_seq_for_repo(req.repo).unwrap_or(0).max(0) as u64;
         let version = w0.wrapping_add(1) as u32; // 以 w0 派生：重新打清单即换版本
         let manifest = match bootstrap::build_repo_manifest_impl(
             &storage,
@@ -1851,6 +2177,7 @@ impl SyncManager {
             Ok(m) => m,
             Err(e) => {
                 warn!("[bootstrap] 建清单失败 repo={}: {}", req.repo, e);
+                self.bootstrap_rebuild_at.write().remove(&key);
                 return;
             }
         };
@@ -1863,13 +2190,45 @@ impl SyncManager {
         );
         self.bootstrap_manifests
             .write()
-            .insert((conn.node_id, req.repo), manifest.clone());
+            .insert(key, manifest.clone());
+        self.bootstrap_manifest_at
+            .write()
+            .insert(key, Instant::now());
+        self.bootstrap_rebuild_at.write().remove(&key);
         let resp = BootstrapManifestResponseMessage { manifest };
         if let Err(e) = conn
             .send_message(MessageType::BootstrapManifestResponse, &resp)
             .await
         {
             warn!("[bootstrap] 发送清单失败: {}", e);
+        } else {
+            self.metrics.record_message_sent();
+        }
+    }
+
+    /// v9：回一个**显式空块**作为 NAK。
+    ///
+    /// 旧实现在「重建进行中 / index 越界 / DB 读失败」三条路径上直接 `return` 不回帧，
+    /// 请求方因此永远收不到响应、`done_chunks` 恒为 0 且无任何失败计数可触发自愈
+    /// （实测 `phase=transfer, done=0` 卡死两天）。空块的 `entries.len() == 0`
+    /// 会命中接收方 `verify_transport(expected>0, 0) == false`，从而进入可计数、可升级的失败路径。
+    async fn send_bootstrap_nak(&self, conn: &PeerConn, repo: u8, index: u32, reason: &str) {
+        debug!(
+            "[bootstrap] 回显式 NAK: peer={}, repo={}, index={}, reason={}",
+            conn.node_id, repo, index, reason
+        );
+        let resp = BootstrapChunkResponseMessage {
+            repo,
+            index,
+            entries: Vec::new(),
+            hash: [0u8; 32],
+            is_last: false,
+        };
+        if let Err(e) = conn
+            .send_message(MessageType::BootstrapChunkResponse, &resp)
+            .await
+        {
+            warn!("[bootstrap] 发送 NAK 失败 to={}: {}", conn.node_id, e);
         } else {
             self.metrics.record_message_sent();
         }
@@ -1887,41 +2246,34 @@ impl SyncManager {
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
-        let manifest = match self
-            .bootstrap_manifests
-            .read()
-            .get(&(conn.node_id, req.repo))
-            .cloned()
-        {
+        let key = (conn.node_id, req.repo);
+        // 读锁守卫不得跨 await：先 clone 出缓存清单再 match。
+        let cached_manifest = self.bootstrap_manifests.read().get(&key).cloned();
+        let manifest = match cached_manifest {
             Some(m) => m,
             None => {
-                // F6: 应答方清单缓存是纯内存（重启即空），而请求方 resume 持本地持久化的
-                // 旧清单直接要块，双方互等对方先发清单请求 → 死锁（「无清单缓存」双端刷屏）。
-                // 现场按当前 DB 重建清单并缓存，直接服务该块；若与请求方旧清单版本漂移，
-                // 由请求方校验失败计数触发重拉清单自愈（F7）。
-                //
-                // 批次 3 租约：重建是**DB 全表扫描**（百万行级，实测数分钟）。请求方每 60s
-                // resume 一次 → 重建未完成前缓存仍为空 → 下一轮请求又触发一次重建，
-                // 双端互请时形成双向重建循环，DB IO 与 Federation 分类槽被吃光。
-                // 这里给「重建中」加租约：租约内到达的块请求直接跳过（下一轮 resume 会再来）。
-                {
-                    let mut g = self.bootstrap_rebuild_at.write();
-                    if let Some(t) = g.get(&(conn.node_id, req.repo)) {
-                        if t.elapsed() < Duration::from_secs(BOOTSTRAP_REBUILD_LEASE_SECS) {
-                            debug!(
-                                "[bootstrap] 清单重建进行中（已 {}s），本轮跳过块请求: peer={} repo={} index={}",
-                                t.elapsed().as_secs(),
-                                conn.node_id,
-                                req.repo,
-                                req.index
-                            );
-                            return;
-                        }
+                // F6/v9：应答方清单缓存是纯内存（重启即空），而请求方持本地持久化的旧清单
+                // 直接要块 —— 若按 index 硬服务，两侧块边界不同会让请求方把**不同区间**的数据
+                // 当成第 i 块落地，造成静默空洞（实测双端 74 块 vs 82 块、done_chunks 照常 +1）。
+                // 因此这里**只回清单、令请求方以同一边界重新开始**，从根上消除 index↔区间错位。
+                // 重建中（租约内）回显式空 NAK，让请求方走可计数、可升级的失败路径。
+                let lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
+                let rebuilding_age = {
+                    let g = self.bootstrap_rebuild_at.read();
+                    g.get(&key).map(|t| t.elapsed())
+                };
+                if let Some(age) = rebuilding_age {
+                    if age < lease {
+                        self.send_bootstrap_nak(&conn, req.repo, req.index, "manifest rebuilding")
+                            .await;
+                        return;
                     }
-                    g.insert((conn.node_id, req.repo), Instant::now());
                 }
+                self.bootstrap_rebuild_at
+                    .write()
+                    .insert(key, Instant::now());
                 let storage = self.delta_storage();
-                let w0 = storage.oplog_max_seq().unwrap_or(0).max(0) as u64;
+                let w0 = storage.oplog_max_seq_for_repo(req.repo).unwrap_or(0).max(0) as u64;
                 let version = w0.wrapping_add(1) as u32;
                 match bootstrap::build_repo_manifest_impl(
                     &storage,
@@ -1932,28 +2284,41 @@ impl SyncManager {
                 ) {
                     Ok(m) => {
                         info!(
-                            "[bootstrap] 清单缓存缺失，现场重建: peer={}, repo={}, 块数={}, w0={}",
+                            "[bootstrap] 清单缓存缺失，现场重建并要求请求方重新对齐: peer={}, repo={}, 块数={}, w0={}, 丢弃其 index={}",
                             conn.node_id,
                             req.repo,
                             m.chunks.len(),
-                            w0
+                            w0,
+                            req.index
                         );
-                        self.bootstrap_manifests
+                        self.bootstrap_manifests.write().insert(key, m.clone());
+                        self.bootstrap_manifest_at
                             .write()
-                            .insert((conn.node_id, req.repo), m.clone());
-                        self.bootstrap_rebuild_at
-                            .write()
-                            .remove(&(conn.node_id, req.repo));
-                        m
+                            .insert(key, Instant::now());
+                        self.bootstrap_rebuild_at.write().remove(&key);
+                        let resp = BootstrapManifestResponseMessage { manifest: m };
+                        if conn
+                            .send_message(MessageType::BootstrapManifestResponse, &resp)
+                            .await
+                            .is_ok()
+                        {
+                            self.metrics.record_message_sent();
+                        }
+                        return;
                     }
                     Err(e) => {
-                        self.bootstrap_rebuild_at
-                            .write()
-                            .remove(&(conn.node_id, req.repo));
+                        self.bootstrap_rebuild_at.write().remove(&key);
                         warn!(
                             "[bootstrap] 收到分块请求且清单重建失败 peer={}, repo={}: {}",
                             conn.node_id, req.repo, e
                         );
+                        self.send_bootstrap_nak(
+                            &conn,
+                            req.repo,
+                            req.index,
+                            "manifest rebuild failed",
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -1963,10 +2328,15 @@ impl SyncManager {
             Some(c) => c.clone(),
             None => {
                 warn!(
-                    "[bootstrap] 分块 index={} 越界（共 {} 块）",
+                    "[bootstrap] 分块 index={} 越界（共 {} 块）→ 回 NAK 并作废清单缓存迫使重新对齐",
                     req.index,
                     manifest.chunks.len()
                 );
+                // 缓存与请求方已失配：作废缓存，使下一次请求走「重建 + 重新对齐」路径。
+                self.bootstrap_manifests.write().remove(&key);
+                self.bootstrap_manifest_at.write().remove(&key);
+                self.send_bootstrap_nak(&conn, req.repo, req.index, "index out of range")
+                    .await;
                 return;
             }
         };
@@ -1983,6 +2353,8 @@ impl SyncManager {
             Ok(r) => r,
             Err(e) => {
                 warn!("[bootstrap] 取块哈希失败 index={}: {}", req.index, e);
+                self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk hash failed")
+                    .await;
                 return;
             }
         };
@@ -1998,6 +2370,8 @@ impl SyncManager {
             Ok(rows) => rows.into_iter().take(chunk.rows as usize).collect(),
             Err(e) => {
                 warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
+                self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk entries failed")
+                    .await;
                 return;
             }
         };
@@ -2049,34 +2423,69 @@ impl SyncManager {
             );
             return;
         }
+        // v9：**空清单是「重建在途」的回退帧，不是真清单** —— 必须原样丢弃，
+        // 绝不能落库（旧写法会把它当清单 `bootstrap_save(..., Some(&mf))` 覆盖本地有效清单，
+        // 把断点续传状态直接摧毁）。因此空清单要在任何写入之前拦掉。
+        if mf.chunks.is_empty() {
+            warn!(
+                "[bootstrap] 收到空清单（对端正在重建/无数据），忽略且不改本地状态: peer={} repo={}",
+                conn.node_id, mf.repo
+            );
+            return;
+        }
         let now = chrono::Utc::now().timestamp_millis();
+        // v9：同 version 的清单视为同一快照 ⇒ 保留已有完成进度，避免「重打清单 = 进度归零」
+        // 造成的零净进展循环（清零 → 重传 → 再清零）。
+        let same_snapshot = self
+            .delta_storage()
+            .bootstrap_load(&conn.node_id.0, mf.repo)
+            .ok()
+            .flatten()
+            .filter(|(p, _)| p.version == mf.version && p.peer.as_slice() == conn.node_id.0)
+            .map(|(p, _)| p);
         let mut progress = bootstrap::BootstrapProgress::new(mf.repo, conn.node_id.0.to_vec(), now);
         progress.phase = bootstrap::BootstrapPhase::Transfer;
         progress.version = mf.version;
         progress.w0_seq = mf.w0_seq;
         progress.total_chunks = mf.chunks.len() as u64;
-        progress.done_chunks = 0;
-        // 把该对端该 repo 的版本向量对齐到 w0（追尾起点；MAX 语义下仅前进）
-        let _ = self.delta_storage().set_peer_seq(
-            &conn.node_id.0,
-            mf.repo,
-            delta::seq_to_i64(mf.w0_seq),
-        );
+        progress.done_chunks = match same_snapshot {
+            Some(ref prev) => {
+                let keep = prev.done_chunks.min(mf.chunks.len() as u64);
+                if keep > 0 {
+                    info!(
+                        "[bootstrap] 清单版本未变（version={}），保留已完成进度 done={}/{}",
+                        mf.version,
+                        keep,
+                        mf.chunks.len()
+                    );
+                }
+                keep
+            }
+            None => 0,
+        };
+        progress.bytes = same_snapshot.map(|p| p.bytes).unwrap_or(0);
+        // v9：**不再在此处 `set_peer_seq`**。旧实现在一个字节都没落地时就把该 (peer,repo) 的
+        // per-repo 游标抬到 w0（`set_peer_seq` 是 MAX 语义、只进不退），于是「数据未传、
+        // 水位已声明」—— lag 归零、看板显示已同步，且无法回退。现在改为竣工时
+        // （`finish_bootstrap`）才推进游标。
         if let Err(e) = self.delta_storage().bootstrap_save(&progress, Some(&mf)) {
             warn!("[bootstrap] 保存进度失败: {}", e);
         }
+        // v9：换清单即清空该 (peer,repo) 的分块尝试计数（新一轮重新计数）
+        self.bootstrap_chunk_attempt
+            .write()
+            .remove(&(conn.node_id, mf.repo));
         info!(
-            "[bootstrap] 收到清单 from={}: 总行={}, 块数={}, w0={}",
+            "[bootstrap] 收到清单 from={}: 总行={}, 块数={}, w0={}, 续传起点={}",
             conn.node_id,
             mf.total_rows,
             mf.chunks.len(),
-            mf.w0_seq
+            mf.w0_seq,
+            progress.done_chunks
         );
-        if mf.chunks.is_empty() {
-            self.finish_bootstrap(&conn, mf.repo, mf.w0_seq).await;
-            return;
-        }
-        self.request_bootstrap_chunk(&conn, mf.repo, 0, &mf).await;
+        let start_index = progress.done_chunks as u32;
+        self.request_bootstrap_chunk(&conn, mf.repo, start_index, &mf)
+            .await;
     }
 
     /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉或切追尾。
@@ -2088,7 +2497,10 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
-        let (mut progress, mf) = match self.delta_storage().bootstrap_load(resp.repo) {
+        // v9：按 (peer, repo) 读取进度 —— 旧实现只按 repo 读，多对端时会把 B 的块响应
+        // 记到 A 的进度上（进度表主键已在 v9 改为 (peer,repo)）。
+        let peer_key = conn.node_id.0;
+        let (mut progress, mf) = match self.delta_storage().bootstrap_load(&peer_key, resp.repo) {
             Ok(Some((p, Some(m)))) => (p, m),
             Ok(_) => {
                 warn!("[bootstrap] 收到块 {} 但无进度/清单，忽略", resp.index);
@@ -2099,10 +2511,28 @@ impl SyncManager {
                 return;
             }
         };
+        if progress.peer.as_slice() != peer_key {
+            warn!(
+                "[bootstrap] 块响应来源与进度归属不一致，忽略: resp_from={} progress_peer={}",
+                conn.node_id,
+                progress.peer.len()
+            );
+            return;
+        }
         let chunk = match mf.chunks.iter().find(|c| c.index == resp.index) {
             Some(c) => c.clone(),
             None => return,
         };
+        // v9：收到响应（含 NAK）即清掉「无响应」计数 —— 该计数器只用于识别**完全无回帧**的
+        // 传输/连接故障，不应把「对端明确回 NAK」也算进去（NAK 走 verify_fails 自愈路径）。
+        {
+            let mut m = self.bootstrap_chunk_attempt.write();
+            if let Some(e) = m.get_mut(&(conn.node_id, resp.repo)) {
+                if e.0 == resp.index {
+                    m.remove(&(conn.node_id, resp.repo));
+                }
+            }
+        }
         // ④ 批量 upsert（A4：走全 repo 通用 dispatch handle_sync_batch，按 resp.repo 分派到
         // apply_node/peer/infohash/tracker_sync，严禁逐条 INSERT，也严禁硬编码走 NODE 落地）
         if !resp.entries.is_empty() {
@@ -2117,8 +2547,13 @@ impl SyncManager {
         // 清单仍是对端 DB，接收方的多余行还在，永远对不上。
         // 一致性校验应交给 range 反熵（v8 下唯一兜底通道）负责，bootstrap 只负责搬数据。
         let ok = bootstrap::verify_transport(chunk.rows, resp.entries.len());
+        // v9：失败（含对端显式 NAK/空块）时**重发同一 index**，绝不跳到下一块 ——
+        // 旧实现失败后仍执行 `request(index+1)`，等于把该区间的数据静默跳过（永久空洞）。
+        let mut retry_same = false;
         if ok {
-            self.bootstrap_verify_fails.write().remove(&resp.repo);
+            self.bootstrap_verify_fails
+                .write()
+                .remove(&(conn.node_id, resp.repo));
             progress.done_chunks = (resp.index as u64 + 1).max(progress.done_chunks);
             progress.bytes += resp
                 .entries
@@ -2127,45 +2562,57 @@ impl SyncManager {
                 .sum::<u64>();
             progress.phase = bootstrap::BootstrapPhase::Transfer;
         } else {
-            // 传输期漂移或丢包：不改 done_chunks，等下一轮恢复任务重拉
+            // 传输期漂移或丢包：不改 done_chunks，重发同块或升级为重拉清单
             warn!(
-                "[bootstrap] 块 {} 传输校验失败（声明 {} 行 / 实收 {} 行，可能丢包），保持进度 done={}",
-                resp.index, chunk.rows, resp.entries.len(), progress.done_chunks
+                "[bootstrap] 块 {} 传输校验失败（声明 {} 行 / 实收 {} 行），保持进度 done={}",
+                resp.index,
+                chunk.rows,
+                resp.entries.len(),
+                progress.done_chunks
             );
-            // F7: 连续 3 次校验失败 → 判定清单漂移（对端重启后已重建清单/数据已前进，
-            // 本地旧清单的块 hash 恒对不上），重发清单请求重置进度重拉。
+            // F7/v9: 连续 N 次失败 → 判定清单漂移/边界失配，重拉清单重置进度重拉。
             // 块数据按 upsert 落库（幂等），重复拉取无害。
             let fails = self
                 .bootstrap_verify_fails
                 .read()
-                .get(&resp.repo)
+                .get(&(conn.node_id, resp.repo))
                 .copied()
                 .unwrap_or(0)
                 + 1;
-            if fails >= 3 {
-                self.bootstrap_verify_fails.write().remove(&resp.repo);
+            if fails >= self.config.bootstrap_chunk_max_attempts.max(1) {
+                self.bootstrap_verify_fails
+                    .write()
+                    .remove(&(conn.node_id, resp.repo));
                 warn!(
-                    "[bootstrap] 连续 {} 次校验失败，判定清单漂移，重拉清单: repo={}, peer={}",
+                    "[bootstrap] 连续 {} 次分块失败，判定清单漂移/边界失配，重拉清单: repo={}, peer={}",
                     fails, resp.repo, conn.node_id
                 );
                 self.clone().start_bootstrap(conn.node_id, resp.repo).await;
             } else {
-                self.bootstrap_verify_fails.write().insert(resp.repo, fails);
+                self.bootstrap_verify_fails
+                    .write()
+                    .insert((conn.node_id, resp.repo), fails);
+                retry_same = true;
             }
         }
         progress.updated_ms = chrono::Utc::now().timestamp_millis();
         let _ = self.delta_storage().bootstrap_save(&progress, None);
 
         let last = resp.is_last || (resp.index as usize + 1) >= mf.chunks.len();
-        if last && ok {
-            self.finish_bootstrap(&conn, resp.repo, mf.w0_seq).await;
-        } else if !last {
-            self.request_bootstrap_chunk(&conn, resp.repo, resp.index + 1, &mf)
+        if ok {
+            if last {
+                self.finish_bootstrap(&conn, resp.repo, mf.w0_seq).await;
+            } else {
+                self.request_bootstrap_chunk(&conn, resp.repo, resp.index + 1, &mf)
+                    .await;
+            }
+        } else if retry_same {
+            self.request_bootstrap_chunk(&conn, resp.repo, resp.index, &mf)
                 .await;
         }
     }
 
-    /// 请求清单中第 `index` 块。
+    /// v9：请求清单中第 `index` 块，并记录「无响应」尝试次数/首次时刻。
     async fn request_bootstrap_chunk(
         &self,
         conn: &PeerConn,
@@ -2175,6 +2622,18 @@ impl SyncManager {
     ) {
         if manifest.chunks.iter().all(|c| c.index != index) {
             return;
+        }
+        // v9：记录 (index, 次数, 首次时刻)。resume tick 据此判定「对端一直不回帧」
+        // 并升级为「重拉清单」——旧实现无计数、无超时，只会在 60s 周期里无限重发同一 index。
+        {
+            let mut m = self.bootstrap_chunk_attempt.write();
+            let e = m
+                .entry((conn.node_id, repo))
+                .or_insert((index, 0, Instant::now()));
+            if e.0 != index {
+                *e = (index, 0, Instant::now());
+            }
+            e.1 = e.1.saturating_add(1);
         }
         let req = BootstrapChunkRequestMessage { repo, index };
         match conn
@@ -2189,17 +2648,87 @@ impl SyncManager {
     /// 完成 ③④ 后进入 ⑤ 追尾（复用 P1-3 delta 通道拉 `seq > w0`）。
     async fn finish_bootstrap(self: &Arc<Self>, conn: &PeerConn, repo: u8, w0_seq: u64) {
         let now = chrono::Utc::now().timestamp_millis();
-        if let Ok(Some((mut p, mf))) = self.delta_storage().bootstrap_load(repo) {
+        if let Ok(Some((mut p, mf))) = self.delta_storage().bootstrap_load(&conn.node_id.0, repo) {
             p.phase = bootstrap::BootstrapPhase::Done;
             p.updated_ms = now;
             let _ = self.delta_storage().bootstrap_save(&p, mf.as_ref());
         }
+        // v9：追尾起点在这里落库。清单响应阶段不再提前推进游标（见
+        // `handle_bootstrap_manifest_response`），保证「数据真正落地后才声明水位」。
+        let _ = self
+            .delta_storage()
+            .set_peer_seq(&conn.node_id.0, repo, delta::seq_to_i64(w0_seq));
+        // v9：清掉该 (peer,repo) 的分块尝试/失败计数与 gap 标记 —— 快照已补齐历史空洞。
+        self.bootstrap_chunk_attempt
+            .write()
+            .remove(&(conn.node_id, repo));
+        self.bootstrap_verify_fails
+            .write()
+            .remove(&(conn.node_id, repo));
+        self.delta_gap.write().remove(&(conn.node_id, repo));
+        // v9：追尾不受协商策略门控 —— 进入 bootstrap 的判定之一恰是
+        // 「策略 = BOOTSTRAP」，而 `delta_channel_allowed` 要求策略 = DELTA，
+        // 旧实现因此让竣工后的追尾被同一条策略静默拒绝（B5）。这里清掉协商结果，
+        // 迫使下一轮重协商，同时把该 (peer,repo) 的节流清空以便立即追尾。
+        self.negotiated.write().remove(&conn.node_id);
+        self.negotiation_sent_at.write().remove(&conn.node_id);
+        self.delta_request_at.write().remove(&(conn.node_id, repo));
+        self.delta_has_more.write().insert((conn.node_id, repo));
         info!(
-            "[bootstrap] {} 块全部落地并校验通过，切 delta 追尾（since_seq={}）",
+            "[bootstrap] {} 块全部落地，切 delta 追尾（since_seq={}，已清协商以解除追尾门控）",
             conn.node_id, w0_seq
         );
         // ⑤ 追尾：从 w0 拉 oplog 增量（P1-3 通道）
         self.trigger_delta_sync(conn.node_id, repo).await;
+    }
+
+    /// v9：某 (peer, repo) 是否存在**仍在推进**的 bootstrap 进度。
+    ///
+    /// 旧判定是 `bootstrap_list().any(|p| p.repo == rt && p.phase != Done)` ——
+    /// 不含 peer、无超时、无失败态、`bootstrap_clear` 在生产零调用，于是一行卡在 Transfer
+    /// 就让**该 repo 对所有对端的 delta 永久停摆**（实测 repo1/2/3 零进展 25 分钟）。
+    /// 现在要求 peer/repo 双匹配且 `updated_ms` 在 `bootstrap_stall_secs` 内；
+    /// 超期即判定卡死 → 置 Idle（保留 w0/清单/进度，下一轮 resume 继续）并返回 false，
+    /// 让 delta 立刻恢复。
+    fn bootstrap_running_fresh(
+        &self,
+        list: &[bootstrap::BootstrapProgress],
+        peer: NodeId,
+        repo: u8,
+    ) -> bool {
+        let Some(p) = list
+            .iter()
+            .find(|p| p.repo == repo && p.peer.as_slice() == peer.0)
+        else {
+            return false;
+        };
+        if p.phase == bootstrap::BootstrapPhase::Done {
+            return false;
+        }
+        let st = self.delta_storage();
+        let stall_ms = self.config.bootstrap_stall_secs.saturating_mul(1000).max(1);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let age_ms = now_ms.saturating_sub(p.updated_ms).max(0) as u64;
+        if age_ms <= stall_ms {
+            return true;
+        }
+        warn!(
+            "[bootstrap] 进度停滞 {}s（阈值 {}s）→ 置 Idle 并放行 delta: peer={} repo={} done={}/{} phase={}",
+            age_ms / 1000,
+            self.config.bootstrap_stall_secs,
+            peer,
+            repo,
+            p.done_chunks,
+            p.total_chunks,
+            p.phase.as_str()
+        );
+        let mut reset = p.clone();
+        reset.phase = bootstrap::BootstrapPhase::Idle;
+        reset.updated_ms = now_ms;
+        reset.error = Some(format!("stalled {}s (v9 watchdog)", age_ms / 1000));
+        let _ = st.bootstrap_save(&reset, None);
+        self.bootstrap_chunk_attempt.write().remove(&(peer, repo));
+        false
     }
 
     /// P2-1：重启后恢复未完成的 bootstrap（按已落进度续传）。
@@ -2211,6 +2740,8 @@ impl SyncManager {
             Ok(l) => l,
             Err(_) => return,
         };
+        let max_attempts = self.config.bootstrap_chunk_max_attempts.max(1);
+        let chunk_timeout = Duration::from_secs(self.config.bootstrap_chunk_timeout_secs.max(1));
         for p in list {
             if p.phase == bootstrap::BootstrapPhase::Done || p.peer.len() != 20 {
                 continue;
@@ -2218,7 +2749,38 @@ impl SyncManager {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(&p.peer);
             let peer = NodeId(arr);
-            match self.delta_storage().bootstrap_load(p.repo) {
+            // v9：无响应升级 —— 同一 index 连续请求超限或超时（对端完全没回帧）时重拉清单。
+            // 旧实现没有这层判定，只会在 60s 周期里无限重发同一 index（实测 194 次全从块 0）。
+            let stale_request = {
+                let m = self.bootstrap_chunk_attempt.read();
+                match m.get(&(peer, p.repo)) {
+                    Some(&(idx, cnt, first)) => {
+                        idx == p.done_chunks as u32
+                            && (cnt >= max_attempts || first.elapsed() >= chunk_timeout)
+                    }
+                    None => false,
+                }
+            };
+            if stale_request {
+                let (idx, cnt, secs) = {
+                    let m = self.bootstrap_chunk_attempt.read();
+                    m.get(&(peer, p.repo))
+                        .map(|&(i, c, t)| (i, c, t.elapsed().as_secs()))
+                        .unwrap_or((0, 0, 0))
+                };
+                warn!(
+                    "[bootstrap] 分块 {} 连续 {} 次 / {}s 无响应 → 重拉清单: peer={} repo={}",
+                    idx, cnt, secs, peer, p.repo
+                );
+                self.bootstrap_chunk_attempt.write().remove(&(peer, p.repo));
+                self.clone().start_bootstrap(peer, p.repo).await;
+                continue;
+            }
+            if self.sessions.get_connection(&peer).is_none() {
+                // 无连接时不计入失败，等连接恢复再续传（避免把「没连接」当成对端无响应）。
+                continue;
+            }
+            match self.delta_storage().bootstrap_load(&p.peer, p.repo) {
                 Ok(Some((_, Some(mf)))) if (mf.chunks.len() as u64) > p.done_chunks => {
                     if let Some(conn) = self.sessions.get_connection(&peer) {
                         debug!(
@@ -2304,33 +2866,35 @@ impl SyncManager {
                     continue;
                 }
 
-                // 对端比本地多 20% 以上才触发
+                // v9：触发条件改为「**绝对差**超阈值 **或** 相对差超 20%」。
+                // 旧实现只看相对比例（20%），于是 1.86M vs 1.73M（差 12 万行、7%）永不触发 ——
+                // 实测本端领先 12 万行就是这么来的。方向仍保持「对端更多 → 本端拉取」：
+                // 本端领先时由对端自己的巡检触发它来拉我们（两端同代码、同规则，天然对称）。
+                if remote_count <= local_count {
+                    continue;
+                }
+                let diff = remote_count - local_count;
                 let ratio = remote_count as f64 / local_count as f64;
-                if ratio < SNAPSHOT_RATIO_THRESHOLD {
+                if ratio < SNAPSHOT_RATIO_THRESHOLD
+                    && diff <= self.config.range_bulk_threshold_rows.max(1)
+                {
                     continue;
                 }
 
-                // 检查是否已有进行中的 bootstrap
-                let already_running = if let Ok(list) = self.delta_storage().bootstrap_list() {
-                    list.iter().any(|p| {
-                        p.peer.len() == 20 && {
-                            let mut arr = [0u8; 20];
-                            arr.copy_from_slice(&p.peer);
-                            NodeId(arr) == *peer
-                                && p.repo == repo
-                                && p.phase != bootstrap::BootstrapPhase::Done
-                        }
-                    })
-                } else {
-                    false
-                };
-                if already_running {
+                // 检查是否已有正在进行且仍在推进的 bootstrap（v9：带新鲜度判定）
+                let running_rows = self.delta_storage().bootstrap_list().unwrap_or_default();
+                if self.bootstrap_running_fresh(&running_rows, *peer, repo) {
                     continue;
                 }
 
                 info!(
-                    "[bootstrap] 检测到差异: repo={} local={}, remote={}, ratio={:.1}%, 触发 bootstrap: peer={}",
-                    repo, local_count, remote_count, ratio * 100.0, peer
+                    "[bootstrap] 检测到差异: repo={} local={}, remote={}, diff={}, ratio={:.1}%, 触发 bootstrap: peer={}",
+                    repo,
+                    local_count,
+                    remote_count,
+                    diff,
+                    ratio * 100.0,
+                    peer
                 );
 
                 if let Some(conn) = self.sessions.get_connection(peer) {
@@ -2418,16 +2982,45 @@ impl SyncManager {
             .map(|p| {
                 serde_json::json!({
                     "repo": p.repo,
+                    // v9：暴露 peer —— 进度表已按 (peer, repo) 存储，旧接口不输出 peer
+                    // 导致现场无法判断「卡住的是哪个对端」（本次故障正是卡在这里）。
+                    "peer": p.peer.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
                     "phase": p.phase.as_str(),
                     "total_chunks": p.total_chunks,
                     "done_chunks": p.done_chunks,
                     "ratio": p.ratio(),
                     "bytes": p.bytes,
                     "w0_seq": p.w0_seq,
+                    "updated_ms": p.updated_ms,
                     "error": p.error,
+                    "stalled": chrono::Utc::now().timestamp_millis()
+                        .saturating_sub(p.updated_ms)
+                        .max(0) as u64
+                        > self.config.bootstrap_stall_secs.saturating_mul(1000),
                 })
             })
             .collect();
+        // v9：oplog 空洞标记（对端已裁剪、中间段结构性缺失）与 gossip 丢批计数
+        let gaps: Vec<serde_json::Value> = self
+            .delta_gap
+            .read()
+            .iter()
+            .map(|(peer, repo)| {
+                serde_json::json!({
+                    "peer": peer.0.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                    "repo": repo,
+                })
+            })
+            .collect();
+        let (drop_overflow, drop_expired, drop_retry, requeued) = self.gossip_engine.drop_stats();
+        let coalesce_depth = self.gossip_engine.coalesce_pending_depth();
+        let gossip_drops = serde_json::json!({
+            "outbox_overflow": drop_overflow,
+            "expired": drop_expired,
+            "retry_budget": drop_retry,
+            "requeued_on_cancel": requeued,
+            "coalesce_pending": coalesce_depth,
+        });
         let range_stats = serde_json::json!({
             "leaf_ranges": self
                 .range_leaf_ranges
@@ -2463,6 +3056,8 @@ impl SyncManager {
             "range_reconcile_diagnostic_only": self.config.range_reconcile_diagnostic_only,
             "bootstrap_enabled": self.config.bootstrap_enabled,
             "bootstrap": bootstraps,
+            "delta_gap": gaps,
+            "gossip_drops": gossip_drops,
             "reconcile_nodes_visited": self
                 .range_ranges_visited
                 .load(std::sync::atomic::Ordering::Relaxed),

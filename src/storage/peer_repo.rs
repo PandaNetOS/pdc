@@ -162,7 +162,8 @@ impl PeerRepoImpl {
             .collect();
         // P1-2：本地新增/更新记入 oplog（delta 同步来源）；失败只告警。
         crate::storage::oplog::record_local_ops(&self.storage, rt, &entries);
-        gossip.submit_gossip(rt, entries);
+        // v9：改走攒批提交（出口限流按帧计，逐条提交会把联邦出口钉死在 100 entry/s）。
+        gossip.submit_gossip_coalesced(rt, entries);
     }
 
     /// 纭繚鏁版嵁宸插姞杞斤紙濡傛灉 cache 涓虹┖锛屼粠 SQLite 鍚屾鍔犺浇锛?

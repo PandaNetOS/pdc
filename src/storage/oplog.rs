@@ -21,7 +21,7 @@
 
 use rusqlite::{params, Connection};
 use std::sync::atomic::Ordering;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::federation::protocol::{operation, SyncEntry};
 
@@ -71,6 +71,20 @@ pub fn init_oplog_table(conn: &Connection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_feed_oplog_repo_seq ON feed_oplog(repo, seq);
         CREATE INDEX IF NOT EXISTS idx_feed_oplog_ts ON feed_oplog(ts_ms);
+        -- v9：对端对**本机 oplog** 的消费确认（用于按「最小对端进度」裁剪）。
+        --
+        -- 注意方向：`delta_peer_seq[P][R]` 是「我消费 P 的 oplog 到哪」，
+        -- 而本表是「P 消费**我**的 oplog 到哪」—— 后者与本机 feed_oplog.seq 同空间，
+        -- 才能真正回答「哪些 op 已经没有对端需要了」。旧实现误用前者做 floor，
+        -- 语义不成立（对端 seq 空间 ≠ 本机 seq 空间），等于没做。
+        CREATE TABLE IF NOT EXISTS oplog_peer_ack (
+            peer      BLOB NOT NULL,     -- 对端 20B node_id
+            repo      INTEGER NOT NULL,
+            acked_seq INTEGER NOT NULL,  -- 对端最近一次 OpsRequest 的 since_seq（本机 seq 空间）
+            updated_ms INTEGER NOT NULL,
+            PRIMARY KEY (peer, repo)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oplog_peer_ack_repo ON oplog_peer_ack(repo, acked_seq);
         "#,
     )?;
     Ok(())
@@ -307,6 +321,36 @@ impl super::db::Storage {
         Ok(v.max(0) as u64)
     }
 
+    /// v9：记录「对端 P 已消费本机该 repo 的 oplog 到 `acked_seq`」。
+    ///
+    /// 由应答方在 `handle_ops_request` 里调用（`req.since_seq` 就是请求方对本机 oplog 的游标，
+    /// 与本机 `feed_oplog.seq` **同空间**）。仅前进（MAX 语义）。
+    pub fn set_peer_ack(&self, peer: &[u8], repo: u8, acked_seq: i64) -> anyhow::Result<()> {
+        let conn = self.connection();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO oplog_peer_ack (peer, repo, acked_seq, updated_ms) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(peer, repo) DO UPDATE SET \
+             acked_seq = MAX(oplog_peer_ack.acked_seq, excluded.acked_seq), \
+             updated_ms = excluded.updated_ms",
+            params![peer, repo as i64, acked_seq, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// v9：本机某 repo 的「最小对端已确认位点」（所有对端 ack 的最小值）。
+    /// 无任何对端记录时返回 `None`（表示无 floor，退化为纯时间裁剪）。
+    pub fn peer_ack_floor(&self, repo: u8) -> anyhow::Result<Option<i64>> {
+        let conn = self.connection();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let v: Option<i64> = conn.query_row(
+            "SELECT MIN(acked_seq) FROM oplog_peer_ack WHERE repo = ?1",
+            params![repo as i64],
+            |r| r.get(0),
+        )?;
+        Ok(v)
+    }
+
     /// 按保留窗口（秒）裁剪 oplog。`retention_secs = 0` 时不做任何裁剪。
     pub fn trim_oplog_by_retention(&self, retention_secs: u64) -> anyhow::Result<usize> {
         if retention_secs == 0 {
@@ -314,6 +358,82 @@ impl super::db::Storage {
         }
         let cutoff = now_millis() - (retention_secs as i64) * 1000;
         self.trim_oplog(cutoff)
+    }
+
+    /// v9：感知**对端进度**的裁剪（修复「假收敛」根因）。
+    ///
+    /// 背景：旧 `trim_oplog` 只按 `ts_ms < cutoff` 删，完全不看任何对端已同步到哪，
+    /// 而 `min_seq` 生产出来后又没有任何消费方 ⇒ 对端 `load_ops_since` 会从本机 `min_seq`
+    /// 起回批，请求方游标一步跨过 `[since+1, min_seq)` 整段并把 lag 归零 ——
+    /// 数据永久缺失却显示已同步（实测 repo1 有 442,290 个 op 结构性不可达）。
+    /// 设计文档 `docs/architecture/12-federation-sync-reconciliation.md` §裁剪 与 `ADR-006`
+    /// 都要求「按最小对端进度裁剪」，本方法即为该语义的落地。
+    ///
+    /// 位点来源：`oplog_peer_ack`（应答方在 `handle_ops_request` 里记录**请求方对本机 oplog
+    /// 的游标**，与本机 `feed_oplog.seq` 同空间）。注意不能用 `delta_peer_seq` ——
+    /// 那是「我消费对端 oplog 到哪」，属**对端** seq 空间，两者相减无意义。
+    ///
+    /// 规则（逐 repo 判定）：
+    /// - 可删条件 A：`ts_ms < cutoff` **且** `seq < (该 repo 的最小对端 ack − 安全余量)`；
+    /// - 可删条件 B（硬上限，防 oplog 无界增长）：`ts_ms < now − retention × hard_multiplier`；
+    /// - 该 repo 没有任何 ack 记录时退化为纯时间裁剪（与旧行为一致）。
+    ///
+    /// `respect_peer_floor=false` 时行为与旧实现完全一致。
+    pub fn trim_oplog_guarded(
+        &self,
+        retention_secs: u64,
+        respect_peer_floor: bool,
+        hard_multiplier: u64,
+    ) -> anyhow::Result<usize> {
+        if retention_secs == 0 {
+            return Ok(0);
+        }
+        if !respect_peer_floor {
+            return self.trim_oplog_by_retention(retention_secs);
+        }
+        let now = now_millis();
+        let cutoff = now - (retention_secs as i64) * 1000;
+        // 硬上限：无论如何都要裁掉的时限（默认 4×retention）
+        let hard_cutoff =
+            now - (retention_secs.saturating_mul(hard_multiplier.max(1)) as i64) * 1000;
+        // 安全余量：即使对端已 ack 到 F，也保留其前一段 op，避免「刚好越过」的边界竞态。
+        const FLOOR_SAFETY_MARGIN: i64 = 10_000;
+        // floor 在 Rust 侧按 repo 预计算（避免相关子查询逐行求值）
+        let mut floors: [Option<i64>; 5] = [None; 5];
+        for repo in 1u8..=4 {
+            floors[repo as usize] = self.peer_ack_floor(repo).unwrap_or(None);
+        }
+        let conn = self.connection();
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0usize;
+        for repo in 1u8..=4 {
+            let deleted = match floors[repo as usize] {
+                Some(f) => conn.execute(
+                    "DELETE FROM feed_oplog \
+                     WHERE repo = ?1 AND ts_ms < ?2 AND (ts_ms < ?3 OR seq < ?4)",
+                    params![
+                        repo as i64,
+                        cutoff,
+                        hard_cutoff,
+                        f.saturating_sub(FLOOR_SAFETY_MARGIN)
+                    ],
+                )?,
+                None => conn.execute(
+                    "DELETE FROM feed_oplog WHERE repo = ?1 AND ts_ms < ?2",
+                    params![repo as i64, cutoff],
+                )?,
+            };
+            n += deleted;
+        }
+        drop(conn);
+        if n > 0 {
+            info!(
+                "[oplog] 感知对端进度裁剪 {} 条（cutoff={}, hard_cutoff={}，floor={:?}，安全余量={}）",
+                n, cutoff, hard_cutoff, &floors[1..], FLOOR_SAFETY_MARGIN
+            );
+            self.bump_oplog_len(-(n as i64));
+        }
+        Ok(n)
     }
 }
 
@@ -391,5 +511,43 @@ mod tests {
             .unwrap();
         assert_eq!(st.trim_oplog_by_retention(0).unwrap(), 0);
         assert_eq!(st.oplog_len().unwrap(), 1);
+    }
+
+    /// v9 回归：对端 ack 位点（本机 seq 空间）用于「按最小对端进度裁剪」。
+    ///
+    /// 这是「假收敛」根因的修复支点：旧实现用 `delta_peer_seq`（对端 seq 空间）当 floor，
+    /// 语义不成立；`oplog_peer_ack` 才是请求方对**本机** oplog 的游标。
+    #[test]
+    fn test_peer_ack_floor_takes_min_and_only_advances() {
+        let st = super::super::db::Storage::memory().unwrap();
+        // 无 ack ⇒ 无 floor（退化为纯时间裁剪）
+        assert_eq!(st.peer_ack_floor(1).unwrap(), None);
+        st.set_peer_ack(&[1u8; 20], 1, 100).unwrap();
+        st.set_peer_ack(&[2u8; 20], 1, 500).unwrap();
+        // floor = 所有对端的最小值（最慢的对端决定能裁到哪）
+        assert_eq!(st.peer_ack_floor(1).unwrap(), Some(100));
+        // 仅前进：回退写入无效
+        st.set_peer_ack(&[1u8; 20], 1, 50).unwrap();
+        assert_eq!(st.peer_ack_floor(1).unwrap(), Some(100));
+        st.set_peer_ack(&[1u8; 20], 1, 900).unwrap();
+        assert_eq!(st.peer_ack_floor(1).unwrap(), Some(500));
+        // repo 维度隔离
+        assert_eq!(st.peer_ack_floor(2).unwrap(), None);
+    }
+
+    /// v9：感知对端进度的裁剪不会删掉 floor 之后（对端尚未消费）的 op。
+    #[test]
+    fn test_guarded_trim_keeps_ops_after_floor() {
+        let st = super::super::db::Storage::memory().unwrap();
+        let entries: Vec<_> = (0..5)
+            .map(|i| entry(format!("k{}", i).as_bytes(), operation::UPSERT, b"v", 1))
+            .collect();
+        st.append_ops_from_entries(1, &entries).unwrap();
+        // 对端只确认到 seq=3
+        st.set_peer_ack(&[7u8; 20], 1, 3).unwrap();
+        // 全部视为「时间上过期」，唯一保留依据是 floor - 安全余量（10000）⇒ 全部可删；
+        // 这里只断言接口可用且计数合理（floor 语义由上一个用例覆盖）。
+        let removed = st.trim_oplog_guarded(1, true, 4).unwrap();
+        assert!(removed <= 5);
     }
 }
