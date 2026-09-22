@@ -146,6 +146,21 @@ impl TrackerDiscoverer {
         discoverer
     }
 
+    /// 挂载内置 DNS 解析池（重建 HTTP 客户端，不再走系统 DNS）
+    ///
+    /// 在 [`Self::new`] 之后调用；`pool` 为 `None` 时保持 reqwest 默认解析器。
+    pub fn with_dns_pool(mut self, pool: Option<&Arc<pnos_net::DnsPool>>) -> Self {
+        self.client = crate::dns_resolve::apply_dns_pool(
+            Client::builder()
+                .timeout(self.config.timeout)
+                .user_agent(&self.config.user_agent),
+            pool,
+        )
+        .build()
+        .expect("failed to build reqwest client");
+        self
+    }
+
     /// 注入 TrackerRepo（统一数据归口 + 持久化）
     pub fn with_tracker_repo(mut self, repo: Arc<crate::storage::TrackerRepoImpl>) -> Self {
         self.tracker_repo = Some(repo);
@@ -198,11 +213,19 @@ impl TrackerDiscoverer {
     }
 
     /// 从远程 URL 拉取 Tracker 列表
-    pub async fn fetch_remote_trackers(url: &str) -> anyhow::Result<Vec<String>> {
-        let client = reqwest::Client::builder()
-            .timeout(REMOTE_TRACKER_FETCH_TIMEOUT)
-            .user_agent("PDC-TrackerFetcher/1.0")
-            .build()?;
+    ///
+    /// `pool` 为 `Some` 时用内置 DnsPool 解析目标域名（不读系统 DNS）。
+    pub async fn fetch_remote_trackers_with_pool(
+        url: &str,
+        pool: Option<&Arc<pnos_net::DnsPool>>,
+    ) -> anyhow::Result<Vec<String>> {
+        let client = crate::dns_resolve::apply_dns_pool(
+            reqwest::Client::builder()
+                .timeout(REMOTE_TRACKER_FETCH_TIMEOUT)
+                .user_agent("PDC-TrackerFetcher/1.0"),
+            pool,
+        )
+        .build()?;
         let resp = client.get(url).send().await?;
         let text = resp.text().await?;
         let trackers: Vec<String> = text
@@ -218,6 +241,11 @@ impl TrackerDiscoverer {
             .collect();
         info!("[tracker] 从远程拉取到 {} 个 tracker", trackers.len());
         Ok(trackers)
+    }
+
+    /// 从远程 URL 拉取 Tracker 列表（使用 reqwest 默认解析器）
+    pub async fn fetch_remote_trackers(url: &str) -> anyhow::Result<Vec<String>> {
+        Self::fetch_remote_trackers_with_pool(url, None).await
     }
 
     /// 获取活跃的 Tracker 列表（未被禁用的）

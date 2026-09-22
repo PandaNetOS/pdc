@@ -562,6 +562,29 @@ async fn async_main(
         });
     }
 
+    // 6.75 初始化进程级 DNS 解析池（内置公共 DNS，不读宿主系统 DNS 配置）
+    //
+    // 必须早于 federation / crawler 构造：iroh 端点（pkarr 发布/解析、
+    // DnsAddressLookup TXT、DERP 主机名）、联邦种子解析、tracker/scrape/
+    // subscription 的 HTTP 客户端都从这里取解析器，保证全进程共用一份。
+    let dns_pool = match PeerDiscoveryCenter::dns_pool::init_global(&config.dns) {
+        Ok(pool) => {
+            info!(
+                "[main] DNS 解析池已就绪: servers={:?}, 系统 DNS 回退={}",
+                pool.servers()
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>(),
+                pool.allow_system_fallback()
+            );
+            pool
+        }
+        Err(e) => {
+            warn!("[main] DNS 解析池初始化失败（回退惰性默认值）: {}", e);
+            PeerDiscoveryCenter::dns_pool::global()
+        }
+    };
+
     // 6.8 创建联邦网络服务（如果启用）
     let federation_service: Option<Arc<FederationService>> = if config.federation.enabled {
         // 联邦数据目录从配置存储路径的父目录获取（零配置：不再硬编码 target/data）
@@ -580,7 +603,8 @@ async fn async_main(
             Some(tracker_repo.clone()),
         ) {
             Ok(svc) => {
-                let svc = Arc::new(svc);
+                // 注入 DNS 配置：iroh 端点解析器（不读宿主系统 DNS）
+                let svc = Arc::new(svc.with_dns(config.dns.clone()));
                 info!("[main] 联邦网络服务已创建");
                 Some(svc)
             }
@@ -682,6 +706,7 @@ async fn async_main(
     // 7. 创建爬虫引擎（如果启用），在 AppState 之前创建以便共享状态
     let (crawler_state, crawler_routing_table, crawler_ref) = if config.crawler.enabled {
         let crawler = CrawlerEngine::new(config.crawler.clone(), event_bus.clone())
+            .with_dns_pool(dns_pool.clone())
             .with_sockets(crawler_sockets)
             .with_peer_repo(peer_repo.clone())
             .with_storage(storage.clone())
@@ -736,6 +761,7 @@ async fn async_main(
     let fetcher_ref: Option<Arc<PeerDiscoveryCenter::services::TrackerPeerFetcher>> = {
         let tracker_discoverer = Arc::new(
             PeerDiscoveryCenter::discoverers::tracker::TrackerDiscoverer::with_default_config()
+                .with_dns_pool(Some(&dns_pool))
                 .with_tracker_repo(tracker_repo.clone()),
         );
         let fetcher =
@@ -756,6 +782,7 @@ async fn async_main(
     let subscription_config = PeerDiscoveryCenter::services::SubscriptionConfig::default();
     let subscription_service =
         PeerDiscoveryCenter::services::SubscriptionService::new(subscription_config)
+            .with_dns_pool(Some(&dns_pool))
             .with_infohash_repo(infohash_repo.clone());
     let subscription_service = Arc::new(subscription_service);
     tokio::spawn(async move {
@@ -1428,8 +1455,12 @@ async fn async_main(
 
         let dht_activity = Arc::new(DhtActivityTracker::new());
         let peer_history = Arc::new(PeerHistoryManager::new());
-        let scrape_service = Arc::new(ScrapeService::new().with_tracker_repo(tracker_repo.clone()
-            as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>));
+        let scrape_service = Arc::new(
+            ScrapeService::new()
+                .with_dns_pool(Some(&dns_pool))
+                .with_tracker_repo(tracker_repo.clone()
+                    as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::TrackerRepository>),
+        );
         let metadata_service = Arc::new(MetadataService::new());
         let availability_calculator = Arc::new(AvailabilityCalculator::new());
 

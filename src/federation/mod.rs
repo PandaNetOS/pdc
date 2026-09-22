@@ -216,6 +216,8 @@ pub struct FederationService {
     shutdown: broadcast::Sender<()>,
     /// 启动时间
     started_at: Instant,
+    /// DNS 解析配置（默认走 pnos-net 内置公共 DNS，不读系统 DNS）
+    dns: pnos_net::dns::DnsConfig,
 }
 
 impl FederationService {
@@ -400,7 +402,17 @@ impl FederationService {
             data_dir: data_dir.to_path_buf(),
             shutdown: shutdown_tx,
             started_at: Instant::now(),
+            dns: pnos_net::dns::DnsConfig::default(),
         })
+    }
+
+    /// 注入 DNS 解析配置
+    ///
+    /// 决定 iroh 端点用哪个解析器解析 pkarr / DnsAddressLookup / DERP 主机名。
+    /// 不调用时使用内置公共 DNS（不读宿主系统 DNS 配置）。
+    pub fn with_dns(mut self, dns: pnos_net::dns::DnsConfig) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// 初始化 NetAgent（Iroh+TCP 传输层）并绑定 SDK 会话层
@@ -433,6 +445,9 @@ impl FederationService {
                 derp_urls: Vec::new(),
                 connect_timeout: IROH_CONNECT_TIMEOUT,
                 alpn: b"pnos/federation/1".to_vec(),
+                // 注入内置 DNS 配置：iroh 默认解析器会读宿主系统 DNS 配置，
+                // 宿主解析器不可用时 pkarr / DnsAddressLookup / DERP 全部握不上。
+                dns: self.dns.clone(),
             })
         } else {
             None
@@ -507,9 +522,12 @@ impl FederationService {
         // 4.1 启动时先执行一次 STUN 探测，确保 setup_mapping 能拿到 STUN 结果
         //     否则首次 setup_mapping 时 last_stun 为 None，reachability 会误判为 Unknown
         //     使用 spawn_blocking + 3秒超时，避免 STUN 无响应时阻塞 tokio 运行时
+        //     先在异步侧用内置 DNS 池把服务器域名解析成 ip:port（不读系统 DNS），
+        //     再把字面量交给阻塞线程，阻塞线程内部不再做任何解析。
+        let stun_servers = self.nat_integration.resolved_stun_servers().await;
         let nat_clone = self.nat_integration.clone();
         let stun_handle = tokio::task::spawn_blocking(move || {
-            nat_clone.stun_probe();
+            nat_clone.stun_probe_with(&stun_servers);
         });
         let _ = tokio::time::timeout(STUN_PROBE_STARTUP_TIMEOUT, stun_handle).await;
 
