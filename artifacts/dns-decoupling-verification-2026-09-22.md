@@ -234,6 +234,15 @@ hickory 0.24.4 `lookup_ip.rs:305-354` 的 `ipv4_and_ipv6` 实现是 `(Ok, Err) =
 - 提交范围 = **B**（纯 DNS/STUN 最小集），`pdc` 工作区里的联邦同步大改（`federation/sync/*`、`storage/*`、文档）+ TaskScheduler 槽位回收修复（`task_scheduler.rs` + `config.rs` 的 `stale_slot_*`）**不**纳入本次。
 - ⚠️ `tools/` 在 meta 仓库被 `.gitignore` 忽略 ⇒ 验收工具是**本地资产，不进任何提交**；因此验收结论与复现步骤必须落在本报告（`pdc/artifacts/`，已跟踪）。
 
+### 9.1 提交记录
+
+| 仓库 | 分支 | commit | 内容 | 门禁 |
+|---|---|---|---|---|
+| `pnos-sdk` | `session-layer` | `edfd860` | `dns.rs`(严格模式丢弃) + `nat/stun.rs`(去硬编码兜底) + `discovery/mqtt.rs` + `transport/iroh.rs`，4 files, +667 −50 | 20 PASS / 0 FAIL / 6 WARN |
+| `pdc` | `pdc-session-layer` | `d8ec224` | DNS 池接线 + STUN 预解析 + 配置 + 本报告，13 files, +630 −31 | 21 PASS / 0 FAIL / 5 WARN |
+
+两个仓库各有 **一次提交**，均按「B 范围」**逐文件/逐 hunk**暂存，未夹带联邦同步大改与 TaskScheduler 槽位回收修复（见 §9 第一条）。门禁 WARN 项（pdc: 6/9/10/11/13；sdk: 9/10/11/13/18/20）全部落在**本次未触碰的文件**上，属仓库既有债。
+
 ---
 
 ## 附：复现命令
