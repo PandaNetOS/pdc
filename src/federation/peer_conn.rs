@@ -105,6 +105,11 @@ impl PeerConn {
         self.caps().supports_range_reconcile()
     }
 
+    /// 对端是否支持 Range 反熵修复通用通道 Pull/Push2（协议版本 >= 8）
+    pub fn supports_range_v2(&self) -> bool {
+        self.caps().supports_range_v2()
+    }
+
     /// 对端是否支持 bootstrap 专用通道（协议版本 >= 6）
     pub fn supports_bootstrap(&self) -> bool {
         self.caps().supports_bootstrap()

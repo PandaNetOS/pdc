@@ -1,5 +1,10 @@
 # PDC Merkle 树分片幻影差异分析报告
 
+> ⚠️ **本文已过时（2026-09-22）：Merkle 树已从 pdc 全面移除。** **该幻影差异问题随 Merkle 移除而彻底消失**，本文存档保留排查方法。
+>
+> 现行同步架构以 [ADR-007 Range 反熵唯一兜底](../docs/adr/007-range-only-anti-entropy.md) 与 [AGENTS.md §联邦同步架构 v8](../AGENTS.md) 为准；
+> 下文涉及 Merkle 对账 / 分片同步引擎 / DiffSync / FullSync 的描述仅作历史参考，不代表当前代码。
+
 > 现象：TrackerRepo 两边数据完全一致，但分层 Merkle 对比仍报告 **375 个差异 L2 分片**。
 > 结论：这不是数据不一致，而是 **merkle 哈希计算公式在两条重算路径上不一致**——同一个 tracker 行，被增量重算和全量冷重算算出两种不同的 data_hash，导致同一行数据在两边处于"不同编码版本"的重算相位时产生幻影差异。
 

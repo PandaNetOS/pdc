@@ -71,6 +71,11 @@ impl PeerCaps {
         crate::federation::sync::range_reconcile::supports_range_reconcile(self.version)
     }
 
+    /// 对端是否支持 Range 反熵修复通用通道（Pull/Push2，协议版本 >= 8）
+    pub fn supports_range_v2(&self) -> bool {
+        self.version >= 8
+    }
+
     /// 对端是否支持 bootstrap 专用通道（协议版本 >= 6）
     pub fn supports_bootstrap(&self) -> bool {
         self.version >= crate::federation::sync::bootstrap::BOOTSTRAP_PROTOCOL_VERSION

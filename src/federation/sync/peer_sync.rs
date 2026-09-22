@@ -12,11 +12,9 @@ use tracing::{debug, info};
 
 use crate::event_bus::EventBus;
 use crate::federation::gossip::GossipEngine;
-use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
-use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::PeerRepoImpl;
 use crate::types::{Event, Infohash, PeerInfo, PeerSource};
 
@@ -52,25 +50,10 @@ pub(crate) fn build_peer_sync_entry(
     Some((key, payload_bytes, data_hash))
 }
 
-/// 从已序列化的 PeerSyncPayload 计算 data_hash（与 build_peer_sync_entry 公式一致）。
-/// 用于 apply/重建路径，反序列化 payload 后按 db.rs 公式计算。
-#[allow(dead_code)]
-pub(crate) fn data_hash_from_payload(payload: &[u8]) -> Option<Vec<u8>> {
-    let p: PeerSyncPayload = bincode::deserialize(payload).ok()?;
-    let mut buf = Vec::with_capacity(p.infohash.len() + 16 + 2);
-    buf.extend_from_slice(p.infohash.as_slice());
-    buf.extend_from_slice(p.addr.ip().to_string().as_bytes());
-    buf.extend_from_slice(&p.addr.port().to_le_bytes());
-    Some(blake3::hash(&buf).as_bytes().to_vec())
-}
-
 /// PeerRepo 同步服务
 pub struct PeerSync {
     peer_repo: Arc<PeerRepoImpl>,
     _gossip_engine: Arc<GossipEngine>,
-    merkle: Arc<MerkleTree>,
-    #[allow(dead_code)]
-    merkle_queue: Arc<MerkleUpdateQueue>,
     _local_node_id: NodeId,
     metrics: Arc<FederationMetrics>,
     enabled: bool,
@@ -81,8 +64,6 @@ impl PeerSync {
     pub fn new(
         peer_repo: Arc<PeerRepoImpl>,
         _gossip_engine: Arc<GossipEngine>,
-        merkle: Arc<MerkleTree>,
-        #[allow(dead_code)] merkle_queue: Arc<MerkleUpdateQueue>,
         _local_node_id: NodeId,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
@@ -90,8 +71,6 @@ impl PeerSync {
         Self {
             peer_repo,
             _gossip_engine,
-            merkle,
-            merkle_queue,
             _local_node_id,
             metrics,
             enabled: true,
@@ -199,11 +178,6 @@ impl PeerSync {
         }
     }
 
-    /// 获取 Merkle 树引用（用于反熵对账）
-    pub fn merkle(&self) -> Arc<MerkleTree> {
-        self.merkle.clone()
-    }
-
     /// 收集全量 Peer 同步条目（用于差量同步）
     ///
     /// 遍历 by_infohash 中的所有 (infohash, addr) 关联，构建 SyncEntry 列表。
@@ -300,13 +274,9 @@ mod tests {
             metrics.clone(),
             shutdown_tx.clone(),
         ));
-        let merkle = Arc::new(MerkleTree::new(16));
-        let queue = Arc::new(MerkleUpdateQueue::new());
         let peer_sync = PeerSync::new(
             peer_repo.clone(),
             gossip,
-            merkle,
-            queue,
             NodeId([1; 20]),
             metrics,
             shutdown_tx,

@@ -11,10 +11,9 @@ use parking_lot::RwLock;
 use rand::SeedableRng;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::merkle::MerkleProvider;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::node_id::NodeId;
 use crate::federation::peer_conn::PeerConn;
@@ -48,8 +47,11 @@ pub struct GossipEngine {
     metrics: Arc<FederationMetrics>,
     /// 关闭信号
     _shutdown: broadcast::Sender<()>,
-    /// 每个 batch 的重试次数计数（按 msg_id），超过 MAX_RETRIES 则丢弃
+    /// 每个 batch 的重试次数计数（按 msg_id），超过重试预算则丢弃
     retry_counts: RwLock<FxHashMap<u64, u32>>,
+    /// P1-1：每个 batch 的**首次重试时刻**（按 msg_id），用于按时间预算判定放弃，
+    /// 取代旧的「按 tick 计数 3 次」（≈3 秒就丢批）。
+    retry_first_at: RwLock<FxHashMap<u64, std::time::Instant>>,
     /// 每个节点的 Gossip 连续发送失败计数，达到阈值则断开连接
     consecutive_failures: RwLock<FxHashMap<NodeId, u32>>,
     /// 发送端速率限制：当前统计窗口的起始 unix 秒（固定窗口计数器，全局维度）
@@ -82,8 +84,11 @@ struct ConnSendResult {
     successful_nodes: FxHashSet<NodeId>,
 }
 
-/// 单个 batch 最大重试次数，超过则丢弃
-const MAX_RETRIES: u32 = 3;
+/// P1-1：单个 batch 的重试**时间预算**，超过则丢弃。
+///
+/// 取代旧的「按 tick 计数 MAX_RETRIES=3」（1 秒/tick，≈3 秒就连人带批丢弃）：
+/// 大批量推送或对端瞬时抖动根本等不到恢复窗口，等于静默丢数据。
+const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 本地序列化辅助结构：与线网格式 GossipBatchBulkMessage 字段布局完全一致，
 /// 但持有引用而非所有权，避免发送 bulk 时深拷贝 batch 数据。
@@ -123,6 +128,7 @@ impl GossipEngine {
             metrics,
             _shutdown: shutdown,
             retry_counts: RwLock::new(FxHashMap::default()),
+            retry_first_at: RwLock::new(FxHashMap::default()),
             consecutive_failures: RwLock::new(FxHashMap::default()),
             rate_window_secs: AtomicU64::new(0),
             bytes_in_window: AtomicU64::new(0),
@@ -546,8 +552,10 @@ impl GossipEngine {
         //   仅 ~13% 的 batch 真正出队，队列永久积压在 4900 上限。
         // 修复后：gossip 协议只需至少一个邻居收到即可继续传播。
         //   - 至少一个连接发送成功 → 已传播，DROP（不回退）
-        //   - 零成功 + 至少一个连接实际失败（连接错误）→ 回退重试（带 MAX_RETRIES）
-        //   - 零成功 + 全部因限流跳过（无连接错误）→ 系统过载，DROP（不回退，避免死循环）
+        //   - 零成功 + 至少一个连接实际失败（连接错误）→ 回退重试（受 RETRY_BUDGET 限制）
+        //   - 零成功 + 全部因限流跳过（无连接错误）→ P1-1 起**同样回退重试**
+        //     （旧实现在此 DROP：全量推送时限流跳过率极高，等于静默丢掉大部分数据；
+        //      回退由 30s 时间预算兜底，不会死循环）
         //   - 未分配到任何连接的孤儿 batch → 回退（从未尝试发送）
 
         let all_batch_ids: std::collections::HashSet<u64> =
@@ -559,62 +567,75 @@ impl GossipEngine {
             .copied()
             .collect();
 
-        // 需要重试的：零成功 + 至少一个连接实际失败（非限流跳过）
-        let retry_ids: std::collections::HashSet<u64> = no_success_ids
-            .iter()
-            .filter(|id| failed_msg_ids.contains(id))
-            .copied()
-            .collect();
+        // P1-1：需要重试的 = **所有零成功**的 batch（含「全部因限流跳过」）。
+        //
+        // 旧实现把限流跳过的批次**直接丢弃**（不回退 outbox、不重试）。但全量推送时
+        // 整表按 5000 条/批灌进 outbox，排空速率（每 100ms 最多 1 万批）远超 gossip
+        // 限流（默认 50MB/s ≈ 140 批/s），于是绝大多数批次走 rate_drop 分支被静默丢弃，
+        // `wait_outbox_empty` 因此假性"排空" —— 全量同步丢了大部分数据却不报错。
+        // 现在零成功的 batch 一律回退重试，由**时间预算**（而非 3 次 tick）兜住上界。
+        let retry_ids: std::collections::HashSet<u64> = no_success_ids.iter().copied().collect();
 
-        // 因限流全部跳过且零成功的 batch（DROP，不回退）
+        // 统计用：因限流全部跳过且零成功的 batch（旧实现会丢弃，现已改为回退重试）
         let rate_drop_count = no_success_ids
             .iter()
             .filter(|id| !failed_msg_ids.contains(id))
             .count();
 
-        // 将需要重试的 batch 放回 outbox，带重试次数限制
+        // 将需要重试的 batch 放回 outbox，带重试**时间预算**限制
         if !retry_ids.is_empty() {
             let mut retry_guard = self.retry_counts.write();
+            let mut first_guard = self.retry_first_at.write();
+            let now = std::time::Instant::now();
             let mut returned: Vec<GossipBatchMessage> = Vec::new();
 
             for batch in batches.iter() {
                 if !retry_ids.contains(&batch.msg_id) {
-                    // 不需要重试（已成功传播或因限流丢弃），清理重试计数
+                    // 已成功传播（至少一个邻居收到）→ 清理重试状态
                     retry_guard.remove(&batch.msg_id);
+                    first_guard.remove(&batch.msg_id);
                     continue;
                 }
+                let started = *first_guard.entry(batch.msg_id).or_insert(now);
                 let count = retry_guard.entry(batch.msg_id).or_insert(0);
                 *count += 1;
-                if *count >= MAX_RETRIES {
+                let elapsed = now.duration_since(started);
+                if elapsed >= RETRY_BUDGET {
                     error!(
-                        "[federation] Gossip 批次 msg_id={} 重试 {} 次仍失败，丢弃",
-                        batch.msg_id, count
+                        "[federation] Gossip 批次 msg_id={} 重试 {} 次 / {}s 仍未成功，丢弃",
+                        batch.msg_id,
+                        count,
+                        elapsed.as_secs()
                     );
                     retry_guard.remove(&batch.msg_id);
+                    first_guard.remove(&batch.msg_id);
                 } else {
                     warn!(
-                        "[federation] Gossip 批次 msg_id={} 发送失败（第 {} 次），放回 outbox 重试",
+                        "[federation] Gossip 批次 msg_id={} 第 {} 次发送未成功，放回 outbox 重试",
                         batch.msg_id, count
                     );
                     returned.push(batch.clone());
                 }
             }
+            drop(first_guard);
             drop(retry_guard);
 
             if !returned.is_empty() {
                 self.extend_outbox_unique(returned);
             }
         } else {
-            // 没有需要重试的，清理所有批次的重试计数
+            // 没有需要重试的，清理所有批次的重试状态
             let mut retry_guard = self.retry_counts.write();
+            let mut first_guard = self.retry_first_at.write();
             for batch in batches.iter() {
                 retry_guard.remove(&batch.msg_id);
+                first_guard.remove(&batch.msg_id);
             }
         }
 
         if rate_drop_count > 0 {
             debug!(
-                "[federation] 限流全跳过且零成功的 {} 条 batch 直接丢弃（不回退 outbox）",
+                "[federation] 限流全跳过且零成功的 {} 条 batch 回退 outbox 重试（旧实现直接丢弃）",
                 rate_drop_count
             );
         }
@@ -903,73 +924,6 @@ impl GossipEngine {
         }
 
         result
-    }
-
-    /// 启动反熵（anti-entropy）后台任务（已迁移到 TaskScheduler）
-    ///
-    /// 周期性反熵由 TaskScheduler 调用 `anti_entropy_tick()` 驱动。
-    /// 此方法保留为空以兼容现有调用点，不再内部 spawn。
-    pub fn spawn_anti_entropy<M: MerkleProvider + 'static>(
-        self: Arc<Self>,
-        merkle_provider: Arc<M>,
-    ) {
-        // 已迁移：周期性反熵对账由 TaskScheduler 调度 anti_entropy_tick()
-        let _ = merkle_provider;
-    }
-
-    /// 单次反熵：随机选1个邻居，发送所有 repo_type 的 MerkleDigest（由 TaskScheduler 调度）
-    pub async fn anti_entropy_tick<M: MerkleProvider>(self: Arc<Self>, merkle_provider: Arc<M>) {
-        let conns = self.sessions.all_connections();
-        if conns.is_empty() {
-            self.metrics.record_anti_entropy_no_conn();
-            debug!("[federation] 反熵跳过：无连接");
-            return;
-        }
-        // P3-C：本轮反熵确实执行了（可观测性：此前无法证明周期任务被调用过）
-        self.metrics.record_anti_entropy_tick();
-
-        use rand::seq::SliceRandom;
-        let mut rng = rand::rngs::StdRng::from_entropy();
-        let conn = match conns.choose(&mut rng) {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
-        let mut sent = 0u8;
-        // 发送所有 repo 的 MerkleDigest（Node/Peer/Infohash/Tracker）
-        for repo_type in &[
-            repo_type::NODE,
-            repo_type::PEER,
-            repo_type::INFOHASH,
-            repo_type::TRACKER,
-        ] {
-            // P1-4：该 repo 若已由 range-based 反熵接管，则不再发 MerkleDigest（避免双重对账）。
-            if merkle_provider.range_reconcile_owns(*repo_type) {
-                continue;
-            }
-            // P2-5：按 repo 差异化周期——未到期的 repo 本轮跳过。
-            if !merkle_provider.anti_entropy_due(*repo_type) {
-                continue;
-            }
-            let digest = merkle_provider.get_digest(*repo_type);
-            if let Err(e) = conn.send_message(MessageType::MerkleDigest, &digest).await {
-                warn!(
-                    "[federation] 反熵 MerkleDigest 发送失败 (repo={}): {}",
-                    repo_type, e
-                );
-            } else {
-                self.metrics.record_message_sent();
-                self.metrics.record_anti_entropy_digest();
-                sent += 1;
-            }
-        }
-
-        info!(
-            "[federation] 反熵对账发送到 {} ({} 个 repo, 连接数={})",
-            conn.node_id,
-            sent,
-            conns.len()
-        );
     }
 
     /// outbox 大小

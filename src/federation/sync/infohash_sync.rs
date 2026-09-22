@@ -11,10 +11,8 @@ use tracing::debug;
 
 use crate::event_bus::EventBus;
 use crate::federation::gossip::GossipEngine;
-use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
 use crate::federation::protocol::*;
-use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::InfohashRepoImpl;
 use crate::types::{Event, Infohash};
 
@@ -38,20 +36,10 @@ pub(crate) fn build_infohash_sync_entry(infohash: Infohash) -> Option<(Vec<u8>, 
     Some((key, payload_bytes, data_hash))
 }
 
-/// 从已序列化的 InfohashSyncPayload 计算 data_hash（与 build_infohash_sync_entry 公式一致）。
-#[allow(dead_code)]
-pub(crate) fn data_hash_from_payload(payload: &[u8]) -> Option<Vec<u8>> {
-    let p: InfohashSyncPayload = bincode::deserialize(payload).ok()?;
-    Some(blake3::hash(p.infohash.as_slice()).as_bytes().to_vec())
-}
-
 /// InfohashRepo 同步服务
 pub struct InfohashSync {
     infohash_repo: Arc<InfohashRepoImpl>,
     _gossip_engine: Arc<GossipEngine>,
-    merkle: Arc<MerkleTree>,
-    #[allow(dead_code)]
-    merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
     enabled: bool,
     shutdown: broadcast::Sender<()>,
@@ -61,16 +49,12 @@ impl InfohashSync {
     pub fn new(
         infohash_repo: Arc<InfohashRepoImpl>,
         _gossip_engine: Arc<GossipEngine>,
-        merkle: Arc<MerkleTree>,
-        #[allow(dead_code)] merkle_queue: Arc<MerkleUpdateQueue>,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
         Self {
             infohash_repo,
             _gossip_engine,
-            merkle,
-            merkle_queue,
             metrics,
             enabled: true,
             shutdown,
@@ -155,11 +139,6 @@ impl InfohashSync {
         }
     }
 
-    /// 获取 Merkle 树引用（用于反熵对账）
-    pub fn merkle(&self) -> Arc<MerkleTree> {
-        self.merkle.clone()
-    }
-
     /// 收集全量 Infohash 同步条目（用于初始全量同步）
     ///
     /// 遍历所有已注册的 infohash，构建 SyncEntry 列表。
@@ -227,9 +206,8 @@ mod tests {
             metrics.clone(),
             shutdown_tx.clone(),
         ));
-        let merkle = Arc::new(MerkleTree::new(16));
-        let queue = Arc::new(MerkleUpdateQueue::new());
-        let ih_sync = InfohashSync::new(repo.clone(), gossip, merkle, queue, metrics, shutdown_tx);
+
+        let ih_sync = InfohashSync::new(repo.clone(), gossip, metrics, shutdown_tx);
 
         assert_eq!(repo.count_sync(), 0);
 

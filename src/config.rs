@@ -179,6 +179,17 @@ pub struct TaskSchedulerConfig {
     /// 闭环重新计算自适应间隔的 tick 周期数。
     #[serde(default = "default_adaptive_recalc_ticks")]
     pub adaptive_recalc_ticks: u32,
+    /// 槽位泄漏强制回收开关（**默认 true**）。
+    ///
+    /// 在飞任务超过「超时 × `stale_slot_factor`」仍不返回时判定为槽位泄漏，强制回收该
+    /// 分类槽位。不回收的后果是分类并发槽被永久占满 ⇒ 该分类所有任务停摆
+    /// （2026-09-21 远端 51 事故：联邦 runtime 静默后 10 个在飞任务永久占槽，
+    /// Federation 分类封印到进程结束）。仅在确认泄漏判定有误报风险时才建议关闭。
+    #[serde(default = "default_stale_slot_reclaim_enabled")]
+    pub stale_slot_reclaim_enabled: bool,
+    /// 槽位泄漏判定系数：在飞时长 > 任务超时 × 该系数 ⇒ 判定为泄漏。
+    #[serde(default = "default_stale_slot_factor")]
+    pub stale_slot_factor: f32,
 }
 
 fn default_crawl_concurrency() -> u32 {
@@ -261,6 +272,14 @@ fn default_adaptive_recalc_ticks() -> u32 {
     5
 }
 
+fn default_stale_slot_reclaim_enabled() -> bool {
+    true
+}
+
+fn default_stale_slot_factor() -> f32 {
+    1.5
+}
+
 /// `task_scheduler.intervals` 的字段级 serde 默认值。
 ///
 /// 必须与 `TaskSchedulerConfig` 的 `impl Default` 保持一致，否则
@@ -308,6 +327,8 @@ impl Default for TaskSchedulerConfig {
             adaptive_min_ratio: default_adaptive_min_ratio(),
             adaptive_max_ratio: default_adaptive_max_ratio(),
             adaptive_recalc_ticks: default_adaptive_recalc_ticks(),
+            stale_slot_reclaim_enabled: default_stale_slot_reclaim_enabled(),
+            stale_slot_factor: default_stale_slot_factor(),
         }
     }
 }

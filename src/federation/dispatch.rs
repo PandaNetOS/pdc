@@ -262,6 +262,7 @@ impl FederationDispatcher {
                             .unwrap_or(1);
                         self.caps.set(peer_id, version);
                         let _ = self.peer(peer_id);
+                        self.metrics.record_connection_established();
                         info!(
                             "[federation] 会话建立: {} @ {} (proto=v{})",
                             peer_id, addr, version
@@ -455,125 +456,6 @@ impl FederationDispatcher {
                 }
                 true
             }
-            MessageType::MerkleDigest => {
-                self.metrics.record_message_recv();
-                if let Ok(digest) = bincode::deserialize::<MerkleDigestMessage>(&payload) {
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_merkle_digest(&conn, digest).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::MerkleRequest => {
-                self.metrics.record_message_recv();
-                if let Ok(request) = bincode::deserialize::<MerkleRequestMessage>(&payload) {
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_merkle_request(&conn, request).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::MerkleRepair => {
-                self.metrics.record_message_recv();
-                // P0-2: MerkleRepair 也是纯内存 + 批量 SQLite 写入，走 async handler（去掉 spawn_blocking 开销）
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = rt.clone();
-                    self.spawn_async_handler(conn, move || async move {
-                        if let Ok(repair) = bincode::deserialize::<MerkleRepairMessage>(&payload) {
-                            sync_mgr.handle_merkle_repair(repair);
-                        }
-                    });
-                    true
-                } else {
-                    false
-                }
-            }
-            MessageType::FullSyncStart => {
-                self.metrics.record_message_recv();
-                if let Ok(msg) = bincode::deserialize::<FullSyncStartMessage>(&payload) {
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        info!(
-                            "[federation] 收到 FullSyncStart: repo_type={}, total={}, from={}",
-                            msg.repo_type, msg.total_entries, pc.node_id
-                        );
-                        sync_mgr.handle_full_sync_start(msg.repo_type);
-                    }
-                }
-                false
-            }
-            MessageType::FullSyncBatch => {
-                self.metrics.record_message_recv();
-                if let Ok(msg) = bincode::deserialize::<FullSyncBatchMessage>(&payload) {
-                    let repo_type = msg.repo_type;
-                    let seq = msg.seq;
-                    let count = msg.entries.len();
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        // 直接应用到 repo（不经过 Gossip 去重）
-                        sync_mgr.handle_full_sync_batch(repo_type, &msg.entries);
-                        // 更新差量同步进度（防止无进度超时）
-                        sync_mgr.update_diff_progress();
-                        // 回复 Ack
-                        let ack = FullSyncAckMessage { repo_type, seq };
-                        let _ = pc.send_message(MessageType::FullSyncAck, &ack).await;
-                        debug!(
-                            "[federation] FullSyncBatch 应用: repo_type={}, seq={}, entries={}",
-                            repo_type, seq, count
-                        );
-                    }
-                }
-                false
-            }
-            MessageType::FullSyncAck => {
-                // 发送端接收 Ack，简化版不做流控等待
-                false
-            }
-            MessageType::DiffSyncRequest => {
-                // 差量同步：对端携带 Merkle 摘要，本节点对比后只推送差异分片数据。
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = pc.clone();
-                    if let Ok(req) = bincode::deserialize::<DiffSyncRequestMessage>(&payload) {
-                        tokio::spawn(async move {
-                            sync_mgr.handle_diff_sync_request(conn.node_id, req).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::DiffSyncKeyRequest => {
-                // P0-2: 数据服务器发来差异分片 key 列表分片，对比本地后回传缺失 key。
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = pc.clone();
-                    if let Ok(msg) = bincode::deserialize::<DiffSyncKeyRequestMessage>(&payload) {
-                        tokio::spawn(async move {
-                            sync_mgr.handle_diff_sync_key_request(&conn, msg).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::DiffSyncKeyResponse => {
-                // P0-2: 请求方回传缺失 key 列表分片，唤醒等待中的数据服务器推送任务。
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<DiffSyncKeyResponseMessage>(&payload) {
-                        sync_mgr.handle_diff_sync_key_response(&pc, msg);
-                    }
-                }
-                false
-            }
             MessageType::PeerInfo => {
                 // 握手后对端发来的节点信息（本地各 repo 条目数），记录到 peer_digests
                 // 供全量同步数据源选择时判断数据完整度。
@@ -581,19 +463,6 @@ impl FederationDispatcher {
                 if let Some(sync_mgr) = self.sync_manager.get() {
                     if let Ok(msg) = bincode::deserialize::<PeerInfoMessage>(&payload) {
                         sync_mgr.handle_peer_info(pc.node_id, msg.local_entry_counts);
-                    }
-                }
-                false
-            }
-            MessageType::FullSyncComplete => {
-                self.metrics.record_message_recv();
-                if let Ok(msg) = bincode::deserialize::<FullSyncCompleteMessage>(&payload) {
-                    if let Some(sync_mgr) = self.sync_manager.get() {
-                        info!(
-                            "[federation] 收到 FullSyncComplete: repo_type={}, from={}",
-                            msg.repo_type, pc.node_id
-                        );
-                        sync_mgr.handle_full_sync_complete(msg.repo_type);
                     }
                 }
                 false
@@ -666,94 +535,6 @@ impl FederationDispatcher {
                 }
                 false
             }
-            MessageType::MerkleLevelRequest => {
-                // 分层 Merkle 层级请求：返回指定层级的子哈希列表
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = pc.clone();
-                    if let Ok(req) = bincode::deserialize::<MerkleLevelRequestMessage>(&payload) {
-                        tokio::spawn(async move {
-                            sync_mgr.handle_merkle_level_request(conn, req).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::MerkleLevelResponse => {
-                // 分层 Merkle 层级响应：继续逐层对比流程
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    let sync_mgr = sync_mgr.clone();
-                    let conn = pc.clone();
-                    if let Ok(resp) = bincode::deserialize::<MerkleLevelResponseMessage>(&payload) {
-                        tokio::spawn(async move {
-                            sync_mgr.handle_merkle_level_response(conn, resp).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::ShardSyncBatch => {
-                // 分片同步批次：接收并应用条目，回复 Ack
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<ShardSyncBatchMessage>(&payload) {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        sync_mgr.handle_shard_sync_batch(conn, msg);
-                    }
-                }
-                false
-            }
-            MessageType::ShardSyncAck => {
-                // 分片同步确认：唤醒发送端等待的 oneshot
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<ShardSyncAckMessage>(&payload) {
-                        sync_mgr.handle_shard_sync_ack(msg);
-                    }
-                }
-                false
-            }
-            MessageType::ShardSyncComplete => {
-                // 分片同步完成：标记同步结束，触发 Merkle 重建
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<ShardSyncCompleteMessage>(&payload) {
-                        info!(
-                            "[federation] 收到 ShardSyncComplete: repo_type={}, from={}",
-                            msg.repo_type, pc.node_id
-                        );
-                        sync_mgr.handle_shard_sync_complete(msg);
-                    }
-                }
-                false
-            }
-            MessageType::ShardSyncHashList => {
-                // 分片同步 hash 列表：对比本地 DB，回复缺失 key 列表（异步）
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<ShardSyncHashListMessage>(&payload) {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_shard_sync_hash_list(conn, msg).await;
-                        });
-                    }
-                }
-                false
-            }
-            MessageType::ShardSyncMissing => {
-                // 分片同步缺失 key 列表：唤醒发送端等待的 oneshot
-                self.metrics.record_message_recv();
-                if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<ShardSyncMissingMessage>(&payload) {
-                        sync_mgr.handle_shard_sync_missing(msg);
-                    }
-                }
-                false
-            }
             MessageType::OpsRequest => {
                 // P1-3：增量拉取请求（数据服务器侧）—— 从本地 oplog 取 seq>since_seq 回 OpsBatch（异步）
                 self.metrics.record_message_recv();
@@ -812,15 +593,33 @@ impl FederationDispatcher {
                 }
                 false
             }
-            MessageType::RangeReconcilePush => {
-                // P1-4：Range 反熵推送（接收方）—— 写入本地数据库
+            MessageType::RangeReconcilePull => {
+                // v8：Range 反熵按键拉取（应答方）—— 按 key 加载完整条目回 Push2（异步）
                 self.metrics.record_message_recv();
                 if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<RangeReconcilePushMessage>(&payload) {
+                    if let Ok(msg) = bincode::deserialize::<RangeReconcilePullMessage>(&payload) {
                         let sync_mgr = sync_mgr.clone();
                         let conn = pc.clone();
                         tokio::spawn(async move {
-                            sync_mgr.handle_range_reconcile_push(conn, msg).await;
+                            sync_mgr.handle_range_reconcile_pull(conn, msg).await;
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            MessageType::RangeReconcilePush2 => {
+                // v8：Range 反熵通用推送（接收方）—— 完整 SyncEntry 幂等 apply（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<RangeReconcilePush2Message>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_range_reconcile_push2(conn, msg).await;
                         });
                         true
                     } else {
@@ -930,30 +729,6 @@ impl FederationDispatcher {
         };
 
         offloaded
-    }
-
-    /// P0-2: 异步执行纯内存消息处理（不经过 spawn_blocking）。
-    ///
-    /// GossipBatch 处理是纯内存操作（HashMap + Merkle），不需要阻塞线程池。
-    /// 仍然通过 semaphore 限制并发，避免无界生成异步任务导致 CPU 飙升。
-    fn spawn_async_handler<F, Fut>(&self, conn: Arc<PeerRuntime>, f: F)
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let sem = self.heavy_task_semaphore.clone();
-        tokio::spawn(async move {
-            let _permit = match sem.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    conn.pending.fetch_sub(1, Ordering::Relaxed);
-                    return;
-                }
-            };
-            f().await;
-            drop(_permit);
-            conn.pending.fetch_sub(1, Ordering::Relaxed);
-        });
     }
 
     /// P0-1: 刷新 per-connection GossipBatch 缓冲区（按 repo_type 并行分流）。

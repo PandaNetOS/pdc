@@ -15,19 +15,19 @@
 | [04-data-model.md](architecture/04-data-model.md) | 数据模型，SQLite 表结构与 Repo 设计 | — |
 | [05-runtime-flow.md](architecture/05-runtime-flow.md) | 运行时流程，关键业务时序图 | — |
 | [06-performance.md](architecture/06-performance.md) | 千万级性能优化设计 | — |
-| [07-federation.md](architecture/07-federation.md) | 联邦网络架构（多实例数据同步） | — |
+| [07-federation.md](architecture/07-federation.md) | 联邦网络架构（多实例数据同步，同步部分已随 v8 去 Merkle 化过时） | — |
 | [08-intelligent-control-center.md](architecture/08-intelligent-control-center.md) | 智能控制中心（ICC）详细设计 | Level 3 |
-| [09-merkle-async-update.md](architecture/09-merkle-async-update.md) | Merkle 异步更新优化方案（待实施） | — |
+| ~~[09-merkle-async-update.md](architecture/09-merkle-async-update.md)~~ | ~~Merkle 异步更新优化方案~~ **已取消**（2026-09-22 Merkle 移除，仅存档） | — |
 | [10-icc-upgrade-plan.md](architecture/10-icc-upgrade-plan.md) | ICC 升级方案（待确认） | Level 3 |
-| [11-billion-scale-storage.md](architecture/11-billion-scale-storage.md) | 亿级数据存储架构方案（设计阶段） | — |
-| [12-federation-sync-reconciliation.md](architecture/12-federation-sync-reconciliation.md) | 联邦同步架构重构方案（S1–S5 已实施） | — |
+| [11-billion-scale-storage.md](architecture/11-billion-scale-storage.md) | 亿级数据存储架构方案（设计阶段；Merkle 部分已过时） | — |
+| [12-federation-sync-reconciliation.md](architecture/12-federation-sync-reconciliation.md) | 联邦同步架构重构方案（S1–S5 已实施；Merkle 部分已被 ADR-007 作废） | — |
 
 ### 分析报告 (`artifacts/`)
 
 | 文档 | 说明 |
 |---|---|
-| [federation-sync-loop-analysis.md](../artifacts/federation-sync-loop-analysis.md) | 联邦同步回环排查分析（对账粒度 → 每 60s 重传全表），含 R1–R5 根因 |
-| [merkle-diff-analysis.md](../artifacts/merkle-diff-analysis.md) | Merkle 树分片幻影差异分析（tracker `disabled` 编码宽度不一致） |
+| [federation-sync-loop-analysis.md](../artifacts/federation-sync-loop-analysis.md) | 联邦同步回环排查分析（对账粒度 → 每 60s 重传全表），含 R1–R5 根因（Merkle 根因已随去 Merkle 化消失） |
+| ~~[merkle-diff-analysis.md](../artifacts/merkle-diff-analysis.md)~~ | ~~Merkle 树分片幻影差异分析~~ **已归档**（2026-09-22 Merkle 移除，问题不复存在） |
 
 ### 架构决策记录 (`docs/adr/`)
 
@@ -38,7 +38,8 @@
 | [003](adr/003-scoring-model.md) | 增量评分模型与脏标记机制 | ✅ 已采纳 | 2026-09-08 |
 | [004](adr/004-performance-targets.md) | 千万级数据性能目标与优化架构 | ✅ 已采纳 | 2026-09-08 |
 | [005](adr/005-intelligent-control-center.md) | 智能控制中心（ICC）设立与统一控制收口 | ✅ 已采纳 | 2026-09-10 |
-| [006](adr/006-federation-sync-convergence.md) | 联邦同步收敛架构（稳态 delta + 兜底区间反熵 + 独立 bootstrap） | 📋 提议中 | 2026-09-19 |
+| [006](adr/006-federation-sync-convergence.md) | 联邦同步收敛架构（稳态 delta + 兜底区间反熵 + 独立 bootstrap） | ⚠️ Merkle 部分已被 007 取代 | 2026-09-19 |
+| [007](adr/007-range-only-anti-entropy.md) | **Merkle 反熵全退场，Range 反熵成为唯一兜底通道（协议 v8）** | ✅ 已实施 | 2026-09-22 |
 | [模板](adr/000-template.md) | ADR 编写模板 | — | — |
 
 ### 开发文档 (`docs/development/`)

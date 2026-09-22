@@ -10,11 +10,8 @@ use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::federation::gossip::GossipEngine;
-use crate::federation::merkle::MerkleTree;
 use crate::federation::metrics::FederationMetrics;
-use crate::federation::node_id::NodeId;
 use crate::federation::protocol::*;
-use crate::federation::sync::merkle_updater::MerkleUpdateQueue;
 use crate::storage::TrackerRepoImpl;
 
 /// Tracker 同步负载
@@ -42,19 +39,10 @@ pub(crate) fn build_tracker_sync_entry(url: &str) -> Option<(Vec<u8>, Vec<u8>, V
     Some((key, payload_bytes, data_hash))
 }
 
-/// 从已序列化的 TrackerSyncPayload 计算 data_hash（与 build_tracker_sync_entry 公式一致）。
-pub(crate) fn data_hash_from_payload(payload: &[u8]) -> Option<Vec<u8>> {
-    let p: TrackerSyncPayload = bincode::deserialize(payload).ok()?;
-    Some(blake3::hash(p.url.as_bytes()).as_bytes().to_vec())
-}
-
 /// TrackerRepo 同步服务
 pub struct TrackerSync {
     tracker_repo: Arc<TrackerRepoImpl>,
     gossip_engine: Arc<GossipEngine>,
-    merkle: Arc<MerkleTree>,
-    #[allow(dead_code)]
-    merkle_queue: Arc<MerkleUpdateQueue>,
     metrics: Arc<FederationMetrics>,
     last_full_sync: parking_lot::RwLock<Instant>,
     _enabled: bool,
@@ -65,16 +53,12 @@ impl TrackerSync {
     pub fn new(
         tracker_repo: Arc<TrackerRepoImpl>,
         gossip_engine: Arc<GossipEngine>,
-        merkle: Arc<MerkleTree>,
-        #[allow(dead_code)] merkle_queue: Arc<MerkleUpdateQueue>,
         metrics: Arc<FederationMetrics>,
         shutdown: broadcast::Sender<()>,
     ) -> Self {
         Self {
             tracker_repo,
             gossip_engine,
-            merkle,
-            merkle_queue,
             metrics,
             last_full_sync: parking_lot::RwLock::new(Instant::now()),
             _enabled: true,
@@ -146,14 +130,6 @@ impl TrackerSync {
             Vec::new()
         };
 
-        if operation == operation::DELETE {
-            // 真正删除：标记墓碑（下次冷重算排除），不从热数据物理删除
-            self.merkle.mark_tombstone(&key);
-        } else {
-            let data_hash = data_hash_from_payload(&payload).unwrap_or_default();
-            self.merkle.update(&key, &payload, &data_hash);
-        }
-
         let entry = SyncEntry {
             key,
             operation,
@@ -181,7 +157,19 @@ impl TrackerSync {
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
-                // TrackerRepoImpl 没有 remove 方法，删除操作忽略
+                // P0-3：入站删除必须落地为软删墓碑，不能丢弃。
+                // 此前直接 `continue` → 删除永远无法在联邦内传播（对端删了、本地还在），
+                // 反熵每轮都为它做功；而对端持续回推 upsert 还会把本地已删条目复活。
+                // 注意走 `remove_tracker_remote_sync`（不写 oplog），避免删除两端来回反射。
+                let url = match std::str::from_utf8(&entry.key) {
+                    Ok(u) => u.to_string(),
+                    Err(_) => match bincode::deserialize::<TrackerSyncPayload>(&entry.payload) {
+                        Ok(p) => p.url,
+                        Err(_) => continue,
+                    },
+                };
+                self.tracker_repo.remove_tracker_remote_sync(&url);
+                applied += 1;
                 continue;
             }
             let payload: TrackerSyncPayload = match bincode::deserialize(&entry.payload) {
@@ -195,7 +183,8 @@ impl TrackerSync {
 
         // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
         if !items.is_empty() {
-            self.tracker_repo.add_trackers_batch_internal(&items);
+            // P0-3：remote=true → 命中本地软删墓碑时不复活
+            self.tracker_repo.add_trackers_batch_internal(&items, true);
         }
 
         // 【回环修复】入站 apply 不再 update_incremental_batch 标记 dirty（避免整批推回对端）。
@@ -205,11 +194,6 @@ impl TrackerSync {
             self.metrics.record_tracker_sync(applied as u64);
             debug!("[federation] Tracker 同步应用 {} 条", applied);
         }
-    }
-
-    /// 获取 Merkle 树引用（用于反熵对账）
-    pub fn merkle(&self) -> Arc<MerkleTree> {
-        self.merkle.clone()
     }
 
     /// 收集全量 Tracker 同步条目（用于初始全量同步）
@@ -239,53 +223,13 @@ impl TrackerSync {
 
         entries
     }
-
-    /// 处理 Merkle 摘要（对账）
-    pub fn handle_merkle_digest(&self, _from_node: NodeId, digest: &MerkleDigestMessage) {
-        let diffs = self.merkle.diff(digest);
-        if diffs.is_empty() {
-            debug!("[federation] Tracker Merkle 对账：无差异");
-            return;
-        }
-
-        debug!(
-            "[federation] Tracker Merkle 对账：{} 个分片有差异，触发全量同步",
-            diffs.len()
-        );
-        // 简化处理：有差异就触发全量同步
-        let trackers = self.tracker_repo.all_trackers_sync();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut entries = Vec::new();
-        for tracker in &trackers {
-            if let Some((key, payload_bytes, _hash)) = build_tracker_sync_entry(&tracker.url) {
-                entries.push(SyncEntry {
-                    key,
-                    operation: operation::UPSERT,
-                    version: now,
-                    payload: payload_bytes,
-                });
-            }
-        }
-        if !entries.is_empty() {
-            self.gossip_engine
-                .submit_gossip(repo_type::TRACKER, entries);
-        }
-    }
-
-    /// 获取 Merkle 摘要
-    pub fn merkle_digest(&self) -> MerkleDigestMessage {
-        self.merkle.digest(repo_type::TRACKER)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::federation::config::FederationConfig;
+    use crate::federation::node_id::NodeId;
     use crate::federation::session::SessionsHandle;
     use crate::storage::Storage;
 
@@ -321,11 +265,8 @@ mod tests {
         let repo = make_tracker_repo();
         let (shutdown_tx, _) = broadcast::channel(1);
         let gossip = make_gossip_engine(shutdown_tx.clone());
-        let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
-        let queue = Arc::new(MerkleUpdateQueue::new());
-        let tracker_sync =
-            TrackerSync::new(repo.clone(), gossip, merkle, queue, metrics, shutdown_tx);
+        let tracker_sync = TrackerSync::new(repo.clone(), gossip, metrics, shutdown_tx);
 
         assert_eq!(repo.count_sync(), 0);
 
@@ -350,35 +291,11 @@ mod tests {
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let gossip = make_gossip_engine(shutdown_tx.clone());
-        let merkle = Arc::new(MerkleTree::new(16));
         let metrics = Arc::new(FederationMetrics::new());
-        let queue = Arc::new(MerkleUpdateQueue::new());
-        let tracker_sync =
-            TrackerSync::new(repo, gossip.clone(), merkle, queue, metrics, shutdown_tx);
+        let tracker_sync = TrackerSync::new(repo, gossip.clone(), metrics, shutdown_tx);
 
         // 提交变更，应加入 gossip outbox
         tracker_sync.submit_tracker_change("http://change.tracker:6969", operation::UPSERT);
         assert_eq!(gossip.outbox_size(), 1);
-    }
-
-    #[test]
-    fn test_merkle_digest() {
-        let repo = make_tracker_repo();
-        repo.add_tracker_sync("http://digest.tracker:6969".to_string());
-
-        let (shutdown_tx, _) = broadcast::channel(1);
-        let gossip = make_gossip_engine(shutdown_tx.clone());
-        let merkle = Arc::new(MerkleTree::new(16));
-        let metrics = Arc::new(FederationMetrics::new());
-        let queue = Arc::new(MerkleUpdateQueue::new());
-        let tracker_sync =
-            TrackerSync::new(repo, gossip, merkle.clone(), queue, metrics, shutdown_tx);
-
-        // 先做一次全量同步更新 merkle
-        tracker_sync.do_full_sync();
-
-        let digest = tracker_sync.merkle_digest();
-        assert_eq!(digest.repo_type, repo_type::TRACKER);
-        assert_eq!(digest.shard_count, 16);
     }
 }

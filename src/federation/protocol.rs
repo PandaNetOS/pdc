@@ -43,64 +43,28 @@ pub enum MessageType {
     RelayData = 9,
     /// Gossip 批量消息
     GossipBatch = 10,
-    /// Merkle 摘要
-    MerkleDigest = 11,
-    /// Merkle 请求
-    MerkleRequest = 12,
+    // 编号 11 / 12：已废弃并移除（原 MerkleDigest / MerkleRequest，随 Merkle 反熵退场）。
     /// 同步批量
     SyncBatch = 13,
     /// 断开通知
     Goodbye = 14,
-    /// Merkle 修复数据
-    MerkleRepair = 15,
-    /// 全量同步开始
-    FullSyncStart = 16,
-    /// 全量同步批次
-    FullSyncBatch = 17,
-    /// 全量同步确认
-    FullSyncAck = 18,
-    /// 全量同步完成
-    FullSyncComplete = 19,
+    // 编号 15-19：已废弃并移除（原 MerkleRepair / FullSyncStart/Batch/Ack/Complete，
+    // 其唯一发送者 DiffSync 随 Merkle 反熵退场一并退役）。
     /// Gossip 批量合并帧（多个 GossipBatch 合并为一个大帧发送，减少网络往返）。
     /// 假设对端支持此消息类型（当前所有对端同版本），未来需加能力协商。
     GossipBatchBulk = 20,
-    /// 差量同步请求（Merkle 差异≥20%时触发，携带本地 Merkle 摘要，对端只推差异分片）
-    DiffSyncRequest = 21,
+    // 编号 21：已废弃并移除（原 DiffSyncRequest）。
     /// 节点信息（握手后立即双向发送，携带本地各 repo 条目数，
-    /// 供对端在数据源选择时判断哪个节点数据最完整）。
+    /// 供 bootstrap 自动触发时判断对端数据量）。
     PeerInfo = 22,
     // 编号 23 / 24 / 25：已废弃并移除。
     // 原为 Push-Pull Gossip 的 GossipDigest / GossipPullRequest / GossipPullResponse；
-    // P1-9 移除该同步路径后不再收发（反熵改由分层 Merkle + Range 接管），
-    // 编号在此保留空位，避免与历史对端的编号语义错位。
+    // P1-9 移除该同步路径后不再收发，编号保留空位避免与历史对端错位。
     /// 实时 peer 查询请求（announce 时本地 peer 不足，向联邦节点查询）
     PeerQueryRequest = 26,
     /// 实时 peer 查询响应
     PeerQueryResponse = 27,
-    /// DiffSync key 列表请求（数据服务器 → 请求方）：携带差异分片的 key 列表分片。
-    /// 仅协议版本 >=2 的对端使用；旧版本对端走原始全量推送。
-    DiffSyncKeyRequest = 28,
-    /// DiffSync key 列表响应（请求方 → 数据服务器）：返回请求方缺失的 key 列表分片。
-    DiffSyncKeyResponse = 29,
-    /// 分层 Merkle 层级请求：请求某层某分片的子哈希列表（协议版本 >=3）。
-    /// 对比流程：L0根 → L1一级分片(256) → L2二级分片(65536)，最多3轮定位差异。
-    MerkleLevelRequest = 30,
-    /// 分层 Merkle 层级响应：返回请求层级的子哈希列表（协议版本 >=3）。
-    MerkleLevelResponse = 31,
-    /// 分片同步批次：携带差异 L2 二级分片的数据条目（协议版本 >=3）。
-    /// 替代旧版全量 key 交换，只同步差异 L2 分片，支持并行+断点续传。
-    ShardSyncBatch = 32,
-    /// 分片同步确认：接收方确认收到指定批次（协议版本 >=3）。
-    ShardSyncAck = 33,
-    /// 分片同步完成：发送方通知所有差异 L2 分片已同步完毕（协议版本 >=3）。
-    ShardSyncComplete = 34,
-    /// 分片同步 hash 列表（数据服务器 → 请求方）：携带某 L2 分片内所有条目的
-    /// (key, data_hash) 列表。请求方对比本地 DB 后回传缺失 key（ShardSyncMissing），
-    /// 数据服务器只推送真正缺失的条目，把重复率从 ~97% 降到 <5%。
-    ShardSyncHashList = 35,
-    /// 分片同步缺失 key 列表（请求方 → 数据服务器）：请求方对比本地 DB 后，
-    /// 回传本地缺失的 key 列表，数据服务器只推送这些 key 的完整数据。
-    ShardSyncMissing = 36,
+    // 编号 28-36：已废弃并移除（原 DiffSync key 交换 / 分层 Merkle 层级请求 / 分片同步家族）。
     /// P1-3：增量（delta）拉取请求（B → A）：`OpsRequest { repo, since_seq, limit }`。
     /// 仅当 `federation.delta_sync_enabled = true` 时发送；对端不支持时该消息被丢弃（回退反熵）。
     OpsRequest = 37,
@@ -121,12 +85,18 @@ pub enum MessageType {
     BootstrapChunkRequest = 43,
     /// P2-1：bootstrap 分块响应（A → B）：携带该块完整条目。
     BootstrapChunkResponse = 44,
-    /// P1-4：Range 反熵推送（A → B）：发现本地多后，直接推送本地多的节点数据给对端。
-    RangeReconcilePush = 45,
+    // 编号 45：已废弃并移除（原 NODE 专属 RangeReconcilePush/PushNodeEntry，v8 起由 49 号
+    // `RangeReconcilePush2`（4 repo 通用 SyncEntry）取代，编号保留空位避免与历史对端错位）。
     /// v7 建连协商（双向互发）：互报各 repo 数据量 / 收发能力 / 吞吐提示。
     SyncNegotiate = 46,
     /// v7 建连协商确认：按 repo 下发同步策略（DELTA / BOOTSTRAP / NONE）。
     SyncNegotiateAck = 47,
+    /// v8 Range 反熵按键拉取（B → A）：叶级对账发现「对端多」的 key 列表，
+    /// 请对端按 key 加载完整条目后以 `RangeReconcilePush2` 回发。
+    RangeReconcilePull = 48,
+    /// v8 Range 反熵推送（4 repo 通用）：携带完整 `SyncEntry`（含 payload），
+    /// 接收方直接走 `handle_sync_batch` 幂等 apply（不写 oplog、不传播）。
+    RangeReconcilePush2 = 49,
 }
 
 impl MessageType {
@@ -144,30 +114,17 @@ impl MessageType {
             8 => Some(MessageType::RelaySetup),
             9 => Some(MessageType::RelayData),
             10 => Some(MessageType::GossipBatch),
-            11 => Some(MessageType::MerkleDigest),
-            12 => Some(MessageType::MerkleRequest),
+            // 11 / 12：已废弃（原 MerkleDigest / MerkleRequest），不再映射
             13 => Some(MessageType::SyncBatch),
             14 => Some(MessageType::Goodbye),
-            15 => Some(MessageType::MerkleRepair),
-            16 => Some(MessageType::FullSyncStart),
-            17 => Some(MessageType::FullSyncBatch),
-            18 => Some(MessageType::FullSyncAck),
-            19 => Some(MessageType::FullSyncComplete),
+            // 15-19：已废弃（原 MerkleRepair / FullSync 家族），不再映射
             20 => Some(MessageType::GossipBatchBulk),
-            21 => Some(MessageType::DiffSyncRequest),
+            // 21：已废弃（原 DiffSyncRequest），不再映射
             22 => Some(MessageType::PeerInfo),
             // 23 / 24 / 25：已废弃（原 Push-Pull Gossip），不再映射
             26 => Some(MessageType::PeerQueryRequest),
             27 => Some(MessageType::PeerQueryResponse),
-            28 => Some(MessageType::DiffSyncKeyRequest),
-            29 => Some(MessageType::DiffSyncKeyResponse),
-            30 => Some(MessageType::MerkleLevelRequest),
-            31 => Some(MessageType::MerkleLevelResponse),
-            32 => Some(MessageType::ShardSyncBatch),
-            33 => Some(MessageType::ShardSyncAck),
-            34 => Some(MessageType::ShardSyncComplete),
-            35 => Some(MessageType::ShardSyncHashList),
-            36 => Some(MessageType::ShardSyncMissing),
+            // 28-36：已废弃（原 DiffSync key 交换 / 分层 Merkle / 分片同步家族），不再映射
             37 => Some(MessageType::OpsRequest),
             38 => Some(MessageType::OpsBatch),
             39 => Some(MessageType::RangeReconcileRequest),
@@ -176,9 +133,11 @@ impl MessageType {
             42 => Some(MessageType::BootstrapManifestResponse),
             43 => Some(MessageType::BootstrapChunkRequest),
             44 => Some(MessageType::BootstrapChunkResponse),
-            45 => Some(MessageType::RangeReconcilePush),
+            // 45：已废弃（原 NODE 专属 RangeReconcilePush），不再映射
             46 => Some(MessageType::SyncNegotiate),
             47 => Some(MessageType::SyncNegotiateAck),
+            48 => Some(MessageType::RangeReconcilePull),
+            49 => Some(MessageType::RangeReconcilePush2),
             _ => None,
         }
     }
@@ -198,16 +157,19 @@ impl MessageType {
 /// 6：支持 bootstrap 专用通道（BootstrapManifest*/BootstrapChunk*，与在线反熵解耦的全量引导）。
 /// 7：支持建连协商（SyncNegotiate/SyncNegotiateAck）：连接建立后先互报数据量/能力并协商
 ///    per-repo 同步策略，稳定性门控（连接存活 ≥ `strategy_min_conn_secs`）通过后才开大通道。
+/// 8：Range 反熵修复通道通用化（RangeReconcilePull/RangeReconcilePush2）：4 repo 均可
+///    推送/按键拉取完整 SyncEntry，Merkle 反熵协议族（11/12/15/21/28-36/45）同版退役。
 /// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle；
 /// version >= 4 且 `federation.delta_sync_enabled=true` 时启用 delta 通道；
 /// version >= 5 且 `federation.range_reconcile_enabled=true` 时启用 range 反熵；
 /// version >= 6 且 `federation.bootstrap_enabled=true` 时启用 bootstrap 通道；
 /// version >= 7 且 `federation.negotiation_enabled=true` 时 delta/bootstrap 大通道需协商通过后才启动
-/// （对端 < v7 回落旧行为：不协商直接按既有开关运行）。
+/// （对端 < v7 回落旧行为：不协商直接按既有开关运行）；
+/// version >= 8 时启用 range 修复的 Pull/Push2 通用通道（对端 < v8 时不发，仅保留叶级对账）。
 ///
 /// G4 迁移：原定义在 `federation/connection.rs`，随握手实现一并归位到协议层
 /// （`connection.rs` 保留 `pub use` 转发）。
-pub const HELLO_PROTOCOL_VERSION: u32 = 7;
+pub const HELLO_PROTOCOL_VERSION: u32 = 8;
 
 /// 握手消息（阶段2：Ed25519 签名认证）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,249 +469,6 @@ pub struct SyncBatchMessage {
     pub entries: Vec<SyncEntry>,
 }
 
-/// Merkle 摘要
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MerkleDigestMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 分片数
-    pub shard_count: u16,
-    /// 各分片 Merkle 根（热+冷合并根 combined_roots）
-    pub roots: Vec<[u8; 32]>,
-    /// 各分片条目数（热+冷合计）
-    pub entry_counts: Vec<u32>,
-    /// L0 全量根（热+冷全量数据的根哈希）。
-    /// Option 用于向后兼容：旧版本节点不发送此字段，接收方为 None 时跳过 full_root 快速比较。
-    #[serde(default)]
-    pub full_root: Option<[u8; 32]>,
-}
-
-/// Merkle 分片请求（对账发现差异后，请求指定分片的全量条目）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MerkleRequestMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 请求的分片索引列表
-    pub shards: Vec<u16>,
-}
-
-/// Merkle 修复数据（响应分片请求，携带指定分片的所有条目）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MerkleRepairMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 修复的同步条目
-    pub entries: Vec<SyncEntry>,
-}
-
-/// 全量同步开始
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FullSyncStartMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 总条目数
-    pub total_entries: u64,
-}
-
-/// 全量同步批次
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FullSyncBatchMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 同步条目
-    pub entries: Vec<SyncEntry>,
-    /// 批次序号
-    pub seq: u64,
-}
-
-/// 全量同步确认
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FullSyncAckMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 已确认的批次序号
-    pub seq: u64,
-}
-
-/// 全量同步完成
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FullSyncCompleteMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-}
-
-/// 差量同步请求（Merkle 差异≥20%时触发）
-///
-/// 请求方携带本地单个 repo 的 Merkle 摘要，对端对比后找出差异分片，
-/// 只推送差异分片的条目（不是全量）。
-/// 每个 repo 独立触发差量同步，独立并发。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiffSyncRequestMessage {
-    /// 发起方本地单个 repo 的 Merkle 摘要
-    pub digest: MerkleDigestMessage,
-}
-
-/// DiffSync key 列表请求（数据服务器 → 请求方，协议版本 >=2）。
-///
-/// 数据服务器发现差异分片后，不直接推送全部条目（重复率 ~90%），而是先把差异分片的
-/// key 列表分片发给请求方。请求方对比本地 key 后回传缺失 key（DiffSyncKeyResponse），
-/// 数据服务器只推送缺失条目，重复率降至 <5%。
-///
-/// 为避免单条消息过大，key 列表按 `DIFF_SYNC_KEY_CHUNK_SIZE` 分片发送，
-/// 接收方累计直到 `is_last == true`。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiffSyncKeyRequestMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 差异分片索引列表（请求方据此从本地 DB 加载同分片 key 做对比）
-    pub shards: Vec<u16>,
-    /// 本片 key 列表（每个 key 为 SyncEntry.key 的原始字节）
-    pub keys: Vec<Vec<u8>>,
-    /// 是否为最后一片 key（请求方收到最后一片后才对比并回复）
-    pub is_last: bool,
-}
-
-/// DiffSync key 列表响应（请求方 → 数据服务器，协议版本 >=2）。
-///
-/// 请求方对比本地 key 后，把缺失的 key 列表分片回传。同样按分片发送，
-/// 数据服务器累计直到 `is_last == true`，再只加载/推送这些缺失 key 的完整条目。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiffSyncKeyResponseMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 请求方缺失的 key 列表（本片）
-    pub missing_keys: Vec<Vec<u8>>,
-    /// 是否为最后一片缺失 key（数据服务器收到最后一片后开始推送）
-    pub is_last: bool,
-}
-
-/// DiffSync key 列表单条消息最大 key 数（约 200KB，避免超大帧）。
-pub const DIFF_SYNC_KEY_CHUNK_SIZE: usize = 10000;
-
-// ============================================================================
-// 分层 Merkle 对比协议（协议版本 >=3，亿级数据架构升级）
-// ============================================================================
-
-/// 分层 Merkle 层级请求（协议版本 >=3）。
-///
-/// 请求对端返回指定层级的子哈希列表，用于逐层定位差异分片：
-/// - level=0: 请求 L0 根哈希（parent_shard 忽略，返回 1 个哈希）
-/// - level=1: 请求 L1 一级分片哈希（parent_shard 忽略，返回 256 个哈希）
-/// - level=2: 请求指定 L1 下的 L2 二级分片哈希（parent_shard 指定 L1，返回 256 个哈希）
-///
-/// 对比流程最多 3 轮：交换根 → 不一致则交换 L1 → 对差异 L1 交换 L2 → 只同步差异 L2。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MerkleLevelRequestMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 请求层级（0=L0根, 1=L1一级分片, 2=L2二级分片）
-    pub level: u8,
-    /// 父分片索引（level=2 时为 L1 分片索引；level=0/1 时忽略）
-    pub parent_shard: u16,
-}
-
-/// 分层 Merkle 层级响应（协议版本 >=3）。
-///
-/// 返回请求层级的子哈希列表和对应条目数。
-/// - level=0: hashes 含 1 个根哈希
-/// - level=1: hashes 含 256 个 L1 哈希
-/// - level=2: hashes 含 256 个 L2 哈希（指定 L1 下）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MerkleLevelResponseMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 响应层级（0=L0根, 1=L1一级分片, 2=L2二级分片）
-    pub level: u8,
-    /// 父分片索引（与请求对应）
-    pub parent_shard: u16,
-    /// 子哈希列表（数量取决于层级：1/256/256）
-    pub hashes: Vec<[u8; 32]>,
-    /// 各子分片条目数（与 hashes 一一对应）
-    pub entry_counts: Vec<u32>,
-}
-
-// ============================================================================
-// 分片同步协议（协议版本 >=3，替代旧版全量 key 交换）
-// ============================================================================
-
-/// 分片同步批次（协议版本 >=3）。
-///
-/// 携带差异 L2 二级分片的数据条目。发送方按 L2 分片分组，
-/// 每批可覆盖一个或多个 L2 分片，接收方独立应用并确认。
-/// 支持并行同步（多个 L2 分片同时传输）、独立超时重试、断点续传。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShardSyncBatchMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 本批次覆盖的 L2 二级分片索引列表
-    pub l2_shards: Vec<u32>,
-    /// 同步条目
-    pub entries: Vec<SyncEntry>,
-    /// 批次序号（用于确认和去重）
-    pub seq: u64,
-    /// 是否为最后一批（发送方通知同步完成）
-    pub is_last: bool,
-}
-
-/// 分片同步确认（协议版本 >=3）。
-///
-/// 接收方确认收到并应用指定批次，发送方据此推进窗口和记录进度。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShardSyncAckMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 已确认的批次序号
-    pub seq: u64,
-    /// 本批次应用的条目数
-    pub applied_count: u32,
-}
-
-/// 分片同步完成（协议版本 >=3）。
-///
-/// 发送方通知所有差异 L2 分片已同步完毕，携带统计信息供监控和对账。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShardSyncCompleteMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 同步的 L2 分片总数
-    pub total_l2_shards: u32,
-    /// 同步的条目总数
-    pub total_entries: u64,
-    /// 总批次序号上限（接收方据此判断是否有遗漏）
-    pub max_seq: u64,
-}
-
-/// 分片同步 hash 列表（数据服务器 → 请求方）。
-///
-/// 携带某 L2 分片内所有条目的 (key, data_hash)，用于对端对比找出缺失条目。
-/// 若分片内条目数超过单条消息上限，按片发送，接收方累计直到 `is_last == true`。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShardSyncHashListMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 对应的 L2 二级分片索引（接收方据此定位本地 L1 分片做对比）
-    pub l2_shard: u32,
-    /// (key, data_hash) 列表
-    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
-    /// 是否为最后一片
-    pub is_last: bool,
-}
-
-/// 分片同步缺失 key 列表（请求方 → 数据服务器）。
-///
-/// 请求方对比本地 DB 后，把缺失的 key 列表回传，数据服务器只推送这些 key 的完整数据。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShardSyncMissingMessage {
-    /// 仓库类型
-    pub repo_type: u8,
-    /// 对应的 L2 二级分片索引
-    pub l2_shard: u32,
-    /// 请求方缺失的 key 列表
-    pub missing_keys: Vec<Vec<u8>>,
-    /// 是否为最后一片
-    pub is_last: bool,
-}
-
 /// P1-3：单条变更操作（oplog 条目在协议上的表示）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpEntry {
@@ -862,6 +581,29 @@ pub struct PushNodeEntry {
     pub consecutive_failures: u32,
     pub nodes_returned: u64,
     pub last_active: i64,
+}
+
+/// v8：Range 反熵按键拉取（B → A）。
+/// 叶级对账发现「对端多」后，把缺失 key 列表发给对端，由对端按 key 加载完整条目
+/// 以 `RangeReconcilePush2` 回发。仅对 `protocol_version >= 8` 的对端发送。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeReconcilePullMessage {
+    /// 仓库类型
+    pub repo: u8,
+    /// 请求方缺失、对端持有的 key 列表（`load_repo_key_hashes_in_range` 的 DB 形态）
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// v8：Range 反熵推送消息（4 repo 通用，A → B）。
+/// 携带完整 `SyncEntry`（含 payload），接收方经 `handle_sync_batch` 幂等 apply——
+/// 入站路径不写 oplog、不提交 gossip（「入站不写回」不变量）。
+/// 仅对 `protocol_version >= 8` 的对端发送；取代 NODE 专属的 45 号旧推送。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeReconcilePush2Message {
+    /// 仓库类型
+    pub repo: u8,
+    /// 完整同步条目（key/payload 与各 repo gossip 条目同构）
+    pub entries: Vec<SyncEntry>,
 }
 
 /// P2-1：bootstrap 清单请求（B → A）。
@@ -1041,9 +783,17 @@ mod tests {
 
     #[test]
     fn test_message_type_roundtrip() {
-        for i in 0..=14u8 {
+        // v8 起编号 11/12、15-19、21、28-36、45 退役为空位，不再连续可 roundtrip；
+        // 改为抽查存活编号（含退役空位必须返回 None）。
+        for i in [0u8, 10, 13, 14, 20, 22, 26, 27, 37, 40, 44, 46, 47, 48, 49] {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(mt.as_u8(), i);
+        }
+        for i in [11u8, 12, 15, 16, 19, 21, 28, 36, 45] {
+            assert!(
+                MessageType::from_u8(i).is_none(),
+                "已退役编号 {i} 不应再映射"
+            );
         }
         assert!(MessageType::from_u8(255).is_none());
     }

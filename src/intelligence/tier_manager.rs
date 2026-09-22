@@ -138,27 +138,17 @@ impl TierManageable for PeerTierManager {
             }
         }
 
-        // 冷数据归档：超过 warm_threshold 的 peer 从主表迁移到归档表（减少主表体积）
-        if cold_count > 0 {
-            let threshold = self.config.warm_threshold_secs as i64;
-            if let Some(wq) = &self.write_queue {
-                // 通过 WriteQueue/IOScheduler 提交
-                wq.send(move |conn| {
-                    let _ = crate::storage::db::Storage::archive_cold_peers_in_tx(conn, threshold);
-                    Ok(())
-                });
-                debug!("[tier_manager] 冷数据归档已入队 WriteQueue");
-            } else if let Some(ref storage) = self.storage {
-                let storage = storage.clone();
-                match tokio::task::spawn_blocking(move || storage.archive_cold_peers(threshold))
-                    .await
-                {
-                    Ok(Ok(count)) => debug!("[tier_manager] PeerRepo 冷数据归档: {} 个", count),
-                    Ok(Err(e)) => warn!("[tier_manager] PeerRepo 冷数据归档失败: {}", e),
-                    Err(e) => warn!("[tier_manager] PeerRepo 冷数据归档任务失败: {}", e),
-                }
-            }
-        }
+        // 冷数据归档（peers → peers_archive）：已按「永久资产模式」移除，不再执行。
+        //
+        // 移除理由：
+        // ① 归档是「物理删除 peers 行 + INSERT 到归档表」，既无软删墓碑也不写 oplog。
+        //    对端 range/delta 反熵发现该 peer 缺失后会重新推送，peer 被插回主表 →
+        //    下一轮又被归档，形成冷 peer 的周期性搬移（联邦内无意义的来回做功）。
+        // ② `peers_archive` 本身计入 `peer_repo_total`（rest_api.rs 口径），归档对
+        //    「总量」没有任何收益，只会让 total 出现搬移抖动，不利于以 total 验收收敛。
+        // ③ health_check::cleanup_expired_peers 同样是「不删除 peer」的语义，保持一致。
+        //
+        // cold_count 仍照常统计，供分层观测使用。
 
         let stats = TierStats {
             hot_count,

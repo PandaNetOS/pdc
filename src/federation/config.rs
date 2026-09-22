@@ -154,19 +154,6 @@ pub struct FederationConfig {
     /// 全量同步期间 Gossip 每秒最多发送字节数（临时放开限流）。
     #[serde(default = "default_full_sync_gossip_max_bytes_per_second")]
     pub full_sync_gossip_max_bytes_per_second: u64,
-    /// Merkle 树异步批量更新触发阈值（条数）。
-    /// 队列累计达到此条数时通过 Notify 立即唤醒后台 flush，无需等待间隔。
-    #[serde(default = "default_merkle_async_update_batch_size")]
-    pub merkle_async_update_batch_size: usize,
-    /// Merkle 冷数据重算间隔（秒）。
-    /// 每小时从 DB 全量加载 key+hash 重算冷分片根，默认 3600 秒。
-    #[serde(default = "default_merkle_cold_rebuild_interval_secs")]
-    pub merkle_cold_rebuild_interval_secs: u64,
-    /// Merkle 增量更新间隔（秒）。
-    /// 后台任务每此间隔取出 dirty 分片，从 DB 加载对应分片数据重算分片根和全量根。
-    /// 默认 10 秒。
-    #[serde(default = "default_merkle_incremental_update_interval_secs")]
-    pub merkle_incremental_update_interval_secs: u64,
     /// P1-2：oplog 保留窗口（秒）。默认 86400（24h）。
     /// **必须 > 预估 bootstrap 时长**（架构文档铁律 4），否则新节点追尾时水位 W0 之后的 op
     /// 已被裁掉，只能重打快照。设为 0 表示永不裁剪（表会无界增长，不建议）。
@@ -175,10 +162,8 @@ pub struct FederationConfig {
     /// P1-2：oplog 裁剪任务间隔（秒）。默认 3600（1h）。
     #[serde(default = "default_oplog_trim_interval_secs")]
     pub oplog_trim_interval_secs: u64,
-    /// P1-3：是否启用 delta（oplog 增量）同步通道。默认 false。
-    /// 该通道改变线上协议（新增 OpsRequest/OpsBatch 消息），必须两端同版本后开启；
-    /// 关闭时完全不发这些消息，行为与改造前一致。
-    #[serde(default)]
+    /// P1-3：是否启用 delta（oplog 增量）同步通道。默认 true（v8 起与 impl Default 对齐）。
+    #[serde(default = "default_true")]
     pub delta_sync_enabled: bool,
     /// P1-3：delta 增量拉取周期（秒）。默认 60（稳态足够，欠账期配合批量 1 千条防慢盘打死）。
     ///
@@ -199,16 +184,30 @@ pub struct FederationConfig {
     /// v7：range 叶级差集大差集阈值（行数）。默认 10000。
     #[serde(default = "default_range_bulk_threshold_rows")]
     pub range_bulk_threshold_rows: u64,
-    /// P1-4：是否启用 Range-based（有序区间 + 分界点下钻）反熵作为 NODE repo 的反熵主链。
-    /// 默认 false：行为与改造前一致（既有分层 Merkle 反熵），必须两端同版本（>= v5）后开启。
-    #[serde(default)]
-    pub range_reconcile_enabled: bool,
-    /// P1-4 灰度：只读诊断模式。true（默认）时只求差集并打印统计、**不修改任何数据**。
+    /// P1-4：是否启用 Range-based（有序区间 + 分界点下钻）反熵。默认 true。
+    /// v8 起 range 是**唯一**反熵通道（Merkle 反熵已退役），四个 repo 全部走此通道。
     #[serde(default = "default_true")]
+    pub range_reconcile_enabled: bool,
+    /// P1-4 灰度遗留开关：只读诊断模式。默认 false（v8 起与 impl Default 对齐，直接修复）。
+    #[serde(default)]
     pub range_reconcile_diagnostic_only: bool,
+    /// B1：range 反熵 per-repo 周期（秒），顺序 NODE/PEER/INFOHASH/TRACKER。
+    ///
+    /// 四个 repo 走**同一套**反熵逻辑与触发条件，仅周期可按 repo 调；四项**全部来自配置**
+    /// （旧实现把 30/120/300/600 写死在 `sync::mod::RANGE_INTERVAL_SECS` 常量里，不可调，
+    /// 也不满足「参数同源于配置」）。
+    #[serde(default = "default_range_interval_secs")]
+    pub range_reconcile_interval_secs: [u64; 4],
     /// P1-4：叶级行数阈值（区间内行数 ≤ 该值即交换行指纹清单求差）。
     #[serde(default = "default_range_leaf_rows")]
     pub range_reconcile_leaf_rows: u32,
+    /// B2：per-repo 叶级行数阈值，顺序 NODE/PEER/INFOHASH/TRACKER。
+    ///
+    /// 与 `range_reconcile_interval_secs` 同理：同一套下钻逻辑，四项阈值全部走配置。
+    /// 旧实现里 TRACKER=512、PEER/INFOHASH=2048 是写死常量，NODE 却去读
+    /// `range_reconcile_leaf_rows` —— 一个读配置两个写死，属策略来源不一致。
+    #[serde(default = "default_range_leaf_rows_per_repo")]
+    pub range_reconcile_leaf_rows_per_repo: [u32; 4],
     /// P1-4：单次响应的最大分界点数。
     #[serde(default = "default_range_max_splits")]
     pub range_reconcile_max_splits: u32,
@@ -218,9 +217,8 @@ pub struct FederationConfig {
     /// P1-4：单轮诊断抽样的区间数。
     #[serde(default = "default_range_sample_ranges")]
     pub range_reconcile_sample_ranges: u32,
-    /// P2-1：是否启用 bootstrap 专用通道（与在线反熵解耦的全量引导）。
-    /// 默认 false：不注册、不发起、不响应任何 bootstrap 消息。
-    #[serde(default)]
+    /// P2-1：是否启用 bootstrap 专用通道（与在线反熵解耦的全量引导）。默认 true。
+    #[serde(default = "default_true")]
     pub bootstrap_enabled: bool,
     /// P2-1：bootstrap 单块行数。
     #[serde(default = "default_bootstrap_chunk_rows")]
@@ -228,12 +226,6 @@ pub struct FederationConfig {
     /// P2-1：bootstrap 服务端带宽预算（字节/秒）。0 = 不限流。
     #[serde(default = "default_bootstrap_rate_bytes_per_sec")]
     pub bootstrap_rate_bytes_per_sec: u64,
-    /// P2-5：NODE repo 的反熵周期（秒）。NODE churn 最高，用更短周期。
-    #[serde(default = "default_anti_entropy_node_interval_secs")]
-    pub anti_entropy_node_interval_secs: u64,
-    /// P2-5：其余 repo 的反熵周期（秒）。
-    #[serde(default = "default_anti_entropy_other_interval_secs")]
-    pub anti_entropy_other_interval_secs: u64,
     /// 发送端 GossipBatch 合并为 bulk 帧的最大 batch 数量。
     /// 同一连接的多个 batch 合并为一个 GossipBatchBulk 发送，减少网络往返。
     #[serde(default = "default_gossip_bulk_max_batches")]
@@ -253,62 +245,6 @@ pub struct FederationConfig {
     /// 超过此时长自动恢复正常转发（Gossip 拉取无显式完成信号，用可配置时长兜底）。
     #[serde(default = "default_full_sync_receiving_settle_ms")]
     pub full_sync_receiving_settle_ms: u64,
-    /// DiffSync key 列表交换超时（秒）。
-    /// 数据服务器发出差异分片 key 列表后，等待对端回传缺失 key 列表的最长时间。
-    /// 超时则回退到原始全量推送逻辑（对端不支持新协议或网络异常时的兜底）。
-    #[serde(default = "default_diff_key_exchange_timeout_secs")]
-    pub diff_key_exchange_timeout_secs: u64,
-    /// 是否启用分层 Merkle 对比协议（协议版本 >=3）。
-    /// 启用后使用 L0→L1→L2 三层对比定位差异，替代旧版全量 key 交换。
-    /// 对端不支持时自动回退到旧协议。
-    #[serde(default = "default_true")]
-    pub layered_merkle_enabled: bool,
-    /// 分片并行同步最大并发数（同时同步的 L2 分片数）。
-    /// 默认 4，每个分片独立超时、独立重试，单分片失败不影响其他分片。
-    #[serde(default = "default_shard_sync_max_concurrency")]
-    pub shard_sync_max_concurrency: usize,
-    /// 单个 L2 分片同步超时（秒）。
-    /// 超过此时间未收到确认则重试该分片，超过重试次数后标记失败。
-    #[serde(default = "default_shard_sync_timeout_secs")]
-    pub shard_sync_timeout_secs: u64,
-    /// 单个 L2 分片同步最大重试次数（不含首次）。
-    #[serde(default = "default_shard_sync_retry_count")]
-    pub shard_sync_retry_count: u32,
-    /// 分片同步每批条目数（ShardSyncBatch 的 entries 数量）。
-    /// 默认 5000，平衡消息大小和网络往返次数。
-    #[serde(default = "default_shard_sync_batch_size")]
-    pub shard_sync_batch_size: usize,
-    /// 分片同步速率限制（条目/秒），0 表示不限制。
-    /// 用于避免同步期间占用过多磁盘 IO 和网络带宽，影响爬虫和 Tracker 正常运行。
-    #[serde(default = "default_shard_sync_rate_limit_per_sec")]
-    pub shard_sync_rate_limit_per_sec: u64,
-    /// 分片同步窗口大小（发送方未确认的在途批次数）。
-    #[serde(default = "default_shard_sync_window_size")]
-    pub shard_sync_window_size: usize,
-    /// 单批次最大发送重试次数（不含首次）。
-    /// 发送失败后按指数退避重试，超过此次数则丢弃该批次并记录失败统计。
-    #[serde(default = "default_shard_sync_max_retries")]
-    pub shard_sync_max_retries: u32,
-    /// 分片同步发送失败指数退避基数（毫秒）。
-    /// 第 n 次重试前等待 base_backoff_ms * 2^(send_retry_count)。
-    #[serde(default = "default_shard_sync_base_backoff_ms")]
-    pub shard_sync_base_backoff_ms: u64,
-    /// 分片同步发送失败最大退避上限（毫秒）。
-    /// 指数退避超过此值后不再增长，封顶等待。
-    #[serde(default = "default_shard_sync_max_backoff_ms")]
-    pub shard_sync_max_backoff_ms: u64,
-    /// 连续发送失败断开阈值。
-    /// 连续达到此次数发送失败则标记连接断开，停止当前同步并触发上层重连。
-    #[serde(default = "default_shard_sync_consecutive_fail_threshold")]
-    pub shard_sync_consecutive_fail_threshold: u32,
-    /// 分片同步引擎完成后轮询清理间隔（秒）。
-    /// 后台任务轮询检查引擎是否已结束，结束后从活跃列表移除。
-    #[serde(default = "default_shard_sync_engine_poll_interval_secs")]
-    pub shard_sync_engine_poll_interval_secs: u64,
-    /// 分片同步窗口流控等待时间（毫秒）。
-    /// 窗口满时等待此时间后重新检查在途批次数。
-    #[serde(default = "default_shard_sync_window_flow_sleep_ms")]
-    pub shard_sync_window_flow_sleep_ms: u64,
 }
 
 fn default_listen_port() -> u16 {
@@ -419,15 +355,6 @@ fn default_full_sync_gossip_max_messages_per_second() -> u32 {
 fn default_full_sync_gossip_max_bytes_per_second() -> u64 {
     50 * 1024 * 1024
 }
-fn default_merkle_async_update_batch_size() -> usize {
-    10000
-}
-fn default_merkle_cold_rebuild_interval_secs() -> u64 {
-    3600
-}
-fn default_merkle_incremental_update_interval_secs() -> u64 {
-    10
-}
 fn default_oplog_retention_secs() -> u64 {
     86_400
 }
@@ -457,6 +384,19 @@ fn default_range_bulk_threshold_rows() -> u64 {
 fn default_range_leaf_rows() -> u32 {
     crate::federation::sync::range_reconcile::DEFAULT_LEAF_ROWS
 }
+/// B1：range 反熵 per-repo 周期默认值（秒），顺序 NODE/PEER/INFOHASH/TRACKER。
+fn default_range_interval_secs() -> [u64; 4] {
+    [30, 120, 300, 600]
+}
+/// B2：per-repo 叶级行数阈值默认值，顺序 NODE/PEER/INFOHASH/TRACKER。
+fn default_range_leaf_rows_per_repo() -> [u32; 4] {
+    [
+        default_range_leaf_rows(), // NODE：沿用既有配置默认值
+        2048,                      // PEER
+        2048,                      // INFOHASH
+        512,                       // TRACKER（小库）
+    ]
+}
 fn default_range_max_splits() -> u32 {
     crate::federation::sync::range_reconcile::DEFAULT_MAX_SPLITS
 }
@@ -472,12 +412,6 @@ fn default_bootstrap_chunk_rows() -> u32 {
 fn default_bootstrap_rate_bytes_per_sec() -> u64 {
     crate::federation::sync::bootstrap::DEFAULT_RATE_BYTES_PER_SEC
 }
-fn default_anti_entropy_node_interval_secs() -> u64 {
-    30
-}
-fn default_anti_entropy_other_interval_secs() -> u64 {
-    300
-}
 fn default_gossip_bulk_max_batches() -> usize {
     50
 }
@@ -490,46 +424,6 @@ fn default_parallel_propagation() -> bool {
 fn default_full_sync_receiving_settle_ms() -> u64 {
     60_000
 }
-fn default_diff_key_exchange_timeout_secs() -> u64 {
-    30
-}
-fn default_shard_sync_max_concurrency() -> usize {
-    4
-}
-fn default_shard_sync_timeout_secs() -> u64 {
-    60
-}
-fn default_shard_sync_retry_count() -> u32 {
-    3
-}
-fn default_shard_sync_batch_size() -> usize {
-    5000
-}
-fn default_shard_sync_rate_limit_per_sec() -> u64 {
-    0
-}
-fn default_shard_sync_window_size() -> usize {
-    3
-}
-fn default_shard_sync_max_retries() -> u32 {
-    3
-}
-fn default_shard_sync_base_backoff_ms() -> u64 {
-    200
-}
-fn default_shard_sync_max_backoff_ms() -> u64 {
-    5000
-}
-fn default_shard_sync_consecutive_fail_threshold() -> u32 {
-    5
-}
-fn default_shard_sync_engine_poll_interval_secs() -> u64 {
-    5
-}
-fn default_shard_sync_window_flow_sleep_ms() -> u64 {
-    50
-}
-
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
@@ -576,43 +470,25 @@ impl Default for FederationConfig {
             full_sync_gossip_max_messages_per_second:
                 default_full_sync_gossip_max_messages_per_second(),
             full_sync_gossip_max_bytes_per_second: default_full_sync_gossip_max_bytes_per_second(),
-            merkle_async_update_batch_size: default_merkle_async_update_batch_size(),
-            merkle_cold_rebuild_interval_secs: default_merkle_cold_rebuild_interval_secs(),
-            merkle_incremental_update_interval_secs:
-                default_merkle_incremental_update_interval_secs(),
             oplog_retention_secs: default_oplog_retention_secs(),
             oplog_trim_interval_secs: default_oplog_trim_interval_secs(),
             delta_sync_enabled: true,
             delta_sync_interval_secs: default_delta_sync_interval_secs(),
             range_reconcile_enabled: true,
             range_reconcile_diagnostic_only: false,
+            range_reconcile_interval_secs: default_range_interval_secs(),
             range_reconcile_leaf_rows: default_range_leaf_rows(),
+            range_reconcile_leaf_rows_per_repo: default_range_leaf_rows_per_repo(),
             range_reconcile_max_splits: default_range_max_splits(),
             range_reconcile_max_depth: default_range_max_depth(),
             range_reconcile_sample_ranges: default_range_sample_ranges(),
             bootstrap_enabled: true,
             bootstrap_chunk_rows: default_bootstrap_chunk_rows(),
             bootstrap_rate_bytes_per_sec: default_bootstrap_rate_bytes_per_sec(),
-            anti_entropy_node_interval_secs: default_anti_entropy_node_interval_secs(),
-            anti_entropy_other_interval_secs: default_anti_entropy_other_interval_secs(),
             gossip_bulk_max_batches: default_gossip_bulk_max_batches(),
             gossip_bulk_max_bytes: default_gossip_bulk_max_bytes(),
             parallel_propagation: default_parallel_propagation(),
             full_sync_receiving_settle_ms: default_full_sync_receiving_settle_ms(),
-            diff_key_exchange_timeout_secs: default_diff_key_exchange_timeout_secs(),
-            layered_merkle_enabled: default_true(),
-            shard_sync_max_concurrency: default_shard_sync_max_concurrency(),
-            shard_sync_timeout_secs: default_shard_sync_timeout_secs(),
-            shard_sync_retry_count: default_shard_sync_retry_count(),
-            shard_sync_batch_size: default_shard_sync_batch_size(),
-            shard_sync_rate_limit_per_sec: default_shard_sync_rate_limit_per_sec(),
-            shard_sync_window_size: default_shard_sync_window_size(),
-            shard_sync_max_retries: default_shard_sync_max_retries(),
-            shard_sync_base_backoff_ms: default_shard_sync_base_backoff_ms(),
-            shard_sync_max_backoff_ms: default_shard_sync_max_backoff_ms(),
-            shard_sync_consecutive_fail_threshold: default_shard_sync_consecutive_fail_threshold(),
-            shard_sync_engine_poll_interval_secs: default_shard_sync_engine_poll_interval_secs(),
-            shard_sync_window_flow_sleep_ms: default_shard_sync_window_flow_sleep_ms(),
             negotiation_enabled: default_negotiation_enabled(),
             strategy_min_conn_secs: default_strategy_min_conn_secs(),
             delta_watchdog_stall_ticks: default_delta_watchdog_stall_ticks(),

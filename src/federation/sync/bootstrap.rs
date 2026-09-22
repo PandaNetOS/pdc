@@ -249,27 +249,14 @@ impl Storage {
     }
 }
 
-/// 为 NODE repo 构建 bootstrap 清单（流式分块，内存开销 O(chunk_rows)）。
+/// 全 repo 通用清单构建（流式分块，内存开销 O(chunk_rows)）。
 ///
 /// 逐块推进游标：每块取 `chunk_rows + 1` 行，多取的 1 行用作下一块的 `lo`（即本块 `hi`），
 /// 使 `[lo, hi)` 恰好覆盖 `chunk_rows` 行；末块的 `hi = None`（+∞）。
-pub fn build_node_manifest(
-    storage: &Storage,
-    chunk_rows: u32,
-    w0_seq: u64,
-    version: u32,
-) -> anyhow::Result<BootstrapManifest> {
-    build_repo_manifest_impl(
-        storage,
-        crate::federation::sync::repo_type::NODE,
-        chunk_rows,
-        w0_seq,
-        version,
-    )
-}
-
-/// v7：全 repo 通用清单构建（与 [`build_node_manifest`] 同算法，
-/// 区间读取换成 `load_repo_key_hashes_in_range(repo, …)`）。
+///
+/// A7：这是**唯一**的清单构建入口，区间读取走 `load_repo_key_hashes_in_range(repo, …)`。
+/// 原 `build_node_manifest` 包装函数把 repo 写死成 NODE，与「全 repo 统一逻辑」冲突，
+/// 已删除 —— 调用方必须显式传 repo。
 pub fn build_repo_manifest_impl(
     storage: &Storage,
     repo: u8,
@@ -318,8 +305,11 @@ pub fn build_repo_manifest_impl(
         index += 1;
     }
 
+    // P0-2：清单 `repo` 必须回填入参，不能硬编码 NODE。
+    // 旧实现写死 NODE，导致应答方为 PEER/INFOHASH/TRACKER 构造出的清单被标记成 NODE，
+    // 请求方（handle_bootstrap_manifest_response）按 repo 校验时全部错位丢弃。
     Ok(BootstrapManifest {
-        repo: crate::federation::protocol::repo_type::NODE,
+        repo,
         version,
         w0_seq,
         chunk_rows: chunk_rows as u32,
@@ -387,7 +377,28 @@ impl TokenBucket {
     }
 }
 
+/// P0-4：**传输完整性**校验 —— 只校验收到的条目本身，不重算本地区间。
+///
+/// 取代旧的一致性语义 `verify_chunk`（落地后重算本地 `[lo,hi)` 摘要与清单 hash 比对）。
+/// 旧语义必然恒失配：只要接收方在该 key 区间内有**任何对端没有的行**（双方各自独立爬取
+/// 产生的 ~2% 差异，全域均匀分布），或对端在传输期有写入，每个块都判失败。后果是 F7 的
+/// 「连续 3 次失败重拉清单」陷入死循环 —— 重拉回来的清单仍是对端 DB，接收方的多余行还在，
+/// 永远对不上。一致性校验应交给 range 反熵（v8 下唯一兜底通道）。
+///
+/// 判定规则：
+/// - 声明 0 行的块必须收到 0 条；
+/// - 声明 N 行的块必须收到 ≥1 且 ≤N 条（对端在传输期发生删除会让实收少于声明，属正常）。
+pub fn verify_transport(expected_rows: u64, received: usize) -> bool {
+    if expected_rows == 0 {
+        return received == 0;
+    }
+    received > 0 && received as u64 <= expected_rows
+}
+
 /// 校验收到的行是否与清单块哈希一致。
+///
+/// ⚠️ 语义为「一致性」校验（本地重算 vs 清单），P0-4 后 bootstrap 主流程已改用
+/// [`verify_transport`]；此函数保留供离线/诊断使用，勿再接入主流程。
 pub fn verify_chunk(expected: &[u8; 32], rows: &[(Vec<u8>, Vec<u8>)]) -> bool {
     let got = chunk_hash(rows);
     let ok = &got == expected;
@@ -434,7 +445,9 @@ mod tests {
     fn test_manifest_chunking_covers_all_rows() {
         let st = Storage::memory().unwrap();
         seed_nodes(&st, 1000);
-        let mf = build_node_manifest(&st, 256, 42, 1).unwrap();
+        let mf =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 256, 42, 1)
+                .unwrap();
         assert_eq!(mf.w0_seq, 42);
         assert_eq!(mf.total_rows, 1000);
         // 1000 / 256 = 3 满块 + 1 残块 = 4 块
@@ -472,7 +485,8 @@ mod tests {
     #[test]
     fn test_manifest_empty_db() {
         let st = Storage::memory().unwrap();
-        let mf = build_node_manifest(&st, 100, 0, 1).unwrap();
+        let mf = build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 100, 0, 1)
+            .unwrap();
         assert_eq!(mf.total_rows, 0);
         assert!(mf.chunks.is_empty());
     }

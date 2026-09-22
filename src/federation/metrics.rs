@@ -43,24 +43,12 @@ pub struct FederationMetrics {
     pub relay_channels_rejected: AtomicU64,
     /// 涓户閫氶亾鍏抽棴娆℃暟
     pub relay_channels_closed: AtomicU64,
-    /// Merkle 淇娆℃暟
-    pub merkle_repairs: AtomicU64,
     /// 绛惧悕楠岃瘉澶辫触娆℃暟
     pub signature_verification_failures: AtomicU64,
     /// 杩炴帴寤虹珛鎴愬姛娆℃暟
     pub connections_established: AtomicU64,
     /// 杩炴帴鏂紑娆℃暟
     pub connections_closed: AtomicU64,
-    /// P3-C: how many anti-entropy rounds actually executed
-    /// (TaskScheduler -> `GossipNetwork::anti_entropy_tick`).
-    /// Before this counter existed there was no way to prove the periodic
-    /// anti-entropy task was ever invoked.
-    pub anti_entropy_ticks: AtomicU64,
-    /// P3-C: how many MerkleDigest messages anti-entropy actually sent
-    /// (one per due repo per tick).
-    pub anti_entropy_digests_sent: AtomicU64,
-    /// P3-C: ticks that returned early because no peer connection existed.
-    pub anti_entropy_no_conn: AtomicU64,
 }
 
 impl FederationMetrics {
@@ -144,10 +132,6 @@ impl FederationMetrics {
         self.relay_channels_closed.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_merkle_repair(&self) {
-        self.merkle_repairs.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn record_signature_failure(&self) {
         self.signature_verification_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -159,19 +143,6 @@ impl FederationMetrics {
 
     pub fn record_connection_closed(&self) {
         self.connections_closed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_anti_entropy_tick(&self) {
-        self.anti_entropy_ticks.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_anti_entropy_digest(&self) {
-        self.anti_entropy_digests_sent
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_anti_entropy_no_conn(&self) {
-        self.anti_entropy_no_conn.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 鐢熸垚蹇収锛堝皢 AtomicU64 杞负鏅€氬瓧娈碉級
@@ -194,15 +165,11 @@ impl FederationMetrics {
             relay_channels_accepted: self.relay_channels_accepted.load(Ordering::Relaxed),
             relay_channels_rejected: self.relay_channels_rejected.load(Ordering::Relaxed),
             relay_channels_closed: self.relay_channels_closed.load(Ordering::Relaxed),
-            merkle_repairs: self.merkle_repairs.load(Ordering::Relaxed),
             signature_verification_failures: self
                 .signature_verification_failures
                 .load(Ordering::Relaxed),
             connections_established: self.connections_established.load(Ordering::Relaxed),
             connections_closed: self.connections_closed.load(Ordering::Relaxed),
-            anti_entropy_ticks: self.anti_entropy_ticks.load(Ordering::Relaxed),
-            anti_entropy_digests_sent: self.anti_entropy_digests_sent.load(Ordering::Relaxed),
-            anti_entropy_no_conn: self.anti_entropy_no_conn.load(Ordering::Relaxed),
         }
     }
 }
@@ -227,13 +194,9 @@ pub struct FederationMetricsSnapshot {
     pub relay_channels_accepted: u64,
     pub relay_channels_rejected: u64,
     pub relay_channels_closed: u64,
-    pub merkle_repairs: u64,
     pub signature_verification_failures: u64,
     pub connections_established: u64,
     pub connections_closed: u64,
-    pub anti_entropy_ticks: u64,
-    pub anti_entropy_digests_sent: u64,
-    pub anti_entropy_no_conn: u64,
 }
 
 #[cfg(test)]
@@ -265,7 +228,6 @@ mod tests {
         m.record_relay_channel_accepted();
         m.record_relay_channel_rejected();
         m.record_relay_channel_closed();
-        m.record_merkle_repair();
         m.record_signature_failure();
         m.record_connection_established();
         m.record_connection_closed();
@@ -280,7 +242,6 @@ mod tests {
         assert_eq!(s.relay_channels_accepted, 1);
         assert_eq!(s.relay_channels_rejected, 1);
         assert_eq!(s.relay_channels_closed, 1);
-        assert_eq!(s.merkle_repairs, 1);
         assert_eq!(s.signature_verification_failures, 1);
         assert_eq!(s.connections_established, 1);
         assert_eq!(s.connections_closed, 1);

@@ -702,6 +702,67 @@ impl Storage {
         Ok(n)
     }
 
+    /// P0-3：判断指定 tracker 是否存在软删墓碑（`deleted_at` 非 NULL）。
+    ///
+    /// 用于入站 upsert 的仲裁：本地已删除的 tracker 不得被对端回推的 upsert 复活，
+    /// 否则形成「A 删 → B 未删 → 反熵判差异 → B 回推 upsert → A 复活 → 反熵再判差异」
+    /// 的永动闭环，删除操作在联邦内结构性不可能收敛。
+    pub fn is_tracker_tombstoned(&self, url: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT 1 FROM trackers WHERE url = ?1 AND deleted_at IS NOT NULL LIMIT 1",
+            params![url],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    }
+
+    /// P0-3：入站 UPSERT 的安全写入 —— 命中本地墓碑时**保留墓碑**（不复活），
+    /// 否则与 [`Self::save_tracker`] 完全一致。
+    ///
+    /// 与直接改 `save_tracker` 的 upsert（`deleted_at=NULL`）区分开：本地主动重新发现
+    /// tracker 时仍走 `save_tracker` 正常复活，只有入站路径才受墓碑约束。
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_tracker_keep_tombstone(
+        &self,
+        url: &str,
+        score: f64,
+        total_requests: u64,
+        success_requests: u64,
+        failed_requests: u64,
+        total_peers_discovered: u64,
+        total_response_time_ms: f64,
+        consecutive_failures: u32,
+        disabled: bool,
+    ) -> anyhow::Result<()> {
+        self.record_write("trackers", 1);
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        let l2 = compute_l2_shard(url.as_bytes()) as i64;
+        conn.execute(
+            r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
+                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
+                l2_shard, updated_at, deleted_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+               ON CONFLICT(url) DO UPDATE SET
+                score=excluded.score, total_requests=excluded.total_requests,
+                success_requests=excluded.success_requests,
+                failed_requests=excluded.failed_requests,
+                total_peers_discovered=excluded.total_peers_discovered,
+                total_response_time_ms=excluded.total_response_time_ms,
+                consecutive_failures=excluded.consecutive_failures,
+                disabled=excluded.disabled, last_used=excluded.last_used,
+                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at"#,
+            params![
+                url, score, total_requests as i64, success_requests as i64,
+                failed_requests as i64, total_peers_discovered as i64,
+                total_response_time_ms, consecutive_failures as i64,
+                disabled as i64, now, l2, now
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 在已有连接上批量保存 trackers（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
     pub fn save_trackers_batch_in_tx(
         conn: &Connection,
@@ -1290,220 +1351,6 @@ impl Storage {
         .ok()
     }
 
-    // ---- 分层 Merkle 同步：按 L2 精确分片加载行 ----
-
-    /// 构建 `WHERE col IN (?1, ?2, ...)` 占位符 SQL 片段
-    fn in_placeholders(n: usize) -> String {
-        (1..=n)
-            .map(|i| format!("?{}", i))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    /// 按 **L2 二级分片**加载 DHT 节点行（id, ip, port），走 l2_shard 索引。
-    /// P1-5：分片列存真 L2（0..65535），传入 L2 值即可精确命中，避免整条 L1 加载的 256× 放大。
-    pub fn load_node_rows_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, String, u16)>> {
-        if shards.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let sql = format!(
-            "SELECT id, ip, port FROM dht_nodes WHERE l2_shard IN ({}) AND deleted_at IS NULL",
-            Self::in_placeholders(shards.len())
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(shards.iter().map(|&s| s as i64)),
-            |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let ip: String = row.get(1)?;
-                let port: i64 = row.get(2)?;
-                Ok((id, ip, port as u16))
-            },
-        )?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    /// 按 **L2 二级分片**加载 Peer 行（infohash, ip, port, source, last_active），走 l2_shard 索引。
-    pub fn load_peer_rows_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, String, u16, String, i64)>> {
-        if shards.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let sql = format!(
-            "SELECT infohash, ip, port, source, last_active FROM peers WHERE l2_shard IN ({}) AND deleted_at IS NULL",
-            Self::in_placeholders(shards.len())
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(shards.iter().map(|&s| s as i64)),
-            |row| {
-                let infohash: Vec<u8> = row.get(0)?;
-                let ip: String = row.get(1)?;
-                let port: i64 = row.get(2)?;
-                let source: String = row.get(3)?;
-                let last_active: i64 = row.get(4)?;
-                Ok((infohash, ip, port as u16, source, last_active))
-            },
-        )?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    /// 按 **L2 二级分片**加载 Infohash 行（infohash, last_seen, first_source），走 l2_shard 索引。
-    pub fn load_infohash_rows_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, i64, String)>> {
-        if shards.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let sql = format!(
-            "SELECT infohash, last_seen, first_source FROM infohashes WHERE l2_shard IN ({}) AND deleted_at IS NULL",
-            Self::in_placeholders(shards.len())
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(shards.iter().map(|&s| s as i64)),
-            |row| {
-                let infohash: Vec<u8> = row.get(0)?;
-                let last_seen: i64 = row.get(1)?;
-                let first_source: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
-                Ok((infohash, last_seen, first_source))
-            },
-        )?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    /// 按 **L2 二级分片**加载 Tracker 行（url, disabled, last_used），走 l2_shard 索引。
-    pub fn load_tracker_rows_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(String, bool, Option<i64>)>> {
-        if shards.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let sql = format!(
-            "SELECT url, disabled, last_used FROM trackers WHERE l2_shard IN ({}) AND deleted_at IS NULL",
-            Self::in_placeholders(shards.len())
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(shards.iter().map(|&s| s as i64)),
-            |row| {
-                let url: String = row.get(0)?;
-                let disabled: i64 = row.get(1)?;
-                let last_used: Option<i64> = row.get(2)?;
-                Ok((url, disabled != 0, last_used))
-            },
-        )?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    // ---- 分层 Merkle 同步：全量 (key, data_hash) 冷重算 ----
-
-    /// 加载全部节点的 (key, data_hash)，用于 Merkle 冷根重算。
-    /// key = "ip:port"，data_hash = blake3(id || ip || port_le)，与 build_node_sync_entry 一致。
-    pub fn load_all_node_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt =
-            conn.prepare("SELECT id, ip, port FROM dht_nodes WHERE deleted_at IS NULL")?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let ip: String = row.get(1)?;
-            let port: i64 = row.get(2)?;
-            Ok((id, ip, port))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let (id, ip, port) = r?;
-            let key = format!("{}:{}", ip, port).into_bytes();
-            let mut buf = Vec::with_capacity(id.len() + ip.len() + 2);
-            buf.extend_from_slice(&id);
-            buf.extend_from_slice(ip.as_bytes());
-            buf.extend_from_slice(&port.to_le_bytes());
-            let data_hash = blake3::hash(&buf).as_bytes().to_vec();
-            out.push((key, data_hash));
-        }
-        Ok(out)
-    }
-
-    /// 加载全部 Peer 的 (key, data_hash)，用于 Merkle 冷根重算。
-    /// key = "<hex_infohash>:<ip>:<port>"，data_hash = blake3(infohash || ip || port_le)。
-    pub fn load_all_peer_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt =
-            conn.prepare("SELECT infohash, ip, port FROM peers WHERE deleted_at IS NULL")?;
-        let rows = stmt.query_map([], |row| {
-            let ih: Vec<u8> = row.get(0)?;
-            let ip: String = row.get(1)?;
-            let port: i64 = row.get(2)?;
-            Ok((ih, ip, port))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let (ih, ip, port) = r?;
-            let mut arr = [0u8; 20];
-            if ih.len() == 20 {
-                arr.copy_from_slice(&ih);
-            }
-            let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-            let key = format!("{}:{}:{}", ih_hex, ip, port).into_bytes();
-            let mut buf = Vec::with_capacity(ih.len() + ip.len() + 2);
-            buf.extend_from_slice(&ih);
-            buf.extend_from_slice(ip.as_bytes());
-            buf.extend_from_slice(&port.to_le_bytes());
-            let data_hash = blake3::hash(&buf).as_bytes().to_vec();
-            out.push((key, data_hash));
-        }
-        Ok(out)
-    }
-
-    /// 加载全部 Infohash 的 (key, data_hash)，用于 Merkle 冷根重算。
-    /// key = infohash 原始字节，data_hash = blake3(infohash)。
-    pub fn load_all_infohash_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT infohash FROM infohashes WHERE deleted_at IS NULL")?;
-        let rows = stmt.query_map([], |row| {
-            let ih: Vec<u8> = row.get(0)?;
-            Ok(ih)
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let ih = r?;
-            let data_hash = blake3::hash(&ih).as_bytes().to_vec();
-            out.push((ih, data_hash));
-        }
-        Ok(out)
-    }
-
-    /// 加载全部 Tracker 的 (key, data_hash)，用于 Merkle 冷根重算。
-    /// key = url 字节，data_hash = blake3(url)。
-    pub fn load_all_tracker_keys_hashes(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT url FROM trackers WHERE deleted_at IS NULL")?;
-        let rows = stmt.query_map([], |row| {
-            let url: String = row.get(0)?;
-            Ok(url)
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let url = r?;
-            let data_hash = blake3::hash(url.as_bytes()).as_bytes().to_vec();
-            out.push((url.into_bytes(), data_hash));
-        }
-        Ok(out)
-    }
-
-    // ---- 按需单行加载 / 统计 ----
-
     /// 加载热/温 DHT 节点（最近活跃或高分），按评分降序 + LIMIT，供分层缓存启动加载。
     pub fn load_hot_warm_nodes(
         &self,
@@ -1727,28 +1574,9 @@ impl Storage {
         Ok(count as u64)
     }
 
-    /// 按 L2 二级分片加载节点 (key, data_hash)，用于 Merkle 增量重算。
-    pub fn load_node_keys_hashes_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let rows = self.load_node_rows_by_shards(shards)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, ip, port) in rows {
-            let key = format!("{}:{}", ip, port).into_bytes();
-            let mut buf = Vec::with_capacity(id.len() + ip.len() + 2);
-            buf.extend_from_slice(&id);
-            buf.extend_from_slice(ip.as_bytes());
-            buf.extend_from_slice(&port.to_le_bytes());
-            let data_hash = blake3::hash(&buf).as_bytes().to_vec();
-            out.push((key, data_hash));
-        }
-        Ok(out)
-    }
-
     /// P2-1：按 key（"ip:port" 字符串）升序加载 NODE 原始行 `(id, ip, port)`，范围 `[lo, hi)`，最多 `limit` 条。
     ///
-    /// 供 bootstrap 分块服务端组装完整 `SyncEntry`（需要 id/ip/port 构造 payload）使用；
+    /// 供 bootstrap 分块服务端与 range 修复通道组装完整 `SyncEntry` 使用；
     /// 排序/比较键与 [`Self::load_node_key_hashes_in_range`] 严格一致。
     pub fn load_node_rows_in_range(
         &self,
@@ -2206,152 +2034,225 @@ impl Storage {
         }
     }
 
-    /// 按 L2 二级分片加载 Peer (key, data_hash)，用于 Merkle 增量重算。
-    pub fn load_peer_keys_hashes_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let rows = self.load_peer_rows_by_shards(shards)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (ih, ip, port, _source, _last_active) in rows {
-            let mut arr = [0u8; 20];
-            if ih.len() == 20 {
-                arr.copy_from_slice(&ih);
-            }
-            let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-            let key = format!("{}:{}:{}", ih_hex, ip, port).into_bytes();
-            let mut buf = Vec::with_capacity(ih.len() + ip.len() + 2);
-            buf.extend_from_slice(&ih);
-            buf.extend_from_slice(ip.as_bytes());
-            buf.extend_from_slice(&port.to_le_bytes());
-            let data_hash = blake3::hash(&buf).as_bytes().to_vec();
-            out.push((key, data_hash));
-        }
-        Ok(out)
-    }
-
-    /// 按 L2 二级分片加载 Infohash (key, data_hash)，用于 Merkle 增量重算。
-    pub fn load_infohash_keys_hashes_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let rows = self.load_infohash_rows_by_shards(shards)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (ih, _last_seen, _first_source) in rows {
-            let data_hash = blake3::hash(&ih).as_bytes().to_vec();
-            out.push((ih, data_hash));
-        }
-        Ok(out)
-    }
-
-    /// 按 L2 二级分片加载 Tracker (key, data_hash)，用于 Merkle 增量重算。
-    pub fn load_tracker_keys_hashes_by_shards(
-        &self,
-        shards: &[u16],
-    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let rows = self.load_tracker_rows_by_shards(shards)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (url, _disabled, _last_used) in rows {
-            let data_hash = blake3::hash(url.as_bytes()).as_bytes().to_vec();
-            out.push((url.into_bytes(), data_hash));
-        }
-        Ok(out)
-    }
-
-    /// 一次性迁移/回填 `l2_shard` 列（P1-5）。
+    /// v8：按 repo 按 key 列表精确加载完整 `SyncEntry`（range 反熵修复通道用）。
     ///
-    /// 以 SQLite 内置 `PRAGMA user_version` 作为迁移标记：达到 [`SHARD_SCHEME_VERSION`] 即视为
-    /// 已是「真 L2」方案，直接返回（O(1) 元数据检查，不扫表）。否则**全表重算**四表的 `l2_shard`
-    /// 为真 L2 值并写回标记。
-    ///
-    /// 为什么必须全表重算而非只补 `l2_shard = 0`：旧库该列存的是 **L1**（0..255），与新方案（L2，
-    /// 0..65535）语义不同，只补 0 值会让两套语义混存，导致按 L2 查询漏行/错行。故本次一次性全表
-    /// 重算；此后所有写入路径都「写入即填」真 L2，不再需要任何回填。
-    /// 启动时调用一次，失败不阻断启动（下次启动会因标记未写入而重试）。
-    pub fn backfill_shards(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let uv: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
-        if uv >= SHARD_SCHEME_VERSION {
-            return Ok(());
-        }
-
-        let tx = conn.unchecked_transaction()?;
-        // dht_nodes: key = "ip:port"
-        {
-            let mut sel = tx.prepare("SELECT id, ip, port FROM dht_nodes")?;
-            let rows: Vec<(Vec<u8>, String, i64)> = sel
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(sel);
-            let mut upd =
-                tx.prepare("UPDATE dht_nodes SET l2_shard = ?1 WHERE ip = ?2 AND port = ?3")?;
-            for (_id, ip, port) in &rows {
-                let key = format!("{}:{}", ip, port);
-                let shard = compute_l2_shard(key.as_bytes()) as i64;
-                upd.execute(params![shard, ip, port])?;
-            }
-        }
-        // peers: key = "<hex_ih>:<ip>:<port>"
-        {
-            let mut sel = tx.prepare("SELECT infohash, ip, port FROM peers")?;
-            let rows: Vec<(Vec<u8>, String, i64)> = sel
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(sel);
-            let mut upd = tx.prepare(
-                "UPDATE peers SET l2_shard = ?1 WHERE infohash = ?2 AND ip = ?3 AND port = ?4",
-            )?;
-            for (ih, ip, port) in &rows {
-                let mut arr = [0u8; 20];
-                if ih.len() == 20 {
-                    arr.copy_from_slice(ih);
+    /// key 必须是 `load_repo_key_hashes_in_range` 产出的 DB 形态：
+    /// NODE `"ip:port"`（IPv6 无方括号）/ PEER `"hex(ih):ip:port"` / INFOHASH 20B 原文 / TRACKER url。
+    /// 查询走各表主键（dht_nodes (ip,port)、peers (infohash,ip,port)、infohashes/trackers 单列主键），
+    /// 按批绑定参数，防超 SQLite 变量上限。
+    pub fn load_repo_entries_by_keys(
+        &self,
+        repo: u8,
+        keys: &[Vec<u8>],
+    ) -> anyhow::Result<Vec<crate::federation::protocol::SyncEntry>> {
+        use crate::federation::protocol::{operation, SyncEntry};
+        const NODE: u8 = 1;
+        const PEER: u8 = 2;
+        const INFOHASH: u8 = 3;
+        const TRACKER: u8 = 4;
+        let to_entry = |t: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>| {
+            t.map(|(key, payload, _dh)| SyncEntry {
+                key,
+                operation: operation::UPSERT,
+                version: 0,
+                payload,
+            })
+        };
+        match repo {
+            NODE => {
+                let mut pairs: Vec<(String, i64)> = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let Ok(s) = std::str::from_utf8(k) else {
+                        continue;
+                    };
+                    // rsplit 取最后一个 ':'：IPv4 "1.2.3.4:6881" 与 IPv6 "::1:8080" 都正确
+                    let Some((ip, port_s)) = s.rsplit_once(':') else {
+                        continue;
+                    };
+                    let Ok(port) = port_s.parse::<i64>() else {
+                        continue;
+                    };
+                    pairs.push((ip.to_string(), port));
                 }
-                let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                let key = format!("{}:{}:{}", ih_hex, ip, port);
-                let shard = compute_l2_shard(key.as_bytes()) as i64;
-                upd.execute(params![shard, ih, ip, port])?;
+                pairs.sort();
+                pairs.dedup();
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut out = Vec::with_capacity(pairs.len());
+                for chunk in pairs.chunks(400) {
+                    let placeholders = chunk
+                        .iter()
+                        .map(|_| "(? , ?)")
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT id, ip, port FROM dht_nodes \
+                         WHERE deleted_at IS NULL AND (ip, port) IN ({placeholders})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
+                    for (ip, port) in chunk {
+                        bind.push(ip);
+                        bind.push(port);
+                    }
+                    let rows = stmt.query_map(bind.as_slice(), |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    for r in rows {
+                        let (id, ip, port) = r?;
+                        let mut arr = [0u8; 20];
+                        if id.len() == 20 {
+                            arr.copy_from_slice(&id);
+                        }
+                        if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                            if let Some(e) =
+                                to_entry(crate::federation::sync::build_node_sync_entry(arr, addr))
+                            {
+                                out.push(e);
+                            }
+                        }
+                    }
+                }
+                Ok(out)
             }
-        }
-        // infohashes: key = infohash 原始字节
-        {
-            let mut sel = tx.prepare("SELECT infohash FROM infohashes")?;
-            let rows: Vec<Vec<u8>> = sel
-                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(sel);
-            let mut upd = tx.prepare("UPDATE infohashes SET l2_shard = ?1 WHERE infohash = ?2")?;
-            for ih in &rows {
-                let shard = compute_l2_shard(ih) as i64;
-                upd.execute(params![shard, ih])?;
+            PEER => {
+                // key = "hex(ih):ip:port"：rsplit 两段得到 port 与 ip，剩余前缀为 ih 的 hex
+                let mut triples: Vec<(Vec<u8>, String, i64)> = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let Ok(s) = std::str::from_utf8(k) else {
+                        continue;
+                    };
+                    let Some((rest, port_s)) = s.rsplit_once(':') else {
+                        continue;
+                    };
+                    let Some((ih_hex, ip)) = rest.rsplit_once(':') else {
+                        continue;
+                    };
+                    let (Ok(port), Ok(ih)) = (port_s.parse::<i64>(), hex::decode(ih_hex)) else {
+                        continue;
+                    };
+                    if ih.len() != 20 {
+                        continue;
+                    }
+                    triples.push((ih, ip.to_string(), port));
+                }
+                triples.sort();
+                triples.dedup();
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut out = Vec::with_capacity(triples.len());
+                for chunk in triples.chunks(300) {
+                    let placeholders = chunk
+                        .iter()
+                        .map(|_| "(? , ? , ?)")
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT infohash, ip, port FROM peers \
+                         WHERE deleted_at IS NULL AND (infohash, ip, port) IN ({placeholders})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+                    for (ih, ip, port) in chunk {
+                        bind.push(ih);
+                        bind.push(ip);
+                        bind.push(port);
+                    }
+                    let rows = stmt.query_map(bind.as_slice(), |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    for r in rows {
+                        let (ih, ip, port) = r?;
+                        let mut arr = [0u8; 20];
+                        if ih.len() == 20 {
+                            arr.copy_from_slice(&ih);
+                        }
+                        if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                            if let Some(e) =
+                                to_entry(crate::federation::sync::peer_sync::build_peer_sync_entry(
+                                    arr, addr,
+                                ))
+                            {
+                                out.push(e);
+                            }
+                        }
+                    }
+                }
+                Ok(out)
             }
-        }
-        // trackers: key = url
-        {
-            let mut sel = tx.prepare("SELECT url FROM trackers")?;
-            let rows: Vec<String> = sel
-                .query_map([], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(sel);
-            let mut upd = tx.prepare("UPDATE trackers SET l2_shard = ?1 WHERE url = ?2")?;
-            for url in &rows {
-                let shard = compute_l2_shard(url.as_bytes()) as i64;
-                upd.execute(params![shard, url])?;
+            INFOHASH => {
+                let ih_keys: Vec<Vec<u8>> =
+                    keys.iter().filter(|k| k.len() == 20).cloned().collect();
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut out = Vec::with_capacity(ih_keys.len());
+                for chunk in ih_keys.chunks(900) {
+                    let placeholders = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT infohash FROM infohashes \
+                         WHERE deleted_at IS NULL AND infohash IN ({placeholders})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let bind: Vec<&dyn rusqlite::ToSql> =
+                        chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+                    let rows = stmt.query_map(bind.as_slice(), |row| row.get::<_, Vec<u8>>(0))?;
+                    for r in rows {
+                        let ih = r?;
+                        if ih.len() != 20 {
+                            continue;
+                        }
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(&ih);
+                        if let Some(e) = to_entry(
+                            crate::federation::sync::infohash_sync::build_infohash_sync_entry(arr),
+                        ) {
+                            out.push(e);
+                        }
+                    }
+                }
+                Ok(out)
             }
+            TRACKER => {
+                let mut urls: Vec<String> = keys
+                    .iter()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect();
+                urls.sort();
+                urls.dedup();
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut out = Vec::with_capacity(urls.len());
+                for chunk in urls.chunks(500) {
+                    let placeholders = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT url FROM trackers \
+                         WHERE deleted_at IS NULL AND url IN ({placeholders})"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let bind: Vec<&dyn rusqlite::ToSql> =
+                        chunk.iter().map(|u| u as &dyn rusqlite::ToSql).collect();
+                    let rows = stmt.query_map(bind.as_slice(), |row| row.get::<_, String>(0))?;
+                    for r in rows {
+                        let url = r?;
+                        if let Some(e) = to_entry(
+                            crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url),
+                        ) {
+                            out.push(e);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
         }
-        tx.commit()?;
-        // 迁移标记写入必须成功，否则下次启动会重复全表重算（幂等，无副作用）
-        conn.execute_batch(&format!("PRAGMA user_version = {}", SHARD_SCHEME_VERSION))?;
-        info!(
-            "[storage] l2_shard 迁移完成：4 表已重算为真 L2 分片（scheme v{}）",
-            SHARD_SCHEME_VERSION
-        );
-        Ok(())
     }
 
     /// 释放 SQLite 内部缓存内存（PRAGMA shrink_memory），内存压力大时调用。
@@ -2360,17 +2261,9 @@ impl Storage {
         let _ = conn.execute_batch("PRAGMA shrink_memory;");
     }
 }
-
-/// 计算 key 所属 L1 分片（0..255），与 `MerkleTree::shard_for_key` 一致。
-/// 取 blake3(key) 首字节（shard_count=256 时 bytes[0] 即 L1 = L2/256）。
-pub fn compute_shard(key: &[u8]) -> u16 {
-    blake3::hash(key).as_bytes()[0] as u16
-}
-
 /// 计算 key 所属 L2 二级分片（0..65535）。
-/// L2 = blake3(key)[0] * 256 + blake3(key)[1]，与 `MerkleTree::l2_shard_for_key` 在
-/// shard_count=256（生产固定值）时**完全一致**。L1 = L2 / 256 = blake3(key)[0]。
-///
+/// L2 = blake3(key)[0] * 256 + blake3(key)[1]，与各 repo 写入路径（`peer_shard_index` 等）
+/// 采用同一公式。
 /// P1-5：`dht_nodes/trackers/infohashes/peers` 四表的 `l2_shard` 列自 scheme v2 起**存真 L2 值**
 /// （此前存的是 L1，属历史遗留）；写入即填此值，查询按精确 L2 命中，从而消除「按 L2 取数却整条
 /// L1 加载」的 256× 放大（R3）。
@@ -2379,10 +2272,6 @@ pub fn compute_l2_shard(key: &[u8]) -> u32 {
     let b = h.as_bytes();
     (b[0] as u32) * 256 + (b[1] as u32)
 }
-
-/// 四表 `l2_shard` 列的分片方案版本。v2 = 存真 L2；v0/v1 = 历史 L1 方案。
-/// 以 SQLite 内置 `PRAGMA user_version` 作为一次性迁移标记。
-const SHARD_SCHEME_VERSION: i64 = 2;
 
 /// peers 表分片索引值（真 L2）。
 /// key = "<hex_ih>:<ip>:<port>"，与 `load_all_peer_keys_hashes` / Merkle 侧 peer key 约定一致。

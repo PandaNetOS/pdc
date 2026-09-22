@@ -55,6 +55,11 @@ const DEPENDENCY_RETRY_DELAY: Duration = Duration::from_secs(30);
 const CRITICAL_RESOURCE_DELAY: Duration = Duration::from_secs(15);
 const STRESSED_FULL_TASK_DELAY: Duration = Duration::from_secs(10);
 const CONCURRENCY_FULL_DELAY: Duration = Duration::from_secs(5);
+/// 分类并发「饥饿补偿」：同一任务连续被分类并发拒绝达到该次数后，允许超额准入。
+/// 6 次 × 5s = 30s，足以区分「暂满」与「结构性饿死」。
+const CONCURRENCY_STARVE_ROUNDS: u32 = 6;
+/// 饥饿补偿的**每分类**超额上限（硬并发 = max + 该值）。
+const CONCURRENCY_OVERSUBSCRIBE: u32 = 2;
 
 /// Watchdog 检测间隔（秒）：独立 OS 线程定期检查心跳
 const WATCHDOG_CHECK_INTERVAL_SECS: u64 = 30;
@@ -292,6 +297,15 @@ impl TaskMetadata {
         self
     }
 
+    /// 设置任务超时（默认 300s）。
+    ///
+    /// 长耗时任务（如 range 反熵全仓对账、bootstrap 清单构建）需要更长预算：
+    /// `tokio::time::timeout` 到点会直接掐死执行中的 future，任务反复重跑做重复功。
+    pub fn with_timeout(mut self, t: Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+
     /// 是否参与自适应间隔闭环。
     ///
     /// 保活任务（心跳/健康检查）与亚秒级任务（gossip flush 等）不参与，
@@ -521,6 +535,16 @@ pub struct SchedulerKnobs {
     pub adaptive_max_ratio: f32,
     /// 闭环重算自适应间隔的 tick 周期
     pub adaptive_recalc_ticks: u32,
+    /// 槽位泄漏强制回收总开关（**默认 true**）。
+    ///
+    /// 在飞任务超过「超时 × [`Self::stale_slot_factor`]」仍不返回时判定为槽位泄漏，
+    /// 强制回收该分类槽位。不回收的后果是分类并发槽被永久占满 ⇒ 该分类所有任务停摆
+    /// （2026-09-21 远端 51 事故：联邦 runtime 静默后 10 个在飞任务永久占槽，
+    /// Federation 分类封印至进程结束，日志刷了 5 万条）。
+    /// 仅在确认「泄漏判定有误报风险」时才建议关闭。
+    pub stale_slot_reclaim_enabled: bool,
+    /// 槽位泄漏判定系数：在飞时长 > 任务 `timeout` × 该系数 ⇒ 判定泄漏。
+    pub stale_slot_factor: f32,
 }
 
 impl Default for SchedulerKnobs {
@@ -542,6 +566,8 @@ impl Default for SchedulerKnobs {
             adaptive_min_ratio: 0.5,
             adaptive_max_ratio: 2.0,
             adaptive_recalc_ticks: 5,
+            stale_slot_reclaim_enabled: true,
+            stale_slot_factor: 1.5,
         }
     }
 }
@@ -570,6 +596,8 @@ impl SchedulerKnobs {
             adaptive_min_ratio: cfg.adaptive_min_ratio,
             adaptive_max_ratio: cfg.adaptive_max_ratio,
             adaptive_recalc_ticks: cfg.adaptive_recalc_ticks,
+            stale_slot_reclaim_enabled: cfg.stale_slot_reclaim_enabled,
+            stale_slot_factor: cfg.stale_slot_factor,
         }
     }
 }
@@ -600,9 +628,12 @@ mod knobs_from_config_tests {
         assert_eq!(k.adaptive_min_ratio, d.adaptive_min_ratio);
         assert_eq!(k.adaptive_max_ratio, d.adaptive_max_ratio);
         assert_eq!(k.adaptive_recalc_ticks, d.adaptive_recalc_ticks);
+        // 槽位泄漏回收是**修 bug** 项，默认必须开启（关掉等于放任分类被永久封印）
+        assert!(k.stale_slot_reclaim_enabled);
+        assert_eq!(k.stale_slot_factor, d.stale_slot_factor);
     }
 
-    /// 16 个字段逐个透传，不得有漏接或错位。
+    /// 18 个字段逐个透传，不得有漏接或错位。
     #[test]
     fn test_knobs_from_config_field_by_field() {
         let cfg = TaskSchedulerConfig {
@@ -622,6 +653,8 @@ mod knobs_from_config_tests {
             adaptive_min_ratio: 0.4,
             adaptive_max_ratio: 1.5,
             adaptive_recalc_ticks: 9,
+            stale_slot_reclaim_enabled: false,
+            stale_slot_factor: 2.25,
             ..Default::default()
         };
         let k = SchedulerKnobs::from_config(&cfg);
@@ -641,6 +674,8 @@ mod knobs_from_config_tests {
         assert_eq!(k.adaptive_min_ratio, 0.4);
         assert_eq!(k.adaptive_max_ratio, 1.5);
         assert_eq!(k.adaptive_recalc_ticks, 9);
+        assert!(!k.stale_slot_reclaim_enabled);
+        assert_eq!(k.stale_slot_factor, 2.25);
     }
 }
 
@@ -992,17 +1027,60 @@ impl Eq for ScheduledItem {}
 type TaskFn =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
-/// RAII 守卫：任务执行体退出（含 panic 展开）时释放分类并发槽位，保证每次执行只释放一次。
+/// 「在飞」任务快照：准入时登记，释放时移除。
+///
+/// 这张表是**分类并发槽的唯一释放凭据**：
+/// - 正常路径：执行体跑完 → [`CategorySlotGuard`] Drop → 摘除登记 + `running -= 1`；
+/// - 异常路径：执行体因 runtime 停摆 / 同步段占死 worker 而永不返回
+///   （`tokio::time::timeout` 只在 await 点取消，此时永不触发）→ 由
+///   [`TaskScheduler::reclaim_stale_slots`] 强制回收。
+///
+/// 二者通过 `token` 互斥：谁先摘除登记谁负责递减计数，保证一个槽位只释放一次。
+#[derive(Debug, Clone)]
+struct InFlightTask {
+    task_id: String,
+    name: String,
+    category: TaskCategory,
+    started_at: Instant,
+    timeout: Duration,
+}
+
+/// RAII 守卫：任务执行体退出（含 panic 展开）时释放分类并发槽位。
+///
+/// 带 `token` 是为了与「watchdog 强制回收」互斥：若登记已被回收方摘除
+/// （判定为泄漏槽位），此处不再递减，避免同一槽位被释放两次。
 struct CategorySlotGuard {
     scheduler: Arc<TaskScheduler>,
     category: TaskCategory,
+    token: u64,
 }
 
 impl Drop for CategorySlotGuard {
     fn drop(&mut self) {
+        let still_owner = self
+            .scheduler
+            .in_flight
+            .write()
+            .remove(&self.token)
+            .is_some();
+        if !still_owner {
+            // 已被强制回收（槽位泄漏）：不得重复递减
+            debug!(
+                "[task_scheduler] 槽位已被强制回收，跳过重复释放（token={}, {:?}）",
+                self.token, self.category
+            );
+            return;
+        }
+        self.scheduler
+            .released_total
+            .fetch_add(1, Ordering::Relaxed);
         let mut running = self.scheduler.running_by_category.write();
         if let Some(cnt) = running.get_mut(&self.category) {
             *cnt = cnt.saturating_sub(1);
+            debug!(
+                "[task_scheduler] 任务释放槽位（{:?} 剩 {}）",
+                self.category, *cnt
+            );
         }
     }
 }
@@ -1046,6 +1124,10 @@ pub struct TaskScheduler {
     load_sampler: Arc<dyn LoadSampler>,
     /// 每个任务当前已被准入控制延迟的 tick 数（防饥饿）
     admission_delays: RwLock<HashMap<String, u32>>,
+    /// 每个任务因「分类并发已满」被连续拒绝的轮数（防分类槽饿死，见
+    /// [`CONCURRENCY_STARVE_ROUNDS`]）。短任务被长 await 任务占满分类槽时会无限期
+    /// 排不到执行 —— 实测 bootstrap 续传 32 次被延迟 / 仅 3 次执行，82 块一块没传。
+    concurrency_starve: RwLock<HashMap<String, u32>>,
     /// S1-P2: EWMA 负载预测器（仅在 predictive_scheduling_enabled 时喂数/查询）
     load_predictor: RwLock<LoadPredictor>,
     /// S1-P2: 每个任务当前已被预测式调度推迟的 tick 数（防饥饿）
@@ -1058,6 +1140,17 @@ pub struct TaskScheduler {
     dirty_backlog: Arc<AtomicI64>,
     /// 六个 runtime 的 Handle（None 时退化为当前 runtime，保持向后兼容）
     runtime_handles: Option<RuntimeHandles>,
+    /// 「在飞」登记表：token → 在飞快照。准入时插入，释放/回收时摘除。
+    /// 是槽位释放的唯一凭据，也是「最老在飞任务年龄」的数据来源。
+    in_flight: RwLock<HashMap<u64, InFlightTask>>,
+    /// 在飞 token 自增器（每次准入取一个新 token）
+    in_flight_seq: AtomicU64,
+    /// 累计准入次数（对账：准入 − 释放 − 强制回收 = 当前在飞）
+    admitted_total: Arc<AtomicU64>,
+    /// 累计正常释放次数
+    released_total: Arc<AtomicU64>,
+    /// 累计被强制回收的泄漏槽位数（> 0 说明发生过槽位泄漏事故）
+    reclaimed_total: Arc<AtomicU64>,
 }
 
 impl TaskScheduler {
@@ -1094,6 +1187,7 @@ impl TaskScheduler {
             )),
             load_sampler,
             admission_delays: RwLock::new(HashMap::new()),
+            concurrency_starve: RwLock::new(HashMap::new()),
             load_predictor: RwLock::new(LoadPredictor::new(
                 SchedulerKnobs::default().predict_ewma_alpha,
                 SchedulerKnobs::default().predict_history_size,
@@ -1103,6 +1197,11 @@ impl TaskScheduler {
             external_io_backpressure: Arc::new(ParkingMutex::new(0.0)),
             dirty_backlog: Arc::new(AtomicI64::new(0)),
             runtime_handles: None,
+            in_flight: RwLock::new(HashMap::new()),
+            in_flight_seq: AtomicU64::new(0),
+            admitted_total: Arc::new(AtomicU64::new(0)),
+            released_total: Arc::new(AtomicU64::new(0)),
+            reclaimed_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1219,6 +1318,125 @@ impl TaskScheduler {
         self.max_concurrency.max_for(cat)
     }
 
+    /// 当前「在飞」任务数（= 已准入但执行体尚未返回）
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.read().len()
+    }
+
+    /// 累计被强制回收的泄漏槽位数；> 0 表示本进程发生过槽位泄漏
+    pub fn reclaimed_total(&self) -> u64 {
+        self.reclaimed_total.load(Ordering::Relaxed)
+    }
+
+    /// 最老的「在飞」任务：(任务名, 在飞秒数, 分类)。无在飞任务时为 None。
+    fn oldest_in_flight(&self) -> Option<(String, u64, TaskCategory)> {
+        let in_flight = self.in_flight.read();
+        in_flight
+            .values()
+            .max_by_key(|e| e.started_at.elapsed())
+            .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs(), e.category))
+    }
+
+    /// 六个分类的 `名称=running/max` 简报（供心跳/诊断；此前只打 4 类，
+    /// 恰好漏掉最容易出事的 federation / tracker）。
+    fn category_brief(&self) -> String {
+        let running = self.running_by_category.read();
+        let mut parts: Vec<String> = Vec::with_capacity(6);
+        for (cat, name) in [
+            (TaskCategory::Crawl, "crawl"),
+            (TaskCategory::Persistence, "persistence"),
+            (TaskCategory::Monitor, "monitor"),
+            (TaskCategory::Network, "network"),
+            (TaskCategory::Federation, "federation"),
+            (TaskCategory::Tracker, "tracker"),
+        ] {
+            parts.push(format!(
+                "{}={}/{}",
+                name,
+                running.get(&cat).unwrap_or(&0),
+                self.max_concurrency.max_for(cat)
+            ));
+        }
+        parts.join(", ")
+    }
+
+    /// 回收「超龄在飞」槽位，返回本次回收数量。
+    ///
+    /// 「超龄」= 在飞时长 > 该任务 `timeout` × `knobs.stale_slot_factor`（默认 1.5）。
+    /// 正常任务在 `timeout` 到点即被 `tokio::time::timeout` 取消并归还槽位；
+    /// 超过 1.5 倍仍不返回，意味着**取消机制本身失效**（worker 不再被 poll，
+    /// 或卡在同步阻塞段），此时执行体的 Drop 永远不会触发，槽位若不强制回收，
+    /// 该分类会被永久占满，`running < max + 超额` 判据恒假 ⇒ 分类永久封印。
+    ///
+    /// 与 [`CategorySlotGuard`] 通过 `in_flight` 登记互斥，保证一个槽位只释放一次。
+    ///
+    /// `cat = None` 表示巡检全部分类（watchdog 线程使用）。
+    pub fn reclaim_stale_slots(&self, cat: Option<TaskCategory>) -> u32 {
+        if !self.knobs.stale_slot_reclaim_enabled {
+            return 0;
+        }
+        let factor = self.knobs.stale_slot_factor.max(1.0) as f64;
+
+        // ① 只读扫描：避免持写锁做耗时判断
+        let stale: Vec<(u64, InFlightTask, f64)> = {
+            let in_flight = self.in_flight.read();
+            in_flight
+                .iter()
+                .filter(|(_, e)| cat.is_none_or(|c| e.category == c))
+                .filter_map(|(token, e)| {
+                    let age = e.started_at.elapsed().as_secs_f64();
+                    if age > e.timeout.as_secs_f64() * factor {
+                        Some((*token, e.clone(), age))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if stale.is_empty() {
+            return 0;
+        }
+
+        // ② 摘除登记（与 CategorySlotGuard::drop 竞争，谁摘到谁负责递减）
+        let mut reclaimed_by_cat: HashMap<TaskCategory, u32> = HashMap::new();
+        {
+            let mut in_flight = self.in_flight.write();
+            for (token, entry, age_secs) in &stale {
+                if in_flight.remove(token).is_none() {
+                    continue;
+                }
+                *reclaimed_by_cat.entry(entry.category).or_insert(0) += 1;
+                error!(
+                    "[task_scheduler] 槽位泄漏：任务 {}（id={}）已在飞 {:.0}s > 超时 {:.0}s×{:.1}，\
+                     强制回收槽位（{:?}）。执行体已不可能返回，不回收则该分类将被永久占满",
+                    entry.name,
+                    entry.task_id,
+                    age_secs,
+                    entry.timeout.as_secs_f64(),
+                    factor,
+                    entry.category
+                );
+            }
+        }
+
+        // ③ 递减分类计数
+        let mut total = 0u32;
+        {
+            let mut running = self.running_by_category.write();
+            for (c, n) in reclaimed_by_cat {
+                if let Some(cnt) = running.get_mut(&c) {
+                    *cnt = cnt.saturating_sub(n);
+                }
+                total += n;
+            }
+        }
+        if total > 0 {
+            self.reclaimed_total
+                .fetch_add(total as u64, Ordering::Relaxed);
+        }
+        total
+    }
+
     /// 注册任务
     pub fn register<F, Fut>(&self, metadata: TaskMetadata, task_fn: F)
     where
@@ -1306,6 +1524,8 @@ impl TaskScheduler {
         self.watchdog_running.store(true, Ordering::Relaxed);
         let watchdog_heartbeat = self.last_heartbeat.clone();
         let watchdog_running = self.watchdog_running.clone();
+        // P0: 槽位泄漏巡检需要访问调度器本体（in_flight 登记表 / 分类计数）
+        let watchdog_scheduler = self.clone();
         std::thread::Builder::new()
             .name("task-scheduler-watchdog".to_string())
             .spawn(move || {
@@ -1329,6 +1549,18 @@ impl TaskScheduler {
                                 WATCHDOG_HEARTBEAT_TIMEOUT_SECS, elapsed_secs
                             );
                         }
+                    }
+                    // P0: 槽位泄漏巡检 —— 运行在本独立 OS 线程上，不依赖任何 tokio runtime，
+                    // 因此即使所有 runtime 都被同步段占死，也能回收被永久占用的分类槽。
+                    // 这是「执行体永不返回 ⇒ 槽位永不释放」的唯一出路。
+                    let reclaimed = watchdog_scheduler.reclaim_stale_slots(None);
+                    if reclaimed > 0 {
+                        error!(
+                            "[task_scheduler] WATCHDOG: 本轮强制回收 {} 个泄漏槽位（累计 {}），在飞剩 {}",
+                            reclaimed,
+                            watchdog_scheduler.reclaimed_total(),
+                            watchdog_scheduler.in_flight_count()
+                        );
                     }
                 }
             })
@@ -1402,16 +1634,23 @@ impl TaskScheduler {
             }
             if heartbeat.elapsed() >= SCHEDULER_HEARTBEAT_INTERVAL {
                 let queue_len = self.queue.read().len();
-                let by_cat = self.running_by_category.read();
+                let brief = self.category_brief();
+                let in_flight = self.in_flight_count();
+                let oldest = match self.oldest_in_flight() {
+                    Some((name, secs, cat)) => format!("最老在飞={}({:?} {}s)", name, cat, secs),
+                    None => "最老在飞=-".to_string(),
+                };
+                // 对账不变式：累计准入 − 累计释放 − 强制回收 = 当前在飞
                 info!(
-                    "[task_scheduler] 调度器心跳: 队列待执行={}, 运行中[crawl={}, persistence={}, monitor={}, network={}]",
+                    "[task_scheduler] 调度器心跳: 队列待执行={}, 运行中[{}], 在飞={}（准入{} − 释放{} − 回收{}）, {}",
                     queue_len,
-                    by_cat.get(&TaskCategory::Crawl).unwrap_or(&0),
-                    by_cat.get(&TaskCategory::Persistence).unwrap_or(&0),
-                    by_cat.get(&TaskCategory::Monitor).unwrap_or(&0),
-                    by_cat.get(&TaskCategory::Network).unwrap_or(&0),
+                    brief,
+                    in_flight,
+                    self.admitted_total.load(Ordering::Relaxed),
+                    self.released_total.load(Ordering::Relaxed),
+                    self.reclaimed_total.load(Ordering::Relaxed),
+                    oldest,
                 );
-                drop(by_cat);
                 heartbeat = Instant::now();
                 // P1-3: 更新原子心跳时间戳，供独立 watchdog 线程检测
                 let now_ms = std::time::SystemTime::now()
@@ -1516,23 +1755,67 @@ impl TaskScheduler {
                 }
             }
 
-            // 分级并发控制：按任务分类限流
+            // 分级并发控制：按任务分类限流（含饥饿补偿 + 槽位泄漏逃生阀）
             {
                 let cat = meta.category;
                 let running = scheduler.running_count(cat);
                 let max = scheduler.max_concurrency_for(cat);
                 if running >= max {
-                    debug!(
-                        "[task_scheduler] 分类并发已满（{:?} {}/{}），延迟: {}",
-                        cat, running, max, meta.name
-                    );
-                    scheduler.schedule_task(
-                        &item.task_id,
-                        Instant::now() + CONCURRENCY_FULL_DELAY,
-                        item.priority,
-                    );
-                    continue;
+                    // 饥饿补偿：分类槽被长 await 任务长期占满时，短任务会无限期排不到执行。
+                    // 连续被拒 CONCURRENCY_STARVE_ROUNDS 轮后，允许在硬上限（max + 超额）内
+                    // 准入一次，避免「永远不执行」；超额幅度很小（+2），不会打爆资源。
+                    let rounds = {
+                        let mut m = scheduler.concurrency_starve.write();
+                        let n = m.entry(item.task_id.clone()).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    let oversubscribe = rounds >= CONCURRENCY_STARVE_ROUNDS
+                        && running < max + CONCURRENCY_OVERSUBSCRIBE;
+
+                    // P0 逃生阀（2026-09-21 远端 51 事故）：硬上限也顶满时，原判据
+                    // `running < max + OVER` 恒为假 ⇒ 分类被**永久封印**（实测联邦 runtime
+                    // 静默后 10 个在飞任务永久占槽，Federation 分类封印到进程结束，
+                    // 日志刷了 5 万条）。此处先尝试回收「超龄在飞」槽位：只要存在泄漏，
+                    // 无论 running 顶到多少都能解开，不再自锁。
+                    let reclaimed = if !oversubscribe && running >= max + CONCURRENCY_OVERSUBSCRIBE
+                    {
+                        scheduler.reclaim_stale_slots(Some(cat))
+                    } else {
+                        0
+                    };
+
+                    if !oversubscribe && reclaimed == 0 {
+                        // 无泄漏可回收 ⇒ 属于真过载，延迟重排。
+                        // 日志限流：前 CONCURRENCY_STARVE_ROUNDS 轮逐轮打，之后每 60 轮
+                        // 一次（5s × 60 = 5 分钟），避免像事故那样单点刷 5 万行日志。
+                        if rounds <= CONCURRENCY_STARVE_ROUNDS || rounds.is_multiple_of(60) {
+                            debug!(
+                                "[task_scheduler] 分类并发已满（{:?} {}/{}），延迟: {}（已连续 {} 轮）",
+                                cat, running, max, meta.name, rounds
+                            );
+                        }
+                        scheduler.schedule_task(
+                            &item.task_id,
+                            Instant::now() + CONCURRENCY_FULL_DELAY,
+                            item.priority,
+                        );
+                        continue;
+                    }
+                    if reclaimed > 0 {
+                        warn!(
+                            "[task_scheduler] 已强制回收 {} 个泄漏槽位（{:?} {}/{}），本次准入: {}（已连续延迟 {} 轮）",
+                            reclaimed, cat, running, max, meta.name, rounds
+                        );
+                    } else {
+                        warn!(
+                            "[task_scheduler] 分类并发饥饿补偿准入（{:?} {}/{}，已连续延迟 {} 轮）: {}",
+                            cat, running, max, rounds, meta.name
+                        );
+                    }
                 }
+                // 准入成功：清零饥饿计数
+                scheduler.concurrency_starve.write().remove(&item.task_id);
             }
 
             // 资源感知准入控制（默认关闭；关闭后 admission_decide 恒为 Allow，行为不变）
@@ -1710,16 +1993,39 @@ impl TaskScheduler {
         };
 
         let category = meta.category;
-        *scheduler
-            .running_by_category
-            .write()
-            .entry(category)
-            .or_insert(0) += 1;
+        // 登记「在飞」+ 占槽。登记表与计数必须同时变更；释放端见 CategorySlotGuard::drop。
+        let token = scheduler.in_flight_seq.fetch_add(1, Ordering::Relaxed);
+        scheduler.in_flight.write().insert(
+            token,
+            InFlightTask {
+                task_id: item.task_id.clone(),
+                name: meta.name.clone(),
+                category,
+                started_at: Instant::now(),
+                timeout: meta.timeout,
+            },
+        );
+        let running_now = {
+            let mut running = scheduler.running_by_category.write();
+            let cnt = running.entry(category).or_insert(0);
+            *cnt += 1;
+            *cnt
+        };
+        scheduler.admitted_total.fetch_add(1, Ordering::Relaxed);
+        // 准入埋点：此前只打 task_id，running 不可见 ⇒ 槽位爬升轨迹无法从日志还原
+        debug!(
+            "[task_scheduler] 任务准入: {}（{:?} {}/{}）",
+            meta.name,
+            category,
+            running_now,
+            scheduler.max_concurrency_for(category)
+        );
 
         // RAII 守卫：无论正常结束/超时/失败/panic，分类并发槽位只释放一次
         let slot_guard = CategorySlotGuard {
             scheduler: scheduler.clone(),
             category,
+            token,
         };
 
         let task_id = item.task_id.clone();
@@ -1921,7 +2227,46 @@ impl TaskScheduler {
             predictive_defer_total: self.predicted_defer_total.load(Ordering::Relaxed),
             external_io_backpressure: *self.external_io_backpressure.lock(),
             dirty_backlog: self.dirty_backlog.load(Ordering::Relaxed),
+            in_flight_tasks: self.in_flight_count(),
+            category_stats: self.category_stats(),
+            reclaimed_slots: self.reclaimed_total(),
         }
+    }
+
+    /// 六个分类的 `(名称, running, max, 最老在飞秒数)`，顺序固定，供监控/摘要使用。
+    pub fn category_stats(&self) -> Vec<(String, u32, u32, u64)> {
+        // 每个分类取该分类内最老的「在飞」任务年龄
+        let oldest_by_cat: HashMap<TaskCategory, u64> = {
+            let in_flight = self.in_flight.read();
+            let mut m: HashMap<TaskCategory, u64> = HashMap::new();
+            for e in in_flight.values() {
+                let age = e.started_at.elapsed().as_secs();
+                let slot = m.entry(e.category).or_insert(0);
+                if age > *slot {
+                    *slot = age;
+                }
+            }
+            m
+        };
+        let running = self.running_by_category.read();
+        [
+            (TaskCategory::Crawl, "crawl"),
+            (TaskCategory::Persistence, "persistence"),
+            (TaskCategory::Monitor, "monitor"),
+            (TaskCategory::Network, "network"),
+            (TaskCategory::Federation, "federation"),
+            (TaskCategory::Tracker, "tracker"),
+        ]
+        .into_iter()
+        .map(|(cat, name)| {
+            (
+                name.to_string(),
+                *running.get(&cat).unwrap_or(&0),
+                self.max_concurrency.max_for(cat),
+                *oldest_by_cat.get(&cat).unwrap_or(&0),
+            )
+        })
+        .collect()
     }
 
     /// 各分类当前运行任务数（按分类名聚合，供监控查询）
@@ -1991,6 +2336,12 @@ pub struct TaskSchedulerSummary {
     pub external_io_backpressure: f32,
     /// S1-P3: 当前 dirty 积压量
     pub dirty_backlog: i64,
+    /// 当前在飞任务数（已准入但执行体尚未返回）
+    pub in_flight_tasks: usize,
+    /// 各分类 `(名称, running, max, 最老在飞秒数)`，六个分类固定顺序
+    pub category_stats: Vec<(String, u32, u32, u64)>,
+    /// 累计被强制回收的泄漏槽位数（> 0 表示发生过槽位泄漏）
+    pub reclaimed_slots: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2458,5 +2809,268 @@ mod tests {
         // summary 中也能查到
         let sum = s.summary();
         assert!((sum.external_io_backpressure - 0.0).abs() < 1e-6);
+    }
+
+    // ---- P0: 槽位泄漏回收 / 在飞登记（2026-09-21 远端 51 事故回归守卫）----
+
+    /// 造一个「在飞已超龄」的登记项，模拟 runtime 停摆后永不返回的执行体。
+    fn insert_stale(s: &Arc<TaskScheduler>, token: u64, cat: TaskCategory, age: Duration) {
+        let now = Instant::now();
+        s.in_flight.write().insert(
+            token,
+            InFlightTask {
+                task_id: format!("t{token}"),
+                name: format!("任务{token}"),
+                category: cat,
+                // Instant 不能表示"过去"，只能从当前时刻往前退
+                started_at: now.checked_sub(age).unwrap_or(now),
+                timeout: Duration::from_secs(10),
+            },
+        );
+        *s.running_by_category.write().entry(cat).or_insert(0) += 1;
+    }
+
+    /// 超龄在飞槽位必须能被回收，且回收精确到分类、幂等。
+    #[test]
+    fn test_reclaim_stale_slots_releases_leaked_slot() {
+        let s = Arc::new(TaskScheduler::new());
+        // token=1：在飞 600s 远超 timeout(10s)×1.5
+        insert_stale(&s, 1, TaskCategory::Federation, Duration::from_secs(60));
+        // token=2：刚准入的「新鲜」在飞项，不得被误回收
+        s.in_flight.write().insert(
+            2,
+            InFlightTask {
+                task_id: "fresh".to_string(),
+                name: "新鲜任务".to_string(),
+                category: TaskCategory::Federation,
+                started_at: Instant::now(),
+                timeout: Duration::from_secs(300),
+            },
+        );
+        *s.running_by_category
+            .write()
+            .entry(TaskCategory::Federation)
+            .or_insert(0) += 1;
+
+        assert_eq!(s.running_count(TaskCategory::Federation), 2);
+        assert_eq!(s.reclaim_stale_slots(Some(TaskCategory::Federation)), 1);
+        assert_eq!(
+            s.running_count(TaskCategory::Federation),
+            1,
+            "只回收超龄那一个"
+        );
+        assert_eq!(s.in_flight_count(), 1);
+        assert_eq!(s.reclaimed_total(), 1);
+        // 幂等：再扫一次无可回收
+        assert_eq!(s.reclaim_stale_slots(Some(TaskCategory::Federation)), 0);
+    }
+
+    /// 分类级回收不得越界影响其它分类。
+    #[test]
+    fn test_reclaim_stale_slots_is_per_category() {
+        let s = Arc::new(TaskScheduler::new());
+        insert_stale(&s, 1, TaskCategory::Federation, Duration::from_secs(60));
+        insert_stale(&s, 2, TaskCategory::Crawl, Duration::from_secs(60));
+
+        assert_eq!(s.reclaim_stale_slots(Some(TaskCategory::Federation)), 1);
+        assert_eq!(s.running_count(TaskCategory::Crawl), 1, "其它分类不受影响");
+        assert_eq!(s.running_count(TaskCategory::Federation), 0);
+        assert_eq!(s.in_flight_count(), 1);
+        // 全分类巡检应把剩下那个也收掉
+        assert_eq!(s.reclaim_stale_slots(None), 1);
+        assert_eq!(s.in_flight_count(), 0);
+    }
+
+    /// 开关关闭时不得回收（保留人工关闭的逃生口）。
+    #[test]
+    fn test_reclaim_respects_disabled_knob() {
+        let s = Arc::new(TaskScheduler::new().with_knobs(SchedulerKnobs {
+            stale_slot_reclaim_enabled: false,
+            ..Default::default()
+        }));
+        insert_stale(&s, 1, TaskCategory::Federation, Duration::from_secs(60));
+        assert_eq!(s.reclaim_stale_slots(None), 0);
+        assert_eq!(s.running_count(TaskCategory::Federation), 1);
+        assert_eq!(s.in_flight_count(), 1);
+    }
+
+    /// 关键回归：回收后执行体的 Drop **不得**重复递减同一槽位。
+    #[tokio::test]
+    async fn test_slot_guard_does_not_double_release_after_reclaim() {
+        let s = Arc::new(TaskScheduler::new());
+        insert_stale(&s, 7, TaskCategory::Federation, Duration::from_secs(60));
+        assert_eq!(s.running_count(TaskCategory::Federation), 1);
+
+        // watchdog 先判定泄漏并回收
+        assert_eq!(s.reclaim_stale_slots(Some(TaskCategory::Federation)), 1);
+        assert_eq!(s.running_count(TaskCategory::Federation), 0);
+
+        // 执行体随后（现实中不会发生）Drop：token 已不在登记表 ⇒ 不再是槽位主人
+        {
+            let _g = CategorySlotGuard {
+                scheduler: s.clone(),
+                category: TaskCategory::Federation,
+                token: 7,
+            };
+        }
+        assert_eq!(
+            s.running_count(TaskCategory::Federation),
+            0,
+            "回收后不得重复递减（否则计数会负向漂移、放大并发）"
+        );
+        assert_eq!(s.reclaimed_total(), 1);
+    }
+
+    /// 正常路径对账：任务跑完 ⇒ 在飞登记清空、槽位归还。
+    #[tokio::test]
+    async fn test_in_flight_registry_balances_after_normal_run() {
+        let s = Arc::new(
+            TaskScheduler::new().with_category_concurrency(CategoryConcurrency {
+                crawl: 1,
+                persistence: 1,
+                monitor: 1,
+                network: 1,
+                federation: 1,
+                tracker: 1,
+            }),
+        );
+        let hits = Arc::new(AtomicU64::new(0));
+        let h = hits.clone();
+        s.register(
+            TaskMetadata::new("burst", "对账压测任务", Duration::from_secs(30))
+                .with_initial_delay(Duration::from_millis(10))
+                .with_jitter(Duration::from_secs(0))
+                .with_category(TaskCategory::Federation),
+            move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            },
+        );
+
+        s.start();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        s.stop();
+        // 给主循环一个 tick 收尾
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(hits.load(Ordering::Relaxed) >= 1, "任务至少执行一次");
+        assert_eq!(s.in_flight_count(), 0, "正常任务跑完必须清空在飞登记");
+        assert_eq!(s.running_count(TaskCategory::Federation), 0, "槽位必须归还");
+        assert_eq!(s.reclaimed_total(), 0, "正常路径不应触发任何回收");
+        // 分类摘要必须覆盖全部 6 类，且 federation 在列（此前心跳漏掉它）
+        let cats = s.category_stats();
+        assert_eq!(cats.len(), 6);
+        assert!(cats.iter().any(|(n, ..)| n == "federation"));
+        assert!(cats.iter().any(|(n, ..)| n == "tracker"));
+    }
+
+    /// 造一个「刚准入」的在飞登记项（用于验证不误回收）。
+    fn insert_fresh(s: &Arc<TaskScheduler>, token: u64, cat: TaskCategory) {
+        s.in_flight.write().insert(
+            token,
+            InFlightTask {
+                task_id: format!("fresh{token}"),
+                name: format!("新鲜任务{token}"),
+                category: cat,
+                started_at: Instant::now(),
+                timeout: Duration::from_secs(10),
+            },
+        );
+        *s.running_by_category.write().entry(cat).or_insert(0) += 1;
+    }
+
+    /// 【核心回归】复现 2026-09-21 远端 51 的"永久封印"：
+    /// `running` 顶到 `max + 超额` 且存在超龄在飞槽位时，准入必须能被解开；
+    /// 若只是"真过载"（在飞都是新鲜的），则照旧延迟，不误杀。
+    #[tokio::test]
+    async fn test_admission_escape_valve_breaks_permanent_seal() {
+        // ---- 场景 A：槽位泄漏 ⇒ 必须能准入 ----
+        let s = Arc::new(
+            TaskScheduler::new().with_category_concurrency(CategoryConcurrency {
+                crawl: 1,
+                persistence: 1,
+                monitor: 1,
+                network: 1,
+                federation: 1, // max = 1，硬上限 = max + 超额 2 = 3
+                tracker: 1,
+            }),
+        );
+        let hits = Arc::new(AtomicU64::new(0));
+        let h = hits.clone();
+        s.register(
+            TaskMetadata::new("victim", "受害者任务", Duration::from_secs(10))
+                .with_jitter(Duration::from_secs(0))
+                .non_deferrable()
+                .with_category(TaskCategory::Federation),
+            move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            },
+        );
+        // 3 个超龄在飞（= max + 超额），模拟 runtime 静默后永不返回的联邦任务
+        for token in 1..=3 {
+            insert_stale(&s, token, TaskCategory::Federation, Duration::from_secs(60));
+        }
+        assert_eq!(s.running_count(TaskCategory::Federation), 3);
+
+        s.schedule_task("victim", Instant::now(), TaskPriority::Normal);
+        TaskScheduler::process_queue(s.clone()).await;
+
+        assert_eq!(
+            s.reclaimed_total(),
+            3,
+            "顶到硬上限时必须触发泄漏回收，否则判据恒假、分类永久封印"
+        );
+        assert_eq!(
+            s.in_flight_count(),
+            1,
+            "回收 3 个后应只剩本次准入的 1 个在飞"
+        );
+        assert_eq!(
+            s.running_count(TaskCategory::Federation),
+            1,
+            "3 收回 + 1 准入 = 1"
+        );
+        assert_eq!(
+            s.queue.read().len(),
+            0,
+            "被解开后任务应当被准入，而不是重新排队"
+        );
+        s.stop();
+
+        // ---- 场景 B：真过载（在飞都新鲜）⇒ 继续延迟，不得误杀 ----
+        let s2 = Arc::new(
+            TaskScheduler::new().with_category_concurrency(CategoryConcurrency {
+                crawl: 1,
+                persistence: 1,
+                monitor: 1,
+                network: 1,
+                federation: 1,
+                tracker: 1,
+            }),
+        );
+        s2.register(
+            TaskMetadata::new("victim2", "受害者任务2", Duration::from_secs(10))
+                .with_jitter(Duration::from_secs(0))
+                .non_deferrable()
+                .with_category(TaskCategory::Federation),
+            || async { Ok(()) },
+        );
+        for token in 1..=3 {
+            insert_fresh(&s2, token, TaskCategory::Federation);
+        }
+        s2.schedule_task("victim2", Instant::now(), TaskPriority::Normal);
+        TaskScheduler::process_queue(s2.clone()).await;
+
+        assert_eq!(s2.reclaimed_total(), 0, "新鲜在飞不得被误判为泄漏");
+        assert_eq!(s2.in_flight_count(), 3, "真过载时不应凭空放行");
+        assert_eq!(s2.queue.read().len(), 1, "应当被延迟重排，等待下一轮");
+        s2.stop();
     }
 }

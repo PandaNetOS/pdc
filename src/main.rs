@@ -24,7 +24,7 @@ const OPLOG_LEN_PREWARM_DELAY_SECS: u64 = 5;
 
 use parking_lot::RwLock;
 use rand::Rng;
-use rustc_hash::{FxHashMap, FxHashSet};
+
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -100,39 +100,6 @@ impl WorkDir {
         self.root.join("data").join("node_id")
     }
 }
-
-/// P1-5：把「受影响 L2 列表 + 从 DB 精确加载到的 (key, data_hash)」整理成
-/// `MerkleTree::recompute_l2_subset_from_db` 所需的入参：
-/// - `by_l1`：L1 → 该 L1 下本次加载到的条目（仅含受影响的 L2 的条目即可）；
-/// - `dirty_in_l1`：L1 → 该 L1 下需要重算的 L2 子集。
-///
-/// 对被删除后变空的 L2（加载不到条目），`recompute_l2_subset_from_db` 会写回 `[0u8;32], 0`
-/// 的「缺席」表示，从而让删除正确折进 Merkle。
-type L1EntryMap = FxHashMap<u16, Vec<(Vec<u8>, Vec<u8>)>>;
-type L1ShardSet = FxHashMap<u16, FxHashSet<u32>>;
-
-fn build_l2_recompute_input(
-    merkle: &PeerDiscoveryCenter::federation::merkle::MerkleTree,
-    l2s: &[u32],
-    keys_hashes: Vec<(Vec<u8>, Vec<u8>)>,
-) -> (L1EntryMap, L1ShardSet) {
-    let mut dirty_in_l1: L1ShardSet = FxHashMap::default();
-    for &l2 in l2s {
-        dirty_in_l1
-            .entry(PeerDiscoveryCenter::federation::merkle::MerkleTree::l1_for_l2(l2))
-            .or_default()
-            .insert(l2);
-    }
-    let mut by_l1: L1EntryMap = FxHashMap::default();
-    for (k, h) in keys_hashes {
-        let l1 = PeerDiscoveryCenter::federation::merkle::MerkleTree::l1_for_l2(
-            merkle.l2_shard_for_key(&k),
-        );
-        by_l1.entry(l1).or_default().push((k, h));
-    }
-    (by_l1, dirty_in_l1)
-}
-
 fn main() -> anyhow::Result<()> {
     // 0. 初始化统一工作目录（pnos-spec WorkDir）
     //    --work-dir 参数 → Standalone 模式；PNOS_APP_ID 环境变量 → Managed 模式；否则 Standalone(当前目录)
@@ -373,11 +340,6 @@ async fn async_main(
         info!("[main] 持久化存储未启用，使用内存模式");
         Arc::new(PeerDiscoveryCenter::storage::Storage::memory().expect("无法创建内存数据库"))
     };
-
-    // 3.5b shard 列一次性回填（旧库历史数据 shard=0 需修正为正确的 blake3(key)%256）
-    if let Err(e) = storage.backfill_shards() {
-        warn!("[main] shard 列回填失败（不影响启动）: {}", e);
-    }
 
     // 3.6 创建所有数据层 Repo（统一数据归口）
     // P2: 先创建 WriteQueue/IOScheduler，再注入到各 Repo
@@ -677,22 +639,15 @@ async fn async_main(
         }
     }
 
-    // 6.8.1 注入联邦引用到各 Repo：本地写入后统一更新 Merkle + 提交 Gossip
-    // （FederationService 已创建，Merkl/Gossip 句柄此时可用；联邦未启用时跳过）
+    // 6.8.1 注入联邦 Gossip 引用到各 Repo：本地写入后提交 Gossip + oplog
+    // （FederationService 已创建，Gossip 句柄此时可用；联邦未启用时跳过）
     if let Some(ref fed) = federation_service {
-        let sm = &fed.sync_manager;
         let gossip = fed.gossip_engine.clone();
-        if let Some(merkle) = sm.peer_merkle() {
-            peer_repo.set_federation_refs(merkle, gossip.clone());
-        }
-        if let Some(merkle) = sm.infohash_merkle() {
-            infohash_repo.set_federation_refs(merkle, gossip.clone());
-        }
-        if let Some(merkle) = sm.tracker_merkle() {
-            tracker_repo.set_federation_refs(merkle, gossip.clone());
-        }
-        node_repo.set_federation_refs(sm.node_merkle(), gossip);
-        info!("[main] 联邦引用已注入各 Repo（本地写入 -> Merkle + Gossip）");
+        peer_repo.set_federation_refs(gossip.clone());
+        infohash_repo.set_federation_refs(gossip.clone());
+        tracker_repo.set_federation_refs(gossip.clone());
+        node_repo.set_federation_refs(gossip);
+        info!("[main] 联邦 Gossip 引用已注入各 Repo（本地写入 -> Gossip + oplog）");
     }
 
     // 6.9 提取全量同步暂停门（联邦启用时），供非核心模块在全量同步期间暂停主动工作
@@ -1880,7 +1835,7 @@ async fn async_main(
         );
     }
 
-    // 8.8 联邦任务注册（4个：心跳/节点同步/DHT发现/Merkle反熵）
+    // 8.8 联邦任务注册（心跳/节点同步/DHT发现等）
     if let Some(ref fed) = federation_service {
         // fed_heartbeat
         let cm = fed.sessions.clone();
@@ -1986,54 +1941,6 @@ async fn async_main(
             );
         }
 
-        // fed_merkle_anti_entropy
-        // P2-5：tick 周期取各 repo 周期的较小值（默认 NODE 30s / 其余 300s），
-        // 具体 repo 是否本轮对账由 SyncManager::anti_entropy_due 按 repo 差异化控制。
-        let g = fed.gossip_engine.clone();
-        let s = fed.sync_manager.clone();
-        let ae_tick_secs = config
-            .federation
-            .anti_entropy_node_interval_secs
-            .min(config.federation.anti_entropy_other_interval_secs);
-        task_scheduler.register(
-            TaskMetadata::new(
-                "fed_merkle_anti_entropy",
-                "联邦Merkle反熵",
-                std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "fed_merkle_anti_entropy",
-                    ae_tick_secs,
-                )),
-            )
-            .with_category(TaskCategory::Federation)
-            .with_priority(TaskPriority::Normal)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Medium,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Low,
-                network: ResourceLevel::Low,
-                is_full_task: false,
-            })
-            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "fed_merkle_anti_entropy_initial_delay",
-                45,
-            )))
-            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "fed_merkle_anti_entropy_jitter",
-                10,
-            ))),
-            move || {
-                let g = g.clone();
-                let s = s.clone();
-                async move {
-                    g.anti_entropy_tick(s).await;
-                    Ok(())
-                }
-            },
-        );
-
         // fed_delta_sync: F1 修复 —— delta 通道的周期驱动
         // 默认 delta_sync_enabled=false 时为空转（no-op）；开启后按 delta_sync_interval_secs
         // 周期向每个已连接对端追问新 op，否则 delta 只在建连时拉一次、之后完全停摆。
@@ -2092,6 +1999,15 @@ async fn async_main(
             )
             .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
+            // F8a 已回滚：实测该任务 avg 127.94s / max 253.61s，并非被 300s 掐死。
+            // 放宽到 900s 只是让它「合法」占住 Federation 分类槽更久，反而放大了
+            // 槽饥饿（诊断：Federation 8/8 槽满 493 次/窗口，bootstrap 续传 32 次
+            // 被延迟 / 仅 3 次执行）。v8 下 range 是唯一兜底通道，占槽时长必须克制。
+            .with_timeout(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_range_reconcile_timeout",
+                300,
+            )))
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
                 memory: ResourceLevel::Low,
@@ -2218,41 +2134,6 @@ async fn async_main(
                 let r = rm.clone();
                 async move {
                     r.cleanup_expired();
-                    Ok(())
-                }
-            },
-        );
-
-        // fed_diff_sync_watcher: 差量同步超时监控（30s）
-        let sm_watch = fed.sync_manager.clone();
-        task_scheduler.register(
-            TaskMetadata::new(
-                "fed_diff_sync_watcher",
-                "联邦差量同步超时监控",
-                std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "fed_diff_sync_watcher",
-                    30,
-                )),
-            )
-            .with_category(TaskCategory::Federation)
-            .with_priority(TaskPriority::Background)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Low,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Low,
-                network: ResourceLevel::Low,
-                is_full_task: false,
-            })
-            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "fed_diff_sync_watcher_initial_delay",
-                60,
-            ))),
-            move || {
-                let sm = sm_watch.clone();
-                async move {
-                    sm.check_diff_sync_timeouts();
                     Ok(())
                 }
             },
@@ -2494,443 +2375,6 @@ async fn async_main(
                 }
             },
         );
-
-        // fed_merkle_flush: Merkle异步批量flush（1000ms）
-        let sm_flush = fed.sync_manager.clone();
-        task_scheduler.register(
-            TaskMetadata::new(
-                "fed_merkle_flush",
-                "联邦Merkle批量flush",
-                std::time::Duration::from_millis(get_interval_secs(
-                    intervals,
-                    "fed_merkle_flush",
-                    1000,
-                )),
-            )
-            .with_category(TaskCategory::Federation)
-            .with_priority(TaskPriority::Normal)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Low,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Medium,
-                network: ResourceLevel::Low,
-                is_full_task: false,
-            })
-            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "fed_merkle_flush_initial_delay",
-                10,
-            ))),
-            move || {
-                let sm = sm_flush.clone();
-                async move {
-                    sm.merkle_flush_tick();
-                    Ok(())
-                }
-            },
-        );
-
-        // 8.8.4 Merkle 重算任务（4 个 repo 独立，Persistence 分类并发=1 串行执行，避免 DB 竞争）
-        // P1-5：常态维护已下沉到「增量任务」（按 dirty L2 精确重算，10s 一次）；
-        // 全量冷重算降级为**低频兜底**（默认 3600s = 1h），不再每 300s 全表重算
-        // （亿级规模下 300s 全表重算不可行，且与增量维护重复）。
-        let cold_rebuild_interval = config.federation.merkle_cold_rebuild_interval_secs;
-        let incremental_interval = config.federation.merkle_incremental_update_interval_secs;
-        info!(
-            "[main] 注册 Merkle 冷重算任务（4 repo，兜底间隔 {}s）+ 增量更新任务（{}s，按 L2 精确重算）",
-            cold_rebuild_interval, incremental_interval
-        );
-
-        // === Merkle 增量更新任务（10s，取出 dirty 分片从 DB 重算） ===
-
-        // Node 增量更新
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_incremental_node",
-                    "Merkle增量更新-Node",
-                    std::time::Duration::from_secs(incremental_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Low,
-                    memory: ResourceLevel::Low,
-                    io: ResourceLevel::Medium,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
-                .with_initial_delay(std::time::Duration::from_secs(15)),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        let merkle = sm.node_merkle();
-                        let dirty = merkle.take_dirty_l2_shards();
-                        if dirty.is_empty() {
-                            return Ok(());
-                        }
-                        // P1-5：按真 L2 精确加载受影响的 L2（DB 分片列已存 L2），
-                        // 用批量 recompute_l2_subset_from_db 一次锁内完成，替代旧的「L1 粒度 + 整 L1 重算」。
-                        let l2s: Vec<u32> = dirty.into_iter().collect();
-                        let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
-                        match st.load_node_keys_hashes_by_shards(&shards) {
-                            Ok(keys_hashes) => {
-                                let (by_l1, dirty_in_l1) =
-                                    build_l2_recompute_input(&merkle, &l2s, keys_hashes);
-                                merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
-                            }
-                            Err(e) => {
-                                warn!("[merkle_incremental] Node 失败: {}", e);
-                                for &l2 in &l2s {
-                                    merkle.mark_dirty_l2(l2);
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Peer 增量更新
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_incremental_peer",
-                    "Merkle增量更新-Peer",
-                    std::time::Duration::from_secs(incremental_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Low,
-                    memory: ResourceLevel::Low,
-                    io: ResourceLevel::Medium,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
-                .with_initial_delay(std::time::Duration::from_secs(20)),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        if let Some(merkle) = sm.peer_merkle() {
-                            let dirty = merkle.take_dirty_l2_shards();
-                            if dirty.is_empty() {
-                                return Ok(());
-                            }
-                            let l2s: Vec<u32> = dirty.into_iter().collect();
-                            let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
-                            match st.load_peer_keys_hashes_by_shards(&shards) {
-                                Ok(keys_hashes) => {
-                                    let (by_l1, dirty_in_l1) =
-                                        build_l2_recompute_input(&merkle, &l2s, keys_hashes);
-                                    merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
-                                }
-                                Err(e) => {
-                                    warn!("[merkle_incremental] Peer 失败: {}", e);
-                                    for &l2 in &l2s {
-                                        merkle.mark_dirty_l2(l2);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Infohash 增量更新
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_incremental_infohash",
-                    "Merkle增量更新-Infohash",
-                    std::time::Duration::from_secs(incremental_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Low,
-                    memory: ResourceLevel::Low,
-                    io: ResourceLevel::Medium,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
-                .with_initial_delay(std::time::Duration::from_secs(25)),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        if let Some(merkle) = sm.infohash_merkle() {
-                            let dirty = merkle.take_dirty_l2_shards();
-                            if dirty.is_empty() {
-                                return Ok(());
-                            }
-                            let l2s: Vec<u32> = dirty.into_iter().collect();
-                            let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
-                            match st.load_infohash_keys_hashes_by_shards(&shards) {
-                                Ok(keys_hashes) => {
-                                    let (by_l1, dirty_in_l1) =
-                                        build_l2_recompute_input(&merkle, &l2s, keys_hashes);
-                                    merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
-                                }
-                                Err(e) => {
-                                    warn!("[merkle_incremental] Infohash 失败: {}", e);
-                                    for &l2 in &l2s {
-                                        merkle.mark_dirty_l2(l2);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Tracker 增量更新
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_incremental_tracker",
-                    "Merkle增量更新-Tracker",
-                    std::time::Duration::from_secs(incremental_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Low,
-                    memory: ResourceLevel::Low,
-                    io: ResourceLevel::Medium,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                // [ALLOWED-HARDCODED: TaskScheduler 任务首次启动延迟，一次性启动装配参数，不影响运行时行为]
-                .with_initial_delay(std::time::Duration::from_secs(30)),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        if let Some(merkle) = sm.tracker_merkle() {
-                            let dirty = merkle.take_dirty_l2_shards();
-                            if dirty.is_empty() {
-                                return Ok(());
-                            }
-                            let l2s: Vec<u32> = dirty.into_iter().collect();
-                            let shards: Vec<u16> = l2s.iter().map(|&l| l as u16).collect();
-                            match st.load_tracker_keys_hashes_by_shards(&shards) {
-                                Ok(keys_hashes) => {
-                                    let (by_l1, dirty_in_l1) =
-                                        build_l2_recompute_input(&merkle, &l2s, keys_hashes);
-                                    merkle.recompute_l2_subset_from_db(&by_l1, &dirty_in_l1);
-                                }
-                                Err(e) => {
-                                    warn!("[merkle_incremental] Tracker 失败: {}", e);
-                                    for &l2 in &l2s {
-                                        merkle.mark_dirty_l2(l2);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Node 冷重算
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_cold_rebuild_node",
-                    "Merkle冷数据重算-Node",
-                    std::time::Duration::from_secs(cold_rebuild_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Medium,
-                    memory: ResourceLevel::Medium,
-                    io: ResourceLevel::High,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "merkle_cold_rebuild_node_initial_delay",
-                    60,
-                ))),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        match st.load_all_node_keys_hashes() {
-                            Ok(keys_hashes) => {
-                                let count = keys_hashes.len();
-                                sm.node_merkle().rebuild_cold_from_db(&keys_hashes);
-                                info!("[merkle_cold_rebuild] Node: {} 条，冷根已重算", count);
-                            }
-                            Err(e) => warn!("[merkle_cold_rebuild] Node 失败: {}", e),
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Peer 冷重算
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_cold_rebuild_peer",
-                    "Merkle冷数据重算-Peer",
-                    std::time::Duration::from_secs(cold_rebuild_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Medium,
-                    memory: ResourceLevel::Medium,
-                    io: ResourceLevel::High,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "merkle_cold_rebuild_peer_initial_delay",
-                    75,
-                ))),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        if let Some(merkle) = sm.peer_merkle() {
-                            match st.load_all_peer_keys_hashes() {
-                                Ok(keys_hashes) => {
-                                    let count = keys_hashes.len();
-                                    merkle.rebuild_cold_from_db(&keys_hashes);
-                                    info!("[merkle_cold_rebuild] Peer: {} 条，冷根已重算", count);
-                                }
-                                Err(e) => warn!("[merkle_cold_rebuild] Peer 失败: {}", e),
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Infohash 冷重算
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_cold_rebuild_infohash",
-                    "Merkle冷数据重算-Infohash",
-                    std::time::Duration::from_secs(cold_rebuild_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Medium,
-                    memory: ResourceLevel::Medium,
-                    io: ResourceLevel::High,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "merkle_cold_rebuild_infohash_initial_delay",
-                    90,
-                ))),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        if let Some(merkle) = sm.infohash_merkle() {
-                            match st.load_all_infohash_keys_hashes() {
-                                Ok(keys_hashes) => {
-                                    let count = keys_hashes.len();
-                                    merkle.rebuild_cold_from_db(&keys_hashes);
-                                    info!(
-                                        "[merkle_cold_rebuild] Infohash: {} 条，冷根已重算",
-                                        count
-                                    );
-                                }
-                                Err(e) => warn!("[merkle_cold_rebuild] Infohash 失败: {}", e),
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
-
-        // Tracker 冷重算
-        {
-            let st = storage.clone();
-            let sm = fed.sync_manager.clone();
-            task_scheduler.register(
-                TaskMetadata::new(
-                    "merkle_cold_rebuild_tracker",
-                    "Merkle冷数据重算-Tracker",
-                    std::time::Duration::from_secs(cold_rebuild_interval),
-                )
-                .with_category(TaskCategory::Persistence)
-                .with_priority(TaskPriority::Background)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Low,
-                    memory: ResourceLevel::Low,
-                    io: ResourceLevel::Medium,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                })
-                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                    intervals,
-                    "merkle_cold_rebuild_tracker_initial_delay",
-                    105,
-                ))),
-                move || {
-                    let st = st.clone();
-                    let sm = sm.clone();
-                    async move {
-                        if let Some(merkle) = sm.tracker_merkle() {
-                            match st.load_all_tracker_keys_hashes() {
-                                Ok(keys_hashes) => {
-                                    let count = keys_hashes.len();
-                                    merkle.rebuild_cold_from_db(&keys_hashes);
-                                    info!(
-                                        "[merkle_cold_rebuild] Tracker: {} 条，冷根已重算",
-                                        count
-                                    );
-                                }
-                                Err(e) => warn!("[merkle_cold_rebuild] Tracker 失败: {}", e),
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            );
-        }
 
         // P1-2：oplog 保留窗口裁剪（窗口默认 24h，必须 > 预估 bootstrap 时长）
         {

@@ -122,7 +122,6 @@ federation:
   full_sync_window_size: 3
   full_sync_gossip_max_messages_per_second: 5000
   full_sync_gossip_max_bytes_per_second: 52428800
-  merkle_async_update_batch_size: 10000
   gossip_bulk_max_batches: 50
   gossip_bulk_max_bytes: 2097152
   parallel_propagation: true

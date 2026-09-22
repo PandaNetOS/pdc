@@ -14,7 +14,6 @@ use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::federation::gossip::GossipEngine;
-use crate::federation::merkle::MerkleTree;
 use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::dht::kbucket::{KBucketEntry, NodeState};
@@ -49,7 +48,6 @@ pub struct NodeRepoImpl {
     cold_addrs: RwLock<FxHashSet<SocketAddr>>,
     storage: Arc<Storage>,
     /// 鑱旈偊寮曠敤锛圤nceLock 娉ㄥ叆锛涙湭璁剧疆鏃舵湰鍦板啓鍏ヤ笉瑙﹀彂 Merkle/Gossip锛宺epo 姝ｅ父宸ヤ綔锛?
-    merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
     /// 鍐欏叆闃熷垪锛堝彲閫夛紝None 鏃堕€€鍖栦负鍚屾鍐欏叆锛?
     write_queue: Option<Arc<WriteQueue>>,
@@ -72,7 +70,6 @@ impl NodeRepoImpl {
             hot_addrs: RwLock::new(FxHashSet::default()),
             cold_addrs: RwLock::new(FxHashSet::default()),
             storage,
-            merkle: OnceLock::new(),
             gossip: OnceLock::new(),
             write_queue: None,
         }
@@ -158,8 +155,7 @@ impl NodeRepoImpl {
 
     /// 娉ㄥ叆鑱旈偊 Merkle 鏍戜笌 Gossip 寮曟搸寮曠敤锛坢ain.rs 鍦?FederationService 鍒涘缓鍚庤皟鐢級銆?
     /// 鏈皟鐢ㄦ椂锛堝鍗曞厓娴嬭瘯锛夛紝鏈湴鍐欏叆涓嶈Е鍙戜紶鎾紝repo 琛屼负瀹屽叏涓嶅彉銆?
-    pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
-        let _ = self.merkle.set(merkle);
+    pub fn set_federation_refs(&self, gossip: Arc<GossipEngine>) {
         let _ = self.gossip.set(gossip);
     }
 
@@ -170,17 +166,9 @@ impl NodeRepoImpl {
         if built.is_empty() {
             return;
         }
-        let Some(merkle) = self.merkle.get() else {
-            return;
-        };
         let Some(gossip) = self.gossip.get() else {
             return;
         };
-        let refs: Vec<(&[u8], &[u8], &[u8])> = built
-            .iter()
-            .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
-            .collect();
-        merkle.update_batch(&refs);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -701,12 +689,8 @@ impl NodeRepository for NodeRepoImpl {
         {
             tracing::warn!("[node_repo] soft_delete_node failed for {}: {}", addr, e);
         }
-        // 联动 Merkle：标记该 key 所在分片为 dirty（墓碑）
-        let key = addr.to_string().into_bytes();
-        if let Some(merkle) = self.merkle.get() {
-            merkle.mark_tombstone(&key);
-        }
         // 联邦删除传播：提交 DELETE 条目，避免对端 upsert-only 合并导致"删除复活"
+        let key = addr.to_string().into_bytes();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

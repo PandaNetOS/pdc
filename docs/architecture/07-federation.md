@@ -1,5 +1,10 @@
 # PDC 联邦网络架构文档
 
+> ⚠️ **本文已过时（2026-09-22）：Merkle 树已从 pdc 全面移除。** **Merkle 分层树与分片同步已彻底移除**，Range 反熵是唯一兜底通道。
+>
+> 现行同步架构以 [ADR-007 Range 反熵唯一兜底](../adr/007-range-only-anti-entropy.md) 与 [AGENTS.md §联邦同步架构 v8](../../AGENTS.md) 为准；
+> 下文涉及 Merkle 对账 / 分片同步引擎 / DiffSync / FullSync 的描述仅作历史参考，不代表当前代码。
+
 > 版本：阶段 4（同步重构 S1–S5：oplog delta 稳态 + 分层 Merkle + Range 反熵 + bootstrap 引导）
 > 日期：2026-09-19
 >

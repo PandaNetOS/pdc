@@ -1,5 +1,10 @@
 # ADR-006: 联邦同步收敛架构（稳态 delta + 兜底区间反熵 + 独立 bootstrap）
 
+> ⚠️ **本文已过时（2026-09-22）：Merkle 树已从 pdc 全面移除。** **本 ADR 中「Merkle 兜底」相关决策已被 ADR-007 取代**；稳态 delta + bootstrap 引导部分仍然有效。
+>
+> 现行同步架构以 [ADR-007 Range 反熵唯一兜底](007-range-only-anti-entropy.md) 与 [AGENTS.md §联邦同步架构 v8](../../AGENTS.md) 为准；
+> 下文涉及 Merkle 对账 / 分片同步引擎 / DiffSync / FullSync 的描述仅作历史参考，不代表当前代码。
+
 > 状态：📋 提议中
 > 日期：2026-09-19
 > 决策者：项目维护者

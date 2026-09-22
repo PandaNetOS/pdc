@@ -1,5 +1,10 @@
 # PDC 联邦同步架构重构方案
 
+> ⚠️ **本文已过时（2026-09-22）：Merkle 树已从 pdc 全面移除。** 本文为 2026-09-19 的重构方案（含 P0 系列 Merkle 止血项），其中 **Merkle 相关部分已随 ADR-007 全部作废**。
+>
+> 现行同步架构以 [ADR-007 Range 反熵唯一兜底](../adr/007-range-only-anti-entropy.md) 与 [AGENTS.md §联邦同步架构 v8](../../AGENTS.md) 为准；
+> 下文涉及 Merkle 对账 / 分片同步引擎 / DiffSync / FullSync 的描述仅作历史参考，不代表当前代码。
+
 > 文档编号：PDC-ARCH-012
 > 版本：v1.0
 > 日期：2026-09-19

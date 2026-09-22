@@ -15,7 +15,6 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashSet;
 
 use crate::federation::gossip::GossipEngine;
-use crate::federation::merkle::MerkleTree;
 use crate::federation::protocol::{operation, repo_type, SyncEntry};
 
 use crate::storage::db::{Storage, TrackerRow};
@@ -32,7 +31,6 @@ pub struct TrackerRepoImpl {
     score_dirty: RwLock<FxHashSet<String>>,
     storage: Arc<Storage>,
     /// 联邦引用（OnceLock 注入）
-    merkle: OnceLock<Arc<MerkleTree>>,
     gossip: OnceLock<Arc<GossipEngine>>,
     /// 写入队列（可选）
     write_queue: Option<Arc<WriteQueue>>,
@@ -62,7 +60,6 @@ impl TrackerRepoImpl {
             persist_dirty: RwLock::new(FxHashSet::default()),
             score_dirty: RwLock::new(FxHashSet::default()),
             storage,
-            merkle: OnceLock::new(),
             gossip: OnceLock::new(),
             write_queue: None,
             tier_enabled,
@@ -79,8 +76,7 @@ impl TrackerRepoImpl {
         self.storage.clone()
     }
 
-    pub fn set_federation_refs(&self, merkle: Arc<MerkleTree>, gossip: Arc<GossipEngine>) {
-        let _ = self.merkle.set(merkle);
+    pub fn set_federation_refs(&self, gossip: Arc<GossipEngine>) {
         let _ = self.gossip.set(gossip);
     }
 
@@ -89,17 +85,9 @@ impl TrackerRepoImpl {
         if built.is_empty() {
             return;
         }
-        let Some(merkle) = self.merkle.get() else {
-            return;
-        };
         let Some(gossip) = self.gossip.get() else {
             return;
         };
-        let refs: Vec<(&[u8], &[u8], &[u8])> = built
-            .iter()
-            .map(|(k, p, h)| (k.as_slice(), p.as_slice(), h.as_slice()))
-            .collect();
-        merkle.update_batch(&refs);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -121,7 +109,16 @@ impl TrackerRepoImpl {
     // ── 同步便捷方法 ──
 
     /// 内部写入：批量新增 tracker，不触发 Merkle/Gossip。
-    pub(crate) fn add_trackers_batch_internal(&self, items: &[(String, u64)]) -> Vec<String> {
+    ///
+    /// P0-3：`remote = true` 表示这批条目来自**联邦入站**——命中本地软删墓碑时**不得复活**。
+    /// 否则闭环为：A 删 T → B 未删 → 反熵判差异 → B 回推 upsert → A 侧缓存 miss、
+    /// `get_tracker_sync` 回源被 `deleted_at IS NULL` 过滤 → 当**新条目**插入 → 持久化时
+    /// upsert 把 `deleted_at` 清成 NULL → **T 复活**。删除因此在联邦内结构性不可能收敛。
+    pub(crate) fn add_trackers_batch_internal(
+        &self,
+        items: &[(String, u64)],
+        remote: bool,
+    ) -> Vec<String> {
         if items.is_empty() {
             return Vec::new();
         }
@@ -140,6 +137,11 @@ impl TrackerRepoImpl {
                         entry.last_used = Some(*last_seen);
                     }
                     self.cache.put(url.clone(), entry);
+                } else if remote && self.storage.is_tracker_tombstoned(url) {
+                    // P0-3：本地墓碑优先 —— 入站 upsert 不复活。
+                    // 注意必须 `continue`：既不能 put 进缓存，也不能标脏，
+                    // 否则后续 persist_dirty → save_tracker 的 upsert 会把墓碑清成 NULL。
+                    continue;
                 } else {
                     self.cache.put(
                         url.clone(),
@@ -185,7 +187,7 @@ impl TrackerRepoImpl {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let new_urls = self.add_trackers_batch_internal(&[(url, now)]);
+        let new_urls = self.add_trackers_batch_internal(&[(url, now)], false);
         self.propagate_trackers(new_urls);
     }
 
@@ -195,7 +197,7 @@ impl TrackerRepoImpl {
             .unwrap_or_default()
             .as_secs();
         let items: Vec<(String, u64)> = urls.iter().map(|u| (u.clone(), now)).collect();
-        let new_urls = self.add_trackers_batch_internal(&items);
+        let new_urls = self.add_trackers_batch_internal(&items, false);
         let count = new_urls.len();
         self.propagate_trackers(new_urls);
         count
@@ -428,24 +430,10 @@ impl TrackerRepoImpl {
     }
 
     /// 执行分层检查 + 驱逐（由 TaskScheduler 定时调用）。
-    /// 驱逐的 tracker 从 Merkle 热数据搬到冷数据（key = url.as_bytes()），
-    /// 节点仍在 cold_entries/cold_roots 中，不从树删除。
+    /// 驱逐仅影响本地缓存分层（冷数据仍在 DB，联邦同步以 DB 为权威）。
     pub fn tier_evict(&self) {
-        let before: std::collections::HashSet<String> =
-            self.cache.iter().into_iter().map(|(k, _)| k).collect();
         self.cache.tier_check();
         self.cache.evict_if_needed();
-        let after: std::collections::HashSet<String> =
-            self.cache.iter().into_iter().map(|(k, _)| k).collect();
-        let evicted: Vec<Vec<u8>> = before
-            .difference(&after)
-            .map(|url| url.as_bytes().to_vec())
-            .collect();
-        if !evicted.is_empty() {
-            if let Some(merkle) = self.merkle.get() {
-                merkle.evict_to_cold(&evicted);
-            }
-        }
     }
 
     /// 紧急驱逐（内存超限时调用）
@@ -546,6 +534,24 @@ impl TrackerRepoImpl {
     }
 }
 
+impl TrackerRepoImpl {
+    /// P0-3：应用**联邦入站**的 tracker 删除。
+    ///
+    /// 与 `remove_tracker` 的区别：**不记 oplog**。入站 apply 写回 oplog 会让删除在两端
+    /// 之间来回反射（A 推删除 → B 应用并记 oplog → B 再把删除推回 A），且违反
+    /// 「入站不写 oplog」的不变量。
+    pub fn remove_tracker_remote_sync(&self, url: &str) {
+        let key = url.to_string();
+        self.cache.remove(&key);
+        // 清除脏标记，避免后续 save_dirty 又把它写回
+        self.persist_dirty.write().remove(&key);
+        self.score_dirty.write().remove(&key);
+        if let Err(e) = self.storage.soft_delete_tracker(url) {
+            tracing::warn!("[tracker_repo] 入站删除：软删除 tracker 失败: {}", e);
+        }
+    }
+}
+
 #[async_trait]
 impl TrackerRepository for TrackerRepoImpl {
     async fn add_tracker(&self, url: String) {
@@ -562,10 +568,6 @@ impl TrackerRepository for TrackerRepoImpl {
         // 物理删除无法与"从来没有"区分，会破坏两端 Merkle 的删除闭环。
         if let Err(e) = self.storage.soft_delete_tracker(url) {
             tracing::warn!("[tracker_repo] 软删除 tracker 失败: {}", e);
-        }
-        // 联动 Merkle：标记分片 dirty，联邦重算时同步删除
-        if let Some(merkle) = self.merkle.get() {
-            merkle.mark_tombstone(url.as_bytes());
         }
         // P1-2：删除记入 oplog（delta 通道传播删除）；失败只告警。
         let now = std::time::SystemTime::now()

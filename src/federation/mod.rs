@@ -10,7 +10,6 @@ pub mod dht_discovery;
 pub mod discovery;
 pub mod dispatch;
 pub mod gossip;
-pub mod merkle;
 pub mod metrics;
 pub mod nat_integration;
 pub mod node_id;
@@ -86,12 +85,6 @@ pub struct FederationStatus {
     pub tracker_sync_enabled: bool,
     /// oplog 当前行数（内存缓存，O(1)；与 `/sync-observability` 的 `oplog.len` 同源）
     pub oplog_len: u64,
-    /// 反熵 tick 已执行次数（有连接时的有效对账轮数）
-    pub anti_entropy_ticks: u64,
-    /// 反熵累计发出的 MerkleDigest 数
-    pub anti_entropy_digests_sent: u64,
-    /// 反熵因无连接而跳过的 tick 数
-    pub anti_entropy_no_conn_skips: u64,
     /// 指标快照
     pub metrics: FederationMetricsSnapshot,
     /// NodeRepo 实际总条目数（F9: = DB 冷数据有效行数 + 内存未落库写队列，唯一权威口径）
@@ -164,12 +157,6 @@ pub struct FederationSnapshot {
 pub struct SyncBrief {
     /// oplog 当前行数（内存缓存）
     pub oplog_len: u64,
-    /// 反熵 tick 已执行次数
-    pub anti_entropy_ticks: u64,
-    /// 反熵累计发出 MerkleDigest 数
-    pub anti_entropy_digests_sent: u64,
-    /// 反熵因无连接跳过的 tick 数
-    pub anti_entropy_no_conn_skips: u64,
 }
 
 /// 联邦服务主入口
@@ -545,7 +532,6 @@ impl FederationService {
         // 6.1 Merkle 异步批量 flush 已迁移到 TaskScheduler（fed_merkle_flush）
 
         // 6.2 启动时从 repo 全量重建 Merkle 树（修复启动时 Merkle 为空导致差量同步推不全）
-        self.sync_manager.clone().spawn_merkle_rebuilder();
 
         // 7. Gossip 传播任务已迁移到 TaskScheduler（fed_gossip_propagation）
 
@@ -682,9 +668,6 @@ impl FederationService {
             relay_channels: self.relay_manager.active_channel_count(),
             tracker_sync_enabled: self.config.sync_tracker_enabled,
             oplog_len: brief.oplog_len,
-            anti_entropy_ticks: brief.anti_entropy_ticks,
-            anti_entropy_digests_sent: brief.anti_entropy_digests_sent,
-            anti_entropy_no_conn_skips: brief.anti_entropy_no_conn_skips,
             metrics: self.metrics.snapshot(),
             // Repo 实际总数由 handler 从 AppState 填充，此处先置 0
             node_repo_total: 0,
@@ -942,9 +925,6 @@ mod tests {
             relay_channels: 0,
             tracker_sync_enabled: false,
             oplog_len: 0,
-            anti_entropy_ticks: 0,
-            anti_entropy_digests_sent: 0,
-            anti_entropy_no_conn_skips: 0,
             metrics: FederationMetricsSnapshot::default(),
             node_repo_total: 0,
             node_repo_hot_total: 0,

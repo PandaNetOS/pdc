@@ -1,5 +1,10 @@
 # PDC 亿级数据存储架构方案
 
+> ⚠️ **本文已过时（2026-09-22）：Merkle 树已从 pdc 全面移除。** 涉及 Merkle 的描述已失效（其余存储设计不受影响）。
+>
+> 现行同步架构以 [ADR-007 Range 反熵唯一兜底](../adr/007-range-only-anti-entropy.md) 与 [AGENTS.md §联邦同步架构 v8](../../AGENTS.md) 为准；
+> 下文涉及 Merkle 对账 / 分片同步引擎 / DiffSync / FullSync 的描述仅作历史参考，不代表当前代码。
+
 > 文档编号：PDC-ARCH-011
 > 版本：v1.0
 > 日期：2026-09-14

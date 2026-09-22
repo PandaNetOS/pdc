@@ -8,7 +8,7 @@
 //! 3. 启动 DHT 魔法 infohash 发现，自动发现其他 PDC 节点
 //! 4. 定期将已连接节点同步到磁盘缓存
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,6 +52,40 @@ pub struct DiscoveryService {
     peer_cache: RwLock<PeerCache>,
     /// NAT 映射后的公网地址（MQTT Rendezvous 上报时优先使用）
     public_addr: RwLock<Option<SocketAddr>>,
+    /// DNS 解析池（进程级共享，内置公共 DNS，不读宿主系统 DNS）
+    dns_pool: Arc<crate::dns_pool::DnsPool>,
+}
+
+/// 拆分 `host:port` 形式的种子地址
+///
+/// 支持 `host:port`、`ip:port`、`[v6]:port` 与裸 `ip`；缺端口时回退
+/// `default_port`。用于把种子地址喂给 DnsPool 解析。
+fn split_host_port(seed: &str, default_port: u16) -> (String, u16) {
+    let seed = seed.trim();
+
+    // 裸 IP（含 IPv6 无括号形式）：无需解析域名
+    if let Ok(ip) = seed.parse::<IpAddr>() {
+        return (ip.to_string(), default_port);
+    }
+
+    // [v6]:port
+    if let Some(rest) = seed.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            return (host.to_string(), port);
+        }
+    }
+
+    match seed.rsplit_once(':') {
+        Some((host, p)) => match p.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (seed.to_string(), default_port),
+        },
+        None => (seed.to_string(), default_port),
+    }
 }
 
 impl DiscoveryService {
@@ -88,7 +122,14 @@ impl DiscoveryService {
             _node_repo,
             _dht_discoverer,
             public_addr: RwLock::new(None),
+            dns_pool: crate::dns_pool::global(),
         }
+    }
+
+    /// 覆盖 DNS 解析池（默认用进程级共享实例）
+    pub fn with_dns_pool(mut self, pool: Arc<crate::dns_pool::DnsPool>) -> Self {
+        self.dns_pool = pool;
+        self
     }
 
     /// 设置 NAT 映射后的公网地址（MQTT Rendezvous 上报时优先使用）
@@ -288,11 +329,15 @@ impl DiscoveryService {
 
     /// 连接单个种子节点
     async fn connect_seed(self: Arc<Self>, seed: &str) -> anyhow::Result<()> {
-        // 解析 DNS
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(seed)
+        // 解析 DNS：走内置 DnsPool（默认公共 DNS），不读宿主系统 DNS 配置。
+        // 此前用 tokio::net::lookup_host（即 getaddrinfo → 系统 DNS），
+        // 宿主解析器整台不可用时会直接把引导流程卡死。
+        let (host, port) = split_host_port(seed, self.config.listen_port);
+        let addrs: Vec<SocketAddr> = self
+            .dns_pool
+            .resolve(&host, port)
             .await
-            .map_err(|e| anyhow::anyhow!("DNS 解析失败 {}: {}", seed, e))?
-            .collect();
+            .map_err(|e| anyhow::anyhow!("DNS 解析失败 {}: {}", seed, e))?;
 
         if addrs.is_empty() {
             anyhow::bail!("DNS 解析无结果: {}", seed);
