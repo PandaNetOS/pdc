@@ -238,10 +238,24 @@ hickory 0.24.4 `lookup_ip.rs:305-354` 的 `ipv4_and_ipv6` 实现是 `(Ok, Err) =
 
 | 仓库 | 分支 | commit | 内容 | 门禁 |
 |---|---|---|---|---|
-| `pnos-sdk` | `session-layer` | `edfd860` | `dns.rs`(严格模式丢弃) + `nat/stun.rs`(去硬编码兜底) + `discovery/mqtt.rs` + `transport/iroh.rs`，4 files, +667 −50 | 20 PASS / 0 FAIL / 6 WARN |
+| `pnos-sdk` | `session-layer` | `cb904ae` | 品牌残留清理（`lpd.rs` 魔数 `PDCL`→`PNOS`、`udp_hole_punch.rs` 载荷 `PDC_HOLE_PUNCH`→`PNOS_HOLE_PUNCH`、`mqtt.rs` 字段 `federation_port`→`service_port`）+ DNS 解耦（`dns.rs` 严格模式丢弃、`nat/stun.rs` 去硬编码兜底、`transport/iroh.rs` 注入解析器、`mqtt.rs` 严格化），6 files, +681 −64 | 20 PASS / 0 FAIL / 6 WARN（与重建前同树的 `edfd860` 结论一致） |
 | `pdc` | `pdc-session-layer` | `d8ec224` | DNS 池接线 + STUN 预解析 + 配置 + 本报告，13 files, +630 −31 | 21 PASS / 0 FAIL / 5 WARN |
 
 两个仓库各有 **一次提交**，均按「B 范围」**逐文件/逐 hunk**暂存，未夹带联邦同步大改与 TaskScheduler 槽位回收修复（见 §9 第一条）。门禁 WARN 项（pdc: 6/9/10/11/13；sdk: 9/10/11/13/18/20）全部落在**本次未触碰的文件**上，属仓库既有债。
+
+### 9.2 `pnos-sdk/.git` 损坏与提交重建（2026-09-22）
+
+`pnos-sdk/.git` 于 14:37 发生损坏：`.git/refs` 与 `.git/logs` 被整个删除，git 判定该目录不再是仓库后**静默向上回退到父仓库**（`D:\PNOS`），随后一次 `gc --auto` 把已不可达的本地提交对象清除。丢失范围经逐 sha `cat-file -t` 验证，**精确为 3 个提交**：
+
+| 原 commit | 内容 | 处置 |
+|---|---|---|
+| `2266f36` | session 会话层 | 远端 PR #1 已合并，随 `798f5ea` 回到本地 |
+| `fff60cc` | 清理 pdc 品牌残留 | 对象丢失 → 按工作区内容并入重建提交 |
+| `edfd860` | 本报告对应的 DNS 修复 | 对象丢失 → 按工作区内容并入重建提交 |
+
+工作区与索引内容完好（索引中另有 32 个 blob 被 gc 清除，已用工作区文件按内容寻址逐一重建，重建后 sha 与索引记录一致）。因此以索引树 `6e7711fe26`（= 原 `edfd860` 的树）为**唯一权威**重建为单个提交 `cb904ae`，parent = 远端 main `798f5ea`；不按不可考的边界拼装 3 个提交，避免失真历史。重建后 `main` == `session-layer` == `cb904ae`，工作区无改动（脏文件数 0）。
+
+`pdc` 侧无损：`d8ec224` / `25af88d` 对象完好；本地 `main` 由 `commit-tree` 造合并提交 `36e4947`（parents = 远端 main `f1f3d67` + `25af88d`，树 = 原 HEAD 树 `1ac5557`），内容零变化，工作区 43 个未暂存改动未受影响。
 
 ---
 
