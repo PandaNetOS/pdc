@@ -1,4 +1,4 @@
-//! 节点身份与地址管理
+﻿//! 节点身份与地址管理
 //!
 //! 阶段2升级：使用 Ed25519 密钥对替代32字节随机数 identity_key。
 //! SigningKey 内部是32字节种子，可 to_bytes()/from_bytes() 持久化。
@@ -146,11 +146,27 @@ pub struct NodeAddress {
     pub reachability: Reachability,
     pub last_seen: u64,
     pub nat_type: Option<String>,
+    /// 多 endpoint 列表（内网/公网都存，用于连接优先级选择）
+    #[serde(default)]
+    pub endpoints: Vec<pnos_net::types::NodeEndpoint>,
 }
 
 impl NodeAddress {
     pub fn preferred_addr(&self) -> Option<SocketAddr> {
         self.ipv4_addr.or(self.ipv6_addr)
+    }
+
+    /// 按优先级选最佳地址：内网优先 → 同类型按延迟升序 → 按成功次数降序
+    pub fn best_endpoint(&self) -> Option<&pnos_net::types::NodeEndpoint> {
+        self.endpoints
+            .iter()
+            .filter(|e| e.fail_count < 20)
+            .min_by(|a, b| {
+                a.priority_weight()
+                    .cmp(&b.priority_weight())
+                    .then_with(|| a.latency_ms.cmp(&b.latency_ms))
+                    .then_with(|| b.success_count.cmp(&a.success_count))
+            })
     }
 }
 
@@ -363,6 +379,7 @@ mod tests {
             reachability: Reachability::Mapped,
             last_seen: 0,
             nat_type: None,
+            endpoints: vec![],
         };
         assert_eq!(
             addr.preferred_addr(),
@@ -481,6 +498,7 @@ mod tests {
             reachability: Reachability::Mapped,
             last_seen: 100,
             nat_type: Some("Cone".to_string()),
+            endpoints: vec![],
         };
         identity.update_addresses(vec![addr.clone()]);
         assert_eq!(identity.addresses_snapshot().len(), 1);

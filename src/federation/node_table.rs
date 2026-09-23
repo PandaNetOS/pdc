@@ -1,4 +1,4 @@
-//! 节点表
+﻿//! 节点表
 //!
 //! 维护联邦网络中已知的所有节点信息，包括地址、连接状态、RTT 等。
 
@@ -299,6 +299,7 @@ mod tests {
             reachability: Reachability::Mapped,
             last_seen,
             nat_type: None,
+            endpoints: vec![],
         }
     }
 

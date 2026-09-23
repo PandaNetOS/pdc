@@ -263,6 +263,7 @@ impl FederationDispatcher {
                         self.caps.set(peer_id, version);
                         let _ = self.peer(peer_id);
                         self.metrics.record_connection_established();
+                        self.node_table.mark_connected(&peer_id, None);
                         info!(
                             "[federation] 会话建立: {} @ {} (proto=v{})",
                             peer_id, addr, version
@@ -292,7 +293,9 @@ impl FederationDispatcher {
                         let rt = self.peer(peer_id);
                         rt.pending.fetch_add(1, Ordering::Relaxed);
                         let this = self.clone();
+                        let recv_bytes = frame.payload.len();
                         tokio::spawn(async move {
+                            this.metrics.record_bytes_recv(recv_bytes as u64);
                             let payload = frame.payload.to_vec();
                             let offloaded = this.dispatch(pc, mt, payload).await;
                             if !offloaded {

@@ -1,4 +1,4 @@
-//! TrackerRepository 实现
+﻿//! TrackerRepository 实现
 //!
 //! 封装 tracker 状态 + SQLite 持久化。
 //!
@@ -408,6 +408,32 @@ impl TrackerRepoImpl {
         // Tracker 列表量小，全量加载
         let storage = self.storage.clone();
         let rows = tokio::task::spawn_blocking(move || storage.load_trackers()).await??;
+        let mut count = 0;
+        for row in rows {
+            self.cache.put(
+                row.url.clone(),
+                TrackerEntry {
+                    url: row.url,
+                    score: row.score,
+                    disabled: row.disabled,
+                    total_requests: row.total_requests,
+                    success_requests: row.success_requests,
+                    failed_requests: row.failed_requests,
+                    total_peers_discovered: row.total_peers_discovered,
+                    avg_response_time_ms: row.total_response_time_ms,
+                    consecutive_failures: row.consecutive_failures,
+                    last_used: None,
+                },
+            );
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// 预加载 top N 个 tracker（按分数排序，启动时用）
+    pub async fn load_initial(&self, limit: usize) -> anyhow::Result<usize> {
+        let storage = self.storage.clone();
+        let rows = tokio::task::spawn_blocking(move || storage.load_top_trackers(limit)).await??;
         let mut count = 0;
         for row in rows {
             self.cache.put(

@@ -142,6 +142,7 @@ impl DhtDiscoveryService {
                         reachability: Reachability::Unknown,
                         last_seen: now,
                         nat_type: None,
+                        endpoints: vec![],
                     };
                     if self.node_table.add_or_update(node_addr) {
                         new_count += 1;

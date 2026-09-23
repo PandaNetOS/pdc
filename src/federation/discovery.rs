@@ -167,6 +167,7 @@ impl DiscoveryService {
                             reachability: Reachability::Unknown,
                             last_seen: 0,
                             nat_type: None,
+                            endpoints: Vec::new(),
                         });
                     }
                 }
@@ -277,6 +278,7 @@ impl DiscoveryService {
                                 reachability: crate::federation::node_id::Reachability::Unknown,
                                 last_seen: now,
                                 nat_type: None,
+                                endpoints: Vec::new(),
                             })
                             .collect();
                         self_clone.process_new_nodes(new_nodes);
@@ -354,6 +356,7 @@ impl DiscoveryService {
                 reachability: Reachability::Unknown,
                 last_seen: 0,
                 nat_type: None,
+                endpoints: Vec::new(),
             });
 
             match self.sessions.clone().connect_to(temp_id, addr).await {
@@ -640,6 +643,7 @@ mod tests {
             reachability: Reachability::Mapped,
             last_seen: 100,
             nat_type: None,
+            endpoints: Vec::new(),
         }
     }
 

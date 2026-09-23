@@ -1,4 +1,4 @@
-//! Gossip 引擎
+﻿//! Gossip 引擎
 //!
 //! 基于流行病协议的消息传播。节点将同步数据提交到 outbox，
 //! 后台任务定期随机选择 fanout 个邻居传播。已处理消息通过 LRU 去重。
@@ -28,9 +28,8 @@ const OUTBOX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct GossipEngine {
     /// 待传播队列
     outbox: RwLock<Vec<GossipBatchMessage>>,
-    /// outbox 中当前存在的 (origin, msg_id) 集合，防止重复条目进入 outbox。
-    /// 与 outbox Vec 同步维护：push 前检查插入，drain 后移除。
-    /// 防止 seen_msgs LRU 驱逐后同一消息被 handle_gossip_batch 重复加入 outbox。
+    /// outbox 中当前存在的 (origin, msg_id) 集合
+    /// 统一锁顺序：先拿 outbox_msg_ids，再拿 outbox，消除 AB-BA 死锁
     outbox_msg_ids: RwLock<FxHashSet<(NodeId, u64)>>,
     /// 已处理消息 ID 去重（按 (origin_node, msg_id) 全局唯一去重）。
     /// 分片 LRU：按 key 哈希分片，消除多 repo 并行 flush 时的全局写锁竞争。
@@ -529,21 +528,19 @@ impl GossipEngine {
             .unwrap_or_default()
             .as_secs();
 
-        // 取出待传播消息
+        // 取出待传播消息（统一锁顺序：先拿 outbox_msg_ids，再拿 outbox，消除 AB-BA 死锁）
         let batches: Vec<GossipBatchMessage> = {
+            let mut ids = self.outbox_msg_ids.write();
             let mut outbox = self.outbox.write();
             if outbox.is_empty() {
                 return;
             }
-            // 全量同步期间跳过 outbox 长度截断和过期过滤：4 repo 并行洪峰（infohash/tracker
-            // 百万级条目 → 数万 batch）会超过 5000 上限，drain 最老批次会导致先提交的 node
-            // 数据丢失。全量同步由 sending_full_sync flag 控制，完成后恢复正常防护。
+            // 全量同步期间跳过 outbox 长度截断和过期过滤
             if !self.is_sending_full_sync() {
                 const MAX_OUTBOX_LEN: usize = 5000;
                 if outbox.len() > MAX_OUTBOX_LEN {
                     let drop_count = outbox.len() - MAX_OUTBOX_LEN;
                     outbox.drain(..drop_count);
-                    // v9：溢出丢弃必须可见（旧实现只有 debug，生产不可见、无指标）
                     self.dropped_outbox_overflow
                         .fetch_add(drop_count as u64, Ordering::Relaxed);
                     warn!(
@@ -554,36 +551,28 @@ impl GossipEngine {
                         self.dropped_outbox_overflow.load(Ordering::Relaxed)
                     );
                 }
-                // 过滤过期消息（超过 300 秒的消息不再传播，避免 2 节点场景下队列积压）
+                // 过滤过期消息
                 let before = outbox.len();
                 outbox.retain(|b| now.saturating_sub(b.timestamp) < 300);
                 let expired = before - outbox.len();
                 if expired > 0 {
                     self.dropped_expired
                         .fetch_add(expired as u64, Ordering::Relaxed);
-                    debug!(
-                        "[federation] outbox 丢弃 {} 条过期消息（累计 {}）",
-                        expired,
-                        self.dropped_expired.load(Ordering::Relaxed)
-                    );
                 }
             }
             if outbox.is_empty() {
                 return;
             }
-            // 单连接场景：一次性取出所有消息，加快传播速度
+            // 单连接场景：一次性取出所有消息
             let conn_count = self.sessions.connection_count();
             let batch_size = if conn_count <= 1 { 500 } else { 100 };
             let count = outbox.len().min(batch_size);
             let drained: Vec<GossipBatchMessage> = outbox.drain(..count).collect();
-            // 同步 outbox_msg_ids：截断/过期/drain 的消息已从 outbox 移除，
-            // 将集合重建为当前 outbox 中剩余消息的 ID，保证一致性。
-            let mut ids = self.outbox_msg_ids.write();
+            // 重建 outbox_msg_ids
             ids.clear();
             for b in outbox.iter() {
                 ids.insert((NodeId(b.origin), b.msg_id));
             }
-            drop(ids);
             drained
         };
 

@@ -185,6 +185,7 @@ impl NatIntegration {
                     reachability,
                     last_seen: now,
                     nat_type: Some(nat_type_str.clone()),
+                    endpoints: vec![],
                 });
             } else {
                 addresses.push(NodeAddress {
@@ -194,6 +195,7 @@ impl NatIntegration {
                     reachability: Reachability::PublicIpv6,
                     last_seen: now,
                     nat_type: Some(nat_type_str.clone()),
+                    endpoints: vec![],
                 });
             }
         }
@@ -208,6 +210,7 @@ impl NatIntegration {
                     reachability: Reachability::Unknown,
                     last_seen: now,
                     nat_type: Some(nat_type_str),
+                    endpoints: vec![],
                 });
             }
         }

@@ -1,4 +1,4 @@
-//! 配置管理
+﻿//! 配置管理
 //!
 //! 支持从 config.yaml 加载配置，也支持环境变量覆盖。
 //! 配置结构按模块组织：server、super_tracker、discoverers、cache、health_check、crawler。

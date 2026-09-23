@@ -33,6 +33,8 @@ pub struct WriteStats {
 /// 存储层
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
+    /// 读连接池：只读查询专用，不抢写锁
+    read_pool: Arc<Mutex<std::collections::VecDeque<Connection>>>,
     write_stats: Arc<Mutex<WriteStats>>,
     /// oplog 行数缓存（-1 = 未初始化）。
     /// `SELECT COUNT(*) FROM feed_oplog` 在大表上要扫整个 B-tree，冷缓存 + 慢盘实测可达
@@ -80,8 +82,20 @@ impl Storage {
         );
         conn.execute_batch(&pragma_sql)?;
 
+        // 初始化读连接池：打开 4 个只读连接，读操作走这里不抢写锁
+        let mut read_pool = std::collections::VecDeque::new();
+        for _ in 0..4 {
+            let rconn = Connection::open(path_ref)?;
+            rconn.execute_batch(&pragma_sql)?;
+            read_pool.push_back(rconn);
+        }
+        info!(
+            "[storage] read pool initialized: {} connections",
+            read_pool.len()
+        );
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_pool: Arc::new(Mutex::new(read_pool)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
             entity_counts_cache: Default::default(),
@@ -96,6 +110,7 @@ impl Storage {
         let conn = Connection::open_in_memory()?;
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_pool: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
             entity_counts_cache: Default::default(),
@@ -117,15 +132,17 @@ impl Storage {
     /// 各实体表有效行数：[dht_nodes, peers, peers_archive, infohashes, trackers]。
     /// 软删墓碑（deleted_at 非 NULL）不计入。
     pub fn valid_entity_counts(&self) -> [i64; 5] {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-2) };
-        [
-            count("SELECT COUNT(*) FROM dht_nodes WHERE deleted_at IS NULL"),
-            count("SELECT COUNT(*) FROM peers WHERE deleted_at IS NULL"),
-            count("SELECT COUNT(*) FROM peers_archive"),
-            count("SELECT COUNT(*) FROM infohashes WHERE deleted_at IS NULL"),
-            count("SELECT COUNT(*) FROM trackers WHERE deleted_at IS NULL"),
-        ]
+        // 只读查询走读连接池，不抢写锁
+        self.read(|conn| {
+            let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-2) };
+            [
+                count("SELECT COUNT(*) FROM dht_nodes WHERE deleted_at IS NULL"),
+                count("SELECT COUNT(*) FROM peers WHERE deleted_at IS NULL"),
+                count("SELECT COUNT(*) FROM peers_archive"),
+                count("SELECT COUNT(*) FROM infohashes WHERE deleted_at IS NULL"),
+                count("SELECT COUNT(*) FROM trackers WHERE deleted_at IS NULL"),
+            ]
+        })
     }
 
     /// 重算并写回缓存（周期任务调用；COUNT 较重，调用方应放阻塞线程）。
@@ -156,6 +173,18 @@ impl Storage {
         self.conn.clone()
     }
 
+    /// 从读连接池拿一个连接，只读操作专用
+    /// 读操作走读连接，不抢写锁，读写不互相阻塞
+    pub fn read<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Connection) -> T,
+    {
+        let mut pool = self.read_pool.lock().unwrap();
+        let conn = pool.pop_front().expect("read pool empty");
+        let result = f(&conn);
+        pool.push_back(conn);
+        result
+    }
     /// 记录写入统计
     fn record_write(&self, table: &str, rows: u64) {
         let mut stats = self.write_stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -833,6 +862,31 @@ impl Storage {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled FROM trackers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
+            Ok(TrackerRow {
+                url: row.get(0)?,
+                score: row.get(1)?,
+                total_requests: row.get::<_, i64>(2)? as u64,
+                success_requests: row.get::<_, i64>(3)? as u64,
+                failed_requests: row.get::<_, i64>(4)? as u64,
+                total_peers_discovered: row.get::<_, i64>(5)? as u64,
+                total_response_time_ms: row.get(6)?,
+                consecutive_failures: row.get::<_, i64>(7)? as u32,
+                disabled: row.get::<_, i64>(8)? != 0,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// 按分数降序加载 top N 个 tracker（启动预加载用）
+    pub fn load_top_trackers(&self, limit: usize) -> anyhow::Result<Vec<TrackerRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled 
+             FROM trackers WHERE deleted_at IS NULL 
+             ORDER BY score DESC 
+             LIMIT ?"
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
             Ok(TrackerRow {
                 url: row.get(0)?,
                 score: row.get(1)?,

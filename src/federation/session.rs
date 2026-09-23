@@ -394,11 +394,16 @@ pub fn session_config_from(config: &FederationConfig, listen: bool) -> SessionCo
 pub struct FederationSessions {
     mgr: Arc<SessionManager>,
     caps: Arc<PeerCapsTable>,
+    metrics: Arc<crate::federation::metrics::FederationMetrics>,
 }
 
 impl FederationSessions {
-    pub fn new(mgr: Arc<SessionManager>, caps: Arc<PeerCapsTable>) -> Self {
-        Self { mgr, caps }
+    pub fn new(
+        mgr: Arc<SessionManager>,
+        caps: Arc<PeerCapsTable>,
+        metrics: Arc<crate::federation::metrics::FederationMetrics>,
+    ) -> Self {
+        Self { mgr, caps, metrics }
     }
 
     /// 底层 `SessionManager`（调度注册、事件订阅用）
@@ -431,9 +436,15 @@ impl FederationSessions {
             .await
     }
 
-    /// 主动补齐（由调度器周期调用；SDK 内部幂等、无 sleep）
+    /// 心跳探测（轻量：仅保活 + 空闲回收，不含补链）
     pub async fn tick(&self) {
         self.mgr.tick().await;
+    }
+
+    /// 补链（重量：并行连接新候选节点）
+    /// max_per_tick: 每轮最多补几个连接
+    pub async fn replenish(&self, max_per_tick: usize) {
+        self.mgr.replenish(max_per_tick).await;
     }
 
     pub async fn disconnect(
@@ -460,6 +471,7 @@ impl FederationSessions {
         msg: &T,
     ) -> anyhow::Result<()> {
         let payload = bincode::serialize(msg).map_err(|e| anyhow::anyhow!("序列化失败: {}", e))?;
+        self.metrics.record_bytes_sent(payload.len() as u64);
         self.mgr
             .send_to(
                 &to_sdk_node_id(*peer),
@@ -475,6 +487,7 @@ impl FederationSessions {
         msg_type: MessageType,
         payload: Vec<u8>,
     ) -> anyhow::Result<()> {
+        self.metrics.record_bytes_sent(payload.len() as u64);
         self.mgr
             .send_to(
                 &to_sdk_node_id(*peer),
@@ -492,6 +505,7 @@ impl FederationSessions {
     ) -> usize {
         match bincode::serialize(msg) {
             Ok(payload) => {
+                self.metrics.record_bytes_sent(payload.len() as u64);
                 self.mgr
                     .broadcast(Frame::new(msg_type.as_u8() as u16, payload), exclude)
                     .await
@@ -763,6 +777,13 @@ impl SessionsHandle {
         }
     }
 
+    /// 补链（重量：并行连接新候选节点）
+    pub async fn replenish(&self, max_per_tick: usize) {
+        if let Some(s) = self.current() {
+            s.replenish(max_per_tick).await;
+        }
+    }
+
     /// 关闭全部会话（旧 `ConnectionManager::shutdown_all`）
     pub async fn shutdown_all(&self) {
         if let Some(s) = self.current() {
@@ -802,7 +823,7 @@ pub async fn bind_federation_sessions(
     let auth: Arc<dyn PeerAuthenticator> = Arc::new(FederationAuthenticator::new(
         identity,
         node_table.clone(),
-        metrics,
+        metrics.clone(),
     ));
     let policy: Arc<dyn PeerPolicy> =
         Arc::new(FederationPolicy::new(node_table, config.max_connections));
@@ -814,7 +835,7 @@ pub async fn bind_federation_sessions(
         policy,
     )
     .await?;
-    Ok(FederationSessions::new(mgr, caps))
+    Ok(FederationSessions::new(mgr, caps, metrics))
 }
 
 #[cfg(test)]

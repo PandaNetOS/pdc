@@ -442,24 +442,36 @@ async fn async_main(
     );
     info!("[main] 数据层 Repo 已初始化（冷热分层已启用）");
 
-    // 3.7 从 SQLite 加载持久化数据
-    match tracker_repo.load_all().await {
-        Ok(n) if n > 0 => info!("[main] 从 SQLite 加载了 {} 个 Tracker", n),
+    // 3.7 从 SQLite 加载持久化数据（并行加载，利用 WAL 读并发）
+    let preload = config.tier.preload_top_n;
+    let tracker_repo_clone = tracker_repo.clone();
+    let infohash_repo_clone = infohash_repo.clone();
+    let node_repo_clone = node_repo.clone();
+    let peer_repo_clone = peer_repo.clone();
+
+    let (tracker_res, infohash_res, node_res, peer_res) = tokio::join!(
+        async move { tracker_repo_clone.load_initial(preload).await },
+        async move { infohash_repo_clone.load_initial(preload).await },
+        async move { node_repo_clone.load_initial(preload).await },
+        async move { peer_repo_clone.load_initial(preload).await },
+    );
+
+    match tracker_res {
+        Ok(n) if n > 0 => info!("[main] 预加载 {} 个 Tracker（上限 {}）", n, preload),
         _ => {}
     }
-    let preload = config.tier.preload_top_n;
-    match infohash_repo.load_initial(preload).await {
+    match infohash_res {
         Ok(n) if n > 0 => info!("[main] 预加载 {} 个 Infohash（上限 {}）", n, preload),
         _ => {}
     }
-    match node_repo.load_initial(preload).await {
+    match node_res {
         Ok(n) if n > 0 => info!(
             "[main] 从 SQLite 预加载了 {} 个 DHT 节点（上限 {}）",
             n, preload
         ),
         _ => {}
     }
-    match peer_repo.load_initial(preload).await {
+    match peer_res {
         Ok(n) if n > 0 => info!("[main] 预加载 {} 个 Peer（上限 {}）", n, preload),
         _ => {}
     }
@@ -1130,7 +1142,7 @@ async fn async_main(
                     300,
                 )),
             )
-            .with_category(TaskCategory::Persistence)
+            .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -1160,8 +1172,8 @@ async fn async_main(
                     })
                     .await
                     {
-                        Ok(_) => debug!("[persistence] 实体统计校准完成"),
-                        Err(e) => warn!("[persistence] 实体统计校准失败: {}", e),
+                        Ok(_) => debug!("[monitor] 实体统计校准完成"),
+                        Err(e) => warn!("[monitor] 实体统计校准失败: {}", e),
                     }
                     Ok(())
                 }
@@ -1864,6 +1876,37 @@ async fn async_main(
                 let cm = cm.clone();
                 async move {
                     cm.heartbeat_tick().await;
+                    Ok(())
+                }
+            },
+        );
+
+        // fed_replenish（补链：并行连接新候选，每轮最多 3 个）
+        let cm2 = fed.sessions.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "fed_replenish",
+                "联邦补链",
+                std::time::Duration::from_secs(get_interval_secs(intervals, "fed_replenish", 60)),
+            )
+            .with_category(TaskCategory::Federation)
+            .with_priority(TaskPriority::Normal)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Medium,
+                is_full_task: false,
+            })
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_replenish_jitter",
+                10,
+            ))),
+            move || {
+                let cm = cm2.clone();
+                async move {
+                    cm.replenish(3).await; // 每轮最多补 3 个
                     Ok(())
                 }
             },
