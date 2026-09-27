@@ -57,6 +57,10 @@ const SNAPSHOT_RATIO_THRESHOLD: f64 = 1.2;
 /// v10(F2)：Range 抽样进度的停滞阈值（秒）—— 超过未推进视为对端持续不可达/连接失效，
 /// 弃置该进度、下一轮重新抽样。正常推进时每 tick 刷新，不会触发。
 const RANGE_SAMPLE_STALL_SECS: u64 = 1800;
+/// v10：bootstrap 发起互斥的 TTL（秒）。多触发器（协商 Ack / 巡检 / 续传欠账）并发点火
+/// 的竞态窗口内同一 (peer,repo) 只允许一个在途发起；60s 后 bootstrap_state 必有进度，
+/// 由 `bootstrap_running_fresh` 接管去重。
+const BOOTSTRAP_INFLIGHT_TTL_SECS: u64 = 60;
 
 /// v10(F2)：一轮 Range 抽样对账的进行中状态（断点续跑游标）。
 ///
@@ -199,6 +203,8 @@ pub struct SyncManager {
     /// v10(F4)：快照冷却期 —— (peer, repo) → 竣工时刻。冷却期内协商裁定与巡检
     /// 对该 repo 强制 DELTA，防「竣工 → 清协商重裁 → 行数未变 → 又裁 BOOTSTRAP」环。
     bootstrap_cooldown: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v10：bootstrap 发起互斥 —— (peer, repo) → 发起时刻（TTL 内重复触发直接拒绝）。
+    bootstrap_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
     delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
@@ -329,6 +335,7 @@ impl SyncManager {
             range_peer_tick_last: RwLock::new(FxHashMap::default()),
             range_progress: RwLock::new(FxHashMap::default()),
             bootstrap_cooldown: RwLock::new(FxHashMap::default()),
+            bootstrap_inflight: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
             range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
@@ -1059,6 +1066,15 @@ impl SyncManager {
     }
 
     /// v10(F4)：该 (peer, repo) 是否在快照冷却期内。
+    /// v10：bootstrap 发起互斥。返回 true = 获得发起槽位；false = TTL 内已有在途发起。
+    /// 多触发器（协商 Ack / 巡检 / 续传欠账）并发点火的竞态窗口内，同一 (peer,repo)
+    /// 只放行一个 start_bootstrap（实测启动期同 repo 15s 内两轮并行竣工）。
+    fn try_acquire_bootstrap_slot(&self, peer: &NodeId, repo: u8) -> bool {
+        let mut m = self.bootstrap_inflight.write();
+        m.retain(|_, t| t.elapsed().as_secs() < BOOTSTRAP_INFLIGHT_TTL_SECS);
+        m.insert((*peer, repo), Instant::now()).is_none()
+    }
+
     fn snapshot_in_cooldown(&self, peer: &NodeId, repo: u8) -> bool {
         let mut m = self.bootstrap_cooldown.write();
         let ttl = self.config.bootstrap_cooldown_secs.max(1);
@@ -2010,6 +2026,14 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // v10(F2b)：bootstrap 传输期让路 —— 快照是全量 IO（实测 NODE 128 块 × 2 万行），
+        // 与反熵区间扫描争同一 SQLite 读池，会把 tick 从毫秒级拖到 300s 超时
+        // （2026-09-27 实测：快照期连续两个 tick 飞满 300s 被杀）。铁律 1（低优先级
+        // 可抢占）：快照在途时反熵让路，竣工/停滞判定失效后自动恢复。
+        if self.bootstrap_transfer_active() {
+            debug!("[range] bootstrap 传输进行中，本轮反熵让路");
+            return;
+        }
         // v9：单轮最多处理 `range_repos_per_tick` 个 repo（默认 1）。
         // 旧实现一轮把 4 个 repo 全部串行跑完（各 160+ 个区间、合计约 505 帧），
         // 实测单次占槽 166~226s，把同分类的 delta / bootstrap / 心跳一起饿死。
@@ -2090,6 +2114,17 @@ impl SyncManager {
         let pick = supported[start % supported.len()].clone();
         rr.insert(repo, (start + 1) % conns.len());
         Some(pick)
+    }
+
+    /// v10(F2b)：是否有 bootstrap 传输仍在推进（反熵让路判定）。
+    /// 任一 (peer,repo) 的进度非 Done 且 `bootstrap_stall_secs` 内仍在更新 → 传输活跃。
+    fn bootstrap_transfer_active(&self) -> bool {
+        let rows = self.delta_storage().bootstrap_list().unwrap_or_default();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let fresh_ms = self.config.bootstrap_stall_secs.max(1) as i64 * 1000;
+        rows.iter().any(|p| {
+            !matches!(p.phase, bootstrap::BootstrapPhase::Done) && now_ms - p.updated_ms <= fresh_ms
+        })
     }
 
     /// v7：单 repo 的 range 反熵抽样对账（原 NODE 专属逻辑通用化）。
@@ -3152,6 +3187,14 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // v10：发起互斥 —— 竞态窗口内同一 (peer,repo) 只放行一个在途发起。
+        if !self.try_acquire_bootstrap_slot(&peer, repo) {
+            debug!(
+                "[bootstrap] 已有在途发起（TTL {}s 内），跳过重复触发: peer={} repo={}",
+                BOOTSTRAP_INFLIGHT_TTL_SECS, peer, repo
+            );
+            return;
+        }
         // P0-1/P0-5：bootstrap 已打通全 repo（清单构建 build_repo_manifest_impl 与应答取数
         // load_repo_sync_entries_in_range 本就是 repo 通用的，落地改走 handle_sync_batch）。
         // 保留范围校验（非法 repo 值一律拒绝），不再限制只做 NODE。
@@ -3607,6 +3650,35 @@ mod tests {
         );
         // 对端无自报状态（协商早期）→ 保守放行
         assert!(mgr.snapshot_really_needed(&NodeId([9; 20]), repo_type::PEER));
+    }
+
+    /// v10 收尾测试：bootstrap 发起互斥（竞态窗口单飞）与 Range 让路判定
+    /// （快照传输活跃时反熵让路，避免 SQLite 读池争用把 tick 拖到 300s）。
+    #[test]
+    fn test_bootstrap_inflight_mutex_and_range_yield() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage.clone(), make_config());
+        let peer = NodeId([4; 20]);
+
+        // 发起互斥：首次获得槽位，同 (peer,repo) 重复触发被拒；不同 repo 不互斥
+        assert!(mgr.try_acquire_bootstrap_slot(&peer, repo_type::PEER));
+        assert!(!mgr.try_acquire_bootstrap_slot(&peer, repo_type::PEER));
+        assert!(mgr.try_acquire_bootstrap_slot(&peer, repo_type::INFOHASH));
+
+        // Range 让路：无 bootstrap 进度 → 不让路；有非 Done 且新鲜的进度 → 让路
+        assert!(!mgr.bootstrap_transfer_active());
+        let mut p = bootstrap::BootstrapProgress::new(
+            repo_type::PEER,
+            peer.0.to_vec(),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        p.phase = bootstrap::BootstrapPhase::Transfer;
+        storage.bootstrap_save(&p, None).unwrap();
+        assert!(
+            mgr.bootstrap_transfer_active(),
+            "快照传输活跃期反熵必须让路"
+        );
     }
 
     #[test]

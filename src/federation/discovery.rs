@@ -283,8 +283,42 @@ impl DiscoveryService {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let new_nodes: Vec<crate::federation::node_id::NodeAddress> = node
+                        // v10(F7)：过滤本端地址 —— 同 NAT 后多节点经 STUN 会得到**相同的
+                        // 公网映射**（同一公网 IP:port 不可能同时映射两台内网机），互把对方
+                        // 广播里的该地址当可达目标，连接经网关 hairpin 后要么连回自己
+                        // （自连接拒绝）、要么以次优路径连到对方（被拒），形成每 30s 一次的
+                        // 回环连接风暴（2026-09-27 实测 52/58）。本端监听地址与公网映射
+                        // 地址一律不入节点表、不触发连接。
+                        let my_addrs: std::collections::HashSet<SocketAddr> = {
+                            let mut s: std::collections::HashSet<SocketAddr> = self_clone
+                                .identity
+                                .addresses_snapshot()
+                                .iter()
+                                .filter_map(|a| a.preferred_addr())
+                                .collect();
+                            if let Some(p) = *self_clone.public_addr.read() {
+                                s.insert(p);
+                            }
+                            s
+                        };
+                        if NodeId(node.node_id.0) == self_clone.identity.node_id {
+                            debug!("[federation] 忽略本节点自广播");
+                            continue;
+                        }
+                        let owned_addrs: Vec<SocketAddr> = node
                             .addresses
+                            .iter()
+                            .copied()
+                            .filter(|a| !my_addrs.contains(a))
+                            .collect();
+                        if owned_addrs.is_empty() {
+                            debug!(
+                                "[federation] 发现事件地址均为本端地址，跳过: node_id={}",
+                                hex::encode(node.node_id.0)
+                            );
+                            continue;
+                        }
+                        let new_nodes: Vec<crate::federation::node_id::NodeAddress> = owned_addrs
                             .iter()
                             .map(|addr| crate::federation::node_id::NodeAddress {
                                 node_id: node.node_id.0,
