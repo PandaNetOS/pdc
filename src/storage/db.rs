@@ -48,6 +48,22 @@ pub struct Storage {
     pub(crate) entity_counts_cache: [std::sync::atomic::AtomicI64; 5],
 }
 
+/// 读连接归还 guard：`Storage::read` 的闭包 panic（unwind）时也把连接放回池，
+/// 避免连接永久泄漏导致池耗尽。
+struct PoolReturn<'a> {
+    pool: &'a Mutex<std::collections::VecDeque<Connection>>,
+    conn: Option<Connection>,
+}
+
+impl Drop for PoolReturn<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.push_back(conn);
+        }
+    }
+}
+
 impl Storage {
     /// 打开或创建数据库（使用默认 SQLite 配置）
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
@@ -131,7 +147,12 @@ impl Storage {
 
     /// 各实体表有效行数：[dht_nodes, peers, peers_archive, infohashes, trackers]。
     /// 软删墓碑（deleted_at 非 NULL）不计入。
+    /// 优先读触发器维护的增量计数（O(1)，见 init_tables 的 table_counts），
+    /// 仅存量库升级后未校准的短暂窗口回退真实 COUNT。
     pub fn valid_entity_counts(&self) -> [i64; 5] {
+        if let Some(c) = self.valid_entity_counts_incremental() {
+            return c;
+        }
         // 只读查询走读连接池，不抢写锁
         self.read(|conn| {
             let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-2) };
@@ -145,19 +166,95 @@ impl Storage {
         })
     }
 
-    /// 重算并写回缓存（周期任务调用；COUNT 较重，调用方应放阻塞线程）。
+    /// 增量计数路径：任一表未校准（calibrated=0）则返回 None。
+    fn valid_entity_counts_incremental(&self) -> Option<[i64; 5]> {
+        let mut out = [0i64; 5];
+        for (i, name) in [
+            "dht_nodes",
+            "peers",
+            "peers_archive",
+            "infohashes",
+            "trackers",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (_, valid) = self.table_count_cached(name)?;
+            out[i] = valid;
+        }
+        Some(out)
+    }
+
+    /// 读取单表增量计数 (total, valid)；未校准返回 None。
+    /// 走读连接池（单行主键读，不与写批次抢写锁）；池空时由 read() 回退写连接
+    /// （`Storage::memory()` 测试路径）。
+    pub fn table_count_cached(&self, table: &str) -> Option<(i64, i64)> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT total, valid FROM table_counts WHERE name = ?1 AND calibrated = 1",
+                params![table],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok()
+        })
+    }
+
+    /// 全量校准增量行数计数器并写回缓存（启动校准/周期任务调用）。
+    /// 每表一次单遍扫描同时取 total+valid，校准后所有计数读路径 O(1)。
+    /// COUNT 较重，调用方必须放阻塞线程（spawn_blocking），禁止在 API/async 线程直接调用。
     pub fn refresh_entity_counts(&self) -> [i64; 5] {
         use std::sync::atomic::Ordering;
-        let c = self.valid_entity_counts();
-        for (i, v) in c.iter().enumerate() {
-            self.entity_counts_cache[i].store(*v, Ordering::Relaxed);
+        let names = [
+            "dht_nodes",
+            "peers",
+            "peers_archive",
+            "infohashes",
+            "trackers",
+        ];
+        let mut calibrated: Vec<(usize, i64)> = Vec::with_capacity(names.len());
+        {
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, name) in names.iter().enumerate() {
+                // 单遍扫描同时取 total 与 valid（peers_archive 无墓碑列，valid=total）
+                let sql = if *name == "peers_archive" {
+                    format!("SELECT COUNT(*), COUNT(*) FROM {}", name)
+                } else {
+                    format!(
+                        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END), 0) FROM {}",
+                        name
+                    )
+                };
+                if let Ok((total, valid)) =
+                    conn.query_row(&sql, [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                {
+                    let _ = conn.execute(
+                        "INSERT INTO table_counts (name, total, valid, calibrated) \
+                         VALUES (?1, ?2, ?3, 1) \
+                         ON CONFLICT(name) DO UPDATE SET total = ?2, valid = ?3, calibrated = 1",
+                        params![name, total, valid],
+                    );
+                    calibrated.push((i, valid));
+                }
+            }
+        }
+        let mut c = [-1i64; 5];
+        for (i, v) in calibrated {
+            c[i] = v;
+            self.entity_counts_cache[i].store(v, Ordering::Relaxed);
         }
         c
     }
 
-    /// 读取缓存计数；未校准（-1）时先 COUNT 校准（仅一次，后续走缓存）。
+    /// 读取缓存计数。优先触发器维护的增量计数（O(1)）；增量计数未就绪时
+    /// 沿用缓存逻辑（缓存未校准则做一次重 COUNT 校准，之后走缓存）。
     pub fn entity_counts_cached(&self) -> [i64; 5] {
         use std::sync::atomic::Ordering;
+        if let Some(c) = self.valid_entity_counts_incremental() {
+            for (i, v) in c.iter().enumerate() {
+                self.entity_counts_cache[i].store(*v, Ordering::Relaxed);
+            }
+            return c;
+        }
         if self.entity_counts_cache[0].load(Ordering::Relaxed) < 0 {
             return self.refresh_entity_counts();
         }
@@ -175,15 +272,35 @@ impl Storage {
 
     /// 从读连接池拿一个连接，只读操作专用
     /// 读操作走读连接，不抢写锁，读写不互相阻塞
+    ///
+    /// 健壮性（2026-09-23 API 失联事故复盘）：
+    /// - 池锁只在 pop/push 时持有，不跨 `f` 执行；
+    /// - `f` panic 时由 RAII guard 归还连接（旧行为：连接永久丢失，池耗尽后
+    ///   `expect("read pool empty")` panic → 锁毒化 → 全进程读路径雪崩）；
+    /// - 毒化锁自愈（into_inner），不再级联 panic；
+    /// - 池空（`Storage::memory()` 测试库未建池 / 极端耗尽）回退写连接。
     pub fn read<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&Connection) -> T,
     {
-        let mut pool = self.read_pool.lock().unwrap();
-        let conn = pool.pop_front().expect("read pool empty");
-        let result = f(&conn);
-        pool.push_back(conn);
-        result
+        let pooled = {
+            let mut pool = self.read_pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.pop_front()
+        };
+        match pooled {
+            Some(conn) => {
+                let guard = PoolReturn {
+                    pool: &self.read_pool,
+                    conn: Some(conn),
+                };
+                let conn = guard.conn.as_ref().expect("PoolReturn conn");
+                f(conn)
+            }
+            None => {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                f(&conn)
+            }
+        }
     }
     /// 记录写入统计
     fn record_write(&self, table: &str, rows: u64) {
@@ -433,6 +550,98 @@ impl Storage {
             "#,
         )?;
 
+        // ===== 增量行数计数器（消除周期性全表 COUNT 扫描，2026-09-23）=====
+        //
+        // 背景：统计快照（每秒）、监控 WebSocket、联邦协商都通过 count_table /
+        // valid_entity_counts 触发 `SELECT COUNT(*)` 全表扫描；在慢盘 + 写入高压下
+        // 单次 COUNT 可达分钟级，且 db::read() 在查询期间持有读池锁，一条慢 COUNT
+        // 会卡死全进程读路径（2026-09-23 API 6886 失联事故根因）。
+        //
+        // 方案：table_counts 保存每表 (total, valid)，由行级触发器增量维护——
+        // SQLite 对 `INSERT .. ON CONFLICT DO UPDATE` 只在真插入时触发 INSERT
+        // 触发器、冲突更新时只触发 UPDATE 触发器，因此无需在 Rust 端区分
+        // 插入/更新。触发器在同一事务内执行，崩溃/回滚天然一致。
+        //
+        // 校准：计数器以 calibrated 标记是否可信；空库（新建/内存库）建表即校准，
+        // 存量库由启动校准 + db_entity_stats_refresh 周期任务以真实 COUNT 回写。
+        // 未校准期间读路径回退真实 COUNT（与旧版行为一致）。
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS table_counts (
+                name TEXT PRIMARY KEY,
+                total INTEGER NOT NULL DEFAULT 0,
+                valid INTEGER NOT NULL DEFAULT 0,
+                calibrated INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO table_counts (name, total, valid, calibrated) VALUES
+                ('dht_nodes', 0, 0, 0),
+                ('peers', 0, 0, 0),
+                ('peers_archive', 0, 0, 0),
+                ('infohashes', 0, 0, 0),
+                ('trackers', 0, 0, 0);
+            "#,
+        )?;
+        {
+            // 软删表（含 deleted_at 列）：INSERT（总+有效）、墓碑/复活（仅有效）、
+            // DELETE（总+按旧值有效）各一组触发器。WHEN 条件保证软删幂等
+            // （重复 UPDATE 同一墓碑不重复计数）。
+            let mut triggers = String::new();
+            for tbl in ["dht_nodes", "peers", "infohashes", "trackers"] {
+                triggers.push_str(&format!(
+                    r#"
+            CREATE TRIGGER IF NOT EXISTS trg_{t}_ins_total AFTER INSERT ON {t}
+            BEGIN UPDATE table_counts SET total = total + 1 WHERE name = '{t}'; END;
+            CREATE TRIGGER IF NOT EXISTS trg_{t}_ins_valid AFTER INSERT ON {t}
+            WHEN new.deleted_at IS NULL
+            BEGIN UPDATE table_counts SET valid = valid + 1 WHERE name = '{t}'; END;
+            CREATE TRIGGER IF NOT EXISTS trg_{t}_tombstone AFTER UPDATE OF deleted_at ON {t}
+            WHEN old.deleted_at IS NULL AND new.deleted_at IS NOT NULL
+            BEGIN UPDATE table_counts SET valid = valid - 1 WHERE name = '{t}'; END;
+            CREATE TRIGGER IF NOT EXISTS trg_{t}_revive AFTER UPDATE OF deleted_at ON {t}
+            WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL
+            BEGIN UPDATE table_counts SET valid = valid + 1 WHERE name = '{t}'; END;
+            CREATE TRIGGER IF NOT EXISTS trg_{t}_del_total AFTER DELETE ON {t}
+            BEGIN UPDATE table_counts SET total = total - 1 WHERE name = '{t}'; END;
+            CREATE TRIGGER IF NOT EXISTS trg_{t}_del_valid AFTER DELETE ON {t}
+            WHEN old.deleted_at IS NULL
+            BEGIN UPDATE table_counts SET valid = valid - 1 WHERE name = '{t}'; END;
+            "#,
+                    t = tbl
+                ));
+            }
+            // peers_archive 无 deleted_at 列，valid 恒等于 total
+            triggers.push_str(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS trg_peers_archive_ins AFTER INSERT ON peers_archive
+            BEGIN
+                UPDATE table_counts SET total = total + 1, valid = valid + 1 WHERE name = 'peers_archive';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_peers_archive_del AFTER DELETE ON peers_archive
+            BEGIN
+                UPDATE table_counts SET total = total - 1, valid = valid - 1 WHERE name = 'peers_archive';
+            END;
+            "#,
+            );
+            conn.execute_batch(&triggers)?;
+        }
+        // 空库（新建文件/内存库）计数值天然为真，直接标记已校准，避免读路径走
+        // COUNT 回退；存量库保持 calibrated=0，由启动校准任务回填真值。
+        let all_entity_tables_empty = [
+            "dht_nodes",
+            "peers",
+            "peers_archive",
+            "infohashes",
+            "trackers",
+        ]
+        .iter()
+        .all(|t| {
+            conn.query_row(&format!("SELECT 1 FROM {} LIMIT 1", t), [], |_| Ok(()))
+                .is_err()
+        });
+        if all_entity_tables_empty {
+            conn.execute("UPDATE table_counts SET calibrated = 1", [])?;
+        }
+
         // v9：range 反熵 / bootstrap 分块都按**表达式键**做 `ORDER BY` 与区间比较
         // （NODE `(ip||':'||port)`、PEER `(lower(hex(infohash))||':'||ip||':'||port)`），
         // 而此前没有任何匹配索引 ⇒ 每次调用都是「全表扫描 + 全量排序」，且全程持有连接锁
@@ -526,7 +735,7 @@ impl Storage {
 
     /// 加载所有 DHT 节点
     pub fn load_dht_nodes(&self) -> anyhow::Result<Vec<DhtNodeRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time FROM dht_nodes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
@@ -549,6 +758,7 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 清空 DHT 节点表
@@ -859,7 +1069,7 @@ impl Storage {
     }
 
     pub fn load_trackers(&self) -> anyhow::Result<Vec<TrackerRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt = conn.prepare("SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled FROM trackers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok(TrackerRow {
@@ -875,11 +1085,12 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 按分数降序加载 top N 个 tracker（启动预加载用）
     pub fn load_top_trackers(&self, limit: usize) -> anyhow::Result<Vec<TrackerRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt = conn.prepare(
             "SELECT url, score, total_requests, success_requests, failed_requests, total_peers_discovered, total_response_time_ms, consecutive_failures, disabled 
              FROM trackers WHERE deleted_at IS NULL 
@@ -900,6 +1111,7 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     // ---- Infohash ----
@@ -974,7 +1186,7 @@ impl Storage {
     /// 批量保存 infohash（在已有连接上执行，供 IOScheduler 回调）
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt =
             conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
@@ -991,6 +1203,7 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 更新 infohash 评分
@@ -1096,7 +1309,7 @@ impl Storage {
 
     /// 加载所有 peer
     pub fn load_peers(&self) -> anyhow::Result<Vec<PeerRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt = conn.prepare("SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active FROM peers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -1116,6 +1329,7 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 清空 peers 表
@@ -1323,7 +1537,7 @@ impl Storage {
         infohash: &[u8; 20],
         limit: usize,
     ) -> anyhow::Result<Vec<PeerHistoryRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt = conn.prepare("SELECT ip, port, source, score, discovered_at FROM peer_history WHERE infohash = ?1 ORDER BY discovered_at DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![infohash.as_slice(), limit as i64], |row| {
             Ok(PeerHistoryRow {
@@ -1335,6 +1549,7 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 清理过期 peer 历史（保留 days 天）
@@ -1377,13 +1592,14 @@ impl Storage {
 
     /// 查询统计历史
     pub fn query_stats_history(&self, metric: &str, hours: u64) -> anyhow::Result<Vec<(i64, f64)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let cutoff = chrono::Utc::now().timestamp() - (hours as i64 * 3600);
         let mut stmt = conn.prepare("SELECT timestamp, value FROM stats_history WHERE metric = ?1 AND timestamp >= ?2 ORDER BY timestamp")?;
         let rows = stmt.query_map(params![metric, cutoff], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     // ---- Stats Aggregate ----
@@ -1418,13 +1634,14 @@ impl Storage {
 
     /// 加载累计统计
     pub fn load_aggregate(&self, metric: &str) -> Option<f64> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row(
-            "SELECT value FROM stats_aggregate WHERE metric = ?1",
-            params![metric],
-            |row| row.get(0),
-        )
-        .ok()
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT value FROM stats_aggregate WHERE metric = ?1",
+                params![metric],
+                |row| row.get(0),
+            )
+            .ok()
+        })
     }
 
     /// 加载热/温 DHT 节点（最近活跃或高分），按评分降序 + LIMIT，供分层缓存启动加载。
@@ -1434,43 +1651,44 @@ impl Storage {
         min_score: f64,
         limit: usize,
     ) -> anyhow::Result<Vec<DhtNodeRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let warm_cutoff = now - warm_threshold_secs as i64;
-        let mut stmt = conn.prepare(
-            r#"SELECT id, ip, port, score, state, query_count, success_count,
+        self.read(|conn| {
+            let now = chrono::Utc::now().timestamp();
+            let warm_cutoff = now - warm_threshold_secs as i64;
+            let mut stmt = conn.prepare(
+                r#"SELECT id, ip, port, score, state, query_count, success_count,
                   total_latency_ms, consecutive_failures, nodes_returned, last_query_time
                FROM dht_nodes
                WHERE deleted_at IS NULL AND (last_active > ?1 OR score >= ?2)
                ORDER BY score DESC
                LIMIT ?3"#,
-        )?;
-        let rows = stmt.query_map(params![warm_cutoff, min_score, limit as i64], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let mut id_arr = [0u8; 20];
-            if id.len() == 20 {
-                id_arr.copy_from_slice(&id);
-            }
-            Ok(DhtNodeRow {
-                id: id_arr,
-                ip: row.get(1)?,
-                port: row.get::<_, i64>(2)? as u16,
-                score: row.get(3)?,
-                state: row.get(4)?,
-                query_count: row.get::<_, i64>(5)? as u64,
-                success_count: row.get::<_, i64>(6)? as u64,
-                total_latency_ms: row.get::<_, i64>(7)? as u64,
-                consecutive_failures: row.get::<_, i64>(8)? as u32,
-                nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
-                last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
-            })
-        })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+            )?;
+            let rows = stmt.query_map(params![warm_cutoff, min_score, limit as i64], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let mut id_arr = [0u8; 20];
+                if id.len() == 20 {
+                    id_arr.copy_from_slice(&id);
+                }
+                Ok(DhtNodeRow {
+                    id: id_arr,
+                    ip: row.get(1)?,
+                    port: row.get::<_, i64>(2)? as u16,
+                    score: row.get(3)?,
+                    state: row.get(4)?,
+                    query_count: row.get::<_, i64>(5)? as u64,
+                    success_count: row.get::<_, i64>(6)? as u64,
+                    total_latency_ms: row.get::<_, i64>(7)? as u64,
+                    consecutive_failures: row.get::<_, i64>(8)? as u32,
+                    nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
+                    last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 限量加载 peers（按最近活跃降序 + LIMIT），供启动预加载
     pub fn load_limited_peers(&self, limit: usize) -> anyhow::Result<Vec<PeerRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| {
         let mut stmt = conn.prepare(
             "SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active
              FROM peers WHERE deleted_at IS NULL
@@ -1494,160 +1712,172 @@ impl Storage {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 限量加载 infohashes（按引用数降序 + LIMIT），供启动预加载
     pub fn load_limited_infohashes(&self, limit: usize) -> anyhow::Result<Vec<InfohashRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT infohash, ref_count, first_source, score
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT infohash, ref_count, first_source, score
              FROM infohashes WHERE deleted_at IS NULL
              ORDER BY ref_count DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit as i64], |row| {
-            let ih: Vec<u8> = row.get(0)?;
-            let mut arr = [0u8; 20];
-            if ih.len() == 20 {
-                arr.copy_from_slice(&ih);
-            }
-            Ok(InfohashRow {
-                infohash: arr,
-                ref_count: row.get::<_, i64>(1)? as u32,
-                first_source: row.get(2)?,
-                score: row.get::<_, f64>(3).unwrap_or(0.0),
-            })
-        })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+            )?;
+            let rows = stmt.query_map([limit as i64], |row| {
+                let ih: Vec<u8> = row.get(0)?;
+                let mut arr = [0u8; 20];
+                if ih.len() == 20 {
+                    arr.copy_from_slice(&ih);
+                }
+                Ok(InfohashRow {
+                    infohash: arr,
+                    ref_count: row.get::<_, i64>(1)? as u32,
+                    first_source: row.get(2)?,
+                    score: row.get::<_, f64>(3).unwrap_or(0.0),
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
     }
 
     /// 按 (ip, port) 加载单个 DHT 节点（缓存未命中时按需加载）。
     pub fn load_dht_node_by_addr(&self, ip: &str, port: u16) -> anyhow::Result<Option<DhtNodeRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, \
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, \
              consecutive_failures, nodes_returned, last_query_time FROM dht_nodes \
              WHERE ip = ?1 AND port = ?2 AND deleted_at IS NULL",
-        )?;
-        let result = stmt.query_row(params![ip, port as i64], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let mut id_arr = [0u8; 20];
-            if id.len() == 20 {
-                id_arr.copy_from_slice(&id);
+            )?;
+            let result = stmt.query_row(params![ip, port as i64], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let mut id_arr = [0u8; 20];
+                if id.len() == 20 {
+                    id_arr.copy_from_slice(&id);
+                }
+                Ok(DhtNodeRow {
+                    id: id_arr,
+                    ip: row.get(1)?,
+                    port: row.get::<_, i64>(2)? as u16,
+                    score: row.get(3)?,
+                    state: row.get(4)?,
+                    query_count: row.get::<_, i64>(5)? as u64,
+                    success_count: row.get::<_, i64>(6)? as u64,
+                    total_latency_ms: row.get::<_, i64>(7)? as u64,
+                    consecutive_failures: row.get::<_, i64>(8)? as u32,
+                    nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
+                    last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
+                })
+            });
+            match result {
+                Ok(row) => Ok(Some(row)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            Ok(DhtNodeRow {
-                id: id_arr,
-                ip: row.get(1)?,
-                port: row.get::<_, i64>(2)? as u16,
-                score: row.get(3)?,
-                state: row.get(4)?,
-                query_count: row.get::<_, i64>(5)? as u64,
-                success_count: row.get::<_, i64>(6)? as u64,
-                total_latency_ms: row.get::<_, i64>(7)? as u64,
-                consecutive_failures: row.get::<_, i64>(8)? as u32,
-                nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
-                last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
-            })
-        });
-        match result {
-            Ok(row) => Ok(Some(row)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
     /// 按 (ip, port) 加载单个 Peer（缓存未命中时按需加载）。
     pub fn load_peer_by_addr(&self, ip: &str, port: u16) -> anyhow::Result<Option<PeerRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
             "SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, \
              last_active FROM peers WHERE ip = ?1 AND port = ?2 AND deleted_at IS NULL",
         )?;
-        let result = stmt.query_row(params![ip, port as i64], |row| {
-            let ih: Vec<u8> = row.get(0)?;
-            let mut arr = [0u8; 20];
-            if ih.len() == 20 {
-                arr.copy_from_slice(&ih);
+            let result = stmt.query_row(params![ip, port as i64], |row| {
+                let ih: Vec<u8> = row.get(0)?;
+                let mut arr = [0u8; 20];
+                if ih.len() == 20 {
+                    arr.copy_from_slice(&ih);
+                }
+                Ok(PeerRow {
+                    infohash: arr,
+                    ip: row.get(1)?,
+                    port: row.get::<_, i64>(2)? as u16,
+                    source: row.get(3)?,
+                    score: row.get(4)?,
+                    connection_attempts: row.get::<_, i64>(5)? as u32,
+                    connection_successes: row.get::<_, i64>(6)? as u32,
+                    last_active: row.get(7)?,
+                })
+            });
+            match result {
+                Ok(row) => Ok(Some(row)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            Ok(PeerRow {
-                infohash: arr,
-                ip: row.get(1)?,
-                port: row.get::<_, i64>(2)? as u16,
-                source: row.get(3)?,
-                score: row.get(4)?,
-                connection_attempts: row.get::<_, i64>(5)? as u32,
-                connection_successes: row.get::<_, i64>(6)? as u32,
-                last_active: row.get(7)?,
-            })
-        });
-        match result {
-            Ok(row) => Ok(Some(row)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
     /// 按 infohash 加载单个 Infohash 行（缓存未命中时按需加载）。
     pub fn load_infohash_by_hash(&self, ih: &[u8; 20]) -> anyhow::Result<Option<InfohashRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT infohash, ref_count, first_source, score FROM infohashes \
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT infohash, ref_count, first_source, score FROM infohashes \
              WHERE infohash = ?1 AND deleted_at IS NULL",
-        )?;
-        let result = stmt.query_row(params![ih.as_slice()], |row| {
-            let ih: Vec<u8> = row.get(0)?;
-            let mut arr = [0u8; 20];
-            if ih.len() == 20 {
-                arr.copy_from_slice(&ih);
+            )?;
+            let result = stmt.query_row(params![ih.as_slice()], |row| {
+                let ih: Vec<u8> = row.get(0)?;
+                let mut arr = [0u8; 20];
+                if ih.len() == 20 {
+                    arr.copy_from_slice(&ih);
+                }
+                Ok(InfohashRow {
+                    infohash: arr,
+                    ref_count: row.get::<_, i64>(1)? as u32,
+                    first_source: row.get(2)?,
+                    score: row.get::<_, f64>(3).unwrap_or(0.0),
+                })
+            });
+            match result {
+                Ok(row) => Ok(Some(row)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            Ok(InfohashRow {
-                infohash: arr,
-                ref_count: row.get::<_, i64>(1)? as u32,
-                first_source: row.get(2)?,
-                score: row.get::<_, f64>(3).unwrap_or(0.0),
-            })
-        });
-        match result {
-            Ok(row) => Ok(Some(row)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
     /// 按 url 加载单个 Tracker 行（缓存未命中时按需加载）。
     pub fn load_tracker_by_url(&self, url: &str) -> anyhow::Result<Option<TrackerRow>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT url, score, total_requests, success_requests, failed_requests, \
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT url, score, total_requests, success_requests, failed_requests, \
              total_peers_discovered, total_response_time_ms, consecutive_failures, disabled \
              FROM trackers WHERE url = ?1 AND deleted_at IS NULL",
-        )?;
-        let result = stmt.query_row(params![url], |row| {
-            Ok(TrackerRow {
-                url: row.get(0)?,
-                score: row.get(1)?,
-                total_requests: row.get::<_, i64>(2)? as u64,
-                success_requests: row.get::<_, i64>(3)? as u64,
-                failed_requests: row.get::<_, i64>(4)? as u64,
-                total_peers_discovered: row.get::<_, i64>(5)? as u64,
-                total_response_time_ms: row.get(6)?,
-                consecutive_failures: row.get::<_, i64>(7)? as u32,
-                disabled: row.get::<_, i64>(8)? != 0,
-            })
-        });
-        match result {
-            Ok(row) => Ok(Some(row)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+            )?;
+            let result = stmt.query_row(params![url], |row| {
+                Ok(TrackerRow {
+                    url: row.get(0)?,
+                    score: row.get(1)?,
+                    total_requests: row.get::<_, i64>(2)? as u64,
+                    success_requests: row.get::<_, i64>(3)? as u64,
+                    failed_requests: row.get::<_, i64>(4)? as u64,
+                    total_peers_discovered: row.get::<_, i64>(5)? as u64,
+                    total_response_time_ms: row.get(6)?,
+                    consecutive_failures: row.get::<_, i64>(7)? as u32,
+                    disabled: row.get::<_, i64>(8)? != 0,
+                })
+            });
+            match result {
+                Ok(row) => Ok(Some(row)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
     }
 
     /// 统计表的总行数（表名为调用方硬编码常量，无注入风险）。
+    /// 优先读触发器维护的增量计数（O(1)）；未校准时回退真实 COUNT（与旧版一致）。
     pub fn count_table(&self, table: &str) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
-            row.get(0)
-        })?;
-        Ok(count as u64)
+        if let Some((total, _)) = self.table_count_cached(table) {
+            return Ok(total.max(0) as u64);
+        }
+        self.read(|conn| {
+            let count: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+                    row.get(0)
+                })?;
+            Ok(count as u64)
+        })
     }
 
     /// P2-1：按 key（"ip:port" 字符串）升序加载 NODE 原始行 `(id, ip, port)`，范围 `[lo, hi)`，最多 `limit` 条。
@@ -1660,33 +1890,34 @@ impl Storage {
         hi: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, String, i64)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-        let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-        // v9：按需拼谓词，使新增的表达式索引 `idx_dht_nodes_ip_port_expr` 能被用于
-        // **区间定位**。旧写法 `(?1 IS NULL OR (ip||':'||port) >= ?1)` 让 SQLite 无法做
-        // 索引范围扫描，只能退化为「索引有序全扫 + 逐行过滤」—— 建一次清单要跑 93 个块查询，
-        // 每个都从表头扫到 `lo`，合计上亿次探测（实测单次重建 >131s，持锁期间拖垮 API/写队列）。
-        let (sql, binds) = Self::node_range_sql(
-            "SELECT id, ip, port FROM dht_nodes",
-            &lo_s,
-            &hi_s,
-            limit.max(1) as i64,
-        );
-        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        self.read(|conn| {
+            let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+            let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+            // v9：按需拼谓词，使新增的表达式索引 `idx_dht_nodes_ip_port_expr` 能被用于
+            // **区间定位**。旧写法 `(?1 IS NULL OR (ip||':'||port) >= ?1)` 让 SQLite 无法做
+            // 索引范围扫描，只能退化为「索引有序全扫 + 逐行过滤」—— 建一次清单要跑 93 个块查询，
+            // 每个都从表头扫到 `lo`，合计上亿次探测（实测单次重建 >131s，持锁期间拖垮 API/写队列）。
+            let (sql, binds) = Self::node_range_sql(
+                "SELECT id, ip, port FROM dht_nodes",
+                &lo_s,
+                &hi_s,
+                limit.max(1) as i64,
+            );
+            let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
     }
 
     /// v9：为 NODE 的区间查询拼装 SQL 与绑定参数（共用于原始行查询与 (key,data_hash) 查询）。
@@ -1731,7 +1962,19 @@ impl Storage {
         hi: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.read(|conn| Self::query_node_key_hashes(conn, lo, hi, limit))
+    }
+
+    /// 纯 SQL 实现：按 [lo, hi) 区间读 dht_nodes 的 (key, hash)。
+    /// 不持有任何锁，调用方负责连接生命周期。供 `load_node_key_hashes_in_range`
+    /// 与 `load_repo_key_hashes_in_range`（已在外层 read 闭包内）共用，避免嵌套
+    /// `self.read()` 在 `Storage::memory()` 回退写锁路径下二次 lock 同一 Mutex 死锁。
+    fn query_node_key_hashes(
+        conn: &rusqlite::Connection,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
         let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
         // v9：与 `load_node_rows_in_range` 同一套「按需谓词」拼装（使表达式索引可用于区间定位）。
@@ -1768,10 +2011,10 @@ impl Storage {
         &self,
         keys: &[Vec<u8>],
     ) -> anyhow::Result<Vec<crate::storage::db::DhtNodeRow>> {
+        self.read(|conn| {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let placeholders = vec!["?"; keys.len()].join(",");
         let sql = format!(
             "SELECT id, ip, port, score, state, query_count, success_count,              total_latency_ms, consecutive_failures, nodes_returned              FROM dht_nodes              WHERE deleted_at IS NULL AND (ip || ':' || port) IN ({})",
@@ -1810,6 +2053,7 @@ impl Storage {
             out.push(r?);
         }
         Ok(out)
+        })
     }
 
     /// P1-4：均匀抽取 `n` 个 NODE key 作为区间分界（用 rowid 伪随机探针，避免全表扫描）。
@@ -1817,38 +2061,40 @@ impl Storage {
     /// 返回**已排序去重**的 key 列表。`MAX(rowid)` 为 O(1)，每个探针为 O(log N) 的 rowid 查找，
     /// 整体 O(n log N)（相对 O(N) 全表扫描可忽略）。
     pub fn sample_node_range_keys(&self, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let max_rowid: i64 =
-            conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM dht_nodes", [], |r| {
-                r.get(0)
-            })?;
-        if max_rowid <= 0 {
-            return Ok(Vec::new());
-        }
-        // 手写 LCG（避免引入 rand 依赖；seed 取自当前时间，保证每轮抽样不同）
-        let mut state: u64 = (chrono::Utc::now().timestamp_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
-        let mut stmt = conn.prepare_cached(
-            "SELECT ip, port FROM dht_nodes WHERE deleted_at IS NULL AND rowid >= ?1 \
-             ORDER BY rowid ASC LIMIT 1",
-        )?;
-        for _ in 0..n {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let probe = ((state >> 33) % (max_rowid as u64)) as i64;
-            if let Ok((ip, port)) = stmt.query_row(params![probe], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            }) {
-                keys.push(format!("{}:{}", ip, port).into_bytes());
+        self.read(|conn| {
+            if n == 0 {
+                return Ok(Vec::new());
             }
-        }
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
+            let max_rowid: i64 =
+                conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM dht_nodes", [], |r| {
+                    r.get(0)
+                })?;
+            if max_rowid <= 0 {
+                return Ok(Vec::new());
+            }
+            // 手写 LCG（避免引入 rand 依赖；seed 取自当前时间，保证每轮抽样不同）
+            let mut state: u64 =
+                (chrono::Utc::now().timestamp_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
+            let mut stmt = conn.prepare_cached(
+                "SELECT ip, port FROM dht_nodes WHERE deleted_at IS NULL AND rowid >= ?1 \
+             ORDER BY rowid ASC LIMIT 1",
+            )?;
+            for _ in 0..n {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let probe = ((state >> 33) % (max_rowid as u64)) as i64;
+                if let Ok((ip, port)) = stmt.query_row(params![probe], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                }) {
+                    keys.push(format!("{}:{}", ip, port).into_bytes());
+                }
+            }
+            keys.sort();
+            keys.dedup();
+            Ok(keys)
+        })
     }
 
     // ---- v7：统一 range 反熵（全 repo 支持）----
@@ -1864,153 +2110,154 @@ impl Storage {
         hi: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
-        const NODE: u8 = 1;
-        const PEER: u8 = 2;
-        const INFOHASH: u8 = 3;
-        const TRACKER: u8 = 4;
-        match repo {
-            NODE => self.load_node_key_hashes_in_range(lo, hi, limit),
-            PEER => {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT infohash, ip, port FROM peers \
+        self.read(|conn| {
+            // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
+            const NODE: u8 = 1;
+            const PEER: u8 = 2;
+            const INFOHASH: u8 = 3;
+            const TRACKER: u8 = 4;
+            match repo {
+                NODE => Self::query_node_key_hashes(conn, lo, hi, limit),
+                PEER => {
+                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT infohash, ip, port FROM peers \
                      WHERE deleted_at IS NULL \
                        AND (?1 IS NULL OR {key_expr} >= ?1) \
                        AND (?2 IS NULL OR {key_expr} < ?2) \
                      ORDER BY {key_expr} ASC LIMIT ?3"
-                ))?;
-                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    let (ih, ip, port) = r?;
-                    let mut arr = [0u8; 20];
-                    if ih.len() == 20 {
-                        arr.copy_from_slice(&ih);
+                    ))?;
+                    let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        let (ih, ip, port) = r?;
+                        let mut arr = [0u8; 20];
+                        if ih.len() == 20 {
+                            arr.copy_from_slice(&ih);
+                        }
+                        let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                        let key = format!("{}:{}:{}", ih_hex, ip, port).into_bytes();
+                        let mut buf = Vec::with_capacity(ih.len() + ip.len() + 2);
+                        buf.extend_from_slice(&ih);
+                        buf.extend_from_slice(ip.as_bytes());
+                        buf.extend_from_slice(&port.to_le_bytes());
+                        out.push((key, blake3::hash(&buf).as_bytes().to_vec()));
                     }
-                    let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                    let key = format!("{}:{}:{}", ih_hex, ip, port).into_bytes();
-                    let mut buf = Vec::with_capacity(ih.len() + ip.len() + 2);
-                    buf.extend_from_slice(&ih);
-                    buf.extend_from_slice(ip.as_bytes());
-                    buf.extend_from_slice(&port.to_le_bytes());
-                    out.push((key, blake3::hash(&buf).as_bytes().to_vec()));
+                    Ok(out)
                 }
-                Ok(out)
-            }
-            INFOHASH => {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut stmt = conn.prepare(
-                    "SELECT infohash FROM infohashes \
+                INFOHASH => {
+                    let mut stmt = conn.prepare(
+                        "SELECT infohash FROM infohashes \
                      WHERE deleted_at IS NULL \
                        AND (?1 IS NULL OR infohash >= ?1) \
                        AND (?2 IS NULL OR infohash < ?2) \
                      ORDER BY infohash ASC LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    let ih = r?;
-                    out.push((ih.clone(), blake3::hash(&ih).as_bytes().to_vec()));
+                    )?;
+                    let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        let ih = r?;
+                        out.push((ih.clone(), blake3::hash(&ih).as_bytes().to_vec()));
+                    }
+                    Ok(out)
                 }
-                Ok(out)
-            }
-            TRACKER => {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                let mut stmt = conn.prepare(
-                    "SELECT url FROM trackers \
+                TRACKER => {
+                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let mut stmt = conn.prepare(
+                        "SELECT url FROM trackers \
                      WHERE deleted_at IS NULL \
                        AND (?1 IS NULL OR url >= ?1) \
                        AND (?2 IS NULL OR url < ?2) \
                      ORDER BY url ASC LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                    row.get::<_, String>(0)
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    let url = r?;
-                    out.push((
-                        url.clone().into_bytes(),
-                        blake3::hash(url.as_bytes()).as_bytes().to_vec(),
-                    ));
+                    )?;
+                    let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        let url = r?;
+                        out.push((
+                            url.clone().into_bytes(),
+                            blake3::hash(url.as_bytes()).as_bytes().to_vec(),
+                        ));
+                    }
+                    Ok(out)
                 }
-                Ok(out)
+                _ => Ok(Vec::new()),
             }
-            _ => Ok(Vec::new()),
-        }
+        })
     }
 
     /// v7：按 repo 随机抽样 `n` 个分界 key（LCG 探 rowid，同 [`Self::sample_node_range_keys`]）。
     pub fn sample_repo_range_keys(&self, repo: u8, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        // (表名, key 表达式)：key 表达式须与 load_repo_key_hashes_in_range 的排序键一致
-        // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
-        const NODE: u8 = 1;
-        const PEER: u8 = 2;
-        const INFOHASH: u8 = 3;
-        const TRACKER: u8 = 4;
-        let (table, key_sql): (&str, &str) = match repo {
-            NODE => ("dht_nodes", "(ip || ':' || port)"),
-            PEER => (
-                "peers",
-                "(lower(hex(infohash)) || ':' || ip || ':' || port)",
-            ),
-            INFOHASH => ("infohashes", "infohash"),
-            TRACKER => ("trackers", "url"),
-            _ => return Ok(Vec::new()),
-        };
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let max_rowid: i64 = conn.query_row(
-            &format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", table),
-            [],
-            |r| r.get(0),
-        )?;
-        if max_rowid <= 0 {
-            return Ok(Vec::new());
-        }
-        let mut state: u64 = (chrono::Utc::now().timestamp_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
-        let sql = format!(
-            "SELECT {key_sql} FROM {table} WHERE deleted_at IS NULL AND rowid >= ?1 \
-             ORDER BY rowid ASC LIMIT 1"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
-        for _ in 0..n {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let probe = ((state >> 33) % (max_rowid as u64)) as i64;
-            // key 可能是 TEXT（NODE/PEER/TRACKER）或 BLOB（INFOHASH），用 Value 中转
-            if let Ok(v) = stmt.query_row(params![probe], |row| {
-                row.get::<_, rusqlite::types::Value>(0)
-            }) {
-                let k = match v {
-                    rusqlite::types::Value::Text(s) => s.into_bytes(),
-                    rusqlite::types::Value::Blob(b) => b,
-                    _ => continue,
-                };
-                keys.push(k);
+        self.read(|conn| {
+            if n == 0 {
+                return Ok(Vec::new());
             }
-        }
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
+            // (表名, key 表达式)：key 表达式须与 load_repo_key_hashes_in_range 的排序键一致
+            // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
+            const NODE: u8 = 1;
+            const PEER: u8 = 2;
+            const INFOHASH: u8 = 3;
+            const TRACKER: u8 = 4;
+            let (table, key_sql): (&str, &str) = match repo {
+                NODE => ("dht_nodes", "(ip || ':' || port)"),
+                PEER => (
+                    "peers",
+                    "(lower(hex(infohash)) || ':' || ip || ':' || port)",
+                ),
+                INFOHASH => ("infohashes", "infohash"),
+                TRACKER => ("trackers", "url"),
+                _ => return Ok(Vec::new()),
+            };
+            let max_rowid: i64 = conn.query_row(
+                &format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", table),
+                [],
+                |r| r.get(0),
+            )?;
+            if max_rowid <= 0 {
+                return Ok(Vec::new());
+            }
+            let mut state: u64 =
+                (chrono::Utc::now().timestamp_millis() as u64) ^ 0x9E37_79B9_7F4A_7C15;
+            let sql = format!(
+                "SELECT {key_sql} FROM {table} WHERE deleted_at IS NULL AND rowid >= ?1 \
+             ORDER BY rowid ASC LIMIT 1"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let probe = ((state >> 33) % (max_rowid as u64)) as i64;
+                // key 可能是 TEXT（NODE/PEER/TRACKER）或 BLOB（INFOHASH），用 Value 中转
+                if let Ok(v) = stmt.query_row(params![probe], |row| {
+                    row.get::<_, rusqlite::types::Value>(0)
+                }) {
+                    let k = match v {
+                        rusqlite::types::Value::Text(s) => s.into_bytes(),
+                        rusqlite::types::Value::Blob(b) => b,
+                        _ => continue,
+                    };
+                    keys.push(k);
+                }
+            }
+            keys.sort();
+            keys.dedup();
+            Ok(keys)
+        })
     }
 
     /// v7：按 repo 加载 `[lo, hi)` 区间内的完整 `SyncEntry`（bootstrap 分块服务用）。
@@ -2545,5 +2792,128 @@ mod tests {
         storage.update_aggregate("total_requests", 1000.0).unwrap();
         let val = storage.load_aggregate("total_requests").unwrap();
         assert_eq!(val, 1000.0);
+    }
+
+    #[test]
+    fn test_table_counts_dht_node_lifecycle() {
+        let storage = Storage::memory().unwrap();
+        // 空库在 init_tables 内即已校准，读路径走增量计数且为 0
+        assert_eq!(storage.count_table("dht_nodes").unwrap(), 0);
+
+        let id1 = [1u8; 20];
+        let id2 = [2u8; 20];
+        storage
+            .save_dht_node(&id1, "10.0.0.1", 6881, 1.0, "Good", 1, 1, 1, 0, 1, None)
+            .unwrap();
+        storage
+            .save_dht_node(&id2, "10.0.0.2", 6881, 1.0, "Good", 1, 1, 1, 0, 1, None)
+            .unwrap();
+        assert_eq!(storage.count_table("dht_nodes").unwrap(), 2);
+        assert_eq!(storage.valid_entity_counts()[0], 2);
+
+        // upsert 同主键更新：行数不变（INSERT 触发器不 fire）
+        storage
+            .save_dht_node(&id1, "10.0.0.1", 6881, 2.0, "Good", 2, 2, 2, 0, 2, None)
+            .unwrap();
+        assert_eq!(storage.count_table("dht_nodes").unwrap(), 2);
+        assert_eq!(storage.valid_entity_counts()[0], 2);
+
+        // 软删：total 不变、valid 减 1；重复软删幂等
+        assert_eq!(storage.soft_delete_node("10.0.0.1", 6881).unwrap(), 1);
+        assert_eq!(storage.count_table("dht_nodes").unwrap(), 2);
+        assert_eq!(storage.valid_entity_counts()[0], 1);
+        assert_eq!(storage.soft_delete_node("10.0.0.1", 6881).unwrap(), 0);
+        assert_eq!(storage.valid_entity_counts()[0], 1);
+
+        // upsert 复活墓碑（DO UPDATE SET deleted_at=NULL）：valid 加回
+        storage
+            .save_dht_node(&id1, "10.0.0.1", 6881, 3.0, "Good", 1, 1, 1, 0, 1, None)
+            .unwrap();
+        assert_eq!(storage.valid_entity_counts()[0], 2);
+
+        // 硬删全部：归零
+        storage.clear_dht_nodes().unwrap();
+        assert_eq!(storage.count_table("dht_nodes").unwrap(), 0);
+        assert_eq!(storage.valid_entity_counts()[0], 0);
+    }
+
+    #[test]
+    fn test_table_counts_peers_and_trackers() {
+        let storage = Storage::memory().unwrap();
+        let ih = [7u8; 20];
+        storage
+            .save_peer(&ih, "10.1.0.1", 51413, "dht", 1.0, 0, 0, 1000)
+            .unwrap();
+        storage
+            .save_peer(&ih, "10.1.0.2", 51413, "dht", 1.0, 0, 0, 1000)
+            .unwrap();
+        // 同一 peer 重复上报（upsert 更新）：计数不变
+        storage
+            .save_peer(&ih, "10.1.0.1", 51413, "dht", 1.0, 1, 1, 2000)
+            .unwrap();
+        assert_eq!(storage.count_table("peers").unwrap(), 2);
+        assert_eq!(storage.valid_entity_counts()[1], 2);
+
+        // tracker 墓碑保留语义：软删后 valid 减、total 不变；
+        // keep_tombstone upsert 不复活，普通 save_tracker 复活
+        storage
+            .save_tracker("http://t.example/announce", 1.0, 0, 0, 0, 0, 0.0, 0, false)
+            .unwrap();
+        assert_eq!(storage.count_table("trackers").unwrap(), 1);
+        assert_eq!(
+            storage
+                .soft_delete_tracker("http://t.example/announce")
+                .unwrap(),
+            1
+        );
+        assert_eq!(storage.valid_entity_counts()[4], 0);
+        assert_eq!(storage.count_table("trackers").unwrap(), 1);
+        storage
+            .save_tracker_keep_tombstone(
+                "http://t.example/announce",
+                1.0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                0,
+                false,
+            )
+            .unwrap();
+        assert_eq!(storage.valid_entity_counts()[4], 0);
+        storage
+            .save_tracker("http://t.example/announce", 1.0, 0, 0, 0, 0, 0.0, 0, false)
+            .unwrap();
+        assert_eq!(storage.valid_entity_counts()[4], 1);
+    }
+
+    #[test]
+    fn test_table_counts_reconcile_overwrites_drift() {
+        let storage = Storage::memory().unwrap();
+        let ih = [9u8; 20];
+        storage
+            .save_peer(&ih, "10.2.0.1", 51413, "dht", 1.0, 0, 0, 1000)
+            .unwrap();
+        storage
+            .save_peer(&ih, "10.2.0.2", 51413, "dht", 1.0, 0, 0, 1000)
+            .unwrap();
+
+        // 人为污染计数器，模拟漂移
+        {
+            let conn = storage.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "UPDATE table_counts SET total = total + 100, valid = valid + 100 \
+                 WHERE name = 'peers'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // 校准后回到真值
+        let c = storage.refresh_entity_counts();
+        assert_eq!(c[1], 2);
+        assert_eq!(storage.count_table("peers").unwrap(), 2);
+        assert_eq!(storage.valid_entity_counts()[1], 2);
     }
 }

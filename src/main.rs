@@ -341,6 +341,21 @@ async fn async_main(
         Arc::new(PeerDiscoveryCenter::storage::Storage::memory().expect("无法创建内存数据库"))
     };
 
+    // 3.5.1 启动校准增量行数计数器（table_counts）：存量库升级后首启时计数器
+    // 尚未校准，此处以真实 COUNT 回填一次（每表单遍扫描，阻塞线程执行），
+    // 之后所有计数读路径（统计快照 / 监控 WS / 联邦协商）走触发器维护的 O(1) 计数，
+    // 不再周期性全表扫描。空库在 init_tables 内已完成校准，此处为幂等空操作。
+    {
+        let storage_cal = storage.clone();
+        persistence_handle.spawn_blocking(move || {
+            let c = storage_cal.refresh_entity_counts();
+            info!(
+                "[storage] 启动校准实体行数计数: dht_nodes={} peers={} peers_archive={} infohashes={} trackers={}",
+                c[0], c[1], c[2], c[3], c[4]
+            );
+        });
+    }
+
     // 3.6 创建所有数据层 Repo（统一数据归口）
     // P2: 先创建 WriteQueue/IOScheduler，再注入到各 Repo
     let io_scheduler: Option<Arc<PeerDiscoveryCenter::storage::IoScheduler>> =
@@ -1154,8 +1169,12 @@ async fn async_main(
             move || {
                 let storage = storage_entity.clone();
                 async move {
+                    // 2026-09-23 起行数由 table_counts 触发器增量维护（见 storage/db.rs），
+                    // 本任务只读 O(1) 计数并落 stats_history/aggregate 指标，
+                    // 不再周期全表 COUNT（旧实现慢盘下单轮 >300s 且持锁拖垮读路径）。
+                    // 全量校准仅在启动时执行一次（见 main 3.5.1）。
                     match tokio::task::spawn_blocking(move || {
-                        let c = storage.refresh_entity_counts();
+                        let c = storage.entity_counts_cached();
                         let names = [
                             "db_dht_nodes",
                             "db_peers",
