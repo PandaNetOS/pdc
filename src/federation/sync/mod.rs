@@ -64,6 +64,10 @@ const BOOTSTRAP_INFLIGHT_TTL_SECS: u64 = 60;
 /// v10(A)：双向引导冲突的判定窗口（秒）—— 该窗口内响应过对方的 bootstrap 请求即视为
 /// 「对方正在从我拉快照」，node_id 字典序大的一方让路（响应方优先，确定性无震荡）。
 const BOOTSTRAP_SERVING_WINDOW_SECS: u64 = 120;
+/// v10(A+)：让路保持期（秒）—— 冲突成立后持续让路至少该时长。对端可能因停滞暂停
+/// 请求超过 serving 窗口，仅靠 serving 判定会让路失效 → 双向重启震荡
+/// （实测 15:30-15:34 三轮重启循环）。对端安静满该时长才恢复自己的拉取。
+const BOOTSTRAP_YIELD_HOLD_SECS: u64 = 300;
 
 /// v10(F2)：一轮 Range 抽样对账的进行中状态（断点续跑游标）。
 ///
@@ -213,6 +217,8 @@ pub struct SyncManager {
     /// v10(A)：响应方活动标记 —— (peer, repo) → 最近一次响应对方 bootstrap 请求的时刻。
     /// 「对方在从我拉快照」的信号，用于响应方优先串行化。
     bootstrap_serving_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v10(A+)：让路截止 —— (peer, repo) → 让路保持到的时刻（冲突后持续让路防震荡）。
+    bootstrap_yield_until: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
     delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
@@ -310,6 +316,7 @@ impl SyncManager {
             node_repo,
             local_node_id,
             bootstrap_serving_at: RwLock::new(FxHashMap::default()),
+            bootstrap_yield_until: RwLock::new(FxHashMap::default()),
             gossip_engine,
             peer_sync,
             infohash_sync,
@@ -1088,8 +1095,29 @@ impl SyncManager {
     /// （2026-09-27 实测 52/58：148 块 × 3 次「续传起点=0」）。
     /// 响应方优先：正在响应对方请求者继续传；node_id 字典序大的一方让路暂停自己的拉取
     /// （确定性打破对称，无震荡）。对端完成后让路方由 resume 自动恢复续传。
+    ///
+    /// v10(A+)：**持久让路** —— 让路方判定成立时刷新让路截止（`BOOTSTRAP_YIELD_HOLD_SECS`）；
+    /// 对端请求停滞（serving 过期）后截止前仍让路，防「停滞期让路失效 → 双向重启」震荡
+    /// （实测 15:30-15:34 三轮重启循环）。
     fn should_yield_bootstrap(&self, peer: &NodeId, repo: u8) -> bool {
-        self.serving_peer_bootstrap(peer, repo) && self.local_node_id.0 > peer.0
+        let serving_fresh = self.serving_peer_bootstrap(peer, repo);
+        if serving_fresh && self.local_node_id.0 > peer.0 {
+            // 冲突成立：持续让路并延长截止
+            self.bootstrap_yield_until.write().insert(
+                (*peer, repo),
+                Instant::now() + Duration::from_secs(BOOTSTRAP_YIELD_HOLD_SECS),
+            );
+            return true;
+        }
+        if self.local_node_id.0 > peer.0 {
+            // 对端安静：让路截止前仍保持让路（防震荡），截止后恢复拉取
+            let m = self.bootstrap_yield_until.read();
+            return m
+                .get(&(*peer, repo))
+                .map(|t| *t > Instant::now())
+                .unwrap_or(false);
+        }
+        false
     }
 
     /// v10(A)：响应方活动标记入口（清单/块请求共用）。
@@ -3830,6 +3858,14 @@ mod tests {
         assert!(mgr.should_yield_bootstrap(&smaller_peer, repo_type::NODE));
         // 对端(0x02…) > 本端(0x01…) → 对端让路，本端继续
         assert!(!mgr.should_yield_bootstrap(&bigger_peer, repo_type::NODE));
+        // v10(A+) 持久让路：serving 过期后、让路截止前仍保持让路（防双向重启震荡）
+        mgr.bootstrap_serving_at
+            .write()
+            .remove(&(smaller_peer, repo_type::NODE));
+        assert!(
+            mgr.should_yield_bootstrap(&smaller_peer, repo_type::NODE),
+            "serving 过期但让路截止未到，必须保持让路"
+        );
     }
 
     #[test]
