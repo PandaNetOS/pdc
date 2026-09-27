@@ -117,6 +117,10 @@ pub struct FederationConfig {
     /// 重连冷却时间（秒），断开后此时间内不主动重连同一节点
     #[serde(default = "default_reconnect_cooldown_secs")]
     pub reconnect_cooldown_secs: u64,
+    /// v10(F2 配套)：从未成功握手节点占位（temp_id）的保留宽限（秒），超期即清理。
+    /// 旧实现硬编码 120s（合规 #9 P0）。
+    #[serde(default = "default_never_connected_prune_secs")]
+    pub never_connected_prune_secs: u64,
     /// 重量级消息处理（GossipBatch/MerkleRepair）的最大并发数。
     /// 这些处理涉及大量 DB 写入，通过 Semaphore 限制 spawn_blocking 并发，
     /// 避免无界生成任务导致内存暴涨，同时不阻塞消息接收循环。
@@ -276,6 +280,11 @@ pub struct FederationConfig {
     /// 会把同分类的 delta/bootstrap/心跳一起饿死。
     #[serde(default = "default_range_repos_per_tick")]
     pub range_repos_per_tick: u32,
+    /// v10(F2)：Range 抽样对账每 tick 发送的区间预算。单轮 161 区间拆为多 tick 发送、
+    /// 游标断点续跑 —— 消灭「单轮 >300s 被 TaskScheduler 杀掉、进度作废、从头再来」
+    /// 的超时循环（2026-09-27 实测 52/58 双端超时）。
+    #[serde(default = "default_range_ranges_per_tick")]
+    pub range_ranges_per_tick: u32,
     /// v9：同一 (peer,repo) 叶区间修复的最小间隔（秒），避免同一批差异每轮重复推拉。
     #[serde(default = "default_range_repair_min_interval_secs")]
     pub range_repair_min_interval_secs: u64,
@@ -473,8 +482,8 @@ fn default_gossip_bulk_max_batches() -> usize {
     50
 }
 fn default_gossip_bulk_max_bytes() -> usize {
-    2 * 1024 * 1024
-} // 2MB
+    1536 * 1024
+} // 1.5MB（与 DELTA_BATCH_MAX_BYTES 对齐，留帧头/封装余量）
 fn default_parallel_propagation() -> bool {
     true
 }
@@ -497,6 +506,14 @@ fn default_bootstrap_rebuild_lease_secs() -> u64 {
 }
 fn default_range_repos_per_tick() -> u32 {
     1
+}
+/// v10(F2)：从未握手成功占位的清理宽限（秒）（见 `never_connected_prune_secs`）。
+fn default_never_connected_prune_secs() -> u64 {
+    120
+}
+/// v10(F2)：Range 每 tick 区间预算（见 `range_ranges_per_tick`）。
+fn default_range_ranges_per_tick() -> u32 {
+    32
 }
 fn default_range_repair_min_interval_secs() -> u64 {
     60
@@ -529,6 +546,7 @@ impl Default for FederationConfig {
             relay_bandwidth_limit_mbps: default_relay_bandwidth(),
             relay_max_connections: default_relay_max_connections(),
             relay_auto_setup_on_connect: default_relay_auto_setup_on_connect(),
+            range_ranges_per_tick: default_range_ranges_per_tick(),
             gossip_interval_ms: default_gossip_interval(),
             gossip_fanout: default_gossip_fanout(),
             gossip_seen_shards: default_gossip_seen_shards(),
@@ -545,6 +563,7 @@ impl Default for FederationConfig {
             transport_write_retry_base_ms: default_transport_write_retry_base_ms(),
             gossip_max_consecutive_failures: default_gossip_max_consecutive_failures(),
             reconnect_cooldown_secs: default_reconnect_cooldown_secs(),
+            never_connected_prune_secs: default_never_connected_prune_secs(),
             heavy_task_max_concurrency: default_heavy_task_max_concurrency(),
             gossip_max_bytes_per_second: default_gossip_max_bytes_per_second(),
             gossip_max_messages_per_second: default_gossip_max_messages_per_second(),

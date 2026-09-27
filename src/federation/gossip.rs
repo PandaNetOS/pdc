@@ -1060,6 +1060,7 @@ impl GossipEngine {
         let seen_start = Instant::now();
         let dedup_key = (NodeId(batch.origin), batch.msg_id);
         if !self.seen_msgs.check_and_put(dedup_key, ()) {
+            self.metrics.record_gossip_dedup_dropped();
             debug!(
                 "[federation] Gossip 消息已处理，跳过: msg_id={}",
                 batch.msg_id

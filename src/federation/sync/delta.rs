@@ -31,7 +31,10 @@ pub const DELTA_BATCH_LIMIT_DEFAULT: u32 = 1_000;
 
 /// 单批字节上限（不含帧头）：OpsBatch 组装时按 key+payload 累计估算，超过即截断本批。
 /// 与 `gossip_bulk_max_bytes` 同量级，防止大 value 场景下批帧失控。
-pub const DELTA_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+///
+/// 取 1.5 MiB 并显著小于接收组帧缓冲上限（`MAX_READ_BUF`，17 MiB），为帧头、
+/// 消息封装及高负载下已排队的后续字节预留充足余量，避免单批帧触发接收端缓冲保护。
+pub const DELTA_BATCH_MAX_BYTES: usize = 1536 * 1024;
 
 /// 支持建连协商（SyncNegotiate/Ack）的协议版本。
 pub const NEGOTIATION_PROTOCOL_VERSION: u32 = 7;

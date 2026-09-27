@@ -54,6 +54,32 @@ const BOOTSTRAP_CHECK_INTERVAL_SECS: u64 = 300;
 const SNAPSHOT_MIN_ROWS: u64 = 1_000;
 /// v7：快照分流比例阈值（本端比对端多出该比例且差值超阈值 → 快照）。
 const SNAPSHOT_RATIO_THRESHOLD: f64 = 1.2;
+/// v10(F2)：Range 抽样进度的停滞阈值（秒）—— 超过未推进视为对端持续不可达/连接失效，
+/// 弃置该进度、下一轮重新抽样。正常推进时每 tick 刷新，不会触发。
+const RANGE_SAMPLE_STALL_SECS: u64 = 1800;
+
+/// v10(F2)：一轮 Range 抽样对账的进行中状态（断点续跑游标）。
+///
+/// 旧实现一个 tick 内同步发完全部 161 个区间，在百万行库上单轮 >300s，
+/// 被 TaskScheduler 杀掉后进度（内存 for 循环）全部作废、下一轮从头再来 ——
+/// 兜底对账永远完不成一轮。现在每 tick 只发送 `range_ranges_per_tick` 个区间，
+/// 游标存放在 SyncManager（TaskScheduler 杀掉的是 future，不杀 SyncManager 状态），
+/// 下一 tick 从断点继续。
+#[derive(Clone)]
+struct RangeSampleProgress {
+    /// 分界 key 序列（含 ±∞ 首尾），区间数 = bounds.len() - 1；区间 i = [bounds[i], bounds[i+1])
+    bounds: Vec<Vec<u8>>,
+    leaf_rows: u32,
+    /// 下一个待发送的区间下标
+    next: usize,
+    /// 最近一次推进时刻（停滞超 `RANGE_SAMPLE_STALL_SECS` 弃置重抽）
+    updated: std::time::Instant,
+}
+
+/// P1-4：range 反熵单节点同时处理的最大 handler 数（请求/响应/拉/推共用一个闸）。
+/// dispatch 对每条 range 消息都 `tokio::spawn`，突发上百请求会 spawn 上百并发 handler
+/// 同时 load 区间 / 回帧，高负载节点 IO 饱和引发帧风暴与 os error 10053；闸削平突发。
+const RANGE_MAX_CONCURRENT_HANDLERS: usize = 8;
 
 /// 节点同步负载
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,11 +193,16 @@ pub struct SyncManager {
     range_rr: RwLock<FxHashMap<u8, usize>>,
     /// v9：(peer, repo) → 本周期内最近一次对账时刻，用于多对端公平轮转。
     range_peer_tick_last: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v10(F2)：Range 抽样对账断点 —— (peer, repo) → 进行中的区间序列与游标。
+    /// 每 tick 只发送 `range_ranges_per_tick` 个区间，被超时杀掉也不丢进度。
+    range_progress: RwLock<FxHashMap<(NodeId, u8), RangeSampleProgress>>,
     /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
     delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
     /// 置位后该 repo 优先走 bootstrap/反熵，并在可观测性里暴露（旧实现是静默跳过 + lag 归零）。
     delta_gap: RwLock<FxHashSet<(NodeId, u8)>>,
+    /// P1-4：range 反熵全局并发闸（请求/响应/拉/推 handler 共用），削平突发帧风暴。
+    range_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl SyncManager {
@@ -293,8 +324,10 @@ impl SyncManager {
             range_repair_recent: RwLock::new(FxHashMap::default()),
             range_rr: RwLock::new(FxHashMap::default()),
             range_peer_tick_last: RwLock::new(FxHashMap::default()),
+            range_progress: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
+            range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
         }
     }
 
@@ -973,16 +1006,18 @@ impl SyncManager {
     ///
     /// 旧实现读内存 repo 长度，那只是热/温子集（实测 peer 内存 12,731 而 DB total 25,564），
     /// 与本端对外展示的 total 口径不一致，会让 20% 差异的快照触发判定失真。
+    /// 各 repo 条目数（协商/巡检/快照裁决共用）。
+    ///
+    /// 口径铁律：必须与 `load_repo_key_hashes_in_range`（bootstrap 清单扫描）一致。
+    /// PEER 只取 `peers` 主表活行，**不含 `peers_archive`** —— 归档表不在清单扫描范围，
+    /// 计入后「协商判定永远差一截、快照永远拉不到」→ BOOTSTRAP 死循环
+    /// （2026-09-27 实测 52/58：58 报 40,042 vs 清单 28,009，每 5 分钟全量重拉一轮）。
+    /// node 的 write_queue_len 是落库前瞬时差，自愈性偏差，保留。
     pub(crate) fn local_entry_counts(&self) -> Vec<u32> {
         let db = self.delta_storage().entity_counts_cached();
         let pick = |i: usize| -> u64 { db.get(i).copied().unwrap_or(-1).max(0) as u64 };
         let node = pick(0) + self.node_repo.write_queue_len_sync() as u64;
-        vec![
-            node as u32,
-            (pick(1) + pick(2)) as u32,
-            pick(3) as u32,
-            pick(4) as u32,
-        ]
+        vec![node as u32, pick(1) as u32, pick(3) as u32, pick(4) as u32]
     }
 
     /// v7：构造本端协商载荷（各 repo 状态 + 能力）。
@@ -1435,6 +1470,11 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
+        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         // v7：统一 range 反熵 —— 4 个 repo 全部走 range 通道（key 编码与各 repo Merkle 一致）。
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
@@ -1514,6 +1554,11 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
+        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         // v7：4 个 repo 全部走 range 通道
         if resp.repo < repo_type::NODE || resp.repo > repo_type::TRACKER {
             return;
@@ -1780,6 +1825,11 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
+        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         if msg.repo < repo_type::NODE || msg.repo > repo_type::TRACKER || msg.keys.is_empty() {
             return;
         }
@@ -1836,6 +1886,11 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
+        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         if msg.repo < repo_type::NODE || msg.repo > repo_type::TRACKER || msg.entries.is_empty() {
             return;
         }
@@ -1976,6 +2031,12 @@ impl SyncManager {
                 .write()
                 .retain(|_, t| t.elapsed().as_secs() < cutoff);
         }
+        // v10(F2)：断点优先 —— 该 repo 有未完成的抽样进度（对端连接仍存活）则直接续跑
+        // 同一对端同一序列，不轮转挑新连接、不重新抽样；预算与游标推进见 `range_send_batch`。
+        if let Some((resume_conn, mut prog)) = self.range_resume_candidate(repo, &conns) {
+            self.range_send_batch(&resume_conn, repo, &mut prog).await;
+            return;
+        }
         let conn = match self.pick_range_conn(repo, interval_secs, &conns) {
             Some(c) => c,
             None => return,
@@ -2009,19 +2070,73 @@ impl SyncManager {
         bounds.extend(keys);
         bounds.push(Vec::new()); // +∞
         let leaf_rows = self.leaf_rows_for_repo(repo);
+        let mut prog = RangeSampleProgress {
+            bounds,
+            leaf_rows,
+            next: 0,
+            updated: Instant::now(),
+        };
+        // v10(F2)：本 tick 只发送预算内的区间；未完成时 `range_send_batch` 内部落断点，
+        // 下一 tick 由 `range_resume_candidate` 续跑。
+        self.range_send_batch(&conn, repo, &mut prog).await;
+    }
+
+    /// v10(F2)：取该 repo 仍需续跑的抽样断点（进度存在、对端连接仍存活且支持 range）。
+    fn range_resume_candidate(
+        &self,
+        repo: u8,
+        conns: &[Arc<PeerConn>],
+    ) -> Option<(Arc<PeerConn>, RangeSampleProgress)> {
+        let mut m = self.range_progress.write();
+        // 停滞清理：长时间未推进（对端持续不可达/连接失效）弃置，下一轮重新抽样。
+        m.retain(|_, p| p.updated.elapsed().as_secs() < RANGE_SAMPLE_STALL_SECS);
+        for ((peer, r), prog) in m.iter() {
+            if *r != repo {
+                continue;
+            }
+            if let Some(c) = conns.iter().find(|c| c.node_id == *peer) {
+                if !c.supports_range_reconcile() {
+                    continue;
+                }
+                return Some((c.clone(), prog.clone()));
+            }
+        }
+        None
+    }
+
+    /// v10(F2)：发送当前抽样进度下的一个预算批次（`range_ranges_per_tick` 个区间）并推进游标。
+    ///
+    /// 旧实现一个 tick 内同步发完全部 161 个区间（百万行库上单轮 >300s），被 TaskScheduler
+    /// 超时杀掉后进度作废、下一轮从头再来，兜底对账永远完不成一轮（2026-09-27 实测 52/58）。
+    /// 现在每 tick 只发预算内的区间：被杀不丢进度（游标在 SyncManager）、单 tick 秒级返回、
+    /// Federation 分类槽快速让位。
+    async fn range_send_batch(
+        &self,
+        conn: &Arc<PeerConn>,
+        repo: u8,
+        prog: &mut RangeSampleProgress,
+    ) {
+        let budget = self.config.range_ranges_per_tick.max(1) as usize;
+        let total = prog.bounds.len().saturating_sub(1);
+        let end = prog.next.saturating_add(budget).min(total);
         let storage = self.delta_storage();
         let mut sent = 0u32;
-        for w in bounds.windows(2) {
-            let lo = w[0].clone();
-            let hi = w[1].clone();
+        let mut advanced = prog.next;
+        for i in prog.next..end {
+            let lo = prog.bounds[i].clone();
+            let hi = prog.bounds[i + 1].clone();
             let rows = match storage.load_repo_key_hashes_in_range(
                 repo,
                 Self::range_bound(&lo),
                 Self::range_bound(&hi),
-                leaf_rows as usize + 1,
+                prog.leaf_rows as usize + 1,
             ) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(_) => {
+                    // 本地读失败：跳过该区间（与旧行为一致），游标照常推进。
+                    advanced = i + 1;
+                    continue;
+                }
             };
             let digest = range_reconcile::range_digest(&rows);
             let req = RangeReconcileRequestMessage {
@@ -2029,7 +2144,7 @@ impl SyncManager {
                 lo,
                 hi,
                 digest,
-                leaf_rows,
+                leaf_rows: prog.leaf_rows,
                 depth: 0,
             };
             if let Err(e) = conn
@@ -2037,15 +2152,31 @@ impl SyncManager {
                 .await
             {
                 warn!(
-                    "[range] 发送 RangeReconcileRequest 失败 to={}: {}",
-                    conn.node_id, e
+                    "[range] 发送 RangeReconcileRequest 失败 to={}（区间 {}/{}，进度保留待续跑）: {}",
+                    conn.node_id,
+                    i + 1,
+                    total,
+                    e
                 );
                 break;
             }
             self.metrics.record_message_sent();
+            advanced = i + 1;
             sent += 1;
         }
-        // F3：叶级明细已降为 debug，这里给出每轮一行汇总（轮内发送量 + 累计对账统计 + 当前模式）
+        prog.next = advanced;
+        prog.updated = Instant::now();
+
+        let done = prog.next >= total;
+        if done {
+            self.range_progress.write().remove(&(conn.node_id, repo));
+        } else {
+            self.range_progress
+                .write()
+                .insert((conn.node_id, repo), prog.clone());
+        }
+        // F3：叶级明细已降为 debug，按「批次 debug + 轮次完成 info」两级输出，
+        // 既保留累计对账统计，又避免每 tick 刷一整轮的长日志。
         let leaf_ranges = self
             .range_leaf_ranges
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -2058,12 +2189,8 @@ impl SyncManager {
         let repairs = self
             .range_repair_triggers
             .load(std::sync::atomic::Ordering::Relaxed);
-        info!(
-            "[range] repo={} 抽样对账发送到 {}（{} 个区间，连接数={}）| 累计 叶级对账={} 本地多={} 对端多={} 触发修复={} 模式={}",
-            repo,
-            conn.node_id,
-            sent,
-            conns.len(),
+        let stats = format!(
+            "累计 叶级对账={} 本地多={} 对端多={} 触发修复={} 模式={}",
             leaf_ranges,
             local_only,
             remote_only,
@@ -2074,6 +2201,17 @@ impl SyncManager {
                 "修复"
             }
         );
+        if done {
+            info!(
+                "[range] repo={} 抽样对账一轮发送完成 to={}（{} 个区间）| {}",
+                repo, conn.node_id, total, stats
+            );
+        } else {
+            debug!(
+                "[range] repo={} 本 tick 发送 {} 区间（断点 {}/{}，to={}）| {}",
+                repo, sent, prog.next, total, conn.node_id, stats
+            );
+        }
     }
 
     // ========================================================================
@@ -2182,8 +2320,9 @@ impl SyncManager {
             }
         };
         info!(
-            "[bootstrap] 响应清单请求 from={}: 总行={}, 块数={}, w0={}",
+            "[bootstrap] 响应清单请求 from={}: repo={} 总行={}, 块数={}, w0={}",
             conn.node_id,
+            req.repo,
             manifest.total_rows,
             manifest.chunks.len(),
             w0
@@ -2675,8 +2814,8 @@ impl SyncManager {
         self.delta_request_at.write().remove(&(conn.node_id, repo));
         self.delta_has_more.write().insert((conn.node_id, repo));
         info!(
-            "[bootstrap] {} 块全部落地，切 delta 追尾（since_seq={}，已清协商以解除追尾门控）",
-            conn.node_id, w0_seq
+            "[bootstrap] {} repo={} 块全部落地，切 delta 追尾（since_seq={}，已清协商以解除追尾门控）",
+            conn.node_id, repo, w0_seq
         );
         // ⑤ 追尾：从 w0 拉 oplog 增量（P1-3 通道）
         self.trigger_delta_sync(conn.node_id, repo).await;
@@ -3144,6 +3283,76 @@ mod tests {
         assert_eq!(node_repo.len_sync(), 0);
         mgr.apply_node_sync(&entries);
         assert_eq!(node_repo.len_sync(), 1);
+    }
+
+    /// F1(2026-09-27 52/58 BOOTSTRAP 死循环回归测试)：
+    /// 协商/巡检计数（`local_entry_counts`）必须与 bootstrap 清单扫描
+    /// （`build_repo_manifest_impl` → `load_repo_key_hashes_in_range`）同口径。
+    /// peers 主表 3 活行 + peers_archive 2 行 → peer 计数必须 = 3。
+    /// 旧实现把 archive 计入（= 5），清单永远拉不到那 2 行归档 → 每轮巡检裁 BOOTSTRAP 全量重拉。
+    #[test]
+    fn test_local_entry_counts_matches_manifest_scope() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..3i64 {
+                conn.execute(
+                    "INSERT INTO peers (infohash, ip, port, source) VALUES (?1, ?2, ?3, 'test')",
+                    rusqlite::params![[0xaau8; 20], format!("10.0.0.{}", i), 6881i64],
+                )
+                .unwrap();
+            }
+            for i in 0..2i64 {
+                conn.execute(
+                    "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, archived_at) \
+                     VALUES (?1, ?2, ?3, 0)",
+                    rusqlite::params![[0xbbu8; 20], format!("10.1.0.{}", i), 6881i64],
+                )
+                .unwrap();
+            }
+        }
+
+        let node_repo = Arc::new(NodeRepoImpl::new(storage.clone()));
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let cm = SessionsHandle::new_for_test();
+        let metrics = Arc::new(FederationMetrics::new());
+        let gossip = Arc::new(GossipEngine::new(
+            cm.clone(),
+            make_config(),
+            NodeId([1; 20]),
+            metrics.clone(),
+            shutdown_tx.clone(),
+        ));
+        let mgr = SyncManager::new(
+            cm,
+            node_repo,
+            make_config(),
+            shutdown_tx,
+            gossip,
+            metrics,
+            NodeId([1; 20]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let counts = mgr.local_entry_counts();
+        assert_eq!(
+            counts[1], 3,
+            "peer 计数必须等于 peers 主表活行数（不含 peers_archive）"
+        );
+
+        let manifest =
+            bootstrap::build_repo_manifest_impl(storage.as_ref(), repo_type::PEER, 2, 0, 1)
+                .unwrap();
+        assert_eq!(
+            counts[1] as u64, manifest.total_rows,
+            "协商计数与 bootstrap 清单行数必须一致（口径铁律）"
+        );
     }
 
     #[test]

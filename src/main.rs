@@ -1643,12 +1643,11 @@ async fn async_main(
                 as Arc<dyn PeerDiscoveryCenter::storage::repo_traits::NodeRepository>),
         );
         let tm = tier_mgr.clone();
-        let io_sched = io_scheduler.clone();
         task_scheduler.register(
             TaskMetadata::new(
                 "tier_check",
                 "冷热分层检查",
-                std::time::Duration::from_secs(get_interval_secs(intervals, "tier_check", 300)),
+                std::time::Duration::from_secs(get_interval_secs(intervals, "tier_check", 60)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
@@ -1662,7 +1661,7 @@ async fn async_main(
             .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
                 intervals,
                 "tier_check_initial_delay",
-                225,
+                45,
             )))
             .with_jitter(std::time::Duration::from_secs(get_interval_secs(
                 intervals,
@@ -1671,15 +1670,9 @@ async fn async_main(
             ))),
             move || {
                 let tm = tm.clone();
-                let io_sched = io_sched.clone();
                 async move {
-                    // P3: 仅在 IO 空闲时执行冷驱逐（避免与前台写入竞争）
-                    if let Some(ref s) = io_sched {
-                        if !s.is_idle() {
-                            tracing::debug!("[tier_check] IO 繁忙，跳过本轮冷驱逐");
-                            return Ok(());
-                        }
-                    }
+                    // Capacity eviction is in-memory only (DB rows kept, no tombstones);
+                    // must run even when IO busy. Dirty flush is rate-limited by IOScheduler.
                     tm.check_all().await;
                     Ok(())
                 }

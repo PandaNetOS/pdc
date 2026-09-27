@@ -633,7 +633,7 @@ pub struct TierConfig {
     /// 是否启用冷热分层（默认 true；false 时退化为全量加载）
     #[serde(default = "default_tier_enabled")]
     pub enabled: bool,
-    /// 全局内存硬限制（MB，默认 500）
+    /// 全局内存硬限制（MB，默认 1024）
     #[serde(default = "default_tier_memory_limit_mb")]
     pub memory_limit_mb: usize,
     /// Hot LRU 最大条目数（默认 500,000）
@@ -687,7 +687,7 @@ fn default_tier_enabled() -> bool {
     true
 }
 fn default_tier_memory_limit_mb() -> usize {
-    500
+    1024
 }
 fn default_tier_hot_max_count() -> usize {
     200_000

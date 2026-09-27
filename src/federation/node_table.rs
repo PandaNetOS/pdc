@@ -1,4 +1,4 @@
-﻿//! 节点表
+//! 节点表
 //!
 //! 维护联邦网络中已知的所有节点信息，包括地址、连接状态、RTT 等。
 
@@ -94,22 +94,18 @@ impl NodeTable {
     ///
     /// 如果节点已存在，更新地址信息和 last_seen；如果不存在且未满则添加。
     /// 返回 true 表示新增，false 表示更新。
-    pub fn add_or_update(&self, info: NodeAddress) -> bool {
+    pub fn add_or_update(&self, mut info: NodeAddress) -> bool {
         let node_id = NodeId(info.node_id);
         let mut nodes = self.nodes.write();
 
         if let Some(entry) = nodes.get_mut(&node_id) {
-            // 更新地址信息
-            entry.info.ipv4_addr = info.ipv4_addr;
-            entry.info.ipv6_addr = info.ipv6_addr;
-            entry.info.reachability = info.reachability;
-            entry.info.last_seen = info.last_seen;
-            entry.info.nat_type = info.nat_type;
-            if info.reachability as u8 >= entry.info.reachability as u8 {
-                // 可达性提升时更新
-            }
+            // 多地址聚合（2026-09-27）：不再直接覆盖 ipv4_addr，
+            // 而是把新来源的地址并入 endpoints，局域网/公网地址同时保留。
+            entry.info.merge(info);
             false
         } else {
+            // 新节点：先把单地址字段并入 endpoints
+            info.normalize_endpoints(pnos_net::types::DiscoverySource::PeerCache);
             // 新节点
             if nodes.len() >= self.max_nodes {
                 // 已满，移除活跃度最低的节点
@@ -262,6 +258,31 @@ impl NodeTable {
             }
             // 未连接且超过 timeout 未活跃的节点清理掉
             now.duration_since(entry.first_seen) < timeout
+        });
+        before - nodes.len()
+    }
+
+    /// 清理「从未成功握手」的占位 / 垃圾节点。
+    ///
+    /// 握手成功后 SDK 以**真实 node_id** 注册并 `mark_connected`（`connection_count≥1`）；
+    /// 拨号用的占位 temp_id 条目不会被 `mark_connected`（`connection_count==0`）。
+    /// 本方法清理存在超过 `grace`、仍 `connection_count==0` 且未在连接中的条目，
+    /// 消除经 PEX 交叉传播的 temp_id 垃圾（反复连自己 / 连旧节点、重复拨号）。
+    /// 曾连上过的真实节点（断开后 `connection_count` 仍 ≥1）不受影响。
+    pub fn prune_never_connected(&self, grace: Duration) -> usize {
+        let now = Instant::now();
+        let mut nodes = self.nodes.write();
+        let before = nodes.len();
+        nodes.retain(|_, entry| {
+            if matches!(entry.status, NodeStatus::Connected | NodeStatus::Connecting) {
+                return true;
+            }
+            // 曾成功连过的真实节点保留
+            if entry.connection_count > 0 {
+                return true;
+            }
+            // 从未连过但仍在宽限期内，保留（给握手 / 重试时间）
+            now.duration_since(entry.first_seen) < grace
         });
         before - nodes.len()
     }

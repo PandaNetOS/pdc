@@ -21,6 +21,8 @@ pub struct FederationMetrics {
     pub gossip_propagations: AtomicU64,
     /// Gossip 鎺ユ敹娆℃暟
     pub gossip_received: AtomicU64,
+    /// Gossip 鍘婚噸涓㈠純娆℃暟锛坰een_msgs LRU 鍛戒腑锛屽凡澶勭悊杩囩殑娑堟伅锛?
+    pub gossip_dedup_dropped: AtomicU64,
     /// 鍚屾鏉＄洰搴旂敤鏁?
     pub sync_entries_applied: AtomicU64,
     /// Node 鍚屾璁℃暟
@@ -80,6 +82,11 @@ impl FederationMetrics {
 
     pub fn record_gossip_received(&self) {
         self.gossip_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 璁板綍涓€娆″幓閲嶐€氱煡锛坰een_msgs 鍛戒腑锛屾壒娆′笉鍐嶅簲鐢ㄤ笉鍐嶈浆鍙戯級
+    pub fn record_gossip_dedup_dropped(&self) {
+        self.gossip_dedup_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_sync_entries(&self, count: u64) {
@@ -154,6 +161,7 @@ impl FederationMetrics {
             bytes_recv: self.bytes_recv.load(Ordering::Relaxed),
             gossip_propagations: self.gossip_propagations.load(Ordering::Relaxed),
             gossip_received: self.gossip_received.load(Ordering::Relaxed),
+            gossip_dedup_dropped: self.gossip_dedup_dropped.load(Ordering::Relaxed),
             sync_entries_applied: self.sync_entries_applied.load(Ordering::Relaxed),
             node_sync_count: self.node_sync_count.load(Ordering::Relaxed),
             peer_sync_count: self.peer_sync_count.load(Ordering::Relaxed),
@@ -183,6 +191,7 @@ pub struct FederationMetricsSnapshot {
     pub bytes_recv: u64,
     pub gossip_propagations: u64,
     pub gossip_received: u64,
+    pub gossip_dedup_dropped: u64,
     pub sync_entries_applied: u64,
     pub node_sync_count: u64,
     pub peer_sync_count: u64,

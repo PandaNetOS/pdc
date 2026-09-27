@@ -168,6 +168,64 @@ impl NodeAddress {
                     .then_with(|| b.success_count.cmp(&a.success_count))
             })
     }
+
+    /// 归一化：把 ipv4_addr / ipv6_addr 单地址字段并入 endpoints（按 SocketAddr 去重）。
+    ///
+    /// 历史上各发现路径只填单地址字段、endpoints 留空，导致同一节点的局域网/公网
+    /// 地址无法同时保留。这里统一把单地址收进 endpoints，source 缺失时用 `default_source`。
+    pub fn normalize_endpoints(&mut self, default_source: pnos_net::types::DiscoverySource) {
+        let singles = [self.ipv4_addr, self.ipv6_addr].into_iter().flatten();
+        for addr in singles {
+            if !self.endpoints.iter().any(|e| e.addr == addr) {
+                self.endpoints.push(pnos_net::types::NodeEndpoint {
+                    addr,
+                    kind: pnos_net::types::NodeEndpoint::classify(&addr),
+                    source: default_source,
+                    last_success: self.last_seen,
+                    success_count: 0,
+                    fail_count: 0,
+                    latency_ms: None,
+                });
+            }
+        }
+    }
+
+    /// 聚合另一来源的地址信息：多地址合并而非覆盖。
+    ///
+    /// - endpoints 按 SocketAddr 去重合并，保留各自成功/失败计数；
+    /// - 元信息（reachability/nat_type）随较新的 last_seen 更新；
+    /// - 最后用 best_endpoint 回填 ipv4_addr/ipv6_addr 兼容字段。
+    pub fn merge(&mut self, mut other: NodeAddress) {
+        // 先把双方单地址字段收进 endpoints
+        other.normalize_endpoints(pnos_net::types::DiscoverySource::PeerCache);
+        self.normalize_endpoints(pnos_net::types::DiscoverySource::PeerCache);
+
+        if other.last_seen > self.last_seen {
+            self.last_seen = other.last_seen;
+            self.reachability = other.reachability;
+            self.nat_type = other.nat_type;
+        }
+
+        for ep in other.endpoints {
+            if let Some(existing) = self.endpoints.iter_mut().find(|e| e.addr == ep.addr) {
+                existing.last_success = existing.last_success.max(ep.last_success);
+                existing.success_count = existing.success_count.max(ep.success_count);
+                // 失败计数取较小值：某路径在其他来源处能通，说明它没坏
+                existing.fail_count = existing.fail_count.min(ep.fail_count);
+            } else {
+                self.endpoints.push(ep);
+            }
+        }
+
+        // 回填兼容字段为当前最优地址
+        if let Some(best) = self.best_endpoint() {
+            let addr = best.addr;
+            match addr.ip() {
+                std::net::IpAddr::V4(_) => self.ipv4_addr = Some(addr),
+                std::net::IpAddr::V6(_) => self.ipv6_addr = Some(addr),
+            }
+        }
+    }
 }
 
 /// 节点身份（Ed25519 密钥对）

@@ -163,19 +163,27 @@ impl FederationAuthenticator {
         false
     }
 
-    /// 把 Hello 携带的地址并入节点表（限 64 条，过滤无效地址）
+    /// 把 Hello 携带的地址并入节点表（限 64 条，过滤无效地址与本机地址）
     fn adopt_addresses(&self, hello: &HelloMessage) {
         let total_addrs = hello.addresses.len();
+        // 本机已知地址集合：对端经 NAT 观察到本机后，可能在 Hello 里回传本机 IP，
+        // 这种条目若被登记会导致反复连自己，故按 IP 排除。
+        let local_ips: std::collections::HashSet<std::net::IpAddr> = self
+            .identity
+            .addresses_snapshot()
+            .iter()
+            .filter_map(|a| a.preferred_addr().map(|s| s.ip()))
+            .collect();
         let mut adopted = 0usize;
         for addr_info in hello.addresses.iter().take(MAX_HELLO_ADDRESSES) {
-            let valid = addr_info
-                .preferred_addr()
-                .map(|a| a.port() != 0)
-                .unwrap_or(false);
-            if valid {
-                self.node_table.add_or_update(addr_info.clone());
-                adopted += 1;
+            let Some(paddr) = addr_info.preferred_addr() else {
+                continue;
+            };
+            if paddr.port() == 0 || local_ips.contains(&paddr.ip()) {
+                continue;
             }
+            self.node_table.add_or_update(addr_info.clone());
+            adopted += 1;
         }
         if total_addrs > MAX_HELLO_ADDRESSES {
             warn!(
@@ -183,6 +191,51 @@ impl FederationAuthenticator {
                 total_addrs, adopted
             );
         }
+    }
+
+    /// 检测入站连接是否走了次优路径（NAT 回环）。
+    ///
+    /// 关键判据是**源 IP**，不是端口（出站连接源端口本就是随机的）：
+    /// - 源 IP 就是对端声明的 Lan 地址 IP → 正常局域网直连，放行；
+    /// - 源 IP 不是对端 Lan IP、却与对端 Lan 地址同 /24（典型为源被网关
+    ///   替换成 192.168.30.10）→ NAT 回环，返回对端 Lan 地址引导重连；
+    /// - 源为公网地址、无同网段 Lan 声明 → 公网连入，放行。
+    ///
+    /// 返回应改走的对端局域网地址。
+    fn detect_suboptimal_path(
+        &self,
+        io_peer_addr: SocketAddr,
+        hello: &HelloMessage,
+    ) -> Option<SocketAddr> {
+        use pnos_net::types::{EndpointKind, NodeEndpoint};
+
+        let src_ip = io_peer_addr.ip();
+        let mut lan_fallback: Option<SocketAddr> = None;
+        for addr_info in &hello.addresses {
+            let Some(d) = addr_info.preferred_addr() else {
+                continue;
+            };
+            if NodeEndpoint::classify(&d) != EndpointKind::Lan {
+                continue;
+            }
+            // 源 IP 就是对端 Lan 地址 IP → 正常局域网直连（源端口随机是正常的）
+            if d.ip() == src_ip {
+                return None;
+            }
+            // 源 IP 不是对端 Lan IP 却同 /24 → 源被网关替换（NAT 回环）
+            if lan_fallback.is_none() && same_ipv4_subnet_24(d.ip(), src_ip) {
+                lan_fallback = Some(d);
+            }
+        }
+        lan_fallback
+    }
+}
+
+/// 两个 IPv4 是否同 /24 子网（前 3 字节相同）。
+fn same_ipv4_subnet_24(a: std::net::IpAddr, b: std::net::IpAddr) -> bool {
+    match (a, b) {
+        (std::net::IpAddr::V4(x), std::net::IpAddr::V4(y)) => x.octets()[0..3] == y.octets()[0..3],
+        _ => false,
     }
 }
 
@@ -231,6 +284,9 @@ impl PeerAuthenticator for FederationAuthenticator {
             "[federation] 握手成功: 本地 {} <-> 远端 {} (proto={})",
             self.identity.node_id, peer_id, ack.version
         );
+        // 与入站方向对称：把对端真实 node_id + 声明地址登记进 node_table，
+        // 否则主动拨号成功后 node_table 里没有真实 ID（仅在对端反向连入时才被 adopt）。
+        self.adopt_addresses(&ack);
         Ok(PeerIdentity::new(to_sdk_node_id(peer_id), true)
             .with_metadata(version_metadata(ack.version)))
     }
@@ -265,6 +321,19 @@ impl PeerAuthenticator for FederationAuthenticator {
             .await?;
 
         self.adopt_addresses(&hello);
+
+        // 入站次优路径（NAT 回环）检测：对端本可局域网直连，却走了网关回环。
+        // node_table 已通过 adopt 存入对端 Lan 地址；此处拒绝该连接，
+        // 连接维护任务（connection_maintainer_tick）会用 Lan 地址主动重连。
+        if let Some(peer_addr) = io.peer_addr() {
+            if let Some(lan_addr) = self.detect_suboptimal_path(peer_addr, &hello) {
+                warn!(
+                    "[federation] 入站连接走了次优路径（NAT 回环）：当前源={}，对端局域网地址={}，拒绝并等待局域网重连",
+                    peer_addr, lan_addr
+                );
+                anyhow::bail!("入站次优路径，需局域网重连至 {}", lan_addr);
+            }
+        }
 
         Ok(PeerIdentity::new(to_sdk_node_id(peer_id), true)
             .with_metadata(version_metadata(hello.version)))

@@ -142,15 +142,84 @@ impl NodeRepoImpl {
         self.storage.count_table("dht_nodes").unwrap_or(0)
     }
 
-    /// 执行分层检查 + 驱逐（由 TaskScheduler 定时调用）。
-    /// 这三个 repo 全量驻内存不使用 TieredCache，为空操作。
+    /// 常规分层检查（由 tier_evict 任务每 60 秒调用）。
+    ///
+    /// 把超过 hot_threshold 未访问的节点从 hot 集合标记到 cold 集合（**不卸载内存**）。
+    /// 真正的内存卸载由 [`emergency_evict`](Self::emergency_evict) 在超限时执行。
     pub fn tier_evict(&self) {
-        // no-op: data is fully in memory, no tiered cache to evict from
+        let moved = self.migrate_hot_to_cold_sync(1800);
+        if moved > 0 {
+            tracing::debug!(
+                "[node_repo] 常规分层：{} 个节点 hot → cold（仍驻内存）",
+                moved
+            );
+        }
     }
 
-    /// 紧急驱逐（内存超限时调用）。空操作。
-    pub fn emergency_evict(&self, _count: usize) {
-        // no-op: data is fully in memory
+    /// 紧急驱逐（内存超限时由 memory_monitor 调用）。
+    ///
+    /// 把 count 个**最久未访问**的节点从内存表真正卸载以释放内存。
+    /// 与联邦删除不同：**不写 DB 删除墓碑**（数据行保留在 SQLite），
+    /// 节点可通过 load_initial / 定期刷新重新加载，也不会向对端同步删除。
+    pub fn emergency_evict(&self, count: usize) {
+        // 已在 dirty（未刷盘）集合的节点不卸载，避免丢失尚未持久化的更改
+        let dirty_snapshot: FxHashSet<SocketAddr> = self.dirty.read().clone();
+
+        let nodes = self.nodes.read_all();
+        let mut ranked: Vec<(SocketAddr, Option<Instant>)> = nodes
+            .iter()
+            .filter(|(addr, _)| !dirty_snapshot.contains(addr))
+            .map(|(addr, e)| (*addr, e.last_accessed))
+            .collect();
+        // Option 的 Ord：None < Some(Instant)，None 视为最老，正好满足"最久未访问在前"
+        ranked.sort_by_key(|a| a.1);
+        let targets: Vec<SocketAddr> = ranked.into_iter().take(count).map(|(a, _)| a).collect();
+        drop(nodes);
+
+        if targets.is_empty() {
+            tracing::warn!("[node_repo] 紧急驱逐：无可卸载节点（候选均在 dirty 或内存为空）");
+            return;
+        }
+        let n = self.evict_from_memory(&targets);
+        tracing::warn!(
+            "[node_repo] 紧急驱逐：从内存卸载 {} / {} 个节点（DB 保留，可重载）",
+            n,
+            targets.len()
+        );
+    }
+
+    /// 从内存表卸载指定节点（不写 DB 墓碑），返回实际卸载条目数。
+    fn evict_from_memory(&self, addrs: &[SocketAddr]) -> usize {
+        let mut nodes = self.nodes.write_all();
+        let mut subnet_index = self.subnet_index.write();
+        let mut removed = 0usize;
+        for addr in addrs {
+            if let Some(entry) = nodes.remove(addr) {
+                if let Some(subnet) = Self::subnet_key(*addr) {
+                    if let Some(bucket) = subnet_index.get_mut(&subnet) {
+                        bucket.retain(|x| *x != entry.id);
+                        if bucket.is_empty() {
+                            subnet_index.remove(&subnet);
+                        }
+                    }
+                }
+                removed += 1;
+            }
+        }
+        drop(nodes);
+        drop(subnet_index);
+
+        if removed > 0 {
+            let mut hot = self.hot_addrs.write();
+            let mut cold = self.cold_addrs.write();
+            let mut dirty = self.dirty.write();
+            for addr in addrs {
+                hot.remove(addr);
+                cold.remove(addr);
+                dirty.remove(addr);
+            }
+        }
+        removed
     }
 
     /// 娉ㄥ叆鑱旈偊 Merkle 鏍戜笌 Gossip 寮曟搸寮曠敤锛坢ain.rs 鍦?FederationService 鍒涘缓鍚庤皟鐢級銆?

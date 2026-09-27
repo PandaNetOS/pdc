@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::federation::config::FederationConfig;
-use crate::federation::node_id::{NodeAddress, NodeId, NodeIdentity, Reachability};
+use crate::federation::node_id::{NodeAddress, NodeId, NodeIdentity};
 use crate::federation::node_table::NodeTable;
 use crate::federation::peer_conn::PeerConn;
 use crate::federation::protocol::*;
@@ -54,6 +54,10 @@ pub struct DiscoveryService {
     public_addr: RwLock<Option<SocketAddr>>,
     /// DNS 解析池（进程级共享，内置公共 DNS，不读宿主系统 DNS）
     dns_pool: Arc<crate::dns_pool::DnsPool>,
+    /// P1-5：地址级拨号在途表（addr → 发起时刻）。TTL 内同一地址只拨一次，
+    /// 消除缓存引导 / 发现 / 维护等多条路径对同一地址的并发重复拨号
+    /// （双拨 → 仲裁 → 断连震荡的来源）。
+    dialing: Arc<RwLock<std::collections::HashMap<SocketAddr, std::time::Instant>>>,
 }
 
 /// 拆分 `host:port` 形式的种子地址
@@ -123,6 +127,7 @@ impl DiscoveryService {
             _dht_discoverer,
             public_addr: RwLock::new(None),
             dns_pool: crate::dns_pool::global(),
+            dialing: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -138,6 +143,27 @@ impl DiscoveryService {
         if let Some(a) = addr {
             info!("[federation] Discovery 公网地址已更新: {}", a);
         }
+    }
+
+    /// P1-5：拨号在途 TTL（同一地址在该时间内只允许一次主动拨号）。
+    const DIAL_INFLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// 尝试占据某地址的拨号名额：TTL 内已在拨号返回 false（调用方应跳过）。
+    /// 顺带清理过期的在途记录。
+    fn begin_dial(&self, addr: SocketAddr) -> bool {
+        let mut d = self.dialing.write();
+        let now = std::time::Instant::now();
+        d.retain(|_, t| now.duration_since(*t) < Self::DIAL_INFLIGHT_TTL);
+        if d.contains_key(&addr) {
+            return false;
+        }
+        d.insert(addr, now);
+        true
+    }
+
+    /// 拨号结束（成功 / 失败均调用），释放该地址的在途名额。
+    fn end_dial(&self, addr: SocketAddr) {
+        self.dialing.write().remove(&addr);
     }
 
     /// 引导连接：缓存节点 → 种子节点 → DHT 自动发现
@@ -157,22 +183,11 @@ impl DiscoveryService {
             };
             if !cached_addrs.is_empty() {
                 info!("[federation] 从缓存加载 {} 个历史节点", cached_addrs.len());
-                for addr_str in &cached_addrs {
-                    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                        let temp_id = NodeId::random();
-                        self.node_table.add_or_update(NodeAddress {
-                            node_id: temp_id.0,
-                            ipv4_addr: if addr.is_ipv4() { Some(addr) } else { None },
-                            ipv6_addr: if addr.is_ipv6() { Some(addr) } else { None },
-                            reachability: Reachability::Unknown,
-                            last_seen: 0,
-                            nat_type: None,
-                            endpoints: Vec::new(),
-                        });
-                    }
-                }
+                // 不再预登记随机 temp_id：握手成功后由认证回调（adopt_addresses）
+                // 统一登记真实 node_id，避免 temp_id 占位记录残留为垃圾节点
+                // （反复连自己/连旧节点、重复拨号的根因）。
 
-                // 2. 并发连接缓存中的历史节点
+                // 1. 并发连接缓存中的历史节点
                 for addr_str in &cached_addrs {
                     if addr_str.parse::<SocketAddr>().is_ok() {
                         let self_clone = self.clone();
@@ -278,7 +293,16 @@ impl DiscoveryService {
                                 reachability: crate::federation::node_id::Reachability::Unknown,
                                 last_seen: now,
                                 nat_type: None,
-                                endpoints: Vec::new(),
+                                // 携带分类地址和发现来源，供地址聚合和三级选路使用
+                                endpoints: vec![pnos_net::types::NodeEndpoint {
+                                    addr: *addr,
+                                    kind: pnos_net::types::NodeEndpoint::classify(addr),
+                                    source: node.source,
+                                    last_success: now,
+                                    success_count: 0,
+                                    fail_count: 0,
+                                    latency_ms: None,
+                                }],
                             })
                             .collect();
                         self_clone.process_new_nodes(new_nodes);
@@ -308,8 +332,14 @@ impl DiscoveryService {
             .parse()
             .map_err(|e| anyhow::anyhow!("缓存节点地址解析失败 {}: {}", addr, e))?;
 
+        if !self.begin_dial(socket_addr) {
+            debug!("[federation] 缓存节点 {} 拨号在途，跳过", socket_addr);
+            return Ok(());
+        }
         let temp_id = NodeId::random();
-        match self.sessions.clone().connect_to(temp_id, socket_addr).await {
+        let result = self.sessions.clone().connect_to(temp_id, socket_addr).await;
+        self.end_dial(socket_addr);
+        match result {
             Ok(conn) => {
                 info!(
                     "[federation] 缓存节点连接成功: {} ({})",
@@ -347,19 +377,15 @@ impl DiscoveryService {
 
         // 尝试每个地址
         for addr in addrs {
-            // 种子节点的 node_id 未知，先用随机 ID 占位，握手后会更新
+            // node_id 未知：随机 ID 仅占位供 SDK 拨号；握手后 SDK 以真实 ID 注册，
+            // 认证回调 adopt_addresses 把真实 ID 登记进 node_table，故不预登记 temp_id。
+            if !self.begin_dial(addr) {
+                continue;
+            }
             let temp_id = NodeId::random();
-            self.node_table.add_or_update(NodeAddress {
-                node_id: temp_id.0,
-                ipv4_addr: if addr.is_ipv4() { Some(addr) } else { None },
-                ipv6_addr: if addr.is_ipv6() { Some(addr) } else { None },
-                reachability: Reachability::Unknown,
-                last_seen: 0,
-                nat_type: None,
-                endpoints: Vec::new(),
-            });
-
-            match self.sessions.clone().connect_to(temp_id, addr).await {
+            let result = self.sessions.clone().connect_to(temp_id, addr).await;
+            self.end_dial(addr);
+            match result {
                 Ok(conn) => {
                     info!("[federation] 种子节点连接成功: {} ({})", conn.node_id, addr);
                     // 连接成功后发送 GetNodes
@@ -434,8 +460,11 @@ impl DiscoveryService {
                 .all_nodes()
                 .into_iter()
                 .filter(|e| {
-                    e.status != crate::federation::node_table::NodeStatus::Connected
-                        && e.info.preferred_addr().is_some()
+                    !matches!(
+                        e.status,
+                        crate::federation::node_table::NodeStatus::Connected
+                            | crate::federation::node_table::NodeStatus::Connecting
+                    ) && e.info.preferred_addr().is_some()
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by(|a, b| {
@@ -447,10 +476,16 @@ impl DiscoveryService {
 
             for entry in candidates {
                 if let Some(addr) = entry.info.preferred_addr() {
+                    if !self.begin_dial(addr) {
+                        continue;
+                    }
                     let cm = self.sessions.clone();
                     let node_id = NodeId(entry.info.node_id);
+                    let dialing = self.dialing.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = cm.connect_to(node_id, addr).await {
+                        let r = cm.connect_to(node_id, addr).await;
+                        dialing.write().remove(&addr);
+                        if let Err(e) = r {
                             debug!("[federation] 自动连接 {} 失败: {}", node_id, e);
                         }
                     });
@@ -507,6 +542,17 @@ impl DiscoveryService {
             debug!("[federation] 重置了 {} 个卡住的 Connecting 状态", stale);
         }
 
+        // 1.5 清理从未成功握手的占位（temp_id）垃圾；连接已满时也要清理，
+        // 故放在 target_neighbors 的 early return 之前。
+        let pruned = self
+            .node_table
+            .prune_never_connected(std::time::Duration::from_secs(
+                self.config.never_connected_prune_secs.max(1),
+            ));
+        if pruned > 0 {
+            debug!("[federation] 清理了 {} 个从未握手成功的占位节点", pruned);
+        }
+
         // 2. 如果连接数少于 target_neighbors，尝试连接未连接的节点
         let connected = self.node_table.connected_count();
         if connected >= self.config.target_neighbors {
@@ -523,11 +569,14 @@ impl DiscoveryService {
             if let Ok(addr) = seed.parse::<SocketAddr>() {
                 // 检查是否已连接（优先 node_id 匹配，兼容入站连接临时端口场景）
                 let already_connected = self.sessions.is_seed_connected(addr);
-                if !already_connected {
+                if !already_connected && self.begin_dial(addr) {
                     let cm = self.sessions.clone();
                     let temp_id = NodeId::random();
+                    let dialing = self.dialing.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = cm.connect_to(temp_id, addr).await {
+                        let r = cm.connect_to(temp_id, addr).await;
+                        dialing.write().remove(&addr);
+                        if let Err(e) = r {
                             debug!("[federation] 维护重连种子节点 {} 失败: {}", addr, e);
                         }
                     });
@@ -550,8 +599,11 @@ impl DiscoveryService {
             .all_nodes()
             .into_iter()
             .filter(|e| {
-                e.status != crate::federation::node_table::NodeStatus::Connected
-                    && e.info.preferred_addr().is_some()
+                !matches!(
+                    e.status,
+                    crate::federation::node_table::NodeStatus::Connected
+                        | crate::federation::node_table::NodeStatus::Connecting
+                ) && e.info.preferred_addr().is_some()
                     && !connected_ids.contains(&NodeId(e.info.node_id))
             })
             .collect::<Vec<_>>();
@@ -564,10 +616,16 @@ impl DiscoveryService {
 
         for entry in candidates {
             if let Some(addr) = entry.info.preferred_addr() {
+                if !self.begin_dial(addr) {
+                    continue;
+                }
                 let cm = self.sessions.clone();
                 let node_id = NodeId(entry.info.node_id);
+                let dialing = self.dialing.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = cm.connect_to(node_id, addr).await {
+                    let r = cm.connect_to(node_id, addr).await;
+                    dialing.write().remove(&addr);
+                    if let Err(e) = r {
                         debug!("[federation] 维护重连 {} 失败: {}", node_id, e);
                     }
                 });
@@ -640,7 +698,7 @@ mod tests {
             node_id: [id; 20],
             ipv4_addr: Some(format!("127.0.0.1:{}", port).parse().unwrap()),
             ipv6_addr: None,
-            reachability: Reachability::Mapped,
+            reachability: crate::federation::node_id::Reachability::Mapped,
             last_seen: 100,
             nat_type: None,
             endpoints: Vec::new(),
