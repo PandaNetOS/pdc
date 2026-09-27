@@ -3291,6 +3291,29 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // v10(B2)：方向守卫（所有发起路径的单点判定，含 resume 恢复/续传）——
+        // 对端自报行数不多于本端时，快照拉来的几乎全是本端已有行（行集近似包含），
+        // 数 GB 传输零收益，还会占住带宽与响应能力、阻塞对端真正需要的第一优先拉取。
+        // 实测 52/58：58（305 万行）持续从 52（267 万行）拉无收益快照，而 52 真缺的
+        // 38 万行被让路卡住。仅在协商早期（对端自报缺失）放行，避免误伤冷启动。
+        let remote_rows = self
+            .peer_negotiate_state
+            .read()
+            .get(&peer)
+            .and_then(|v| v.iter().find(|s| s.repo == repo).map(|s| s.row_count))
+            .unwrap_or(0);
+        let local_rows = self
+            .local_entry_counts()
+            .get((repo - repo_type::NODE) as usize)
+            .copied()
+            .unwrap_or(0) as u64;
+        if remote_rows > 0 && remote_rows <= local_rows {
+            debug!(
+                "[bootstrap] 方向守卫：对端行数({})不多于本端({})，跳过快照: peer={} repo={}",
+                remote_rows, local_rows, peer, repo
+            );
+            return;
+        }
         // v10(A)：双向引导冲突让路 —— 对端正在从我拉同 repo 快照且本端为让路方时，
         // 不发起（等对端传完，resume 自动恢复）。
         if self.should_yield_bootstrap(&peer, repo) {
