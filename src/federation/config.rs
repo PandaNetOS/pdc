@@ -285,6 +285,11 @@ pub struct FederationConfig {
     /// 的超时循环（2026-09-27 实测 52/58 双端超时）。
     #[serde(default = "default_range_ranges_per_tick")]
     pub range_ranges_per_tick: u32,
+    /// v10(F4)：快照冷却期（秒）。bootstrap 竣工后该 (peer,repo) 在此期间内，
+    /// 协商裁定与巡检一律强制 DELTA —— 竣工会清协商强制重裁（B5 修复的副作用），
+    /// 而裁定输入（行数）不会立刻变化，无冷却必然重裁 BOOTSTRAP（死循环通道）。
+    #[serde(default = "default_bootstrap_cooldown_secs")]
+    pub bootstrap_cooldown_secs: u64,
     /// v9：同一 (peer,repo) 叶区间修复的最小间隔（秒），避免同一批差异每轮重复推拉。
     #[serde(default = "default_range_repair_min_interval_secs")]
     pub range_repair_min_interval_secs: u64,
@@ -515,6 +520,10 @@ fn default_never_connected_prune_secs() -> u64 {
 fn default_range_ranges_per_tick() -> u32 {
     32
 }
+/// v10(F4)：快照冷却期（秒），覆盖至少 2 个巡检周期（见 `bootstrap_cooldown_secs`）。
+fn default_bootstrap_cooldown_secs() -> u64 {
+    600
+}
 fn default_range_repair_min_interval_secs() -> u64 {
     60
 }
@@ -564,6 +573,7 @@ impl Default for FederationConfig {
             gossip_max_consecutive_failures: default_gossip_max_consecutive_failures(),
             reconnect_cooldown_secs: default_reconnect_cooldown_secs(),
             never_connected_prune_secs: default_never_connected_prune_secs(),
+            bootstrap_cooldown_secs: default_bootstrap_cooldown_secs(),
             heavy_task_max_concurrency: default_heavy_task_max_concurrency(),
             gossip_max_bytes_per_second: default_gossip_max_bytes_per_second(),
             gossip_max_messages_per_second: default_gossip_max_messages_per_second(),

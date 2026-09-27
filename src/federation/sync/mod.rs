@@ -196,6 +196,9 @@ pub struct SyncManager {
     /// v10(F2)：Range 抽样对账断点 —— (peer, repo) → 进行中的区间序列与游标。
     /// 每 tick 只发送 `range_ranges_per_tick` 个区间，被超时杀掉也不丢进度。
     range_progress: RwLock<FxHashMap<(NodeId, u8), RangeSampleProgress>>,
+    /// v10(F4)：快照冷却期 —— (peer, repo) → 竣工时刻。冷却期内协商裁定与巡检
+    /// 对该 repo 强制 DELTA，防「竣工 → 清协商重裁 → 行数未变 → 又裁 BOOTSTRAP」环。
+    bootstrap_cooldown: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
     delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
@@ -325,6 +328,7 @@ impl SyncManager {
             range_rr: RwLock::new(FxHashMap::default()),
             range_peer_tick_last: RwLock::new(FxHashMap::default()),
             range_progress: RwLock::new(FxHashMap::default()),
+            bootstrap_cooldown: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
             range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
@@ -1054,13 +1058,49 @@ impl SyncManager {
         }
     }
 
+    /// v10(F4)：该 (peer, repo) 是否在快照冷却期内。
+    fn snapshot_in_cooldown(&self, peer: &NodeId, repo: u8) -> bool {
+        let mut m = self.bootstrap_cooldown.write();
+        let ttl = self.config.bootstrap_cooldown_secs.max(1);
+        m.retain(|_, t| t.elapsed().as_secs() < ttl);
+        m.contains_key(&(*peer, repo))
+    }
+
+    /// v10(F5)：快照发起前的水位校验。
+    ///
+    /// 对端自报 oplog 保留窗口 `[min_seq, max_seq]`（`peer_negotiate_state`）；
+    /// 我方游标（`delta_peer_seq`，已从对端应用到的 seq）若 ≥ 对端 `min_seq`，
+    /// 说明欠账全部落在对端保留窗口内 —— **delta 即可追平，快照是浪费**；
+    /// 仅当游标 < min_seq（对端 oplog 已裁剪掉我缺失的历史段 → 存在 delta 永远
+    /// 补不上的空洞）才真正需要快照。对端状态缺失（协商早期）时保守放行（回退旧行为）。
+    fn snapshot_really_needed(&self, peer: &NodeId, repo: u8) -> bool {
+        let guard = self.peer_negotiate_state.read();
+        let Some(states) = guard.get(peer) else {
+            return true;
+        };
+        let Some(st) = states.iter().find(|s| s.repo == repo) else {
+            return true;
+        };
+        if st.min_seq == 0 {
+            return true;
+        }
+        let cursor = self
+            .delta_storage()
+            .get_peer_seq(&peer.0, repo)
+            .unwrap_or(0)
+            .max(0) as u64;
+        cursor < st.min_seq
+    }
+
     /// v7：协商策略决策（Ack 发送方视角：为「对端应如何从我这里取数」裁定）。
     ///
     /// 规则（对齐架构评审稿 §追平分流）：
     /// - 对端该 repo 为空且本端有量 → `BOOTSTRAP`（冷启动走快照）；
     /// - 本端比对端多 20% 以上且差 > `range_bulk_threshold_rows` → `BOOTSTRAP`（大差集走快照）；
     /// - 其余 → `DELTA`（稳态水位续拉）；双方皆空 → `NONE`。
-    fn decide_strategies(&self, remote: &SyncNegotiateMessage) -> Vec<RepoStrategy> {
+    /// - v10(F4)：该 (peer,repo) 处于快照冷却期时一律 `DELTA` —— 竣工清协商（B5）后
+    ///   裁定输入（行数）不会立刻变化，无冷却必然重裁 BOOTSTRAP。
+    fn decide_strategies(&self, peer: &NodeId, remote: &SyncNegotiateMessage) -> Vec<RepoStrategy> {
         let counts = self.local_entry_counts();
         let remote_of = |repo: u8| -> u64 {
             remote
@@ -1074,12 +1114,15 @@ impl SyncManager {
             .map(|repo| {
                 let idx = (repo - repo_type::NODE) as usize;
                 let local = counts.get(idx).copied().unwrap_or(0) as u64;
-                let peer = remote_of(repo);
-                let strategy = if local == 0 && peer == 0 {
+                let peer_count = remote_of(repo);
+                let strategy = if local == 0 && peer_count == 0 {
                     protocol::STRATEGY_NONE
-                } else if (peer == 0 && local >= SNAPSHOT_MIN_ROWS)
-                    || (local as f64 / peer.max(1) as f64 > SNAPSHOT_RATIO_THRESHOLD
-                        && local.saturating_sub(peer) > self.config.range_bulk_threshold_rows)
+                } else if self.snapshot_in_cooldown(peer, repo) {
+                    // v10(F4)：冷却期内强制 DELTA（快照刚竣工，追尾是正确路径）
+                    protocol::STRATEGY_DELTA
+                } else if (peer_count == 0 && local >= SNAPSHOT_MIN_ROWS)
+                    || (local as f64 / peer_count.max(1) as f64 > SNAPSHOT_RATIO_THRESHOLD
+                        && local.saturating_sub(peer_count) > self.config.range_bulk_threshold_rows)
                 {
                     // 冷启动（对端为空且本端有量）或大差集 → 走 bootstrap 快照通道
                     protocol::STRATEGY_BOOTSTRAP
@@ -1106,7 +1149,7 @@ impl SyncManager {
         conn: Arc<PeerConn>,
         msg: SyncNegotiateMessage,
     ) {
-        let strategies = self.decide_strategies(&msg);
+        let strategies = self.decide_strategies(&conn.node_id, &msg);
         // v9：记住对端自报的 per-repo 水位（连接早期即可用于判定欠账，不必等 OpsBatch）。
         self.peer_negotiate_state
             .write()
@@ -1155,6 +1198,45 @@ impl SyncManager {
         self.negotiated
             .write()
             .insert(conn.node_id, msg.repos.clone());
+        // v10(F6)：Ack 即行动 —— 对端裁定 BOOTSTRAP 的 repo 立即发起快照，
+        // 不再等最长 5 分钟的巡检周期。发起前过三重守卫：冷却（F4）、
+        // 水位校验（F5，欠账在对端 oplog 窗口内时 delta 即可、无需快照）、
+        // 单飞（bootstrap_running_fresh）。
+        if self.config.bootstrap_enabled {
+            let peer = conn.node_id;
+            for s in &msg.repos {
+                if s.strategy != protocol::STRATEGY_BOOTSTRAP {
+                    continue;
+                }
+                if self.snapshot_in_cooldown(&peer, s.repo) {
+                    debug!(
+                        "[bootstrap] 收到 BOOTSTRAP 裁决 repo={} 但冷却中，跳过",
+                        s.repo
+                    );
+                    continue;
+                }
+                if !self.snapshot_really_needed(&peer, s.repo) {
+                    debug!(
+                        "[bootstrap] 收到 BOOTSTRAP 裁决 repo={} 但欠账在对端 oplog 窗口内（游标≥min_seq），delta 追平即可",
+                        s.repo
+                    );
+                    continue;
+                }
+                let running_rows = self.delta_storage().bootstrap_list().unwrap_or_default();
+                if self.bootstrap_running_fresh(&running_rows, peer, s.repo) {
+                    continue;
+                }
+                info!(
+                    "[bootstrap] 协商裁定 BOOTSTRAP repo={}，立即发起（不等巡检）: peer={}",
+                    s.repo, peer
+                );
+                let sm = self.clone();
+                let repo = s.repo;
+                tokio::spawn(async move {
+                    sm.start_bootstrap(peer, repo).await;
+                });
+            }
+        }
     }
 
     /// v7：查 (peer, repo) 的协商策略；未协商返回 `None`。
@@ -2811,6 +2893,12 @@ impl SyncManager {
         // 迫使下一轮重协商，同时把该 (peer,repo) 的节流清空以便立即追尾。
         self.negotiated.write().remove(&conn.node_id);
         self.negotiation_sent_at.write().remove(&conn.node_id);
+        // v10(F4)：快照冷却 —— 竣工时刻起 `bootstrap_cooldown_secs` 内，协商裁定与
+        // 巡检对本 (peer,repo) 强制 DELTA。清协商（B5 修复）迫使立即重裁，而裁定输入
+        // （行数）不会立刻变化，无冷却则必然再次裁 BOOTSTRAP（实测 52/58 死循环通道）。
+        self.bootstrap_cooldown
+            .write()
+            .insert((conn.node_id, repo), Instant::now());
         self.delta_request_at.write().remove(&(conn.node_id, repo));
         self.delta_has_more.write().insert((conn.node_id, repo));
         info!(
@@ -3023,6 +3111,20 @@ impl SyncManager {
                 // 检查是否已有正在进行且仍在推进的 bootstrap（v9：带新鲜度判定）
                 let running_rows = self.delta_storage().bootstrap_list().unwrap_or_default();
                 if self.bootstrap_running_fresh(&running_rows, *peer, repo) {
+                    continue;
+                }
+                // v10(F4)：快照冷却期内跳过 —— 竣工后行数差不会立刻消失，
+                // 无冷却则每轮巡检必然重触发（死循环通道之二）。
+                if self.snapshot_in_cooldown(peer, repo) {
+                    continue;
+                }
+                // v10(F5)：水位校验 —— 我方游标已 ≥ 对端 oplog 保留窗口起点时，
+                // 欠账全在窗口内，delta 即可追平，快照是纯浪费。
+                if !self.snapshot_really_needed(peer, repo) {
+                    debug!(
+                        "[bootstrap] repo={} peer={} 欠账在对端 oplog 窗口内（游标≥min_seq），跳过快照走 delta",
+                        repo, peer
+                    );
                     continue;
                 }
 
@@ -3353,6 +3455,158 @@ mod tests {
             counts[1] as u64, manifest.total_rows,
             "协商计数与 bootstrap 清单行数必须一致（口径铁律）"
         );
+    }
+
+    /// F4/F5 测试共用构造器（照抄 test_apply_node_sync 的装配方式）。
+    fn make_sync_manager(
+        storage: Arc<crate::storage::db::Storage>,
+        cfg: FederationConfig,
+    ) -> SyncManager {
+        let node_repo = Arc::new(NodeRepoImpl::new(storage));
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let cm = SessionsHandle::new_for_test();
+        let metrics = Arc::new(FederationMetrics::new());
+        let gossip = Arc::new(GossipEngine::new(
+            cm.clone(),
+            cfg.clone(),
+            NodeId([1; 20]),
+            metrics.clone(),
+            shutdown_tx.clone(),
+        ));
+        SyncManager::new(
+            cm,
+            node_repo,
+            cfg,
+            shutdown_tx,
+            gossip,
+            metrics,
+            NodeId([1; 20]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// F4(死循环通道守卫回归)：快照冷却期内的 (peer,repo) 在协商裁定中强制 DELTA，
+    /// 冷却期外恢复行数规则；且冷却按 repo 隔离，不波及其他 repo 裁定。
+    #[test]
+    fn test_snapshot_cooldown_forces_delta() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..200i64 {
+                conn.execute(
+                    "INSERT INTO peers (infohash, ip, port, source) VALUES (?1, ?2, ?3, 'test')",
+                    rusqlite::params![
+                        [0xacu8; 20],
+                        format!("10.2.{}.{}", i / 250, i % 250),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let mut cfg = make_config();
+        cfg.range_bulk_threshold_rows = 10;
+        let mgr = make_sync_manager(storage, cfg);
+
+        let peer = NodeId([2; 20]);
+        let remote = SyncNegotiateMessage {
+            repos: vec![
+                RepoSyncState {
+                    repo: repo_type::PEER,
+                    row_count: 100,
+                    max_seq: 10,
+                    min_seq: 1,
+                    retention_secs: 3600,
+                },
+                RepoSyncState {
+                    repo: repo_type::TRACKER,
+                    row_count: 0,
+                    max_seq: 0,
+                    min_seq: 0,
+                    retention_secs: 3600,
+                },
+            ],
+            caps: SyncCaps {
+                send_rate_bytes_per_sec: 0,
+                recv_rate_bytes_per_sec: 0,
+                disk_throughput_hint: 0,
+                batch_limit: 1000,
+            },
+            timestamp_ms: 0,
+        };
+
+        // 无冷却：本地 200 / 对端 100 = 2.0 > 1.2 且差 100 > 10 → BOOTSTRAP
+        let s = mgr.decide_strategies(&peer, &remote);
+        assert_eq!(
+            s.iter()
+                .find(|r| r.repo == repo_type::PEER)
+                .unwrap()
+                .strategy,
+            protocol::STRATEGY_BOOTSTRAP
+        );
+
+        // 落冷却：同输入必须裁 DELTA（无冷却则竣工清协商重裁必然再次 BOOTSTRAP）
+        mgr.bootstrap_cooldown
+            .write()
+            .insert((peer, repo_type::PEER), Instant::now());
+        let s2 = mgr.decide_strategies(&peer, &remote);
+        assert_eq!(
+            s2.iter()
+                .find(|r| r.repo == repo_type::PEER)
+                .unwrap()
+                .strategy,
+            protocol::STRATEGY_DELTA,
+            "冷却期内必须强制 DELTA"
+        );
+
+        // 冷却按 repo 隔离：TRACKER 双方皆 0 → NONE，不受 PEER 冷却影响
+        //（不用 NODE 验证：其计数含 write_queue 非零积压，前提不成立）
+        assert_eq!(
+            s2.iter()
+                .find(|r| r.repo == repo_type::TRACKER)
+                .unwrap()
+                .strategy,
+            protocol::STRATEGY_NONE
+        );
+    }
+
+    /// F5(水位守卫)：我方游标 ≥ 对端 oplog 保留窗口起点(min_seq) → 欠账全在窗口内，
+    /// delta 可追平、无需快照(false)；游标 < min_seq(retention 断档) → 需要快照(true)；
+    /// 对端状态缺失或 min_seq=0 → 保守放行(true,回退旧行为)。
+    #[test]
+    fn test_snapshot_really_needed_watermark_gate() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage.clone(), make_config());
+
+        let peer = NodeId([3; 20]);
+        mgr.peer_negotiate_state.write().insert(
+            peer,
+            vec![RepoSyncState {
+                repo: repo_type::PEER,
+                row_count: 5,
+                max_seq: 500,
+                min_seq: 100,
+                retention_secs: 3600,
+            }],
+        );
+
+        // 游标 0 < 100：存在 delta 补不上的空洞 → 需要快照
+        assert!(mgr.snapshot_really_needed(&peer, repo_type::PEER));
+        // 游标推进到 150 ≥ 100：欠账全在窗口内 → delta 即可，不需要快照
+        storage.set_peer_seq(&peer.0, repo_type::PEER, 150).unwrap();
+        assert!(
+            !mgr.snapshot_really_needed(&peer, repo_type::PEER),
+            "游标已进对端保留窗口，快照是纯浪费"
+        );
+        // 对端无自报状态（协商早期）→ 保守放行
+        assert!(mgr.snapshot_really_needed(&NodeId([9; 20]), repo_type::PEER));
     }
 
     #[test]
