@@ -61,6 +61,9 @@ const RANGE_SAMPLE_STALL_SECS: u64 = 1800;
 /// 的竞态窗口内同一 (peer,repo) 只允许一个在途发起；60s 后 bootstrap_state 必有进度，
 /// 由 `bootstrap_running_fresh` 接管去重。
 const BOOTSTRAP_INFLIGHT_TTL_SECS: u64 = 60;
+/// v10(A)：双向引导冲突的判定窗口（秒）—— 该窗口内响应过对方的 bootstrap 请求即视为
+/// 「对方正在从我拉快照」，node_id 字典序大的一方让路（响应方优先，确定性无震荡）。
+const BOOTSTRAP_SERVING_WINDOW_SECS: u64 = 120;
 
 /// v10(F2)：一轮 Range 抽样对账的进行中状态（断点续跑游标）。
 ///
@@ -205,6 +208,11 @@ pub struct SyncManager {
     bootstrap_cooldown: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v10：bootstrap 发起互斥 —— (peer, repo) → 发起时刻（TTL 内重复触发直接拒绝）。
     bootstrap_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v10：本端节点身份（双向引导冲突时按 node_id 字典序确定性让路）。
+    local_node_id: NodeId,
+    /// v10(A)：响应方活动标记 —— (peer, repo) → 最近一次响应对方 bootstrap 请求的时刻。
+    /// 「对方在从我拉快照」的信号，用于响应方优先串行化。
+    bootstrap_serving_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
     delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
@@ -300,6 +308,8 @@ impl SyncManager {
         Self {
             sessions,
             node_repo,
+            local_node_id,
+            bootstrap_serving_at: RwLock::new(FxHashMap::default()),
             gossip_engine,
             peer_sync,
             infohash_sync,
@@ -1065,7 +1075,30 @@ impl SyncManager {
         }
     }
 
-    /// v10(F4)：该 (peer, repo) 是否在快照冷却期内。
+    /// v10(A)：该 (peer, repo) 最近是否在响应对方的 bootstrap 请求（对方在从我拉快照）。
+    fn serving_peer_bootstrap(&self, peer: &NodeId, repo: u8) -> bool {
+        let m = self.bootstrap_serving_at.read();
+        m.get(&(*peer, repo))
+            .map(|t| t.elapsed().as_secs() < BOOTSTRAP_SERVING_WINDOW_SECS)
+            .unwrap_or(false)
+    }
+
+    /// v10(A)：双向引导冲突让路判定。双方因 oplog seq 断档互有 gap 时会**同时**发起
+    /// 全量快照互拉，双向 IO 互踩把块响应拖到超时 → 重拉 → w0 漂移断点归零，永不收敛
+    /// （2026-09-27 实测 52/58：148 块 × 3 次「续传起点=0」）。
+    /// 响应方优先：正在响应对方请求者继续传；node_id 字典序大的一方让路暂停自己的拉取
+    /// （确定性打破对称，无震荡）。对端完成后让路方由 resume 自动恢复续传。
+    fn should_yield_bootstrap(&self, peer: &NodeId, repo: u8) -> bool {
+        self.serving_peer_bootstrap(peer, repo) && self.local_node_id.0 > peer.0
+    }
+
+    /// v10(A)：响应方活动标记入口（清单/块请求共用）。
+    fn mark_bootstrap_serving(&self, peer: &NodeId, repo: u8) {
+        self.bootstrap_serving_at
+            .write()
+            .insert((*peer, repo), Instant::now());
+    }
+
     /// v10：bootstrap 发起互斥。返回 true = 获得发起槽位；false = TTL 内已有在途发起。
     /// 多触发器（协商 Ack / 巡检 / 续传欠账）并发点火的竞态窗口内，同一 (peer,repo)
     /// 只放行一个 start_bootstrap（实测启动期同 repo 15s 内两轮并行竣工）。
@@ -1075,6 +1108,7 @@ impl SyncManager {
         m.insert((*peer, repo), Instant::now()).is_none()
     }
 
+    /// v10(F4)：该 (peer, repo) 是否在快照冷却期内。
     fn snapshot_in_cooldown(&self, peer: &NodeId, repo: u8) -> bool {
         let mut m = self.bootstrap_cooldown.write();
         let ttl = self.config.bootstrap_cooldown_secs.max(1);
@@ -2353,6 +2387,8 @@ impl SyncManager {
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
+        // v10(A)：标记「正在响应对方的 bootstrap 请求」—— 双向引导冲突让路的信号源。
+        self.mark_bootstrap_serving(&conn.node_id, req.repo);
         let key = (conn.node_id, req.repo);
         let lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
         // v9：① 缓存复用 —— 租约期内重复到达的清单请求直接回缓存清单，不再全表重排。
@@ -2499,6 +2535,10 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // v10(A)：标记「正在响应对方的 bootstrap 请求」—— 双向引导冲突让路的信号源。
+        self.bootstrap_serving_at
+            .write()
+            .insert((conn.node_id, req.repo), Instant::now());
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
@@ -2692,34 +2732,46 @@ impl SyncManager {
         let now = chrono::Utc::now().timestamp_millis();
         // v9：同 version 的清单视为同一快照 ⇒ 保留已有完成进度，避免「重打清单 = 进度归零」
         // 造成的零净进展循环（清零 → 重传 → 再清零）。
-        let same_snapshot = self
+        // v10(B)：断点继承扩展 —— version 由 w0 派生，对端 oplog 持续写则 w0 每次重拉
+        // 都漂移 → version 必然不同 → 归零循环（实测 52/58 NODE 快照 3 次「续传起点=0」）。
+        // 块边界由 key 空间 + chunk_rows 决定，w0 漂移不改变边界 ⇒ **边界序列一致即继承
+        // done_chunks**；已传块与新 w0 之间约 0.1% 的值漂移由竣工后的 delta 追尾 + Range
+        // 反熵兜底。仅当边界真变化（数据分布剧变/参数调整）才归零。
+        let loaded = self
             .delta_storage()
             .bootstrap_load(&conn.node_id.0, mf.repo)
             .ok()
-            .flatten()
-            .filter(|(p, _)| p.version == mf.version && p.peer.as_slice() == conn.node_id.0)
-            .map(|(p, _)| p);
+            .flatten();
+        let same_snapshot = loaded.filter(|(p, old_mf)| {
+            p.peer.as_slice() == conn.node_id.0
+                && (p.version == mf.version
+                    || old_mf
+                        .as_ref()
+                        .map(|om| Self::manifest_chunks_equivalent(om, &mf))
+                        .unwrap_or(false))
+        });
         let mut progress = bootstrap::BootstrapProgress::new(mf.repo, conn.node_id.0.to_vec(), now);
         progress.phase = bootstrap::BootstrapPhase::Transfer;
         progress.version = mf.version;
         progress.w0_seq = mf.w0_seq;
         progress.total_chunks = mf.chunks.len() as u64;
         progress.done_chunks = match same_snapshot {
-            Some(ref prev) => {
+            Some((ref prev, _)) => {
                 let keep = prev.done_chunks.min(mf.chunks.len() as u64);
                 if keep > 0 {
                     info!(
-                        "[bootstrap] 清单版本未变（version={}），保留已完成进度 done={}/{}",
-                        mf.version,
+                        "[bootstrap] 清单边界一致，继承断点 done={}/{}（旧 version={}, 新 version={}）",
                         keep,
-                        mf.chunks.len()
+                        mf.chunks.len(),
+                        prev.version,
+                        mf.version
                     );
                 }
                 keep
             }
             None => 0,
         };
-        progress.bytes = same_snapshot.map(|p| p.bytes).unwrap_or(0);
+        progress.bytes = same_snapshot.as_ref().map(|(p, _)| p.bytes).unwrap_or(0);
         // v9：**不再在此处 `set_peer_seq`**。旧实现在一个字节都没落地时就把该 (peer,repo) 的
         // per-repo 游标抬到 w0（`set_peer_seq` 是 MAX 语义、只进不退），于是「数据未传、
         // 水位已声明」—— lag 归零、看板显示已同步，且无法回退。现在改为竣工时
@@ -2742,6 +2794,18 @@ impl SyncManager {
         let start_index = progress.done_chunks as u32;
         self.request_bootstrap_chunk(&conn, mf.repo, start_index, &mf)
             .await;
+    }
+
+    /// v10(B)：两份清单的块边界序列是否等价（index/lo/hi/rows 逐一相同）。
+    /// 块哈希不参与比对 —— w0 漂移会改变哈希但不变边界，等价即继承断点。
+    fn manifest_chunks_equivalent(
+        a: &bootstrap::BootstrapManifest,
+        b: &bootstrap::BootstrapManifest,
+    ) -> bool {
+        a.chunks.len() == b.chunks.len()
+            && a.chunks.iter().zip(b.chunks.iter()).all(|(x, y)| {
+                x.index == y.index && x.lo == y.lo && x.hi == y.hi && x.rows == y.rows
+            })
     }
 
     /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉或切追尾。
@@ -2877,6 +2941,15 @@ impl SyncManager {
         manifest: &bootstrap::BootstrapManifest,
     ) {
         if manifest.chunks.iter().all(|c| c.index != index) {
+            return;
+        }
+        // v10(A)：双向引导冲突 —— 对端正在从我拉同 repo 快照且本端为让路方时，
+        // 暂停发块请求（进度保留，对端传完后 resume 自动恢复续传）。
+        if self.should_yield_bootstrap(&conn.node_id, repo) {
+            debug!(
+                "[bootstrap] 双向引导冲突，暂停拉取让路对方: peer={} repo={} index={}",
+                conn.node_id, repo, index
+            );
             return;
         }
         // v9：记录 (index, 次数, 首次时刻)。resume tick 据此判定「对端一直不回帧」
@@ -3185,6 +3258,15 @@ impl SyncManager {
     /// P2-1：向指定对端发起某 repo 的 bootstrap（拉清单 → 分块 → 追尾）。默认关闭。
     pub async fn start_bootstrap(self: Arc<Self>, peer: NodeId, repo: u8) {
         if !self.config.bootstrap_enabled {
+            return;
+        }
+        // v10(A)：双向引导冲突让路 —— 对端正在从我拉同 repo 快照且本端为让路方时，
+        // 不发起（等对端传完，resume 自动恢复）。
+        if self.should_yield_bootstrap(&peer, repo) {
+            debug!(
+                "[bootstrap] 双向引导冲突，让路对方（响应方优先）: peer={} repo={}",
+                peer, repo
+            );
             return;
         }
         // v10：发起互斥 —— 竞态窗口内同一 (peer,repo) 只放行一个在途发起。
@@ -3679,6 +3761,75 @@ mod tests {
             mgr.bootstrap_transfer_active(),
             "快照传输活跃期反熵必须让路"
         );
+    }
+
+    /// v10(B)：块边界等价判定 —— w0/version/块哈希漂移不影响等价（断点继承），
+    /// 块数或边界 key 变化才判不等（数据分布真变化，归零重传）。
+    #[test]
+    fn test_manifest_chunks_equivalent_ignores_w0_drift() {
+        use crate::federation::protocol::repo_type;
+        let mk = |version: u32, w0: u64| bootstrap::BootstrapManifest {
+            repo: repo_type::NODE,
+            version,
+            w0_seq: w0,
+            chunk_rows: 2,
+            total_rows: 4,
+            chunks: vec![
+                bootstrap::ManifestChunk {
+                    index: 0,
+                    lo: vec![],
+                    hi: vec![b'k'],
+                    rows: 2,
+                    hash: [1u8; 32],
+                },
+                bootstrap::ManifestChunk {
+                    index: 1,
+                    lo: vec![b'k'],
+                    hi: vec![],
+                    rows: 2,
+                    hash: [2u8; 32],
+                },
+            ],
+        };
+        let old = mk(829162, 829161);
+        let mut new = mk(4_091_331, 4_091_330);
+        new.chunks[0].hash = [9u8; 32]; // w0 漂移 → 块内容/哈希变
+        assert!(
+            SyncManager::manifest_chunks_equivalent(&old, &new),
+            "w0 漂移不改边界，断点必须继承"
+        );
+        let mut truncated = new.clone();
+        truncated.chunks.pop();
+        assert!(!SyncManager::manifest_chunks_equivalent(&old, &truncated));
+        let mut shifted = new.clone();
+        shifted.chunks[0].hi = vec![b'z'];
+        assert!(!SyncManager::manifest_chunks_equivalent(&old, &shifted));
+    }
+
+    /// v10(A)：双向引导冲突按 node_id 字典序确定性让路（大者让），
+    /// serving 窗口过期或对端更大时不让路。
+    #[test]
+    fn test_bidirectional_bootstrap_yield_by_node_id() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage, make_config());
+        // make_sync_manager 的本端 = NodeId([1;20])
+        let smaller_peer = NodeId([0; 20]);
+        let bigger_peer = NodeId([2; 20]);
+
+        // serving 未刷新 → 不让路
+        assert!(!mgr.should_yield_bootstrap(&smaller_peer, repo_type::NODE));
+
+        // serving 新鲜：本端(0x01…) > 对端(0x00…) → 本端让路
+        mgr.bootstrap_serving_at
+            .write()
+            .insert((smaller_peer, repo_type::NODE), Instant::now());
+        mgr.bootstrap_serving_at
+            .write()
+            .insert((bigger_peer, repo_type::NODE), Instant::now());
+        assert!(mgr.should_yield_bootstrap(&smaller_peer, repo_type::NODE));
+        // 对端(0x02…) > 本端(0x01…) → 对端让路，本端继续
+        assert!(!mgr.should_yield_bootstrap(&bigger_peer, repo_type::NODE));
     }
 
     #[test]
