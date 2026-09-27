@@ -89,6 +89,11 @@ pub struct BootstrapProgress {
     pub bytes: u64,
     pub started_ms: i64,
     pub updated_ms: i64,
+    /// v10(B2)：已传输到的最后一个块的上界 key（hi）。重拉清单后以此在新清单中
+    /// 定位续传起点 —— 块边界会随活表写入漂移，key 游标不随边界失效。
+    /// `None` = 旧进度无游标（归零重来）；`Some(空 vec)` = 已传到 +∞（全量完成）。
+    #[serde(default)]
+    pub last_key: Option<Vec<u8>>,
     /// 失败原因（`phase == Failed` 时非空）。
     pub error: Option<String>,
 }
@@ -104,6 +109,7 @@ impl BootstrapProgress {
             total_chunks: 0,
             done_chunks: 0,
             bytes: 0,
+            last_key: None,
             started_ms: now_ms,
             updated_ms: now_ms,
             error: None,
@@ -522,12 +528,39 @@ impl TokenBucket {
 ///
 /// 判定规则：
 /// - 声明 0 行的块必须收到 0 条；
-/// - 声明 N 行的块必须收到 ≥1 且 ≤N 条（对端在传输期发生删除会让实收少于声明，属正常）。
+/// - 声明 N 行的块必须收到 ≥1 条。
+///
+/// v10(B2)：**活表语义** —— 对端表持续写入，区间实收可能**超过**清单时点的声明行数
+/// （新增 key 落进 [lo,hi)），超收是正常演进、不判失败（此前 `received <= expected`
+/// 在持续写入的大表上必败 → 块 3 次失败 → 重拉清单 → 归零，快照永不传完，
+/// 实测 52/58 NODE 148 块反复归零）。空回包（对端 NAK）仍是唯一失败态；
+/// 重叠/缺失行由竣工后的 delta 追尾与 Range 反熵兜底。
 pub fn verify_transport(expected_rows: u64, received: usize) -> bool {
     if expected_rows == 0 {
         return received == 0;
     }
-    received > 0 && received as u64 <= expected_rows
+    received > 0
+}
+
+/// v10(B2)：在新清单中定位续传起点（key 游标断点）。
+///
+/// `last_key` = 旧进度已传到的最后一个块上界（hi）。块边界会随活表写入漂移
+/// （边界比对在新清单上必然失配），但 key 游标稳定：新清单中第一个
+/// `hi > last_key`（或 hi 为 +∞）的块即为续传块，与 last_key 横跨的部分重传、
+/// 幂等 upsert 无害。`last_key` 为 `None`（旧进度无游标）→ 从 0；
+/// `Some(空 vec)`（已传到 +∞）→ 全跳过。
+pub fn locate_resume_index(chunks: &[ManifestChunk], last_key: Option<&[u8]>) -> u64 {
+    let Some(k) = last_key else {
+        return 0;
+    };
+    if k.is_empty() {
+        return chunks.len() as u64;
+    }
+    chunks
+        .iter()
+        .position(|c| c.hi.is_empty() || c.hi.as_slice() > k)
+        .map(|i| i as u64)
+        .unwrap_or(chunks.len() as u64)
 }
 
 /// 校验收到的行是否与清单块哈希一致。

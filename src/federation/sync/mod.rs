@@ -2418,43 +2418,33 @@ impl SyncManager {
         // v10(A)：标记「正在响应对方的 bootstrap 请求」—— 双向引导冲突让路的信号源。
         self.mark_bootstrap_serving(&conn.node_id, req.repo);
         let key = (conn.node_id, req.repo);
-        let lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
-        // v9：① 缓存复用 —— 租约期内重复到达的清单请求直接回缓存清单，不再全表重排。
+        // v9：① 缓存复用 —— 重复到达的清单请求直接回缓存清单，不再全表重排。
+        // v10(B2)：**缓存保活** —— 旧实现 lease 过期即重建（全表扫 38s），而请求方拉完
+        // 全量需几十分钟 ≫ lease，每次重拉都触发重建 → 缓存边界漂移 → 断点归零死循环。
+        // 现在缓存**一旦建立就一直服务**：请求方持有的清单正是这份，回它永远自洽；
+        // 表增长落在末块 [lo,+∞) 与竣工后的 delta/Range 兜底。仅缓存缺失（重启）才重建。
         // 注意：读锁守卫必须在语句内释放（不得跨 await），否则 handler future 不是 Send。
         let cached = self.bootstrap_manifests.read().get(&key).cloned();
         if let Some(m) = cached {
-            let built_age = {
-                let at = self.bootstrap_manifest_at.read();
-                at.get(&key).map(|t| t.elapsed())
-            };
-            let fresh = matches!(built_age, Some(age) if age < lease);
-            if fresh {
-                debug!(
-                    "[bootstrap] 复用缓存清单 from={} repo={}（块数={}，构建于 {}s 前）",
-                    conn.node_id,
-                    req.repo,
-                    m.chunks.len(),
-                    built_age.map(|a| a.as_secs()).unwrap_or(0)
-                );
-                let resp = BootstrapManifestResponseMessage { manifest: m };
-                if conn
-                    .send_message(MessageType::BootstrapManifestResponse, &resp)
-                    .await
-                    .is_ok()
-                {
-                    self.metrics.record_message_sent();
-                }
-                return;
+            let resp = BootstrapManifestResponseMessage { manifest: m };
+            if conn
+                .send_message(MessageType::BootstrapManifestResponse, &resp)
+                .await
+                .is_ok()
+            {
+                self.metrics.record_message_sent();
             }
+            return;
         }
         // v9：② 单飞 —— 已有一次重建在途时不再并发铺开全表扫描；
         // 有旧缓存就回旧缓存（边界仍然自洽），没有就回空清单让请求方稍后重试。
+        let rebuild_lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
         let rebuilding_age = {
             let g = self.bootstrap_rebuild_at.read();
             g.get(&key).map(|t| t.elapsed())
         };
         if let Some(age) = rebuilding_age {
-            if age < lease {
+            if age < rebuild_lease {
                 warn!(
                     "[bootstrap] 清单重建进行中（已 {}s），本轮回退旧缓存/空清单: peer={} repo={}",
                     age.as_secs(),
@@ -2757,49 +2747,43 @@ impl SyncManager {
             );
             return;
         }
-        let now = chrono::Utc::now().timestamp_millis();
-        // v9：同 version 的清单视为同一快照 ⇒ 保留已有完成进度，避免「重打清单 = 进度归零」
-        // 造成的零净进展循环（清零 → 重传 → 再清零）。
-        // v10(B)：断点继承扩展 —— version 由 w0 派生，对端 oplog 持续写则 w0 每次重拉
-        // 都漂移 → version 必然不同 → 归零循环（实测 52/58 NODE 快照 3 次「续传起点=0」）。
-        // 块边界由 key 空间 + chunk_rows 决定，w0 漂移不改变边界 ⇒ **边界序列一致即继承
-        // done_chunks**；已传块与新 w0 之间约 0.1% 的值漂移由竣工后的 delta 追尾 + Range
-        // 反熵兜底。仅当边界真变化（数据分布剧变/参数调整）才归零。
+        // v10(B2)：断点继承 —— version 相同（同一快照）直接继承 done_chunks；
+        // version 不同（w0 漂移，对端 oplog 持续写则必然）时用 **key 游标** 在新清单
+        // 中定位续传起点：块边界随活表写入漂移，边界比对必然失配 → 归零循环
+        // （实测 52/58 NODE 快照「续传起点=0」反复），key 游标不随边界失效。
+        // 已传块与新 w0 之间的值漂移由竣工后的 delta 追尾 + Range 反熵兜底。
         let loaded = self
             .delta_storage()
             .bootstrap_load(&conn.node_id.0, mf.repo)
             .ok()
             .flatten();
-        let same_snapshot = loaded.filter(|(p, old_mf)| {
-            p.peer.as_slice() == conn.node_id.0
-                && (p.version == mf.version
-                    || old_mf
-                        .as_ref()
-                        .map(|om| Self::manifest_chunks_equivalent(om, &mf))
-                        .unwrap_or(false))
-        });
+        let (same_done, resume_src) = match loaded {
+            Some((p, _)) if p.peer.as_slice() == conn.node_id.0 && p.version == mf.version => {
+                (p.done_chunks.min(mf.chunks.len() as u64), "version")
+            }
+            Some((p, _)) if p.peer.as_slice() == conn.node_id.0 => {
+                let idx = bootstrap::locate_resume_index(&mf.chunks, p.last_key.as_deref());
+                (idx.min(mf.chunks.len() as u64), "last_key")
+            }
+            _ => (0, "none"),
+        };
+        let now = chrono::Utc::now().timestamp_millis();
         let mut progress = bootstrap::BootstrapProgress::new(mf.repo, conn.node_id.0.to_vec(), now);
         progress.phase = bootstrap::BootstrapPhase::Transfer;
         progress.version = mf.version;
         progress.w0_seq = mf.w0_seq;
         progress.total_chunks = mf.chunks.len() as u64;
-        progress.done_chunks = match same_snapshot {
-            Some((ref prev, _)) => {
-                let keep = prev.done_chunks.min(mf.chunks.len() as u64);
-                if keep > 0 {
-                    info!(
-                        "[bootstrap] 清单边界一致，继承断点 done={}/{}（旧 version={}, 新 version={}）",
-                        keep,
-                        mf.chunks.len(),
-                        prev.version,
-                        mf.version
-                    );
-                }
-                keep
-            }
-            None => 0,
-        };
-        progress.bytes = same_snapshot.as_ref().map(|(p, _)| p.bytes).unwrap_or(0);
+        progress.done_chunks = same_done;
+        if same_done > 0 {
+            info!(
+                "[bootstrap] 断点继承（来源 {}）done={}/{}: peer={} repo={}",
+                resume_src,
+                same_done,
+                mf.chunks.len(),
+                conn.node_id,
+                mf.repo
+            );
+        }
         // v9：**不再在此处 `set_peer_seq`**。旧实现在一个字节都没落地时就把该 (peer,repo) 的
         // per-repo 游标抬到 w0（`set_peer_seq` 是 MAX 语义、只进不退），于是「数据未传、
         // 水位已声明」—— lag 归零、看板显示已同步，且无法回退。现在改为竣工时
@@ -2822,18 +2806,6 @@ impl SyncManager {
         let start_index = progress.done_chunks as u32;
         self.request_bootstrap_chunk(&conn, mf.repo, start_index, &mf)
             .await;
-    }
-
-    /// v10(B)：两份清单的块边界序列是否等价（index/lo/hi/rows 逐一相同）。
-    /// 块哈希不参与比对 —— w0 漂移会改变哈希但不变边界，等价即继承断点。
-    fn manifest_chunks_equivalent(
-        a: &bootstrap::BootstrapManifest,
-        b: &bootstrap::BootstrapManifest,
-    ) -> bool {
-        a.chunks.len() == b.chunks.len()
-            && a.chunks.iter().zip(b.chunks.iter()).all(|(x, y)| {
-                x.index == y.index && x.lo == y.lo && x.hi == y.hi && x.rows == y.rows
-            })
     }
 
     /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉或切追尾。
@@ -2903,6 +2875,8 @@ impl SyncManager {
                 .write()
                 .remove(&(conn.node_id, resp.repo));
             progress.done_chunks = (resp.index as u64 + 1).max(progress.done_chunks);
+            // v10(B2)：记录 key 游标 —— 重拉清单后按此定位续传起点（活表边界漂移免疫）。
+            progress.last_key = Some(chunk.hi.clone());
             progress.bytes += resp
                 .entries
                 .iter()
@@ -3791,47 +3765,65 @@ mod tests {
         );
     }
 
-    /// v10(B)：块边界等价判定 —— w0/version/块哈希漂移不影响等价（断点继承），
-    /// 块数或边界 key 变化才判不等（数据分布真变化，归零重传）。
+    /// v10(B2)：key 游标续传定位 —— 块边界随活表写入漂移（块数 129→130、边界 key
+    /// 后移）后，last_key 游标仍能正确定位续传起点；各退化场景（None/+∞/越尾）自洽。
     #[test]
-    fn test_manifest_chunks_equivalent_ignores_w0_drift() {
+    fn test_locate_resume_index_survives_boundary_drift() {
         use crate::federation::protocol::repo_type;
-        let mk = |version: u32, w0: u64| bootstrap::BootstrapManifest {
+        let chunk = |index: u32, hi: Vec<u8>, rows: u64| bootstrap::ManifestChunk {
+            index,
+            lo: vec![],
+            hi,
+            rows,
+            hash: [0u8; 32],
+        };
+        // 旧清单: 3 块, 边界 a/b/c, 已传 2 块 → last_key = "b"
+        let old = bootstrap::BootstrapManifest {
             repo: repo_type::NODE,
-            version,
-            w0_seq: w0,
-            chunk_rows: 2,
-            total_rows: 4,
+            version: 829162,
+            w0_seq: 829161,
+            chunk_rows: 10,
+            total_rows: 30,
             chunks: vec![
-                bootstrap::ManifestChunk {
-                    index: 0,
-                    lo: vec![],
-                    hi: vec![b'k'],
-                    rows: 2,
-                    hash: [1u8; 32],
-                },
-                bootstrap::ManifestChunk {
-                    index: 1,
-                    lo: vec![b'k'],
-                    hi: vec![],
-                    rows: 2,
-                    hash: [2u8; 32],
-                },
+                chunk(0, vec![b'a'], 10),
+                chunk(1, vec![b'b'], 10),
+                chunk(2, vec![], 10),
             ],
         };
-        let old = mk(829162, 829161);
-        let mut new = mk(4_091_331, 4_091_330);
-        new.chunks[0].hash = [9u8; 32]; // w0 漂移 → 块内容/哈希变
-        assert!(
-            SyncManager::manifest_chunks_equivalent(&old, &new),
-            "w0 漂移不改边界，断点必须继承"
+        // 新清单: 活表写入 → 块数 3→4, 边界整体漂移, version/w0 变化
+        let new = bootstrap::BootstrapManifest {
+            repo: repo_type::NODE,
+            version: 4_091_331,
+            w0_seq: 4_091_330,
+            chunk_rows: 10,
+            total_rows: 31,
+            chunks: vec![
+                chunk(0, vec![b'a', b'5'], 10),
+                chunk(1, vec![b'b', b'5'], 10),
+                chunk(2, vec![b'c', b'5'], 10),
+                chunk(3, vec![], 1),
+            ],
+        };
+        // last_key = "b"(旧第 2 块 hi): 新清单第一个 hi > "b" 的是块 1(b'5' > b'b'? 0x35 < 0x62 → 否!)
+        // b"b\x35" 与 "b": 首字节相等, 次字节新清单为 0x35 —— last_key 是精确的 "b"(单字节)。
+        // "b\x35" > "b"(前缀比较, 长者大) → 块 1 hi > last_key → 续传从块 1(部分重传, 幂等)
+        assert_eq!(
+            bootstrap::locate_resume_index(&new.chunks, Some(&old.chunks[1].hi)),
+            1,
+            "last_key 所在块之后的第一个块即续传点"
         );
-        let mut truncated = new.clone();
-        truncated.chunks.pop();
-        assert!(!SyncManager::manifest_chunks_equivalent(&old, &truncated));
-        let mut shifted = new.clone();
-        shifted.chunks[0].hi = vec![b'z'];
-        assert!(!SyncManager::manifest_chunks_equivalent(&old, &shifted));
+        // None → 从 0
+        assert_eq!(bootstrap::locate_resume_index(&new.chunks, None), 0);
+        // +∞(空 hi, 传完全量) → 全跳过
+        assert_eq!(
+            bootstrap::locate_resume_index(&new.chunks, Some(&[])),
+            new.chunks.len() as u64
+        );
+        // last_key 大于前面块的边界，但末块 hi=+∞ 永远兜底 → 续传点 = 末块下标
+        assert_eq!(
+            bootstrap::locate_resume_index(&new.chunks, Some(&[0xff, 0xff])),
+            (new.chunks.len() - 1) as u64
+        );
     }
 
     /// v10(A)：双向引导冲突按 node_id 字典序确定性让路（大者让），
