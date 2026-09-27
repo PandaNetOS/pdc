@@ -1550,6 +1550,24 @@ impl SyncManager {
                 let use_bootstrap = self.config.bootstrap_enabled
                     && bootstrap_decided
                     && conn.connected_secs() >= self.config.strategy_min_conn_secs;
+                // v10(B2)：方向守卫 —— 对端行数不多于本端时，本端的缺口不来自对端的
+                // 存量（快照拉来的都是已有行），欠账由 delta 追平即可。否则竣工后
+                // 行数反超的部分会持续触发空转 bootstrap（每 60s 一次清单往返），
+                // 且空转请求会不断刷新对端视角的 serving，令对端（真正的欠账方）
+                // 被让路机制永久卡住（实测 58 竣工后 52 无法恢复拉取）。
+                let remote_rows = self
+                    .peer_negotiate_state
+                    .read()
+                    .get(&conn.node_id)
+                    .and_then(|v| v.iter().find(|s| s.repo == rt).map(|s| s.row_count))
+                    .unwrap_or(0);
+                let local_rows = self
+                    .local_entry_counts()
+                    .get((rt - repo_type::NODE) as usize)
+                    .copied()
+                    .unwrap_or(0) as u64;
+                let use_bootstrap =
+                    use_bootstrap && !(remote_rows > 0 && remote_rows <= local_rows);
                 if use_bootstrap {
                     // v9：running 判定改为「同 peer 同 repo 且**仍在推进**」（见
                     // bootstrap_running_fresh）：旧实现不含 peer、无超时，一行卡在 Transfer
@@ -2783,6 +2801,17 @@ impl SyncManager {
                 conn.node_id,
                 mf.repo
             );
+        }
+        // v10(B2)：继承判定已覆盖全部块（对端全量此前已落地）→ 直接竣工，
+        // 不再发越界块请求空转；竣工推进游标并切 delta 追尾。
+        if !mf.chunks.is_empty() && same_done >= mf.chunks.len() as u64 {
+            info!(
+                "[bootstrap] 继承判定快照已全部落地，直接竣工: peer={} repo={}",
+                conn.node_id, mf.repo
+            );
+            let _ = self.delta_storage().bootstrap_save(&progress, Some(&mf));
+            self.finish_bootstrap(&conn, mf.repo, mf.w0_seq).await;
+            return;
         }
         // v9：**不再在此处 `set_peer_seq`**。旧实现在一个字节都没落地时就把该 (peer,repo) 的
         // per-repo 游标抬到 w0（`set_peer_seq` 是 MAX 语义、只进不退），于是「数据未传、
