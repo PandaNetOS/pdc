@@ -97,6 +97,13 @@ pub enum MessageType {
     /// v8 Range 反熵推送（4 repo 通用）：携带完整 `SyncEntry`（含 payload），
     /// 接收方直接走 `handle_sync_batch` 幂等 apply（不写 oplog、不传播）。
     RangeReconcilePush2 = 49,
+    /// F8/v9：增量（delta）拉取响应 V2（A → B）：`OpsBatchV2 { repo, ops(含 version), ... }`。
+    ///
+    /// 与 38 号 OpsBatch 的唯一区别是 ops 每条携带真实 LWW version —— 使「对既有条目的
+    /// 版本提升」能走正常 LWW 应用。因 bincode 对结构体追加字段不兼容旧字节流
+    /// （OpsBatch 内嵌的 OpEntry 无 version），按项目先例（v7 新增 SyncNegotiate 家族）
+    /// 以**新消息类型**演进，旧 OpsBatch 对 v4-v8 对端保持字节级不变。
+    OpsBatchV2 = 50,
 }
 
 impl MessageType {
@@ -138,6 +145,7 @@ impl MessageType {
             47 => Some(MessageType::SyncNegotiateAck),
             48 => Some(MessageType::RangeReconcilePull),
             49 => Some(MessageType::RangeReconcilePush2),
+            50 => Some(MessageType::OpsBatchV2),
             _ => None,
         }
     }
@@ -159,17 +167,20 @@ impl MessageType {
 ///    per-repo 同步策略，稳定性门控（连接存活 ≥ `strategy_min_conn_secs`）通过后才开大通道。
 /// 8：Range 反熵修复通道通用化（RangeReconcilePull/RangeReconcilePush2）：4 repo 均可
 ///    推送/按键拉取完整 SyncEntry，Merkle 反熵协议族（11/12/15/21/28-36/45）同版退役。
+/// 9：delta 通道 version 透传（OpsBatchV2）：ops 携带真实 LWW version，修复「对既有
+///    条目的更新被静默丢弃」。对端 < 9 时响应方回退旧 OpsBatch（wire 上无 version 字段）。
 /// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle；
 /// version >= 4 且 `federation.delta_sync_enabled=true` 时启用 delta 通道；
 /// version >= 5 且 `federation.range_reconcile_enabled=true` 时启用 range 反熵；
 /// version >= 6 且 `federation.bootstrap_enabled=true` 时启用 bootstrap 通道；
 /// version >= 7 且 `federation.negotiation_enabled=true` 时 delta/bootstrap 大通道需协商通过后才启动
 /// （对端 < v7 回落旧行为：不协商直接按既有开关运行）；
-/// version >= 8 时启用 range 修复的 Pull/Push2 通用通道（对端 < v8 时不发，仅保留叶级对账）。
+/// version >= 8 时启用 range 修复的 Pull/Push2 通用通道（对端 < v8 时不发，仅保留叶级对账）；
+/// version >= 9 时 delta 通道响应方改发 OpsBatchV2（条目携带真实 version，对端 < 9 回退旧 OpsBatch）。
 ///
 /// G4 迁移：原定义在 `federation/connection.rs`，随握手实现一并归位到协议层
 /// （`connection.rs` 保留 `pub use` 转发）。
-pub const HELLO_PROTOCOL_VERSION: u32 = 8;
+pub const HELLO_PROTOCOL_VERSION: u32 = 9;
 
 /// 握手消息（阶段2：Ed25519 签名认证）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +505,9 @@ pub struct OpsRequestMessage {
 }
 
 /// P1-3：增量拉取响应（A → B）。
+///
+/// F8/v9 起为**兼容通道**：仅对协议版本 < 9 的对端收发（内嵌的 `OpEntry` 无 version
+/// 字段，字节格式保持不变）。version 透传走 [`OpsBatchV2Message`]。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpsBatchMessage {
     /// 仓库类型
@@ -509,6 +523,47 @@ pub struct OpsBatchMessage {
     /// 请求方据此算真实落后量 `server_max_seq - synced_seq`（二者同属应答方 seq 空间、
     /// 且同一 repo）。该 repo 在应答方无任何变更时为 0，此时可观测性里的 `lag_seq`
     /// 返回 null —— 而非修复前那样「跨节点空间」或「跨 repo 维度」相减出的噪声/虚高值。
+    #[serde(default)]
+    pub server_max_seq: u64,
+}
+
+/// F8/v9：单条变更操作（delta V2 通道的 oplog 条目协议表示）。
+///
+/// 与 [`OpEntry`] 字段一致，**额外携带真实 LWW version**。之所以不复用 OpEntry：
+/// OpEntry 内嵌于旧 OpsBatchMessage，追加字段会改变旧消息的 bincode 字节流，
+/// 破坏 v4-v8 对端的互操作 —— 旧 OpsBatch 必须保持字节级不变。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpEntryV2 {
+    /// oplog 全局 seq（对端以最大 seq 推进版本向量）
+    pub seq: u64,
+    /// true = delete（墓碑），false = upsert
+    pub is_delete: bool,
+    /// 条目 key（node="ip:port"，peer="<hex_ih>:<ip>:<port>"，infohash=原始字节，tracker=url）
+    pub key: Vec<u8>,
+    /// upsert 时携带完整 payload（与 SyncEntry.payload 同格式）；delete 时为空
+    pub value: Vec<u8>,
+    /// 产生该变更时的 LWW 版本号（与 SyncEntry.version 同源）。接收端据此走正常
+    /// LWW（version 大者胜）；历史旧行（迁移前置 0）沿用旧「已存在即跳过」语义。
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// F8/v9：增量拉取响应 V2（A → B）。
+///
+/// 与 [`OpsBatchMessage`] 的唯一语义差异：ops 每条携带真实 version，接收端 apply 走
+/// 正常 LWW —— 修复旧通道「version 恒置 0 → 对既有条目的更新被静默丢弃」的问题。
+/// 仅对 `protocol_version >= 9` 的对端发送；接收端请求方按 MessageType 分发（V1/V2 均处理）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpsBatchV2Message {
+    /// 仓库类型
+    pub repo: u8,
+    /// 本批 ops（seq 升序，每条携带真实 version）
+    pub ops: Vec<OpEntryV2>,
+    /// 下一断点：本批最后一条 op 的 seq；本批为空时回显请求的 since_seq
+    pub next_seq: u64,
+    /// 是否还有更多（true 时请求方应立即再发一次 OpsRequest）
+    pub has_more: bool,
+    /// F2：应答方**在该 repo 上**的 oplog 最高 seq（语义与 OpsBatchMessage 同名字段一致）
     #[serde(default)]
     pub server_max_seq: u64,
 }
@@ -785,7 +840,9 @@ mod tests {
     fn test_message_type_roundtrip() {
         // v8 起编号 11/12、15-19、21、28-36、45 退役为空位，不再连续可 roundtrip；
         // 改为抽查存活编号（含退役空位必须返回 None）。
-        for i in [0u8, 10, 13, 14, 20, 22, 26, 27, 37, 40, 44, 46, 47, 48, 49] {
+        for i in [
+            0u8, 10, 13, 14, 20, 22, 26, 27, 37, 40, 44, 46, 47, 48, 49, 50,
+        ] {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(mt.as_u8(), i);
         }
@@ -921,6 +978,51 @@ mod tests {
     fn test_decode_frame_insufficient_data() {
         assert!(decode_frame(&[0, 0, 0]).is_err());
         assert!(decode_frame(&[0, 0, 0, 10, 0]).is_err()); // 声称10字节但只有1字节payload
+    }
+
+    /// F8/v9：OpsBatchV2 编解码 roundtrip —— ops 每条的 version 必须原样往返。
+    /// 这是「delta 通道 version 透传」的协议层闸门：字段丢失/错位都会在此暴露。
+    #[test]
+    fn test_ops_batch_v2_roundtrip() {
+        let batch = OpsBatchV2Message {
+            repo: repo_type::NODE,
+            ops: vec![
+                OpEntryV2 {
+                    seq: 7,
+                    is_delete: false,
+                    key: b"10.0.0.1:6885".to_vec(),
+                    value: vec![1, 2, 3],
+                    version: 1_734_000_000,
+                },
+                OpEntryV2 {
+                    seq: 8,
+                    is_delete: true,
+                    key: b"10.0.0.2:6885".to_vec(),
+                    value: Vec::new(),
+                    version: 1_734_000_001,
+                },
+            ],
+            next_seq: 8,
+            has_more: true,
+            server_max_seq: 99,
+        };
+        let frame = encode_message(MessageType::OpsBatchV2, &batch).unwrap();
+        let (msg_type, payload) = decode_frame(&frame).unwrap();
+        assert_eq!(msg_type, MessageType::OpsBatchV2);
+        assert_eq!(msg_type.as_u8(), 50);
+        let decoded: OpsBatchV2Message = bincode::deserialize(payload).unwrap();
+        assert_eq!(decoded.repo, batch.repo);
+        assert_eq!(decoded.next_seq, 8);
+        assert!(decoded.has_more);
+        assert_eq!(decoded.server_max_seq, 99);
+        assert_eq!(decoded.ops.len(), 2);
+        assert_eq!(decoded.ops[0].seq, 7);
+        assert_eq!(decoded.ops[0].key, b"10.0.0.1:6885");
+        assert_eq!(decoded.ops[0].value, vec![1, 2, 3]);
+        assert!(!decoded.ops[0].is_delete);
+        assert_eq!(decoded.ops[0].version, 1_734_000_000);
+        assert!(decoded.ops[1].is_delete);
+        assert_eq!(decoded.ops[1].version, 1_734_000_001);
     }
 
     #[test]

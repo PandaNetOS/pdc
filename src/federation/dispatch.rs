@@ -566,6 +566,22 @@ impl FederationDispatcher {
                 }
                 false
             }
+            MessageType::OpsBatchV2 => {
+                // F8/v9：增量拉取响应 V2（请求方侧）—— ops 携带真实 LWW version，
+                // apply 走正常 LWW（对既有条目的版本提升不再被 version=0 静默丢弃）。
+                // 分发/推进/续拉逻辑与旧 OpsBatch 完全共用（异步）。
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<OpsBatchV2Message>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_ops_batch_v2(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
             MessageType::RangeReconcileRequest => {
                 // P1-4：Range-based 反熵请求（应答方）—— 回该区间摘要 + 分界点/行指纹（异步）
                 self.metrics.record_message_recv();

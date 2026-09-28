@@ -52,6 +52,11 @@ pub struct OpRecord {
     pub key: Vec<u8>,
     /// upsert 时携带 payload；delete 时为空
     pub value: Vec<u8>,
+    /// F8：产生该变更时的 LWW 版本号（与 `SyncEntry.version` 同源，秒级时间戳）。
+    /// delta V2 通道（OpsBatchV2，协议 v9）把它透传给接收端，使「对既有条目的版本提升」
+    /// 能走正常 LWW 应用，而不是被 version=0 语义静默丢弃。旧数据行经 ALTER TABLE
+    /// 迁移后该列默认 0（接收端对 version=0 维持旧跳过语义，安全回退）。
+    pub version: u64,
     pub ts_ms: i64,
     pub origin: Vec<u8>,
 }
@@ -66,17 +71,28 @@ pub fn init_oplog_table(conn: &Connection) -> anyhow::Result<()> {
             repo    INTEGER NOT NULL,                   -- 0..3
             key     BLOB NOT NULL,
             value   BLOB,                               -- upsert 携带 payload；delete 为空
+            version INTEGER NOT NULL DEFAULT 0,         -- F8：LWW 版本号（delta V2 透传）
             ts_ms   INTEGER NOT NULL,
             origin  BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_feed_oplog_repo_seq ON feed_oplog(repo, seq);
         CREATE INDEX IF NOT EXISTS idx_feed_oplog_ts ON feed_oplog(ts_ms);
-        -- v9：对端对**本机 oplog** 的消费确认（用于按「最小对端进度」裁剪）。
-        --
-        -- 注意方向：`delta_peer_seq[P][R]` 是「我消费 P 的 oplog 到哪」，
-        -- 而本表是「P 消费**我**的 oplog 到哪」—— 后者与本机 feed_oplog.seq 同空间，
-        -- 才能真正回答「哪些 op 已经没有对端需要了」。旧实现误用前者做 floor，
-        -- 语义不成立（对端 seq 空间 ≠ 本机 seq 空间），等于没做。
+        "#,
+    )?;
+    // F8 迁移：已存在的旧库（CREATE TABLE IF NOT EXISTS 不会补列）补 version 列。
+    // 旧行版本号置 0，接收端对 version=0 维持旧的「已存在即跳过」语义，安全回退。
+    let _ = conn.execute(
+        "ALTER TABLE feed_oplog ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // v9：对端对**本机 oplog** 的消费确认（用于按「最小对端进度」裁剪）。
+    //
+    // 注意方向：`delta_peer_seq[P][R]` 是「我消费 P 的 oplog 到哪」，
+    // 而本表是「P 消费**我**的 oplog 到哪」—— 后者与本机 feed_oplog.seq 同空间，
+    // 才能真正回答「哪些 op 已经没有对端需要了」。旧实现误用前者做 floor，
+    // 语义不成立（对端 seq 空间 ≠ 本机 seq 空间），等于没做。
+    conn.execute_batch(
+        r#"
         CREATE TABLE IF NOT EXISTS oplog_peer_ack (
             peer      BLOB NOT NULL,     -- 对端 20B node_id
             repo      INTEGER NOT NULL,
@@ -97,26 +113,46 @@ fn now_millis() -> i64 {
 
 impl super::db::Storage {
     /// 在已有连接上追加一条 op（调用方负责事务/锁）。返回新 op 的 seq。
+    ///
+    /// `version` 为该变更的 LWW 版本号（与 `SyncEntry.version` 同源），F8 起随 oplog
+    /// 持久化并在 delta V2 通道透传；旧语义（无版本）传 0。
     pub fn append_op_in_tx(
         conn: &Connection,
         repo: u8,
         op: &str,
         key: &[u8],
         value: &[u8],
+        version: u64,
     ) -> anyhow::Result<i64> {
         let origin = local_origin();
         conn.execute(
-            "INSERT INTO feed_oplog (op, repo, key, value, ts_ms, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![op, repo as i64, key, value, now_millis(), origin],
+            "INSERT INTO feed_oplog (op, repo, key, value, version, ts_ms, origin) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                op,
+                repo as i64,
+                key,
+                value,
+                version as i64,
+                now_millis(),
+                origin
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     /// 追加单个 op（自取锁，autocommit）。
-    pub fn append_op(&self, repo: u8, op: &str, key: &[u8], value: &[u8]) -> anyhow::Result<i64> {
+    pub fn append_op(
+        &self,
+        repo: u8,
+        op: &str,
+        key: &[u8],
+        value: &[u8],
+        version: u64,
+    ) -> anyhow::Result<i64> {
         let conn = self.connection();
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = Self::append_op_in_tx(&conn, repo, op, key, value)?;
+        let seq = Self::append_op_in_tx(&conn, repo, op, key, value, version)?;
         drop(conn);
         self.bump_oplog_len(1);
         Ok(seq)
@@ -146,7 +182,9 @@ impl super::db::Storage {
                 } else {
                     OP_UPSERT
                 };
-                Self::append_op_in_tx(&tx, repo, op, &e.key, &e.payload)?;
+                // F8：version 一并入账 —— delta V2 通道据此把真实版本透传给对端，
+                // 「对既有条目的版本提升」不再依赖反熵兜底。
+                Self::append_op_in_tx(&tx, repo, op, &e.key, &e.payload, e.version)?;
                 n += 1;
             }
         }
@@ -180,12 +218,12 @@ impl super::db::Storage {
                 let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
                 let mut stmt = if repo == u8::MAX {
                     conn.prepare(
-                        "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
+                        "SELECT seq, op, repo, key, value, version, ts_ms, origin FROM feed_oplog \
                          WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
                     )?
                 } else {
                     conn.prepare(
-                        "SELECT seq, op, repo, key, value, ts_ms, origin FROM feed_oplog \
+                        "SELECT seq, op, repo, key, value, version, ts_ms, origin FROM feed_oplog \
                          WHERE repo = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
                     )?
                 };
@@ -196,8 +234,9 @@ impl super::db::Storage {
                         repo: row.get::<_, i64>(2)? as u8,
                         key: row.get(3)?,
                         value: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                        ts_ms: row.get(5)?,
-                        origin: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
+                        version: row.get::<_, i64>(5)?.max(0) as u64,
+                        ts_ms: row.get(6)?,
+                        origin: row.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(),
                     })
                 };
                 let rows = if repo == u8::MAX {

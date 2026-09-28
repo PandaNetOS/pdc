@@ -100,6 +100,11 @@ impl PeerConn {
         self.caps().supports_delta_sync()
     }
 
+    /// 对端是否支持 delta 通道 version 透传 OpsBatchV2（协议版本 >= 9）
+    pub fn supports_delta_sync_v2(&self) -> bool {
+        self.caps().supports_delta_sync_v2()
+    }
+
     /// 对端是否支持 Range-based 反熵（协议版本 >= 5）
     pub fn supports_range_reconcile(&self) -> bool {
         self.caps().supports_range_reconcile()
