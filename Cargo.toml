@@ -25,6 +25,7 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "trust-dns", "gzip"] }
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"

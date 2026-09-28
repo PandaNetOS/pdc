@@ -1,4 +1,4 @@
-﻿//! 配置管理
+//! 配置管理
 //!
 //! 支持从 config.yaml 加载配置，也支持环境变量覆盖。
 //! 配置结构按模块组织：server、super_tracker、discoverers、cache、health_check、crawler。
@@ -753,16 +753,37 @@ impl Default for PdcConfig {
     }
 }
 
+/// 剥离 UTF-8 BOM（EF BB BF / U+FEFF）。
+///
+/// 背景（2026-09 生产实证）：双节点的 config/config.yaml 被外部工具写入 UTF-8 BOM，
+/// serde_yaml 解析直接失败，整份配置被静默弃用、进程以默认配置运行了数天。
+/// Rust 侧生成配置（serde_yaml::to_string + fs::write）不会写 BOM，BOM 均由外部
+/// 编辑器/工具引入（Windows 记事本、PowerShell Out-File 等），故在读取侧统一防御剥离。
+pub fn strip_utf8_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
+}
+
 impl PdcConfig {
     /// 从 YAML 文件加载配置
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: PdcConfig = serde_yaml::from_str(&content)?;
+        let content = std::fs::read_to_string(&path)?;
+        // 读取侧防御：剥离可能由外部编辑器/工具写入的 UTF-8 BOM，
+        // 避免 serde_yaml 解析失败导致整份配置被弃用、进程退回默认配置
+        if content.starts_with('\u{feff}') {
+            tracing::warn!(
+                "[config] 检测到配置文件带 UTF-8 BOM，已自动剥离（{:?}，建议将编辑器保存编码改为无 BOM UTF-8）",
+                path.as_ref()
+            );
+        }
+        let content = strip_utf8_bom(&content);
+        let config: PdcConfig = serde_yaml::from_str(content)?;
         Ok(config)
     }
 
     /// 从 YAML 字符串加载配置
     pub fn from_yaml(content: &str) -> anyhow::Result<Self> {
+        // 同样做 BOM 防御（调用方可能直接传入文件内容）
+        let content = strip_utf8_bom(content);
         let config: PdcConfig = serde_yaml::from_str(content)?;
         Ok(config)
     }
@@ -1317,6 +1338,38 @@ mod tests {
         assert!(config.discoverers.enable_tracker);
         assert!(config.discoverers.enable_lpd);
         assert!(config.crawler.enabled);
+    }
+
+    /// 带 UTF-8 BOM 的配置文件应被防御性剥离后正常解析
+    /// （2026-09 生产事故回归测试：BOM 导致整份配置被静默弃用）。
+    #[test]
+    fn test_from_file_strips_utf8_bom() {
+        let path = std::env::temp_dir().join(format!("pdc-bom-test-{}.yaml", std::process::id()));
+        let mut content = String::from("\u{feff}");
+        content.push_str("server:\n  port: 7001\nlog_level: debug\n");
+        std::fs::write(&path, content).expect("写入测试文件失败");
+        let config = PdcConfig::from_file(&path).expect("带 BOM 的配置应解析成功");
+        assert_eq!(config.server.port, 7001);
+        assert_eq!(config.log_level, "debug");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 无 BOM 的普通配置文件不受 BOM 剥离影响。
+    #[test]
+    fn test_from_file_without_bom_ok() {
+        let path = std::env::temp_dir().join(format!("pdc-nobom-test-{}.yaml", std::process::id()));
+        std::fs::write(&path, "server:\n  port: 7002\n").expect("写入测试文件失败");
+        let config = PdcConfig::from_file(&path).expect("无 BOM 的配置应解析成功");
+        assert_eq!(config.server.port, 7002);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// from_yaml 字符串入口同样做 BOM 防御（调用方可能直接传入文件内容）。
+    #[test]
+    fn test_from_yaml_strips_utf8_bom() {
+        let config =
+            PdcConfig::from_yaml("\u{feff}log_level: warn\n").expect("带 BOM 的 YAML 应解析成功");
+        assert_eq!(config.log_level, "warn");
     }
 
     /// 已删除的失效配置项若仍残留在旧配置文件中，应被 serde 静默忽略（向后兼容）。

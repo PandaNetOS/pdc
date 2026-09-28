@@ -26,9 +26,12 @@ use parking_lot::RwLock;
 use rand::Rng;
 
 use tracing::{debug, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use PeerDiscoveryCenter::config::get_interval_secs;
+use PeerDiscoveryCenter::config::strip_utf8_bom;
 use PeerDiscoveryCenter::config::PdcConfig;
 use PeerDiscoveryCenter::control_plane::ControlPlane;
 use PeerDiscoveryCenter::crawler::Crawler;
@@ -121,7 +124,8 @@ fn main() -> anyhow::Result<()> {
     install_console_ctrl_handler();
 
     // 1. 初始化日志（级别：RUST_LOG 环境变量 > 配置文件 log_level > info）
-    init_logging(&peek_log_level(&work_dir));
+    //    双写：stdout（部署侧重定向兜底采集）+ 按天滚动文件 logs/pdc.log.YYYY-MM-DD（磁盘有界）
+    let _log_guard = init_logging(&peek_log_level(&work_dir), &work_dir.logs_dir);
 
     // 1.5 初始化 Prometheus metrics
     PeerDiscoveryCenter::data_plane::metrics::init_metrics();
@@ -143,6 +147,9 @@ fn main() -> anyhow::Result<()> {
                 Some(p.to_string_lossy().to_string())
             } else {
                 // 自动生成默认配置文件
+                // 注：serde_yaml::to_string + fs::write 不会写 UTF-8 BOM，生成源头不可能引入 BOM；
+                // 生产环境的 BOM 均来自外部编辑器/工具（如 Windows 记事本、PowerShell Out-File），
+                // 由 config.rs 的 strip_utf8_bom 在读取侧防御剥离。
                 let default_config = PdcConfig::default();
                 match serde_yaml::to_string(&default_config) {
                     Ok(yaml) => {
@@ -3491,7 +3498,11 @@ fn peek_log_level(work_dir: &WorkDir) -> String {
     };
     std::fs::read_to_string(&path)
         .ok()
-        .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
+        .and_then(|content| {
+            // 读取侧防御：剥离 UTF-8 BOM（外部编辑器可能写入），避免解析失败回落 info
+            let content = strip_utf8_bom(&content);
+            serde_yaml::from_str::<serde_yaml::Value>(content).ok()
+        })
         .and_then(|v| {
             v.get("log_level")
                 .and_then(|x| x.as_str())
@@ -3501,21 +3512,66 @@ fn peek_log_level(work_dir: &WorkDir) -> String {
         .unwrap_or_else(|| "info".to_string())
 }
 
-/// 初始化日志。
+/// 初始化日志（stdout + 按天滚动文件双写）。
 ///
 /// 级别来源优先级：`RUST_LOG` 环境变量 > 配置文件 `log_level` > `info`。
-fn init_logging(config_log_level: &str) {
+///
+/// 双写设计：
+/// - stdout layer 保留原有格式与过滤逻辑不变——部署侧仍用
+///   `Start-Process -RedirectStandardOutput` 重定向做兜底采集；
+/// - 新增按天滚动文件 layer（`logs/pdc.log.YYYY-MM-DD`）作为主力落盘，
+///   磁盘占用有界。背景（2026-09 生产实证）：stdout 重定向文件无滚动机制，
+///   log_level 误为 debug 时一夜撑到 877MB，滚动文件按天切分即不会无限增长。
+///   注意 stdout 重定向文件本身仍无滚动，长期治理依赖本滚动文件。
+///
+/// 返回的 [`tracing_appender::non_blocking::WorkerGuard`] 须由调用方持有至进程退出，
+/// 提前 drop 会丢失滚动文件中尚未落盘的日志。
+fn init_logging(
+    config_log_level: &str,
+    logs_dir: &std::path::Path,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::try_new(config_log_level).unwrap_or_else(|_| EnvFilter::new("info"))
     });
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
-        .with_line_number(false)
-        .init();
+        .with_line_number(false);
+
+    // 按天滚动文件 appender：文件名 pdc.log.YYYY-MM-DD；与 stdout_log() 同目录（WorkDir logs）
+    match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("pdc.log")
+        .build(logs_dir)
+    {
+        Ok(appender) => {
+            let (file_writer, guard) = tracing_appender::non_blocking(appender);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_file(false)
+                .with_line_number(false)
+                .with_ansi(false) // 文件落盘不带 ANSI 颜色码
+                .with_writer(file_writer);
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(file_layer)
+                .with(filter)
+                .init();
+            Some(guard)
+        }
+        Err(e) => {
+            // 滚动文件初始化失败（如 logs 目录不可写）：退回仅 stdout，进程照常运行
+            eprintln!("[main] 初始化滚动日志文件失败（{}），退回仅 stdout 输出", e);
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(filter)
+                .init();
+            None
+        }
+    }
 }
 
 /// 解析命令行参数中的配置文件路径
