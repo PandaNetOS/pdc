@@ -1028,24 +1028,33 @@ impl SyncManager {
     /// 统一以 **DB 为唯一数据源**，口径与 `rest_api::federation_status_handler` 的
     /// `*_repo_total` 完全一致（顺序 NODE/PEER/INFOHASH/TRACKER）：
     /// - NODE     = dht_nodes(deleted_at IS NULL) + 内存写队列未落库部分
-    /// - PEER     = peers + peers_archive（冷归档仍计入总量，与 total 验收口径一致）
+    /// - PEER     = peers(deleted_at IS NULL) + peers_archive（F9 方案 B：归档数据参与联邦同步）
     /// - INFOHASH = infohashes(deleted_at IS NULL)
     /// - TRACKER  = trackers(deleted_at IS NULL)
     ///
-    /// 旧实现读内存 repo 长度，那只是热/温子集（实测 peer 内存 12,731 而 DB total 25,564），
-    /// 与本端对外展示的 total 口径不一致，会让 20% 差异的快照触发判定失真。
-    /// 各 repo 条目数（协商/巡检/快照裁决共用）。
-    ///
     /// 口径铁律：必须与 `load_repo_key_hashes_in_range`（bootstrap 清单扫描）一致。
-    /// PEER 只取 `peers` 主表活行，**不含 `peers_archive`** —— 归档表不在清单扫描范围，
-    /// 计入后「协商判定永远差一截、快照永远拉不到」→ BOOTSTRAP 死循环
-    /// （2026-09-27 实测 52/58：58 报 40,042 vs 清单 28,009，每 5 分钟全量重拉一轮）。
+    ///
+    /// 口径沿革：
+    /// - F1（2026-09-27 52/58 实测）：当时清单扫描只扫 peers 主表活行，本函数却把
+    ///   archive 计入（58 报 40,042 vs 清单 28,009），差的部分快照永远拉不到 →
+    ///   每 5 分钟全量重拉一轮的 BOOTSTRAP 死循环。当时修复 = 计数改为主表活行
+    ///   （pick(1)），向清单口径看齐。
+    /// - F9 方案 B（本次）：产品决策反转——归档是本地冷数据分层（存储优化），不是
+    ///   数据边界，两节点都应拥有对方的归档行。清单扫描 PEER 分支改为
+    ///   peers + peers_archive 双表合并（db.rs `query_peer_rows_both_tables`），块读取
+    ///   同步扩到两表，本函数恢复 pick(1)+pick(2)。三口径（协商计数 / 清单行数 /
+    ///   块数据）重新对齐为「两表并集」，同时消除了 F1 之前就存在的
+    ///   「rest_api total 含归档 vs 清单不含」的隐性口径差。
+    ///
     /// node 的 write_queue_len 是落库前瞬时差，自愈性偏差，保留。
     pub(crate) fn local_entry_counts(&self) -> Vec<u32> {
         let db = self.delta_storage().entity_counts_cached();
         let pick = |i: usize| -> u64 { db.get(i).copied().unwrap_or(-1).max(0) as u64 };
         let node = pick(0) + self.node_repo.write_queue_len_sync() as u64;
-        vec![node as u32, pick(1) as u32, pick(3) as u32, pick(4) as u32]
+        // F9 方案 B：peer = peers 主表活行 + peers_archive 归档行（entity_counts 下标
+        // [dht_nodes, peers, peers_archive, infohashes, trackers]，与清单口径严格一致）
+        let peer = pick(1) + pick(2);
+        vec![node as u32, peer as u32, pick(3) as u32, pick(4) as u32]
     }
 
     /// v7：构造本端协商载荷（各 repo 状态 + 能力）。
@@ -3566,11 +3575,15 @@ mod tests {
         assert_eq!(node_repo.len_sync(), 1);
     }
 
-    /// F1(2026-09-27 52/58 BOOTSTRAP 死循环回归测试)：
+    /// F9 方案 B（2026-09-27，归档数据参与联邦同步）口径一致性回归测试：
     /// 协商/巡检计数（`local_entry_counts`）必须与 bootstrap 清单扫描
     /// （`build_repo_manifest_impl` → `load_repo_key_hashes_in_range`）同口径。
-    /// peers 主表 3 活行 + peers_archive 2 行 → peer 计数必须 = 3。
-    /// 旧实现把 archive 计入（= 5），清单永远拉不到那 2 行归档 → 每轮巡检裁 BOOTSTRAP 全量重拉。
+    /// F9 后清单扫描 = peers 主表活行 + peers_archive 归档行（db.rs 双路归并），
+    /// 计数口径同步反转：peers 3 活行 + peers_archive 2 行 → peer 计数 = 清单行数 = 5。
+    ///
+    /// 口径沿革：F1 时期清单只扫主表，计数含 archive 会「差的部分永远拉不到」→
+    /// BOOTSTRAP 死循环；F9 把清单扩到两表后两者必须**同时**含 archive——只改一边
+    /// （计数含/清单不含，或计数不含/清单含）都会把死循环原样请回来。
     #[test]
     fn test_local_entry_counts_matches_manifest_scope() {
         use crate::federation::protocol::repo_type;
@@ -3623,13 +3636,17 @@ mod tests {
 
         let counts = mgr.local_entry_counts();
         assert_eq!(
-            counts[1], 3,
-            "peer 计数必须等于 peers 主表活行数（不含 peers_archive）"
+            counts[1], 5,
+            "peer 计数必须 = peers 主表活行 + peers_archive 归档行（F9 口径）"
         );
 
         let manifest =
             bootstrap::build_repo_manifest_impl(storage.as_ref(), repo_type::PEER, 2, 0, 1)
                 .unwrap();
+        assert_eq!(
+            manifest.total_rows, 5,
+            "bootstrap 清单行数必须含归档行（F9：清单 = peers + peers_archive）"
+        );
         assert_eq!(
             counts[1] as u64, manifest.total_rows,
             "协商计数与 bootstrap 清单行数必须一致（口径铁律）"

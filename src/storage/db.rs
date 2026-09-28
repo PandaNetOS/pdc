@@ -648,6 +648,9 @@ impl Storage {
         // （实测 bootstrap 建一次清单 = 74~93 次全表排序，单次重建 >131s，把 HTTP API 与
         // 写队列一起拖垮）。表达式索引让这两条路径退化为索引有序扫描。
         // 配合 v9 查询侧「按需拼谓词」（见 `node_range_sql`），索引才真正被用于区间定位。
+        // F9 方案 B：peers_archive 归档表也纳入 PEER 清单/块扫描口径（归档是本地冷分层
+        // 不是数据边界），为其建同款 key 表达式索引。注意 archive 无 deleted_at 列，
+        // 索引表达式不含墓碑过滤（活行过滤语义由查询侧 WHERE 决定）。
         // 幂等；首次启动会在 165 万行的 dht_nodes 上同步建索引（一次性、数十秒量级），
         // 失败必须可见（旧写法 `let _ =` 会静默退化为全表排序）。
         if let Err(e) = conn.execute_batch(
@@ -656,6 +659,8 @@ impl Storage {
                 ON dht_nodes((ip || ':' || port));
             CREATE INDEX IF NOT EXISTS idx_peers_key_expr
                 ON peers((lower(hex(infohash)) || ':' || ip || ':' || port));
+            CREATE INDEX IF NOT EXISTS idx_peers_archive_key_expr
+                ON peers_archive((lower(hex(infohash)) || ':' || ip || ':' || port));
             "#,
         ) {
             tracing::warn!(
@@ -2056,6 +2061,119 @@ impl Storage {
         })
     }
 
+    /// F9 方案 B：PEER 同步口径 = `peers` 主表活行 + `peers_archive` 归档行（两表合并）。
+    ///
+    /// 归档是本地冷数据分层（存储优化），不是数据边界——联邦同步应让两节点都拥有
+    /// 对方的归档行。SQLite 视图不可索引，「UNION ALL + 外层 ORDER BY」会让优化器
+    /// 放弃两表各自的 key 表达式索引（idx_peers_key_expr / idx_peers_archive_key_expr）
+    /// 退化为全量排序，故采用**双路归并**：两表分别按各自 key 表达式
+    /// `lower(hex(infohash))||':'||ip||':'||port` 有序取前 `limit` 条（主键
+    /// (infohash,ip,port) 唯一 ⇒ 表内 key 无重复，各表前 limit 条是其范围结果的严格
+    /// 前缀），再按 key 字节序归并取前 `limit` 条——与单表 `ORDER BY key LIMIT n`
+    /// 语义严格一致（SQL TEXT 的 BINARY 序 = UTF-8 字节序）。
+    ///
+    /// **不去重**：同一 (infohash,ip,port) 可能同时存在于两表（先归档、后又重新活跃
+    /// upsert 回主表，归档侧旧副本仍在）。计数口径（`local_entry_counts` =
+    /// peers.valid + peers_archive.valid）按两表行数计，清单必须按同样行数出——
+    /// 若清单侧去重，清单行数 < 协商计数，差的部分快照永远拉不到，BOOTSTRAP 死循环
+    /// （F1 修过的问题换形式复发）。重复行 apply 到对端是幂等 upsert，无害。
+    ///
+    /// 返回 (key, infohash 原始 BLOB, ip, port)，key = `hex(ih):ip:port`（DB 形态）。
+    fn query_peer_rows_both_tables(
+        conn: &rusqlite::Connection,
+        lo: Option<&str>,
+        hi: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, String, i64)>> {
+        // peers 主表只取活行（deleted_at IS NULL）；peers_archive 无墓碑列，全部有效
+        let main_rows = Self::query_peer_rows_one_table(
+            conn,
+            "peers",
+            "deleted_at IS NULL",
+            lo,
+            hi,
+            limit.max(1) as i64,
+        )?;
+        let archive_rows = Self::query_peer_rows_one_table(
+            conn,
+            "peers_archive",
+            "1=1",
+            lo,
+            hi,
+            limit.max(1) as i64,
+        )?;
+        // 双路归并：两边各自有序，轮流取较小 key；同 key 时先取主表行（结果确定）
+        let mut out: Vec<(Vec<u8>, Vec<u8>, String, i64)> =
+            Vec::with_capacity(main_rows.len() + archive_rows.len());
+        let mut ai = main_rows.into_iter().peekable();
+        let mut bi = archive_rows.into_iter().peekable();
+        loop {
+            if out.len() >= limit {
+                break;
+            }
+            let from_main = match (ai.peek(), bi.peek()) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+                (Some(x), Some(y)) => x.0 <= y.0,
+            };
+            let (k, ih, ip, port) = if from_main {
+                ai.next().unwrap()
+            } else {
+                bi.next().unwrap()
+            };
+            out.push((k.into_bytes(), ih, ip, port));
+        }
+        Ok(out)
+    }
+
+    /// 单表侧查询：按 key 表达式 `[lo, hi)` 升序取前 `limit` 行。
+    /// `tombstone_filter`：主表传 `deleted_at IS NULL`，archive 传 `1=1`（无墓碑列）。
+    /// 谓词按需拼装（`?N IS NULL OR ...` 写法会阻断索引范围扫描），与 `node_range_sql`
+    /// 同风格，key 表达式与两表的 key 表达式索引逐字一致。
+    fn query_peer_rows_one_table(
+        conn: &rusqlite::Connection,
+        table: &str,
+        tombstone_filter: &str,
+        lo: Option<&str>,
+        hi: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, Vec<u8>, String, i64)>> {
+        let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
+        let mut sql =
+            format!("SELECT {key_expr}, infohash, ip, port FROM {table} WHERE {tombstone_filter}");
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(3);
+        let mut n = 0usize;
+        if let Some(v) = lo {
+            n += 1;
+            sql.push_str(&format!(" AND {key_expr} >= ?{n}"));
+            binds.push(Box::new(v.to_string()));
+        }
+        if let Some(v) = hi {
+            n += 1;
+            sql.push_str(&format!(" AND {key_expr} < ?{n}"));
+            binds.push(Box::new(v.to_string()));
+        }
+        n += 1;
+        sql.push_str(&format!(" ORDER BY {key_expr} ASC LIMIT ?{n}"));
+        binds.push(Box::new(limit));
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// P1-4：均匀抽取 `n` 个 NODE key 作为区间分界（用 rowid 伪随机探针，避免全表扫描）。
     ///
     /// 返回**已排序去重**的 key 列表。`MAX(rowid)` 为 O(1)，每个探针为 O(log N) 的 rowid 查找，
@@ -2102,7 +2220,8 @@ impl Storage {
     /// v7：按 repo 加载 `(key, data_hash)`，范围 `[lo, hi)`（`None` = ±∞），最多 `limit` 条。
     ///
     /// key 编码与各 repo 的 Merkle / `load_all_*_keys_hashes` 严格一致：
-    /// NODE=`ip:port`、PEER=`hex(ih):ip:port`、INFOHASH=原始 20B、TRACKER=url 字节。
+    /// NODE=`ip:port`、PEER=`hex(ih):ip:port`（F9 方案 B：peers + peers_archive 两表
+    /// 合并，见 `query_peer_rows_both_tables`）、INFOHASH=原始 20B、TRACKER=url 字节。
     pub fn load_repo_key_hashes_in_range(
         &self,
         repo: u8,
@@ -2119,33 +2238,28 @@ impl Storage {
             match repo {
                 NODE => Self::query_node_key_hashes(conn, lo, hi, limit),
                 PEER => {
+                    // F9 方案 B：bootstrap 清单扫描 = peers 主表活行 + peers_archive 归档行
+                    // （双路归并，见 `query_peer_rows_both_tables`）。归档是本地冷分层
+                    // （存储优化）不是数据边界——两节点都应拥有对方的归档行。
+                    // 口径铁律：本清单行数必须与 local_entry_counts 的 peer 项
+                    // （peers.valid + peers_archive.valid）一致，否则差的部分快照永远
+                    // 拉不到 → 协商判定永远差一截 → BOOTSTRAP 死循环（F1 实测教训，
+                    // 2026-09-27 52/58：58 报 40,042 vs 清单 28,009，每 5 分钟全量重拉）。
                     let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
                     let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
-                    let mut stmt = conn.prepare(&format!(
-                        "SELECT infohash, ip, port FROM peers \
-                     WHERE deleted_at IS NULL \
-                       AND (?1 IS NULL OR {key_expr} >= ?1) \
-                       AND (?2 IS NULL OR {key_expr} < ?2) \
-                     ORDER BY {key_expr} ASC LIMIT ?3"
-                    ))?;
-                    let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })?;
+                    let rows = Self::query_peer_rows_both_tables(
+                        conn,
+                        lo_s.as_deref(),
+                        hi_s.as_deref(),
+                        limit,
+                    )?;
                     let mut out = Vec::new();
-                    for r in rows {
-                        let (ih, ip, port) = r?;
-                        let mut arr = [0u8; 20];
-                        if ih.len() == 20 {
-                            arr.copy_from_slice(&ih);
-                        }
-                        let ih_hex = arr.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                        let key = format!("{}:{}:{}", ih_hex, ip, port).into_bytes();
-                        let mut buf = Vec::with_capacity(ih.len() + ip.len() + 2);
+                    for (key, ih, ip, port) in rows {
+                        // data_hash = blake3(infohash || ip_string || port(i64 LE))，
+                        // 沿用本通道原实现的逐字节公式（注意：与 build_peer_sync_entry
+                        // 的 u16(2 字节) port 存在既有宽度差异，属历史口径，F9 不改，
+                        // 只要两端各通道内部自洽即可）
+                        let mut buf = Vec::with_capacity(ih.len() + ip.len() + 8);
                         buf.extend_from_slice(&ih);
                         buf.extend_from_slice(ip.as_bytes());
                         buf.extend_from_slice(&port.to_le_bytes());
@@ -2263,6 +2377,10 @@ impl Storage {
     /// v7：按 repo 加载 `[lo, hi)` 区间内的完整 `SyncEntry`（bootstrap 分块服务用）。
     ///
     /// 条目编码与各 repo 的 gossip 同步条目严格一致（复用 `build_*_sync_entry` 系列函数）。
+    /// F9 方案 B：PEER 分支与清单扫描同口径（peers + peers_archive 双路归并）。归档行
+    /// 落到对端走 `apply_peer_sync` → upsert 进**对端 peers 主表**（联邦层无 archive
+    /// 概念）；对端再按自身冷热策略分层（tier_manager 归档迁移在各节点独立运行）属
+    /// 预期行为，不构成回环——入站 apply 不写 oplog，不会把同步进来的行再广播回去。
     pub fn load_repo_sync_entries_in_range(
         &self,
         repo: u8,
@@ -2303,27 +2421,19 @@ impl Storage {
                 Ok(out)
             }
             PEER => {
+                // F9 方案 B：块数据读取 = peers 主表活行 + peers_archive 归档行（双路
+                // 归并），与清单扫描口径一致（清单列了行，块就必须能取出对应数据）。
                 let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                 let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
                 let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT infohash, ip, port FROM peers \
-                     WHERE deleted_at IS NULL \
-                       AND (?1 IS NULL OR {key_expr} >= ?1) \
-                       AND (?2 IS NULL OR {key_expr} < ?2) \
-                     ORDER BY {key_expr} ASC LIMIT ?3"
-                ))?;
-                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?;
+                let rows = Self::query_peer_rows_both_tables(
+                    &conn,
+                    lo_s.as_deref(),
+                    hi_s.as_deref(),
+                    limit,
+                )?;
                 let mut out = Vec::new();
-                for r in rows {
-                    let (ih, ip, port) = r?;
+                for (_key, ih, ip, port) in rows {
                     let mut arr = [0u8; 20];
                     if ih.len() == 20 {
                         arr.copy_from_slice(&ih);
@@ -2480,6 +2590,11 @@ impl Storage {
                 Ok(out)
             }
             PEER => {
+                // 注意（F9 边界）：本函数是 v8 range 反熵的「按 key 精确修复」通道，
+                // 仍只查 peers 主表。归档行的 key 在 F9 后会出现在清单/range 摘要里，
+                // 但归档行由 bootstrap 全量快照通道收敛（apply 后落到对端主表），
+                // 两节点都有该行后 key+hash 一致，range 对账自然不再报 diff——
+                // 按 key 拉不到 archive 行只会短暂打出「加载到 0 条」日志，无死循环。
                 // key = "hex(ih):ip:port"：rsplit 两段得到 port 与 ip，剩余前缀为 ih 的 hex
                 let mut triples: Vec<(Vec<u8>, String, i64)> = Vec::with_capacity(keys.len());
                 for k in keys {
@@ -2915,5 +3030,132 @@ mod tests {
         assert_eq!(c[1], 2);
         assert_eq!(storage.count_table("peers").unwrap(), 2);
         assert_eq!(storage.valid_entity_counts()[1], 2);
+    }
+
+    /// F9 方案 B：PEER 清单/块读取口径 = peers + peers_archive 两表合并（双路归并）。
+    /// 用「归档行夹在两条主表行之间」的交错 key 验证：
+    /// ① 归并结果真的穿插两表（不是先主表后归档表拼一起）；
+    /// ② 主表软删行不出现、archive 无墓碑列全有效；
+    /// ③ 同 key 两表各出一行（不去重，与计数口径 pick(1)+pick(2) 一致）；
+    /// ④ 分页游标推进不重不漏（与 build_repo_manifest_impl 的分页方式一致）；
+    /// ⑤ data_hash 公式 = blake3(infohash || ip || port_le)。
+    #[test]
+    fn test_load_repo_key_hashes_peer_merges_archive() {
+        const PEER: u8 = 2;
+        let storage = Storage::memory().unwrap();
+        let ih_a = [0x0au8; 20]; // key 前缀 "0a…"：主表
+        let ih_b = [0x0bu8; 20]; // key 前缀 "0b…"：归档表（夹在两条主表行之间）
+        let ih_c = [0x0cu8; 20]; // key 前缀 "0c…"：主表（软删，应被过滤）
+        let hex = |ih: &[u8; 20]| ih.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let k_a = format!("{}:10.0.0.0:6881", hex(&ih_a));
+        let k_b = format!("{}:10.0.0.1:6881", hex(&ih_b));
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT INTO peers (infohash, ip, port, source) VALUES (?1, ?2, ?3, 'test')",
+                rusqlite::params![ih_a.as_slice(), "10.0.0.0", 6881i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, archived_at) \
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![ih_b.as_slice(), "10.0.0.1", 6881i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (infohash, ip, port, source) VALUES (?1, ?2, ?3, 'test')",
+                rusqlite::params![ih_c.as_slice(), "10.0.0.2", 6881i64],
+            )
+            .unwrap();
+            // 软删主表 0c 行：清单口径只取活行
+            conn.execute("UPDATE peers SET deleted_at = 1 WHERE ip = '10.0.0.2'", [])
+                .unwrap();
+            // 归档表再放一份同 key（先归档后又重新活跃的场景）：不去重，两行都出
+            conn.execute(
+                "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, archived_at) \
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![ih_a.as_slice(), "10.0.0.0", 6881i64],
+            )
+            .unwrap();
+        }
+
+        // 全量：0a 主表行、0a 归档行（同 key 不去重、主表在前）、0b 归档行；0c 软删不出
+        let all = storage
+            .load_repo_key_hashes_in_range(PEER, None, None, 10)
+            .unwrap();
+        let keys: Vec<String> = all
+            .iter()
+            .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![k_a.clone(), k_a.clone(), k_b.clone()],
+            "两表合并必须按 key 字节序交错归并，软删行过滤，同 key 不去重"
+        );
+
+        // data_hash 公式 = blake3(infohash || ip || port_le)，本通道（原实现沿用）port
+        // 为 i64 的 8 字节 LE；与 build_peer_sync_entry 的 u16(2 字节) 口径差异是既有
+        // 行为，不在 F9 改动范围（本测试只锁定本通道公式不被悄然改变）
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ih_a);
+        buf.extend_from_slice(b"10.0.0.0");
+        buf.extend_from_slice(&6881i64.to_le_bytes());
+        assert_eq!(all[0].1, blake3::hash(&buf).as_bytes().to_vec());
+
+        // 分页游标推进：忠实复刻 build_repo_manifest_impl 的循环——每次 fetch =
+        // chunk+1，**块体只取前 chunk 行**，游标 = 第 chunk+1 行（第一个未包含行）的
+        // key，续读 [lo, None)；末块取剩余行后停止。
+        let chunk_rows = 2usize;
+        let fetch = chunk_rows + 1;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let rows = storage
+                .load_repo_key_hashes_in_range(PEER, cursor.as_deref(), None, fetch)
+                .unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            let is_last = rows.len() <= chunk_rows;
+            let take = rows.len().min(chunk_rows);
+            collected.extend(rows[..take].iter().map(|(k, _)| k.clone()));
+            if is_last {
+                break;
+            }
+            cursor = Some(rows[take].0.clone());
+        }
+        // 分页合并 = 全量（多重集逐行比较，不去重：同 key 两行都必须恰好出现一次）
+        collected.sort();
+        let mut expect_rows: Vec<Vec<u8>> = all.iter().map(|(k, _)| k.clone()).collect();
+        expect_rows.sort();
+        assert_eq!(
+            collected, expect_rows,
+            "分页合并后应逐行覆盖全量（不丢行、不重发）"
+        );
+
+        // 上界排除语义：hi = k_b（不含）→ 只剩两条 k_a
+        let head = storage
+            .load_repo_key_hashes_in_range(PEER, None, Some(k_b.as_bytes()), 10)
+            .unwrap();
+        assert_eq!(head.len(), 2);
+        assert!(head.iter().all(|(k, _)| k.as_slice() == k_a.as_bytes()));
+
+        // 块数据读取同口径：SyncEntry 覆盖两表 3 行（key 形态 = build_peer_sync_entry 的
+        // "hex(ih):addr"，与清单 key 一致）
+        let entries = storage
+            .load_repo_sync_entries_in_range(PEER, None, None, 10)
+            .unwrap();
+        let mut entry_keys: Vec<String> = entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.key).into_owned())
+            .collect();
+        entry_keys.sort();
+        let mut expect_keys = vec![k_a.clone(), k_a.clone(), k_b];
+        expect_keys.sort();
+        assert_eq!(
+            entry_keys, expect_keys,
+            "块读取必须与清单扫描同口径（两表合并）"
+        );
     }
 }
