@@ -289,18 +289,9 @@ impl DiscoveryService {
                         // （自连接拒绝）、要么以次优路径连到对方（被拒），形成每 30s 一次的
                         // 回环连接风暴（2026-09-27 实测 52/58）。本端监听地址与公网映射
                         // 地址一律不入节点表、不触发连接。
-                        let my_addrs: std::collections::HashSet<SocketAddr> = {
-                            let mut s: std::collections::HashSet<SocketAddr> = self_clone
-                                .identity
-                                .addresses_snapshot()
-                                .iter()
-                                .filter_map(|a| a.preferred_addr())
-                                .collect();
-                            if let Some(p) = *self_clone.public_addr.read() {
-                                s.insert(p);
-                            }
-                            s
-                        };
+                        // v11：本端地址集合构建提取为 `local_addr_set()`，与节点入表路径
+                        // （process_new_nodes）共用同一口径，避免两处各写一份漂移。
+                        let my_addrs = self_clone.local_addr_set();
                         if NodeId(node.node_id.0) == self_clone.identity.node_id {
                             debug!("[federation] 忽略本节点自广播");
                             continue;
@@ -463,15 +454,104 @@ impl DiscoveryService {
         self.process_new_nodes(nodes);
     }
 
+    /// v11：构建本端地址集合 —— 身份地址快照的 preferred_addr + 公网映射地址。
+    ///
+    /// 同 NAT 后多节点经 STUN 会得到**相同的公网映射**（同一公网 IP:port 不可能同时
+    /// 映射两台内网机），凡是命中本端集合的地址都不能作为拨号目标（hairpin 回环）。
+    /// 发现事件路径（v10(F7)）与节点入表路径（process_new_nodes）共用此口径，
+    /// 避免两处各写一份漂移。
+    fn local_addr_set(&self) -> std::collections::HashSet<SocketAddr> {
+        let mut s: std::collections::HashSet<SocketAddr> = self
+            .identity
+            .addresses_snapshot()
+            .iter()
+            .filter_map(|a| a.preferred_addr())
+            .collect();
+        if let Some(p) = *self.public_addr.read() {
+            s.insert(p);
+        }
+        s
+    }
+
+    /// v11(F7 残余路径)：剥离节点条目中命中本端地址集合的地址；全部命中返回 None（整条丢弃）。
+    ///
+    /// 背景：PEX 交换 / GetNodes 响应交换回来的同 NAT 邻居会携带与本端一致的公网映射
+    /// 地址，直连该地址经网关 hairpin：要么连回自己（自连接拒绝）、要么以次优路径连到
+    /// 对方（被拒）——2026-09-27 18:20 实测一条「入站连接走了次优路径（NAT 回环）」。
+    /// 口径与发现事件路径（v10(F7)）一致：只剥离命中地址、保留其余可达地址（如同网段
+    /// 邻居的局域网地址仍可低延迟直连）；条目本无地址时原样返回，不改变既有行为。
+    /// 纯函数（不依赖 self），便于单测。
+    fn strip_local_addrs(
+        n: &NodeAddress,
+        my_addrs: &std::collections::HashSet<SocketAddr>,
+    ) -> Option<NodeAddress> {
+        let had_any = n.ipv4_addr.is_some() || n.ipv6_addr.is_some() || !n.endpoints.is_empty();
+        if !had_any {
+            return Some(n.clone());
+        }
+        let ipv4 = n.ipv4_addr.filter(|a| !my_addrs.contains(a));
+        let ipv6 = n.ipv6_addr.filter(|a| !my_addrs.contains(a));
+        let endpoints: Vec<pnos_net::types::NodeEndpoint> = n
+            .endpoints
+            .iter()
+            .filter(|e| !my_addrs.contains(&e.addr))
+            .cloned()
+            .collect();
+        if ipv4.is_none() && ipv6.is_none() && endpoints.is_empty() {
+            return None; // 全部地址均为本端地址：整条跳过
+        }
+        let mut out = n.clone();
+        out.ipv4_addr = ipv4;
+        out.ipv6_addr = ipv6;
+        out.endpoints = endpoints;
+        // 主地址字段被剥离而 endpoints 仍有可用地址时，提升首个非本端地址为主地址，
+        // 保持 preferred_addr() 可用（自动拨号候选筛选依赖它）。
+        if out.ipv4_addr.is_none() && out.ipv6_addr.is_none() {
+            let promoted = out
+                .endpoints
+                .iter()
+                .map(|e| e.addr)
+                .find(|a| a.is_ipv4())
+                .or_else(|| out.endpoints.iter().map(|e| e.addr).find(|a| a.is_ipv6()));
+            if let Some(a) = promoted {
+                if a.is_ipv4() {
+                    out.ipv4_addr = Some(a);
+                } else {
+                    out.ipv6_addr = Some(a);
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// 处理新发现的节点：加入节点表，尝试连接未连接的
     fn process_new_nodes(&self, nodes: Vec<NodeAddress>) {
+        // v11(F7 残余路径)：入表前过滤本端地址 —— 节点入表/连接发起的其他入口
+        // （PEX 交换回来的节点、GetNodes 响应等）携带的地址可能含与本端一致的公网映射
+        // 地址（同 NAT 多节点共享同一映射），不剥离会在连通性维护时发起 hairpin
+        // 自连接/次优路径连接。口径与发现事件路径（v10(F7)）一致：剥离命中地址、
+        // 全部命中整条跳过。
+        let my_addrs = self.local_addr_set();
         let mut new_count = 0;
+        let mut local_skipped = 0;
         for node_info in &nodes {
             // 跳过自己
             if NodeId(node_info.node_id) == self.identity.node_id {
                 continue;
             }
-            if self.node_table.add_or_update(node_info.clone()) {
+            // v11：剥离命中本端集合的地址；全部命中则整条不入表、不触发连接
+            let filtered = match Self::strip_local_addrs(node_info, &my_addrs) {
+                Some(f) => f,
+                None => {
+                    local_skipped += 1;
+                    debug!(
+                        "[federation] 节点地址均为本端地址，入表跳过: node_id={}",
+                        hex::encode(node_info.node_id)
+                    );
+                    continue;
+                }
+            };
+            if self.node_table.add_or_update(filtered) {
                 new_count += 1;
             }
         }
@@ -481,6 +561,12 @@ impl DiscoveryService {
                 "[federation] 发现 {} 个新节点，节点表总数: {}",
                 new_count,
                 self.node_table.len()
+            );
+        }
+        if local_skipped > 0 {
+            debug!(
+                "[federation] 跳过 {} 个仅含本端地址的节点条目",
+                local_skipped
             );
         }
 
@@ -903,5 +989,69 @@ mod tests {
         assert_eq!(cache.nodes[0].addr, "127.0.0.1:6885");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- v11(F7 残余路径)：strip_local_addrs 纯函数单测 ----
+
+    /// 构造一个携带公网映射地址端点的节点条目
+    fn make_endpoint(addr: SocketAddr) -> pnos_net::types::NodeEndpoint {
+        pnos_net::types::NodeEndpoint {
+            addr,
+            kind: pnos_net::types::NodeEndpoint::classify(&addr),
+            source: pnos_net::types::DiscoverySource::Pex,
+            last_success: 0,
+            success_count: 0,
+            fail_count: 0,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_strip_local_addrs_all_local_skipped() {
+        // 同 NAT 邻居的典型形态：仅携带与本端一致的公网映射地址 → 整条丢弃
+        let pub_addr: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let mut my = std::collections::HashSet::new();
+        my.insert(pub_addr);
+        let mut n = make_node_address(1, 40000);
+        n.ipv4_addr = Some(pub_addr);
+        n.ipv6_addr = None;
+        assert!(DiscoveryService::strip_local_addrs(&n, &my).is_none());
+    }
+
+    #[test]
+    fn test_strip_local_addrs_partial_keeps_lan() {
+        // 部分命中：剥离公网映射地址，保留同网段邻居的局域网地址并提升为主地址
+        let pub_addr: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let lan_addr: SocketAddr = "192.168.1.20:6885".parse().unwrap();
+        let mut my = std::collections::HashSet::new();
+        my.insert(pub_addr);
+        let mut n = make_node_address(1, 40000);
+        n.ipv4_addr = Some(pub_addr); // 命中本端公网映射
+        n.endpoints.push(make_endpoint(lan_addr)); // 局域网地址应保留
+        let filtered =
+            DiscoveryService::strip_local_addrs(&n, &my).expect("局域网地址应保留整条条目");
+        assert_eq!(filtered.ipv4_addr, Some(lan_addr)); // 主地址由 endpoints 提升
+        assert!(filtered.endpoints.iter().all(|e| e.addr != pub_addr));
+        assert_eq!(filtered.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn test_strip_local_addrs_no_overlap_unchanged() {
+        // 无命中：原样保留
+        let my = std::collections::HashSet::new();
+        let n = make_node_address(2, 6885);
+        let filtered = DiscoveryService::strip_local_addrs(&n, &my).expect("无命中应原样保留");
+        assert_eq!(filtered.ipv4_addr, n.ipv4_addr);
+        assert!(filtered.endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_strip_local_addrs_no_address_entry_kept() {
+        // 无地址条目：与本轮过滤无关，保持原样（不改变既有行为）
+        let mut my = std::collections::HashSet::new();
+        my.insert("203.0.113.7:40000".parse::<SocketAddr>().unwrap());
+        let mut n = make_node_address(3, 6885);
+        n.ipv4_addr = None;
+        assert!(DiscoveryService::strip_local_addrs(&n, &my).is_some());
     }
 }

@@ -2494,16 +2494,28 @@ impl SyncManager {
         // 中间该 repo 的历史 op 被永久跳过。
         let w0 = storage.oplog_max_seq_for_repo(req.repo).unwrap_or(0).max(0) as u64;
         let version = w0.wrapping_add(1) as u32; // 以 w0 派生：重新打清单即换版本
-        let manifest = match bootstrap::build_repo_manifest_impl(
-            &storage,
-            req.repo,
-            self.config.bootstrap_chunk_rows,
-            w0,
-            version,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
+                                                 // v11：全表扫描移入 spawn_blocking —— `build_repo_manifest_impl` 是全表排序扫描，
+                                                 // 259 万行表实测 ~38s，此前在异步 handler 里同步执行会把当前 tokio worker 线程
+                                                 // 整段阻塞（其他连接的收发/心跳全被拖住）。移入 blocking 线程池后，重建期间
+                                                 // 后续到达的请求仍走上方「rebuilding 租约 + 旧缓存/NAK 回退」逻辑（已先行写入
+                                                 // rebuilding 标记），不受影响。
+        let chunk_rows = self.config.bootstrap_chunk_rows;
+        let repo = req.repo;
+        let manifest = match tokio::task::spawn_blocking(move || {
+            bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
+        })
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
                 warn!("[bootstrap] 建清单失败 repo={}: {}", req.repo, e);
+                self.bootstrap_rebuild_at.write().remove(&key);
+                return;
+            }
+            Err(e) => {
+                // blocking 任务 join 失败（panic/取消）按建清单失败同一路径处理，
+                // 释放重建标记让下一轮请求可重试
+                warn!("[bootstrap] 建清单任务 join 失败 repo={}: {}", req.repo, e);
                 self.bootstrap_rebuild_at.write().remove(&key);
                 return;
             }
@@ -2607,14 +2619,17 @@ impl SyncManager {
                 let storage = self.delta_storage();
                 let w0 = storage.oplog_max_seq_for_repo(req.repo).unwrap_or(0).max(0) as u64;
                 let version = w0.wrapping_add(1) as u32;
-                match bootstrap::build_repo_manifest_impl(
-                    &storage,
-                    req.repo,
-                    self.config.bootstrap_chunk_rows,
-                    w0,
-                    version,
-                ) {
-                    Ok(m) => {
+                // v11：同 manifest_request —— 现场重建是全表扫描（259 万行实测 ~38s），
+                // 移入 spawn_blocking 避免阻塞 tokio worker 线程；重建期间后续块请求
+                // 仍走上方租约 NAK 路径（rebuilding 标记已先行写入，不破坏）。
+                let chunk_rows = self.config.bootstrap_chunk_rows;
+                let repo = req.repo;
+                let rebuilt = tokio::task::spawn_blocking(move || {
+                    bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
+                })
+                .await;
+                match rebuilt {
+                    Ok(Ok(m)) => {
                         info!(
                             "[bootstrap] 清单缓存缺失，现场重建并要求请求方重新对齐: peer={}, repo={}, 块数={}, w0={}, 丢弃其 index={}",
                             conn.node_id,
@@ -2638,10 +2653,27 @@ impl SyncManager {
                         }
                         return;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         self.bootstrap_rebuild_at.write().remove(&key);
                         warn!(
                             "[bootstrap] 收到分块请求且清单重建失败 peer={}, repo={}: {}",
+                            conn.node_id, req.repo, e
+                        );
+                        self.send_bootstrap_nak(
+                            &conn,
+                            req.repo,
+                            req.index,
+                            "manifest rebuild failed",
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(e) => {
+                        // blocking 任务 join 失败（panic/取消）按重建失败同一路径处理，
+                        // 回 NAK 让请求方走可计数、可升级的失败路径
+                        self.bootstrap_rebuild_at.write().remove(&key);
+                        warn!(
+                            "[bootstrap] 收到分块请求且清单重建任务 join 失败 peer={}, repo={}: {}",
                             conn.node_id, req.repo, e
                         );
                         self.send_bootstrap_nak(
