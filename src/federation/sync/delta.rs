@@ -4,7 +4,8 @@
 //!
 //! 与反熵（Merkle 对账，兜底）的分工：
 //! - **稳态主线 = delta**：对端只发 `OpsRequest { repo, since_seq }`，本端从 `feed_oplog`
-//!   取 `seq > since_seq` 的变更回 `OpsBatch`，成本 **O(Δ)**（Δ = 单轮新增变更数），
+//!   取 `seq > since_seq` 的变更回批次（对端 ≥ v9 回 `OpsBatchV2`（ops 携带真实 version），
+//!   v4-v8 回旧 `OpsBatch`），成本 **O(Δ)**（Δ = 单轮新增变更数），
 //!   与库总量 N、与差异量 d 都无关 —— 这是根治「差异散落全部分片 → 每轮重传整表」的关键。
 //! - **兜底 = 反熵**：delta 丢包/裁剪窗口越界/首次上线时，靠 Merkle 对账收敛。
 //!
@@ -19,11 +20,23 @@
 use rusqlite::{params, Connection};
 use tracing::{debug, warn};
 
-use crate::federation::protocol::{operation, OpEntry, SyncEntry};
+use crate::federation::protocol::{operation, OpEntry, OpEntryV2, SyncEntry};
 use crate::storage::oplog::OpRecord;
 
 /// 支持 delta 通道的协议版本（用于握手能力协商）。
 pub const DELTA_SYNC_PROTOCOL_VERSION: u32 = 4;
+
+/// F8/v9：支持 delta 通道 **version 透传**（OpsBatchV2）的协议版本。
+///
+/// 背景（实测）：旧 OpsBatch 的 ops 每条 version 恒置 0（wire 上根本没有 version 字段），
+/// 接收端对「本地已存在」的条目按旧语义跳过 → **delta 通道对既有条目的更新（版本提升）
+/// 被静默丢弃**，一致性全靠 Range 反熵兜底。OpsBatchV2 让 ops 携带真实 version，
+/// 接收端走正常 LWW（version 大者胜）。
+///
+/// 协议演进遵循项目先例（v7 新增 SyncNegotiate/SyncNegotiateAck）：bincode 对结构体
+/// 追加字段不兼容旧字节流，故**新增消息类型** OpsBatchV2（50 号）而非改 OpsBatch；
+/// 对端握手版本 ≥ 9 时响应方发 V2，否则回退旧 OpsBatch（行为与改造前完全一致）。
+pub const DELTA_SYNC_PROTOCOL_VERSION_V2: u32 = 9;
 
 /// 单批默认上限（条）。1万条批在慢盘上会造成读/apply 长时间持锁（51 事故根因），
 /// 降到千级使单批持锁时间从数十秒降到亚秒级。
@@ -97,12 +110,13 @@ impl crate::storage::db::Storage {
     }
 }
 
-/// 把 `OpsBatch.ops` 转换成统一的 `SyncEntry`，供既有 `apply_*_sync` 幂等应用。
+/// 把旧 `OpsBatch.ops` 转换成统一的 `SyncEntry`，供既有 `apply_*_sync` 幂等应用。
 ///
-/// `version` 置 0：delta 语义是「按 key 覆盖」，与既有反熵/全量的 LWW 版本无关。
-/// 既有 `apply_node_sync` 在 `version == 0` 且本地已存在时会跳过（避免旧数据覆盖新数据），
-/// 因此删除不受影响；upsert 与本地重叠的少量条目会被跳过（delta 的 key 以「本地缺失」为主，
-/// 跳过量很小且安全 —— 真正的收敛由周期反熵兜底）。
+/// **旧通道（对端 v4-v8）专用**：旧 OpsBatch 的 wire 格式里没有 version 字段，
+/// 因此转换结果 version 置 0 —— 既有 `apply_*_sync` 对「version==0 且本地已存在」的条目
+/// 会跳过（避免旧数据覆盖新数据），即本函数维持改造前的保守语义。
+/// 「对既有条目的更新被跳过」由周期反熵兜底；真实 version 透传走
+/// [`ops_to_sync_entries_v2`]（OpsBatchV2，协议 v9）。
 pub fn ops_to_sync_entries(ops: &[OpEntry]) -> Vec<SyncEntry> {
     ops.iter()
         .map(|o| SyncEntry {
@@ -118,15 +132,56 @@ pub fn ops_to_sync_entries(ops: &[OpEntry]) -> Vec<SyncEntry> {
         .collect()
 }
 
-/// 从 oplog `OpRecord` 列表构建 `OpEntry` 列表（供接收方组装 OpsBatch）。
-pub fn records_to_entries(records: &[OpRecord]) -> Vec<OpEntry> {
+/// F8/v9：把 `OpsBatchV2.ops` 转换成统一的 `SyncEntry`，**透传真实 version**。
+///
+/// 与 [`ops_to_sync_entries`] 的唯一差异：version 不再置 0，而是取 oplog 里
+/// 产生该变更时的 LWW 版本号（与 `SyncEntry.version` 同源）。接收端 apply 走
+/// 正常 LWW —— 「对既有条目的版本提升」不再被静默丢弃。
+/// 例外：oplog 迁移前的历史行 version=0，此时沿用旧「已存在即跳过」语义（安全回退）。
+pub fn ops_to_sync_entries_v2(ops: &[OpEntryV2]) -> Vec<SyncEntry> {
+    ops.iter()
+        .map(|o| SyncEntry {
+            key: o.key.clone(),
+            operation: if o.is_delete {
+                operation::DELETE
+            } else {
+                operation::UPSERT
+            },
+            version: o.version,
+            payload: o.value.clone(),
+        })
+        .collect()
+}
+
+/// F8/v9：把 V2 条目降级成旧 `OpEntry`（丢弃 version），供对 v4-v8 对端回退旧 OpsBatch。
+///
+/// 旧消息的 bincode 字节流不含 version 字段，响应方必须显式降级而不是直接复用 V2 结构，
+/// 否则旧对端反序列化会错位/失败。字段语义与 OpEntry 逐项一致。
+pub fn to_legacy_entries(ops: &[OpEntryV2]) -> Vec<OpEntry> {
+    ops.iter()
+        .map(|o| OpEntry {
+            seq: o.seq,
+            is_delete: o.is_delete,
+            key: o.key.clone(),
+            value: o.value.clone(),
+        })
+        .collect()
+}
+
+/// 从 oplog `OpRecord` 列表构建 `OpEntryV2` 列表（供接收方组装 OpsBatchV2）。
+///
+/// F8：version 从 `OpRecord` 原样透传（此前旧 `records_to_entries` 构建旧 OpEntry 时
+/// 无 version 可带，是 delta 通道「更新被静默丢弃」的根因之一）。
+/// oplog 迁移前的历史行 version=0，透传 0 即旧语义，无需特殊处理。
+pub fn records_to_entries(records: &[OpRecord]) -> Vec<OpEntryV2> {
     records
         .iter()
-        .map(|r| OpEntry {
+        .map(|r| OpEntryV2 {
             seq: r.seq.max(0) as u64,
             is_delete: r.op == crate::storage::oplog::OP_DELETE,
             key: r.key.clone(),
             value: r.value.clone(),
+            version: r.version,
         })
         .collect()
 }
@@ -144,6 +199,14 @@ pub fn log_applied(repo: u8, applied: usize, next_seq: u64) {
 /// 检查对端协议版本是否支持 delta 通道（纯判定，不做网络动作）。
 pub fn supports_delta_sync(peer_protocol_version: u32) -> bool {
     peer_protocol_version >= DELTA_SYNC_PROTOCOL_VERSION
+}
+
+/// F8/v9：响应方按对端协议版本判定是否用 OpsBatchV2 发送（纯判定，不做网络动作）。
+///
+/// ≥ [`DELTA_SYNC_PROTOCOL_VERSION_V2`]（9）→ V2（ops 携带真实 version）；
+/// 否则回退旧 OpsBatch（v4-v8，wire 上无 version 字段，字节格式与行为完全不变）。
+pub fn supports_ops_batch_v2(peer_protocol_version: u32) -> bool {
+    peer_protocol_version >= DELTA_SYNC_PROTOCOL_VERSION_V2
 }
 
 /// 安全地把 `u64` seq 转 `i64`（SQLite 存储用）。
@@ -196,7 +259,68 @@ mod tests {
         assert_eq!(es[0].operation, operation::UPSERT);
         assert_eq!(es[0].key, b"k1");
         assert_eq!(es[0].payload, b"v1");
+        // 旧通道（v4-v8）wire 上无 version 字段，转换结果恒为 0（保守跳过语义）
+        assert_eq!(es[0].version, 0);
         assert_eq!(es[1].operation, operation::DELETE);
+        assert_eq!(es[1].version, 0);
+    }
+
+    /// F8/v9：V2 转换必须透传真实 version —— 这是「对既有条目的更新不再被静默丢弃」
+    /// 的转换层闸门（接收端 apply 以 SyncEntry.version 做 LWW）。
+    #[test]
+    fn test_ops_to_sync_entries_v2() {
+        let ops = vec![
+            OpEntryV2 {
+                seq: 10,
+                is_delete: false,
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                version: 1_734_000_000,
+            },
+            OpEntryV2 {
+                seq: 11,
+                is_delete: true,
+                key: b"k2".to_vec(),
+                value: Vec::new(),
+                version: 1_734_000_001,
+            },
+            // oplog 迁移前的历史行：version=0 透传 0（接收端维持旧跳过语义）
+            OpEntryV2 {
+                seq: 12,
+                is_delete: false,
+                key: b"k3".to_vec(),
+                value: b"v3".to_vec(),
+                version: 0,
+            },
+        ];
+        let es = ops_to_sync_entries_v2(&ops);
+        assert_eq!(es.len(), 3);
+        assert_eq!(es[0].operation, operation::UPSERT);
+        assert_eq!(es[0].key, b"k1");
+        assert_eq!(es[0].payload, b"v1");
+        assert_eq!(es[0].version, 1_734_000_000);
+        assert_eq!(es[1].operation, operation::DELETE);
+        assert_eq!(es[1].version, 1_734_000_001);
+        assert_eq!(es[2].version, 0);
+    }
+
+    /// F8/v9：V2 → 旧 OpEntry 降级丢弃 version、其余字段逐项保留
+    /// （对 v4-v8 对端回退旧 OpsBatch 的字节兼容保障）。
+    #[test]
+    fn test_to_legacy_entries() {
+        let ops = vec![OpEntryV2 {
+            seq: 5,
+            is_delete: false,
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+            version: 999,
+        }];
+        let legacy = to_legacy_entries(&ops);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].seq, 5);
+        assert_eq!(legacy[0].key, b"k1");
+        assert_eq!(legacy[0].value, b"v1");
+        assert!(!legacy[0].is_delete);
     }
 
     #[test]
@@ -207,13 +331,13 @@ mod tests {
             SyncEntry {
                 key: b"a".to_vec(),
                 operation: operation::UPSERT,
-                version: 1,
+                version: 7,
                 payload: b"pa".to_vec(),
             },
             SyncEntry {
                 key: b"b".to_vec(),
                 operation: operation::DELETE,
-                version: 2,
+                version: 9,
                 payload: Vec::new(),
             },
         ];
@@ -224,7 +348,20 @@ mod tests {
         assert!(!ops[0].is_delete);
         assert_eq!(ops[0].key, b"a");
         assert_eq!(ops[0].value, b"pa");
+        // F8：version 必须从 oplog 原样透传（此前旧 OpEntry 无 version 可带）
+        assert_eq!(ops[0].version, 7);
         assert!(ops[1].is_delete);
+        assert_eq!(ops[1].version, 9);
+    }
+
+    /// F8/v9：版本选择逻辑 —— ≥9 走 OpsBatchV2（version 透传），<9 回退旧 OpsBatch。
+    #[test]
+    fn test_supports_ops_batch_v2_version_selection() {
+        assert!(!supports_ops_batch_v2(1));
+        assert!(!supports_ops_batch_v2(4));
+        assert!(!supports_ops_batch_v2(8));
+        assert!(supports_ops_batch_v2(9));
+        assert!(supports_ops_batch_v2(10));
     }
 
     #[test]

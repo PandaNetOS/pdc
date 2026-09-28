@@ -757,7 +757,9 @@ impl SyncManager {
 
     /// 处理对端的增量拉取请求（数据服务器侧）
     ///
-    /// 从本地 oplog 取 `seq > since_seq` 的变更（升序，最多 limit 条），组装 OpsBatch 回发。
+    /// 从本地 oplog 取 `seq > since_seq` 的变更（升序，最多 limit 条），组装批次回发。
+    /// F8/v9：对端 ≥ 9 回 `OpsBatchV2`（ops 携带真实 LWW version）；v4-v8 回旧
+    /// `OpsBatch`（wire 上无 version 字段，行为同改造前）。
     /// 仅回发**本地 origin** 的变更（oplog 只记本地变更），成本 O(Δ)。
     pub async fn handle_ops_request(self: Arc<Self>, conn: Arc<PeerConn>, req: OpsRequestMessage) {
         if !self.config.delta_sync_enabled {
@@ -826,60 +828,80 @@ impl SyncManager {
             has_more,
             server_max_seq
         );
-        let batch = OpsBatchMessage {
-            repo: req.repo,
-            ops,
-            next_seq,
-            has_more,
-            server_max_seq,
-        };
-        if let Err(e) = conn.send_message(MessageType::OpsBatch, &batch).await {
-            warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
+        // F8/v9：响应方按对端协议版本选择批次消息形态。
+        // - ≥9：OpsBatchV2 —— ops 每条携带真实 LWW version，接收端对「既有条目的版本提升」
+        //   走正常 LWW（大者胜），不再被 version=0 语义静默丢弃；
+        // - v4-v8：旧 OpsBatch —— wire 上无 version 字段，条目经 to_legacy_entries 降级，
+        //   字节格式与行为同改造前完全一致。
+        if conn.supports_delta_sync_v2() {
+            let batch = OpsBatchV2Message {
+                repo: req.repo,
+                ops,
+                next_seq,
+                has_more,
+                server_max_seq,
+            };
+            if let Err(e) = conn.send_message(MessageType::OpsBatchV2, &batch).await {
+                warn!("[delta] 发送 OpsBatchV2 失败 to={}: {}", conn.node_id, e);
+            } else {
+                self.metrics.record_message_sent();
+            }
         } else {
-            self.metrics.record_message_sent();
+            let batch = OpsBatchMessage {
+                repo: req.repo,
+                ops: delta::to_legacy_entries(&ops),
+                next_seq,
+                has_more,
+                server_max_seq,
+            };
+            if let Err(e) = conn.send_message(MessageType::OpsBatch, &batch).await {
+                warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
+            } else {
+                self.metrics.record_message_sent();
+            }
         }
     }
 
-    /// 处理对端的增量响应（请求方侧）
+    /// delta 批次（V1/V2 共用）应用前段：in-flight 清理、水位记录、游标单调保护、空洞检测。
     ///
-    /// 幂等应用 ops（走既有 `handle_sync_batch`，**不写回 oplog**），推进本地版本向量；
-    /// `has_more=true` 时立即续拉下一批，直到对端返回空批。
-    pub async fn handle_ops_batch(self: Arc<Self>, conn: Arc<PeerConn>, batch: OpsBatchMessage) {
-        if !self.config.delta_sync_enabled {
-            return;
-        }
+    /// 返回 `Some(next_seq)` 表示本批可应用；`None` 表示过期/重复批已被丢弃（单调保护）。
+    /// V1（OpsBatch）与 V2（OpsBatchV2）在此之前的逻辑逐行同构，抽公共方法避免双份漂移。
+    fn prepare_ops_batch(
+        &self,
+        conn: &PeerConn,
+        repo: u8,
+        server_max_seq: u64,
+        next_seq: u64,
+        batch_empty: bool,
+    ) -> Option<u64> {
         // v8 F4：请求往返完成，清除 in-flight 标记（此后 tick 可发下一轮请求）。
-        self.delta_inflight
-            .write()
-            .remove(&(conn.node_id, batch.repo));
+        self.delta_inflight.write().remove(&(conn.node_id, repo));
         // F2：记录对端在本 repo 的 oplog 水位。它与本机记录的 synced_seq 同属对端 seq
         // 空间，二者相减才是「真实落后量」；无此值时 lag 报 null（不跨空间相减）。
         // v8：即使批已过期，水位也是最新信息，始终记录。
-        if batch.server_max_seq > 0 {
+        if server_max_seq > 0 {
             self.delta_peer_max
                 .write()
-                .insert((conn.node_id, batch.repo), batch.server_max_seq);
+                .insert((conn.node_id, repo), server_max_seq);
         }
         // v8 F5：游标单调保护 —— 过期/重复批（next_seq ≤ 当前游标）直接丢弃：
         // 不重复应用、不推进、不续拉。否则重试风暴下乱序到达的旧批会把游标
         // 打回去（实测 1016764 → 1015764），再触发同区间无限重拉。
         let cur = self
             .delta_storage()
-            .get_peer_seq(&conn.node_id.0, batch.repo)
+            .get_peer_seq(&conn.node_id.0, repo)
             .unwrap_or(0)
             .max(0) as u64;
-        let next = delta::seq_to_i64(batch.next_seq).max(0) as u64;
+        let next = delta::seq_to_i64(next_seq).max(0) as u64;
         if next <= cur {
             debug!(
                 "[delta] 丢弃过期/重复批: peer={}, repo={}, next_seq={} ≤ 当前 {}（单调保护）",
-                conn.node_id, batch.repo, batch.next_seq, cur
+                conn.node_id, repo, next_seq, cur
             );
             // v9：单调保护分支同样要清「续拉未完成」标记 —— 否则竣工后的空批
             // （next_seq == cur）会让标记永久粘滞，使 tick 永久绕过配置的拉取间隔。
-            self.delta_has_more
-                .write()
-                .remove(&(conn.node_id, batch.repo));
-            return;
+            self.delta_has_more.write().remove(&(conn.node_id, repo));
+            return None;
         }
         // v9：**oplog 空洞检测**（判据必须用对端的 per-repo `min_seq`，不能用 seq 间距）。
         //
@@ -896,49 +918,60 @@ impl SyncManager {
             .peer_negotiate_state
             .read()
             .get(&conn.node_id)
-            .and_then(|v| v.iter().find(|s| s.repo == batch.repo).map(|s| s.min_seq))
+            .and_then(|v| v.iter().find(|s| s.repo == repo).map(|s| s.min_seq))
             .unwrap_or(0);
         if peer_min_seq > 0 && cur.saturating_add(1) < peer_min_seq {
             let missing = peer_min_seq.saturating_sub(cur).saturating_sub(1);
             warn!(
                 "[delta] 检测到 oplog 空洞: peer={}, repo={}, 缺口约 {} 条（本地游标 {} < 对端 min_seq {}）→ 转 bootstrap 补齐",
-                conn.node_id, batch.repo, missing, cur, peer_min_seq
+                conn.node_id, repo, missing, cur, peer_min_seq
             );
-            self.delta_gap.write().insert((conn.node_id, batch.repo));
-        } else if batch.ops.is_empty() {
+            self.delta_gap.write().insert((conn.node_id, repo));
+        } else if batch_empty {
             // 空批 = 对端该 repo 已无更新可给 ⇒ 不存在待补空洞，清除标记
             // （旧写法只在「本批非空且间距小」时清除，空批会让标记永久粘滞）。
-            self.delta_gap.write().remove(&(conn.node_id, batch.repo));
+            self.delta_gap.write().remove(&(conn.node_id, repo));
         }
-        let entries = delta::ops_to_sync_entries(&batch.ops);
+        Some(next)
+    }
+
+    /// delta 批次（V1/V2 共用）应用后段：幂等 apply → 推进游标 → 节流/续拉。
+    ///
+    /// V1 与 V2 唯一差异是 `entries` 的来源（旧 wire 无 version 置 0；V2 携带真实
+    /// version 走 LWW），apply 及其后的推进/续拉逻辑完全同构。
+    async fn finish_ops_batch(
+        self: &Arc<Self>,
+        conn: &Arc<PeerConn>,
+        repo: u8,
+        next_seq: u64,
+        has_more: bool,
+        entries: Vec<SyncEntry>,
+    ) {
         if !entries.is_empty() {
-            self.handle_sync_batch(batch.repo, &entries);
+            self.handle_sync_batch(repo, &entries);
         }
         // 推进版本向量（仅前进，不回退）
-        if let Err(e) = self.delta_storage().set_peer_seq(
-            &conn.node_id.0,
-            batch.repo,
-            delta::seq_to_i64(batch.next_seq),
-        ) {
+        if let Err(e) =
+            self.delta_storage()
+                .set_peer_seq(&conn.node_id.0, repo, delta::seq_to_i64(next_seq))
+        {
             warn!("[delta] 推进版本向量失败 peer={}: {}", conn.node_id, e);
         }
         // 拉取往返成功：把节流计时推后，避免同一轮里 tick 立刻重发；
         // v9：清掉「续拉未完成」标记（本轮已收到响应）。
         self.delta_request_at
             .write()
-            .insert((conn.node_id, batch.repo), Instant::now());
-        self.delta_has_more
-            .write()
-            .remove(&(conn.node_id, batch.repo));
-        if !entries.is_empty() || batch.has_more {
-            delta::log_applied(batch.repo, entries.len(), batch.next_seq);
+            .insert((conn.node_id, repo), Instant::now());
+        self.delta_has_more.write().remove(&(conn.node_id, repo));
+        if !entries.is_empty() || has_more {
+            delta::log_applied(repo, entries.len(), next_seq);
         }
 
         // 还有更多：立即续拉下一批
-        if batch.has_more {
+        if has_more {
             let req = OpsRequestMessage {
-                repo: batch.repo,
-                since_seq: batch.next_seq,
+                repo,
+                since_seq: next_seq,
                 limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
             };
             if let Err(e) = conn.send_message(MessageType::OpsRequest, &req).await {
@@ -947,24 +980,68 @@ impl SyncManager {
                 // （tick 的节流重发）此前又被 `use_bootstrap → continue` 关闭，
                 // 于是任何一次写超时都会把该 (peer,repo) 的游标永久冻结。
                 if self.config.delta_retry_immediately {
-                    self.delta_request_at
-                        .write()
-                        .remove(&(conn.node_id, batch.repo));
-                    self.delta_has_more
-                        .write()
-                        .insert((conn.node_id, batch.repo));
+                    self.delta_request_at.write().remove(&(conn.node_id, repo));
+                    self.delta_has_more.write().insert((conn.node_id, repo));
                 }
             } else {
                 self.metrics.record_message_sent();
                 // v8 F4：续拉同样标记 in-flight（防与下一轮 tick 叠加）
                 self.delta_inflight
                     .write()
-                    .insert((conn.node_id, batch.repo), Instant::now());
-                self.delta_has_more
-                    .write()
-                    .insert((conn.node_id, batch.repo));
+                    .insert((conn.node_id, repo), Instant::now());
+                self.delta_has_more.write().insert((conn.node_id, repo));
             }
         }
+    }
+
+    /// 处理对端的增量响应（请求方侧，旧通道 OpsBatch，对端 v4-v8）
+    ///
+    /// 幂等应用 ops（走既有 `handle_sync_batch`，**不写回 oplog**），推进本地版本向量；
+    /// `has_more=true` 时立即续拉下一批，直到对端返回空批。
+    pub async fn handle_ops_batch(self: Arc<Self>, conn: Arc<PeerConn>, batch: OpsBatchMessage) {
+        if !self.config.delta_sync_enabled {
+            return;
+        }
+        let Some(next) = self.prepare_ops_batch(
+            &conn,
+            batch.repo,
+            batch.server_max_seq,
+            batch.next_seq,
+            batch.ops.is_empty(),
+        ) else {
+            return;
+        };
+        // 旧 wire 无 version 字段 → version 恒 0（对既有条目维持保守跳过语义）
+        let entries = delta::ops_to_sync_entries(&batch.ops);
+        self.finish_ops_batch(&conn, batch.repo, next, batch.has_more, entries)
+            .await;
+    }
+
+    /// F8/v9：处理对端的增量响应 V2（请求方侧，OpsBatchV2，对端 ≥ v9）
+    ///
+    /// 与 [`Self::handle_ops_batch`] 唯一差异：ops 每条携带真实 LWW version，
+    /// 转换时原样透传 → apply 走正常 LWW，「对既有条目的版本提升」不再被静默丢弃。
+    /// 前段（水位/单调保护/空洞检测）与后段（推进/续拉）与 V1 完全共用。
+    pub async fn handle_ops_batch_v2(
+        self: Arc<Self>,
+        conn: Arc<PeerConn>,
+        batch: OpsBatchV2Message,
+    ) {
+        if !self.config.delta_sync_enabled {
+            return;
+        }
+        let Some(next) = self.prepare_ops_batch(
+            &conn,
+            batch.repo,
+            batch.server_max_seq,
+            batch.next_seq,
+            batch.ops.is_empty(),
+        ) else {
+            return;
+        };
+        let entries = delta::ops_to_sync_entries_v2(&batch.ops);
+        self.finish_ops_batch(&conn, batch.repo, next, batch.has_more, entries)
+            .await;
     }
 
     // ========================================================================
@@ -3595,6 +3672,77 @@ mod tests {
 
         assert_eq!(node_repo.len_sync(), 0);
         mgr.apply_node_sync(&entries);
+        assert_eq!(node_repo.len_sync(), 1);
+    }
+
+    /// F8/v9 回归：delta 通道 version 透传后，「对既有条目的更新」能正常落地，
+    /// 不再被 version=0 的保守跳过语义静默丢弃（修复前一致性全靠 Range 反熵兜底）。
+    ///
+    /// 链路：对端 oplog 批（OpEntryV2 携带真实 version）→ `ops_to_sync_entries_v2`
+    /// （version 原样进入 SyncEntry，作为 LWW/裁决输入）→ `apply_node_sync` 更新
+    /// 已存在的同 key 条目。NODE 的裁决规则是「同 key 取字典序较小的 node_id」，
+    /// 更新侧 node_id 取更小值以命中「对端胜出」分支，并断言内存条目确实被改写。
+    #[test]
+    fn test_delta_v2_entries_update_existing_entry() {
+        let node_repo = make_node_repo();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let cm = SessionsHandle::new_for_test();
+        let metrics = Arc::new(FederationMetrics::new());
+        let gossip = Arc::new(GossipEngine::new(
+            cm.clone(),
+            make_config(),
+            NodeId([1; 20]),
+            metrics,
+            shutdown_tx.clone(),
+        ));
+        let mgr = SyncManager::new(
+            cm,
+            node_repo.clone(),
+            make_config(),
+            shutdown_tx,
+            gossip,
+            Arc::new(FederationMetrics::new()),
+            NodeId([1; 20]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let addr: SocketAddr = "10.0.0.1:6885".parse().unwrap();
+
+        // 1) 本地已有该地址的条目（node_id 字典序较大）
+        let local = NodeSyncPayload {
+            node_id: [0xbb; 20],
+            addr,
+        };
+        mgr.apply_node_sync(&[SyncEntry {
+            key: b"10.0.0.1:6885".to_vec(),
+            operation: operation::UPSERT,
+            version: 100,
+            payload: bincode::serialize(&local).unwrap(),
+        }]);
+        assert_eq!(node_repo.node_id_sync(addr), Some([0xbb; 20]));
+
+        // 2) 对端 delta V2 批：同 key、携带真实（更高）version，node_id 字典序更小 → 应胜出
+        let update = NodeSyncPayload {
+            node_id: [0x99; 20],
+            addr,
+        };
+        let ops = vec![OpEntryV2 {
+            seq: 2,
+            is_delete: false,
+            key: b"10.0.0.1:6885".to_vec(),
+            value: bincode::serialize(&update).unwrap(),
+            version: 200,
+        }];
+        let entries = delta::ops_to_sync_entries_v2(&ops);
+        // 转换层闸门：真实 version 必须进入 SyncEntry（修复前此处恒为 0）
+        assert_eq!(entries[0].version, 200);
+        mgr.apply_node_sync(&entries);
+
+        // 3) 既有条目已被更新（而非被静默丢弃），且没有产生第二条
+        assert_eq!(node_repo.node_id_sync(addr), Some([0x99; 20]));
         assert_eq!(node_repo.len_sync(), 1);
     }
 

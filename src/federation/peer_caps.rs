@@ -66,6 +66,13 @@ impl PeerCaps {
         crate::federation::sync::delta::supports_delta_sync(self.version)
     }
 
+    /// F8/v9：对端是否支持 delta 通道 version 透传（OpsBatchV2，协议版本 >= 9）。
+    ///
+    /// 阈值收敛到 `delta::supports_ops_batch_v2`，与发送点共用同一套判定，避免两处漂移。
+    pub fn supports_delta_sync_v2(&self) -> bool {
+        crate::federation::sync::delta::supports_ops_batch_v2(self.version)
+    }
+
     /// 对端是否支持 Range-based（有序区间下钻）反熵（协议版本 >= 5）
     pub fn supports_range_reconcile(&self) -> bool {
         crate::federation::sync::range_reconcile::supports_range_reconcile(self.version)
