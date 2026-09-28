@@ -29,6 +29,7 @@
 
 use rusqlite::{params, Connection as SqliteConnection};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::storage::db::Storage;
@@ -584,6 +585,161 @@ fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+// ========================================================================
+// v10(C)：块传输窗口调度器 —— 窗口化并发预取的状态机（纯逻辑，可单测）。
+// ========================================================================
+
+/// v10(C)：bootstrap 块传输的窗口状态机。
+///
+/// 旧实现是**链式**传输：收到第 i 块响应才请求第 i+1 块，单块「生成+传输+RTT」
+/// 延迟线性叠加，实测吞吐 0.33MB/s（千兆内网跑不满 1/300）。窗口化后同时挂
+///  个在途请求，乱序接收（块落地是幂等 upsert， 用 max 连续
+/// 前缀推进，乱序安全）；全部块收齐即竣工，不再依赖 is_last 标记的到达顺序。
+///
+/// 纯状态机：不持锁不做 IO， 计算下一批应发送的 index， 驱动状态迁移；NAK/校验失败的块移出在途集合由  自动重发。
+#[derive(Debug)]
+pub struct ChunkWindow {
+    total: u32,
+    window: usize,
+    /// 下一个未请求的 index（严格递增；重试块单独走 retry 队列）
+    next_request: u32,
+    /// 已请求未响应的 index 集合
+    inflight: std::collections::HashSet<u32>,
+    /// 每个在途 index 的发送时刻（reap_timed_out 用）
+    sent_at: std::collections::HashMap<u32, Instant>,
+    /// 已成功响应的 index 集合（恢复时以 0..done 为基数）
+    received: std::collections::HashSet<u32>,
+    /// 每 index 的失败次数（NAK/校验失败），超限触发重拉清单
+    attempts: std::collections::HashMap<u32, u32>,
+    /// 重试队列（失败/NAK 的块，fill() 优先重发）
+    retry: std::collections::VecDeque<u32>,
+}
+
+impl ChunkWindow {
+    /// 恢复续传的连续前缀长度（持久化的 done_chunks），
+    /// 其对应块视作已成功（基数进入 received）。
+    pub fn new(total: u32, window: usize, resume_from: u32) -> Self {
+        let resume = resume_from.min(total);
+        let received = (0..resume).collect::<std::collections::HashSet<_>>();
+        Self {
+            total,
+            window: window.max(1),
+            next_request: resume,
+            inflight: std::collections::HashSet::new(),
+            sent_at: std::collections::HashMap::new(),
+            received,
+            attempts: std::collections::HashMap::new(),
+            retry: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// 计算当前应发送的 index 列表（填满窗口；重试块优先）。
+    /// 传 0 表示使用自身 window 配置。
+    pub fn fill(&mut self, max_inflight: usize) -> Vec<u32> {
+        let cap = if max_inflight == 0 {
+            self.window
+        } else {
+            max_inflight
+        };
+        let now = Instant::now();
+        let mut out = Vec::new();
+        // 重试块优先（失败计数不在此清零，由 on_response 成功时清）
+        while self.inflight.len() < cap {
+            match self.retry.pop_front() {
+                Some(i) => {
+                    if self.inflight.insert(i) {
+                        self.sent_at.insert(i, now);
+                        out.push(i);
+                    }
+                }
+                None => break,
+            }
+        }
+        while self.next_request < self.total && self.inflight.len() < cap {
+            let i = self.next_request;
+            self.next_request += 1;
+            self.inflight.insert(i);
+            self.sent_at.insert(i, now);
+            out.push(i);
+        }
+        out
+    }
+
+    /// 记录一次成功响应。返回 true = 全部块收齐（竣工）。
+    pub fn on_response(&mut self, index: u32) -> bool {
+        self.inflight.remove(&index);
+        self.sent_at.remove(&index);
+        self.attempts.remove(&index);
+        self.received.insert(index);
+        self.received.len() as u32 >= self.total
+    }
+
+    /// 记录一次失败（NAK/校验失败）：移出在途并进重试队列，返回累计失败次数。
+    pub fn on_failure(&mut self, index: u32) -> u32 {
+        self.inflight.remove(&index);
+        self.sent_at.remove(&index);
+        let e = self.attempts.entry(index).or_insert(0);
+        *e = e.saturating_add(1);
+        self.retry.push_back(index);
+        *e
+    }
+
+    /// 回收超时未响应的在途块（网络丢帧/对端静默）：移出在途、移入重试队列，
+    /// 返回被回收的 index 列表（调用方随后 fill() 会优先重发它们）。
+    pub fn reap_timed_out(&mut self, timeout: Duration) -> Vec<u32> {
+        let now = Instant::now();
+        let expired: Vec<u32> = self
+            .sent_at
+            .iter()
+            .filter_map(|(&i, &t)| {
+                if now.duration_since(t) >= timeout {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for i in &expired {
+            self.inflight.remove(i);
+            self.sent_at.remove(i);
+            self.retry.push_back(*i);
+        }
+        expired
+    }
+
+    /// 全部块是否收齐。
+    pub fn is_complete(&self) -> bool {
+        self.received.len() as u32 >= self.total
+    }
+
+    /// 已收块数（含恢复基数）。
+    pub fn received_count(&self) -> u32 {
+        self.received.len() as u32
+    }
+
+    /// 最大连续完成前缀（持久化到 done_chunks，供重启后续传定位）。
+    pub fn done_prefix(&self) -> u32 {
+        let mut n = 0u32;
+        while self.received.contains(&n) {
+            n += 1;
+        }
+        n
+    }
+
+    /// 某 index 的累计失败次数。
+    pub fn attempts_of(&self, index: u32) -> u32 {
+        self.attempts.get(&index).copied().unwrap_or(0)
+    }
+
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.len()
+    }
+
+    pub fn total(&self) -> u32 {
+        self.total
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +886,91 @@ mod tests {
         assert_eq!(tb.wait_duration(1000), std::time::Duration::ZERO); // 用掉整桶
         let d = tb.wait_duration(1000); // 桶空，需 ~1s
         assert!(d.as_secs_f64() > 0.5, "应需等待，实际 {:?}", d);
+    }
+
+    /// v10(C)：窗口化并发预取状态机 —— fill 填满窗口、乱序响应、重试、竣工。
+    #[test]
+    fn test_chunk_window_pipeline() {
+        let mut w = ChunkWindow::new(10, 4, 0);
+        // 初始填满窗口
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![0, 1, 2, 3]);
+        assert_eq!(w.inflight_len(), 4);
+        // 乱序响应(先 2 后 0):done_prefix 只计连续前缀
+        assert!(!w.on_response(2), "仅收 1 块不应竣工");
+        assert_eq!(w.done_prefix(), 0);
+        assert!(!w.on_response(0), "仅收 2 块不应竣工");
+        assert_eq!(w.done_prefix(), 1);
+        // 响应后补发:窗口回落,fill 补新块
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![4, 5]);
+        // 失败:NAK/校验失败移出在途进重试,attempt 计数
+        assert_eq!(w.on_failure(1), 1);
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![1], "失败块经重试队列优先重发");
+        assert_eq!(w.attempts_of(1), 1);
+        // 重发成功
+        assert!(!w.on_response(1), "3/10 块不应竣工");
+        assert_eq!(w.attempts_of(1), 0, "成功后清失败计数");
+        // 补齐剩余在途响应(块 3/4/5),清空窗口后进入推进循环
+        w.on_response(3);
+        w.on_response(4);
+        w.on_response(5);
+        // 持续推进直到全部收齐(on_response 在收齐最后一块时返回 true,属预期)
+        loop {
+            let batch = w.fill(0);
+            if batch.is_empty() {
+                break;
+            }
+            for i in batch {
+                w.on_response(i);
+            }
+        }
+        assert!(w.is_complete());
+        assert_eq!(w.done_prefix(), 10);
+    }
+
+    /// v10(C)：恢复续传 —— resume_from 前缀进入 received 基数,续传起点正确。
+    #[test]
+    fn test_chunk_window_resume() {
+        let mut w = ChunkWindow::new(10, 4, 6);
+        assert_eq!(w.received_count(), 6);
+        assert_eq!(w.done_prefix(), 6);
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![6, 7, 8, 9], "从 resume 点继续填窗");
+        for i in batch {
+            w.on_response(i);
+        }
+        assert!(w.is_complete());
+    }
+
+    /// v10(C)：全量继承(继承判定 done>=total)→ 构造即竣工。
+    #[test]
+    fn test_chunk_window_fully_inherited() {
+        let mut w = ChunkWindow::new(5, 4, 5);
+        assert!(w.is_complete());
+        assert!(w.fill(0).is_empty(), "已全量继承不应再发任何请求");
+    }
+
+    /// v10(C)：超时回收 —— 在途块超过 timeout 未响应 → 移入重试队列，fill 优先重发。
+    #[test]
+    fn test_chunk_window_reap_timed_out() {
+        let mut w = ChunkWindow::new(10, 4, 0);
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![0, 1, 2, 3]);
+        // 刚发出，不超时
+        assert!(w.reap_timed_out(Duration::from_secs(30)).is_empty());
+        // 模拟 sent_at 全部老化：手动把 sent_at 时间调到 1 小时前
+        let old = Instant::now() - Duration::from_secs(3600);
+        for t in w.sent_at.values_mut() {
+            *t = old;
+        }
+        let expired = w.reap_timed_out(Duration::from_secs(30));
+        assert_eq!(expired.len(), 4, "4 个在途块全部超时");
+        assert_eq!(w.inflight_len(), 0, "超时块全部移出在途");
+        // fill 会从重试队列取出重发
+        let batch = w.fill(0);
+        assert_eq!(batch.len(), 4, "超时块经重试队列重发");
+        assert_eq!(w.inflight_len(), 4);
     }
 }

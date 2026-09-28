@@ -14,7 +14,9 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -109,6 +111,41 @@ impl PartialOrd for HeapEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+// ─── v10：bootstrap 快照导入模式（全局 TTL 窗口）──────────────────────────
+//
+// steady 调度的预算（writes_per_tick=10 / steady_tick_ms=10）把落库上限钉在
+// 1,000 行/s —— 稳态磁盘 IO 平滑的正确设计，但冷启动灌入 300 万行快照时
+// 就是 50 分钟的硬天花板（实测）。bootstrap 块每次成功落地时刷新导入窗口，
+// writer_loop 在窗口内解除时间片预算（×200），窗口静默 30s 自动回落稳态，
+// 无需显式关闭、不影响稳态 IO 平滑语义。
+
+/// v10：导入窗口 TTL（秒）—— 窗口内解除时间片预算，静默后自动回落稳态。
+pub const BOOTSTRAP_IMPORT_WINDOW_TTL_SECS: u64 = 30;
+/// v10：导入窗口内 writes_per_tick 的放大倍数。
+pub const BOOTSTRAP_IMPORT_BUDGET_MULTIPLIER: usize = 200;
+
+/// 导入窗口截止时刻（UNIX 毫秒；0 = 未激活）。
+static IMPORT_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+/// 刷新快照导入窗口（bootstrap 块落地路径每次成功后调用）。
+pub fn refresh_bootstrap_import_window(ttl: Duration) {
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+        + ttl.as_millis() as i64;
+    IMPORT_UNTIL_MS.store(until, AtomicOrdering::Release);
+}
+
+/// 导入窗口是否活跃（writer_loop 每 tick 检查）。
+fn import_window_active() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    now < IMPORT_UNTIL_MS.load(AtomicOrdering::Acquire)
 }
 
 /// 无锁令牌桶
@@ -458,10 +495,18 @@ impl IoScheduler {
 
     async fn writer_loop(self: Arc<Self>) {
         let tick_interval = Duration::from_millis(self.config.steady_tick_ms);
-        let max_per_tick = self.config.writes_per_tick.max(1);
+        let base_per_tick = self.config.writes_per_tick.max(1);
 
         loop {
             let tick_start = Instant::now();
+
+            // v10：快照导入窗口 —— bootstrap 大批量落地时解除时间片预算（×200），
+            // 窗口静默 30s 自动回落稳态平滑语义。
+            let max_per_tick = if import_window_active() {
+                base_per_tick.saturating_mul(BOOTSTRAP_IMPORT_BUDGET_MULTIPLIER)
+            } else {
+                base_per_tick
+            };
 
             // 检查关闭信号
             if self.shutdown.load(AtomicOrdering::Acquire) {

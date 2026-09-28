@@ -219,6 +219,8 @@ pub struct SyncManager {
     bootstrap_serving_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v10(A+)：让路截止 —— (peer, repo) → 让路保持到的时刻（冲突后持续让路防震荡）。
     bootstrap_yield_until: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// v10(C)：块传输窗口状态机 —— (peer, repo) → 窗口化并发预取的在途/收齐状态。
+    chunk_windows: RwLock<FxHashMap<(NodeId, u8), bootstrap::ChunkWindow>>,
     /// v9：delta 续拉未完成标记（(peer, repo)）。续拉发送失败时置位，下一 tick 不等间隔立即重试。
     delta_has_more: RwLock<FxHashSet<(NodeId, u8)>>,
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
@@ -317,6 +319,7 @@ impl SyncManager {
             local_node_id,
             bootstrap_serving_at: RwLock::new(FxHashMap::default()),
             bootstrap_yield_until: RwLock::new(FxHashMap::default()),
+            chunk_windows: RwLock::new(FxHashMap::default()),
             gossip_engine,
             peer_sync,
             infohash_sync,
@@ -1545,6 +1548,9 @@ impl SyncManager {
             .retain(|(p, _)| alive.contains(p));
         self.delta_gap.write().retain(|(p, _)| alive.contains(p));
         self.bootstrap_chunk_attempt
+            .write()
+            .retain(|(p, _), _| alive.contains(p));
+        self.chunk_windows
             .write()
             .retain(|(p, _), _| alive.contains(p));
         if pruned > 0 {
@@ -2950,12 +2956,35 @@ impl SyncManager {
             mf.w0_seq,
             progress.done_chunks
         );
-        let start_index = progress.done_chunks as u32;
-        self.request_bootstrap_chunk(&conn, mf.repo, start_index, &mf)
-            .await;
+        // v10(C)：窗口化并发预取 —— 建立窗口状态机（resume_from = 继承的连续前缀），
+        // fill 出首批在途块并批量请求。旧实现链式传输（收一块才请求下一块）把吞吐
+        // 钉死在单块「生成+传输+RTT」线性叠加（实测 0.33MB/s）；窗口化后吞吐随
+        // 窗口扩大，直至撞上落库/磁盘上限。窗口大小配置化（bootstrap_window_size）。
+        let window_size = self.config.bootstrap_window_size.max(1);
+        let mut cw = bootstrap::ChunkWindow::new(
+            mf.chunks.len() as u32,
+            window_size,
+            progress.done_chunks as u32,
+        );
+        let first_batch = cw.fill(0);
+        self.chunk_windows
+            .write()
+            .insert((conn.node_id, mf.repo), cw);
+        info!(
+            "[bootstrap] 窗口化传输启动: peer={} repo={} 块数={} 窗口={} 首批={}",
+            conn.node_id,
+            mf.repo,
+            mf.chunks.len(),
+            window_size,
+            first_batch.len()
+        );
+        for idx in &first_batch {
+            self.request_bootstrap_chunk(&conn, mf.repo, *idx, &mf)
+                .await;
+        }
     }
 
-    /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉或切追尾。
+    /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、窗口续拉或切追尾。
     pub async fn handle_bootstrap_chunk_response(
         self: Arc<Self>,
         conn: Arc<PeerConn>,
@@ -2990,39 +3019,41 @@ impl SyncManager {
             Some(c) => c.clone(),
             None => return,
         };
-        // v9：收到响应（含 NAK）即清掉「无响应」计数 —— 该计数器只用于识别**完全无回帧**的
-        // 传输/连接故障，不应把「对端明确回 NAK」也算进去（NAK 走 verify_fails 自愈路径）。
-        {
-            let mut m = self.bootstrap_chunk_attempt.write();
-            if let Some(e) = m.get_mut(&(conn.node_id, resp.repo)) {
-                if e.0 == resp.index {
-                    m.remove(&(conn.node_id, resp.repo));
-                }
-            }
-        }
+        // v10(C)：窗口状态机 —— (peer,repo) 的 ChunkWindow 缺失（重启/首次响应）
+        // 时从进度重建（resume_from = 持久化的连续前缀 done_chunks）。
+        // 全程只取一次、驱动完状态迁移后回插，不再二次取出（旧代码两次 remove 导致在途状态丢失）。
+        let window_size = self.config.bootstrap_window_size.max(1);
+        let mut cw = self
+            .chunk_windows
+            .write()
+            .remove(&(conn.node_id, resp.repo))
+            .unwrap_or_else(|| {
+                bootstrap::ChunkWindow::new(
+                    mf.chunks.len() as u32,
+                    window_size,
+                    progress.done_chunks.min(mf.chunks.len() as u64) as u32,
+                )
+            });
         // ④ 批量 upsert（A4：走全 repo 通用 dispatch handle_sync_batch，按 resp.repo 分派到
         // apply_node/peer/infohash/tracker_sync，严禁逐条 INSERT，也严禁硬编码走 NODE 落地）
         if !resp.entries.is_empty() {
             self.handle_sync_batch(resp.repo, &resp.entries);
+            // v10(C)：刷新快照导入窗口 —— 落库预算在窗口内解除时间片限速
+            // （writes_per_tick ×200），窗口静默 30s 自动回落稳态平滑语义。
+            crate::storage::io_scheduler::refresh_bootstrap_import_window(Duration::from_secs(
+                crate::storage::io_scheduler::BOOTSTRAP_IMPORT_WINDOW_TTL_SECS,
+            ));
         }
         // ⑥ 校验（P0-4 语义修正）：只做「传输完整性」校验 —— 校验**对端发来的这一批条目**
         // 是否完整到达，不再重算本地 [lo,hi) 区间摘要与清单 hash 比对。
-        //
-        // 旧语义是「一致性」校验，必然恒失配：只要接收方在该 key 区间内有**任何对端没有的
-        // 行**（双方各自独立爬取产生的 ~2% 差异，全域均匀分布），或对端在传输期有写入，
-        // 每个块都判失败。后果是 F7 的「连续 3 次失败重拉清单」陷入死循环 —— 重拉回来的
-        // 清单仍是对端 DB，接收方的多余行还在，永远对不上。
-        // 一致性校验应交给 range 反熵（v8 下唯一兜底通道）负责，bootstrap 只负责搬数据。
         let ok = bootstrap::verify_transport(chunk.rows, resp.entries.len());
-        // v9：失败（含对端显式 NAK/空块）时**重发同一 index**，绝不跳到下一块 ——
-        // 旧实现失败后仍执行 `request(index+1)`，等于把该区间的数据静默跳过（永久空洞）。
-        let mut retry_same = false;
         if ok {
+            // 成功路径：统计字节、记录 key 游标、推进阶段。
+            // done_chunks 不在此处按链式语义 (index+1) 推进 —— 窗口化乱序到达，
+            // done_chunks 必须等于 cw.done_prefix()（最大连续前缀），否则持久化进度会跳号。
             self.bootstrap_verify_fails
                 .write()
                 .remove(&(conn.node_id, resp.repo));
-            progress.done_chunks = (resp.index as u64 + 1).max(progress.done_chunks);
-            // v10(B2)：记录 key 游标 —— 重拉清单后按此定位续传起点（活表边界漂移免疫）。
             progress.last_key = Some(chunk.hi.clone());
             progress.bytes += resp
                 .entries
@@ -3030,53 +3061,51 @@ impl SyncManager {
                 .map(|e| (e.key.len() + e.payload.len() + 16) as u64)
                 .sum::<u64>();
             progress.phase = bootstrap::BootstrapPhase::Transfer;
+            // v10(C)：驱动窗口状态机。on_response 返回 true = 全部块收齐（竣工）。
+            if cw.on_response(resp.index) {
+                progress.done_chunks = cw.done_prefix() as u64;
+                progress.updated_ms = chrono::Utc::now().timestamp_millis();
+                let _ = self.delta_storage().bootstrap_save(&progress, None);
+                self.finish_bootstrap(&conn, resp.repo, mf.w0_seq).await;
+                return;
+            }
         } else {
-            // 传输期漂移或丢包：不改 done_chunks，重发同块或升级为重拉清单
+            // 失败路径（对端 NAK / 空块 / 传输漂移）：不做字节统计，记录告警后驱动窗口重试。
             warn!(
-                "[bootstrap] 块 {} 传输校验失败（声明 {} 行 / 实收 {} 行），保持进度 done={}",
+                "[bootstrap] 块 {} 传输校验失败（声明 {} 行 / 实收 {} 行），保持进度 done={}/{}",
                 resp.index,
                 chunk.rows,
                 resp.entries.len(),
-                progress.done_chunks
+                cw.done_prefix(),
+                mf.chunks.len()
             );
-            // F7/v9: 连续 N 次失败 → 判定清单漂移/边界失配，重拉清单重置进度重拉。
-            // 块数据按 upsert 落库（幂等），重复拉取无害。
-            let fails = self
-                .bootstrap_verify_fails
-                .read()
-                .get(&(conn.node_id, resp.repo))
-                .copied()
-                .unwrap_or(0)
-                + 1;
-            if fails >= self.config.bootstrap_chunk_max_attempts.max(1) {
+            let attempts = cw.on_failure(resp.index);
+            if attempts >= self.config.bootstrap_chunk_max_attempts.max(1) {
+                warn!(
+                    "[bootstrap] 块 {} 连续 {} 次失败，判定清单漂移/边界失配，重拉清单: repo={}, peer={}",
+                    resp.index, attempts, resp.repo, conn.node_id
+                );
                 self.bootstrap_verify_fails
                     .write()
                     .remove(&(conn.node_id, resp.repo));
-                warn!(
-                    "[bootstrap] 连续 {} 次分块失败，判定清单漂移/边界失配，重拉清单: repo={}, peer={}",
-                    fails, resp.repo, conn.node_id
-                );
                 self.clone().start_bootstrap(conn.node_id, resp.repo).await;
-            } else {
-                self.bootstrap_verify_fails
-                    .write()
-                    .insert((conn.node_id, resp.repo), fails);
-                retry_same = true;
+                return;
             }
         }
+        // v10(C)：done_chunks = 最大连续前缀（乱序安全），保存进度后 fill 补发。
+        progress.done_chunks = cw.done_prefix() as u64;
         progress.updated_ms = chrono::Utc::now().timestamp_millis();
         let _ = self.delta_storage().bootstrap_save(&progress, None);
-
-        let last = resp.is_last || (resp.index as usize + 1) >= mf.chunks.len();
-        if ok {
-            if last {
-                self.finish_bootstrap(&conn, resp.repo, mf.w0_seq).await;
-            } else {
-                self.request_bootstrap_chunk(&conn, resp.repo, resp.index + 1, &mf)
-                    .await;
-            }
-        } else if retry_same {
-            self.request_bootstrap_chunk(&conn, resp.repo, resp.index, &mf)
+        // 收到响应即清「无回帧」看门狗计数（该计数只用于识别完全无回帧的连接故障）。
+        self.bootstrap_chunk_attempt
+            .write()
+            .remove(&(conn.node_id, resp.repo));
+        let batch = cw.fill(0);
+        self.chunk_windows
+            .write()
+            .insert((conn.node_id, resp.repo), cw);
+        for idx in batch {
+            self.request_bootstrap_chunk(&conn, resp.repo, idx, &mf)
                 .await;
         }
     }
@@ -3144,6 +3173,8 @@ impl SyncManager {
             .write()
             .remove(&(conn.node_id, repo));
         self.delta_gap.write().remove(&(conn.node_id, repo));
+        // v10(C)：清掉窗口状态机 —— 全部块已收齐，避免泄漏。
+        self.chunk_windows.write().remove(&(conn.node_id, repo));
         // v9：追尾不受协商策略门控 —— 进入 bootstrap 的判定之一恰是
         // 「策略 = BOOTSTRAP」，而 `delta_channel_allowed` 要求策略 = DELTA，
         // 旧实现因此让竣工后的追尾被同一条策略静默拒绝（B5）。这里清掉协商结果，
@@ -3224,7 +3255,6 @@ impl SyncManager {
             Ok(l) => l,
             Err(_) => return,
         };
-        let max_attempts = self.config.bootstrap_chunk_max_attempts.max(1);
         let chunk_timeout = Duration::from_secs(self.config.bootstrap_chunk_timeout_secs.max(1));
         for p in list {
             if p.phase == bootstrap::BootstrapPhase::Done || p.peer.len() != 20 {
@@ -3233,46 +3263,64 @@ impl SyncManager {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(&p.peer);
             let peer = NodeId(arr);
-            // v9：无响应升级 —— 同一 index 连续请求超限或超时（对端完全没回帧）时重拉清单。
-            // 旧实现没有这层判定，只会在 60s 周期里无限重发同一 index（实测 194 次全从块 0）。
-            let stale_request = {
-                let m = self.bootstrap_chunk_attempt.read();
-                match m.get(&(peer, p.repo)) {
-                    Some(&(idx, cnt, first)) => {
-                        idx == p.done_chunks as u32
-                            && (cnt >= max_attempts || first.elapsed() >= chunk_timeout)
-                    }
-                    None => false,
-                }
-            };
-            if stale_request {
-                let (idx, cnt, secs) = {
-                    let m = self.bootstrap_chunk_attempt.read();
-                    m.get(&(peer, p.repo))
-                        .map(|&(i, c, t)| (i, c, t.elapsed().as_secs()))
-                        .unwrap_or((0, 0, 0))
+            // v10(C)：窗口化续传 —— 不依赖链式「从 done_chunks 请求一块」，而是：
+            //   ① 若内存中已有 ChunkWindow（传输进行中）：回收超时在途块，fill 补发。
+            //   ② 若无 ChunkWindow（重启/异常掉出）：从持久化 done_chunks 重建窗口并填满。
+            //   ③ 旧 bootstrap_chunk_attempt 的「idx == done_chunks」判定在窗口化下恒不成立
+            //      （最后请求的 index 可能领先 done_chunks 一整个窗口），改由 ChunkWindow
+            //      的 sent_at 超时回收负责识别「发了请求但对端完全不回帧」。
+            let has_window = self.chunk_windows.read().contains_key(&(peer, p.repo));
+            if has_window {
+                // 传输进行中：回收超时在途块并重发
+                let mf = match self.delta_storage().bootstrap_load(&p.peer, p.repo) {
+                    Ok(Some((_, Some(m)))) => m,
+                    _ => continue,
                 };
-                warn!(
-                    "[bootstrap] 分块 {} 连续 {} 次 / {}s 无响应 → 重拉清单: peer={} repo={}",
-                    idx, cnt, secs, peer, p.repo
-                );
-                self.bootstrap_chunk_attempt.write().remove(&(peer, p.repo));
-                self.clone().start_bootstrap(peer, p.repo).await;
+                if let Some(conn) = self.sessions.get_connection(&peer) {
+                    let mut cw = match self.chunk_windows.write().remove(&(peer, p.repo)) {
+                        Some(w) => w,
+                        None => continue,
+                    };
+                    let timed_out = cw.reap_timed_out(chunk_timeout);
+                    if !timed_out.is_empty() {
+                        warn!(
+                            "[bootstrap] 回收 {} 个超时在途块: peer={} repo={} blocks={:?}",
+                            timed_out.len(),
+                            peer,
+                            p.repo,
+                            timed_out
+                        );
+                    }
+                    let batch = cw.fill(0);
+                    self.chunk_windows.write().insert((peer, p.repo), cw);
+                    for idx in batch {
+                        self.request_bootstrap_chunk(&conn, p.repo, idx, &mf).await;
+                    }
+                }
                 continue;
             }
+            // 无内存窗口（重启后）：从持久化进度重建窗口
             if self.sessions.get_connection(&peer).is_none() {
-                // 无连接时不计入失败，等连接恢复再续传（避免把「没连接」当成对端无响应）。
                 continue;
             }
             match self.delta_storage().bootstrap_load(&p.peer, p.repo) {
-                Ok(Some((_, Some(mf)))) if (mf.chunks.len() as u64) > p.done_chunks => {
+                Ok(Some((_, Some(mf)))) if (mf.chunks.len() as u32) > p.done_chunks as u32 => {
                     if let Some(conn) = self.sessions.get_connection(&peer) {
-                        debug!(
-                            "[bootstrap] 恢复续传: peer={}, repo={}, 从块 {} 继续",
-                            peer, p.repo, p.done_chunks
+                        let window_size = self.config.bootstrap_window_size.max(1);
+                        let mut cw = bootstrap::ChunkWindow::new(
+                            mf.chunks.len() as u32,
+                            window_size,
+                            p.done_chunks.min(mf.chunks.len() as u64) as u32,
                         );
-                        self.request_bootstrap_chunk(&conn, p.repo, p.done_chunks as u32, &mf)
-                            .await;
+                        let batch = cw.fill(0);
+                        debug!(
+                            "[bootstrap] 恢复续传: peer={}, repo={}, 重建窗口 size={}, 首批={:?}",
+                            peer, p.repo, window_size, batch
+                        );
+                        self.chunk_windows.write().insert((peer, p.repo), cw);
+                        for idx in batch {
+                            self.request_bootstrap_chunk(&conn, p.repo, idx, &mf).await;
+                        }
                     }
                 }
                 _ => {

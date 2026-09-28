@@ -230,6 +230,11 @@ pub struct FederationConfig {
     /// P2-1：bootstrap 服务端带宽预算（字节/秒）。0 = 不限流。
     #[serde(default = "default_bootstrap_rate_bytes_per_sec")]
     pub bootstrap_rate_bytes_per_sec: u64,
+    /// v10(C)：bootstrap 块传输的并发窗口（在途块请求数）。链式传输的吞吐被
+    /// 单块「生成+传输+RTT」线性叠加钉死（实测 0.33MB/s）；窗口化预取后吞吐
+    /// 随窗口扩大，直至撞上落库/磁盘上限。
+    #[serde(default = "default_bootstrap_window_size")]
+    pub bootstrap_window_size: usize,
     /// 发送端 GossipBatch 合并为 bulk 帧的最大 batch 数量。
     /// 同一连接的多个 batch 合并为一个 GossipBatchBulk 发送，减少网络往返。
     #[serde(default = "default_gossip_bulk_max_batches")]
@@ -483,6 +488,10 @@ fn default_bootstrap_chunk_rows() -> u32 {
 fn default_bootstrap_rate_bytes_per_sec() -> u64 {
     crate::federation::sync::bootstrap::DEFAULT_RATE_BYTES_PER_SEC
 }
+/// v10(C)：bootstrap 块传输并发窗口（见 `bootstrap_window_size`）。
+fn default_bootstrap_window_size() -> usize {
+    16
+}
 fn default_gossip_bulk_max_batches() -> usize {
     50
 }
@@ -564,6 +573,7 @@ impl Default for FederationConfig {
             sync_infohash_enabled: default_true(),
             sync_tracker_enabled: default_true(),
             dht_discovery_enabled: default_true(),
+            bootstrap_window_size: default_bootstrap_window_size(),
             dht_discovery_interval_secs: default_dht_interval(),
             peer_cache_enabled: default_true(),
             peer_cache_max_nodes: default_peer_cache_max(),
