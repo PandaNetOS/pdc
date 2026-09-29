@@ -1104,8 +1104,8 @@ pub struct TaskScheduler {
     queue: RwLock<BinaryHeap<ScheduledItem>>,
     /// 各分类当前运行任务数
     running_by_category: RwLock<HashMap<TaskCategory, u32>>,
-    /// 各分类最大并发度
-    max_concurrency: CategoryConcurrency,
+    /// 各分类最大并发度（RwLock 包装：支持运行时热更，见 `update_category_concurrency`）
+    max_concurrency: RwLock<CategoryConcurrency>,
     resource_monitor: Arc<ResourceMonitor>,
     seq_counter: RwLock<u64>,
     completed_dependencies: RwLock<HashSet<String>>,
@@ -1116,8 +1116,9 @@ pub struct TaskScheduler {
     watchdog_running: Arc<AtomicBool>,
     /// 自适应控制器（可选，None 时行为与改造前完全一致）
     adaptive_controller: Option<Arc<AdaptiveController>>,
-    /// 运行时旋钮（准入/抖动/画像系数），全部默认关闭以保持向后兼容
-    knobs: SchedulerKnobs,
+    /// 运行时旋钮（准入/抖动/画像系数），全部默认关闭以保持向后兼容。
+    /// RwLock 包装：支持运行时热更，见 `update_knobs`。
+    knobs: RwLock<SchedulerKnobs>,
     /// 任务画像（EWMA 耗时统计）
     profile_store: Arc<TaskProfileStore>,
     /// 负载采样器（可注入 mock）
@@ -1173,7 +1174,7 @@ impl TaskScheduler {
                 m.insert(TaskCategory::Tracker, 0);
                 m
             }),
-            max_concurrency: CategoryConcurrency::default(),
+            max_concurrency: RwLock::new(CategoryConcurrency::default()),
             resource_monitor,
             seq_counter: RwLock::new(0),
             completed_dependencies: RwLock::new(HashSet::new()),
@@ -1181,7 +1182,7 @@ impl TaskScheduler {
             last_heartbeat: Arc::new(AtomicI64::new(0)),
             watchdog_running: Arc::new(AtomicBool::new(false)),
             adaptive_controller: None,
-            knobs: SchedulerKnobs::default(),
+            knobs: RwLock::new(SchedulerKnobs::default()),
             profile_store: Arc::new(TaskProfileStore::new(
                 SchedulerKnobs::default().profile_ewma_alpha,
             )),
@@ -1215,8 +1216,8 @@ impl TaskScheduler {
     }
 
     /// 设置各分类并发度
-    pub fn with_category_concurrency(mut self, config: CategoryConcurrency) -> Self {
-        self.max_concurrency = config;
+    pub fn with_category_concurrency(self, config: CategoryConcurrency) -> Self {
+        *self.max_concurrency.write() = config;
         self
     }
 
@@ -1234,13 +1235,50 @@ impl TaskScheduler {
 
     /// 注入运行时旋钮（准入/随机抖动/画像 EWMA 系数）。
     /// 所有新功能默认关闭，未注入时行为与改造前完全一致。
-    pub fn with_knobs(mut self, knobs: SchedulerKnobs) -> Self {
+    pub fn with_knobs(self, knobs: SchedulerKnobs) -> Self {
         self.profile_store.set_alpha(knobs.profile_ewma_alpha);
         // 重建负载预测器以采用新的 alpha / 历史窗口
         *self.load_predictor.write() =
             LoadPredictor::new(knobs.predict_ewma_alpha, knobs.predict_history_size);
-        self.knobs = knobs;
+        *self.knobs.write() = knobs;
         self
+    }
+
+    /// 运行时热更运行时旋钮（config reloader 调用）。
+    ///
+    /// 画像 EWMA 系数与负载预测器窗口仅影响此后新建的画像/预测状态，
+    /// 已存在的 profile_store / load_predictor 不重建（与启动注入行为一致）。
+    pub fn update_knobs(&self, knobs: SchedulerKnobs) {
+        *self.knobs.write() = knobs;
+    }
+
+    /// 运行时热更各分类最大并发度（config reloader 调用）。
+    /// 下一次准入判定即生效；已运行任务的槽位不受影响。
+    pub fn update_category_concurrency(&self, config: CategoryConcurrency) {
+        *self.max_concurrency.write() = config;
+    }
+
+    /// 运行时热更任务执行周期（config reloader 调用）。
+    ///
+    /// 直接改写任务元数据的基准 `interval` 并重置自适应偏离；
+    /// 任务本次执行完成后按新周期重排（`current_interval_secs` 重置为新基准）。
+    /// 返回 false 表示任务不存在。
+    pub fn update_interval(&self, task_id: &str, interval: Duration) -> bool {
+        let mut tasks = self.tasks.write();
+        match tasks.get_mut(task_id) {
+            Some(meta) => {
+                meta.interval = interval;
+                meta.current_interval_secs = interval.as_secs();
+                meta.adaptive_deviation = 1.0;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 查询任务当前基准周期（config reloader 推断单位用）
+    pub fn task_interval(&self, task_id: &str) -> Option<Duration> {
+        self.tasks.read().get(task_id).map(|m| m.interval)
     }
 
     /// S1-P3/三: 注入外部 IO 背压级别 [0.0, 1.0]（IOScheduler Agent 在 main.rs 中调用）。
@@ -1315,7 +1353,7 @@ impl TaskScheduler {
 
     /// 查询指定分类最大并发度
     pub fn max_concurrency_for(&self, cat: TaskCategory) -> u32 {
-        self.max_concurrency.max_for(cat)
+        self.max_concurrency.read().max_for(cat)
     }
 
     /// 当前「在飞」任务数（= 已准入但执行体尚未返回）
@@ -1354,7 +1392,7 @@ impl TaskScheduler {
                 "{}={}/{}",
                 name,
                 running.get(&cat).unwrap_or(&0),
-                self.max_concurrency.max_for(cat)
+                self.max_concurrency.read().max_for(cat)
             ));
         }
         parts.join(", ")
@@ -1372,10 +1410,14 @@ impl TaskScheduler {
     ///
     /// `cat = None` 表示巡检全部分类（watchdog 线程使用）。
     pub fn reclaim_stale_slots(&self, cat: Option<TaskCategory>) -> u32 {
-        if !self.knobs.stale_slot_reclaim_enabled {
+        let (stale_enabled, factor_knob) = {
+            let knobs = self.knobs.read();
+            (knobs.stale_slot_reclaim_enabled, knobs.stale_slot_factor)
+        };
+        if !stale_enabled {
             return 0;
         }
-        let factor = self.knobs.stale_slot_factor.max(1.0) as f64;
+        let factor = factor_knob.max(1.0) as f64;
 
         // ① 只读扫描：避免持写锁做耗时判断
         let stale: Vec<(u64, InFlightTask, f64)> = {
@@ -1566,15 +1608,13 @@ impl TaskScheduler {
             })
             .expect("failed to spawn watchdog thread");
 
-        info!(
-            "[task_scheduler] 智能任务调度中心已启动（分级并发: crawl={}, persistence={}, monitor={}, network={}, federation={}, tracker={}）",
-            self.max_concurrency.crawl,
-            self.max_concurrency.persistence,
-            self.max_concurrency.monitor,
-            self.max_concurrency.network,
-            self.max_concurrency.federation,
-            self.max_concurrency.tracker
-        );
+        {
+            let mc = self.max_concurrency.read();
+            info!(
+                "[task_scheduler] 智能任务调度中心已启动（分级并发: crawl={}, persistence={}, monitor={}, network={}, federation={}, tracker={}）",
+                mc.crawl, mc.persistence, mc.monitor, mc.network, mc.federation, mc.tracker
+            );
+        }
     }
 
     /// 优雅停止调度器：置位运行标志，主循环与 watchdog 线程都会在下一轮检查后退出。
@@ -1628,8 +1668,15 @@ impl TaskScheduler {
             }
             // S1-P3: 闭环重算自适应间隔（每 N 个 tick；关闭时 no-op）
             adaptive_tick = adaptive_tick.wrapping_add(1);
-            let recalc_period = self.knobs.adaptive_recalc_ticks.max(1) as u64;
-            if self.knobs.adaptive_interval_enabled && adaptive_tick.is_multiple_of(recalc_period) {
+            // 读取后在 await 前释放锁守卫
+            let (adaptive_enabled, recalc_period) = {
+                let knobs = self.knobs.read();
+                (
+                    knobs.adaptive_interval_enabled,
+                    knobs.adaptive_recalc_ticks.max(1) as u64,
+                )
+            };
+            if adaptive_enabled && adaptive_tick.is_multiple_of(recalc_period) {
                 self.recalc_adaptive_intervals();
             }
             if heartbeat.elapsed() >= SCHEDULER_HEARTBEAT_INTERVAL {
@@ -1684,7 +1731,7 @@ impl TaskScheduler {
         let resource = scheduler.resource_monitor.current();
 
         // S1-P2: 每 tick 喂入融合背压后的采样点给负载预测器（仅在启用时）
-        if scheduler.knobs.predictive_scheduling_enabled {
+        if scheduler.knobs.read().predictive_scheduling_enabled {
             let sample = scheduler.effective_sample();
             scheduler.load_predictor.write().record(sample);
         }
@@ -1826,7 +1873,7 @@ impl TaskScheduler {
                     .read()
                     .get(&item.task_id)
                     .unwrap_or(&0);
-                match admission_decide(&scheduler.knobs, &meta, sample, delayed) {
+                match admission_decide(&scheduler.knobs.read(), &meta, sample, delayed) {
                     AdmissionDecision::Delay => {
                         *scheduler
                             .admission_delays
@@ -1866,12 +1913,14 @@ impl TaskScheduler {
             }
 
             // S1-P2: 预测式调度（默认关闭；仅推迟 Normal/Background 低优先级任务）
-            if scheduler.knobs.predictive_scheduling_enabled && is_predictive_deferrable(&meta) {
+            if scheduler.knobs.read().predictive_scheduling_enabled
+                && is_predictive_deferrable(&meta)
+            {
                 let predicted_over = {
                     let p = scheduler.load_predictor.read();
-                    let lookahead = scheduler.knobs.predict_lookahead_ticks.max(1);
-                    (1..=lookahead)
-                        .any(|t| predictive_over_threshold(&scheduler.knobs, p.predict(t)))
+                    let knobs = scheduler.knobs.read();
+                    let lookahead = knobs.predict_lookahead_ticks.max(1);
+                    (1..=lookahead).any(|t| predictive_over_threshold(&knobs, p.predict(t)))
                 };
                 if predicted_over {
                     let delayed = *scheduler
@@ -1879,7 +1928,7 @@ impl TaskScheduler {
                         .read()
                         .get(&item.task_id)
                         .unwrap_or(&0);
-                    if delayed >= scheduler.knobs.admission_max_delay_ticks {
+                    if delayed >= scheduler.knobs.read().admission_max_delay_ticks {
                         // 预测式推迟预算用尽，强制执行避免饥饿
                         scheduler.predicted_delays.write().remove(&item.task_id);
                         debug!(
@@ -1940,14 +1989,20 @@ impl TaskScheduler {
     /// - 保活任务与亚秒级任务不参与（adaptive_eligible=false）。
     /// - dirty 积压高时，优先延长非持久化任务间隔，给持久化让资源。
     fn recalc_adaptive_intervals(&self) {
-        if !self.knobs.adaptive_interval_enabled {
+        let (adaptive_enabled, target, min_ratio, max_ratio) = {
+            let knobs = self.knobs.read();
+            (
+                knobs.adaptive_interval_enabled,
+                knobs.adaptive_target_load,
+                knobs.adaptive_min_ratio,
+                knobs.adaptive_max_ratio,
+            )
+        };
+        if !adaptive_enabled {
             return;
         }
         let sample = self.effective_sample();
         let load = sample.cpu.max(sample.io);
-        let target = self.knobs.adaptive_target_load;
-        let min_ratio = self.knobs.adaptive_min_ratio;
-        let max_ratio = self.knobs.adaptive_max_ratio;
         let dirty = self.dirty_backlog.load(Ordering::Relaxed);
 
         // dirty 积压越重，非持久化任务间隔延长越多（线性到 max_ratio）
@@ -2146,7 +2201,15 @@ impl TaskScheduler {
             };
             // S1-P3: 自适应间隔（关闭时回退基准 meta.interval，行为与改造前一致）
             // 重新读取最新的 current_interval_secs（闭环可能在任务运行期间重算）
-            let base_interval = if scheduler.knobs.adaptive_interval_enabled {
+            let (adaptive_enabled, jitter_enabled, jitter_ratio) = {
+                let knobs = scheduler.knobs.read();
+                (
+                    knobs.adaptive_interval_enabled,
+                    knobs.random_jitter_enabled,
+                    knobs.random_jitter_ratio,
+                )
+            };
+            let base_interval = if adaptive_enabled {
                 scheduler
                     .tasks
                     .read()
@@ -2157,11 +2220,8 @@ impl TaskScheduler {
             } else {
                 meta.interval
             };
-            let interval_with_ratio = apply_interval_jitter(
-                base_interval,
-                scheduler.knobs.random_jitter_enabled,
-                scheduler.knobs.random_jitter_ratio,
-            );
+            let interval_with_ratio =
+                apply_interval_jitter(base_interval, jitter_enabled, jitter_ratio);
             scheduler.schedule_task(
                 &task_id,
                 Instant::now() + interval_with_ratio + Duration::from_secs(jitter_secs),
@@ -2195,7 +2255,7 @@ impl TaskScheduler {
         let tasks = self.tasks.read();
         let stats = self.stats.read();
         let running_by_cat = self.running_by_category.read().clone();
-        let max_conc = self.max_concurrency;
+        let max_conc = *self.max_concurrency.read();
         let queue_len = self.queue.read().len();
 
         let mut total_executions = 0u64;
@@ -2213,7 +2273,7 @@ impl TaskScheduler {
             total_executions,
             total_failures,
             resource: self.resource_monitor.current(),
-            adaptive_interval_enabled: self.knobs.adaptive_interval_enabled,
+            adaptive_interval_enabled: self.knobs.read().adaptive_interval_enabled,
             adaptive_task_count: tasks.values().filter(|m| m.adaptive_eligible()).count(),
             avg_adaptive_deviation: {
                 let elig: Vec<&TaskMetadata> =
@@ -2262,7 +2322,7 @@ impl TaskScheduler {
             (
                 name.to_string(),
                 *running.get(&cat).unwrap_or(&0),
-                self.max_concurrency.max_for(cat),
+                self.max_concurrency.read().max_for(cat),
                 *oldest_by_cat.get(&cat).unwrap_or(&0),
             )
         })
@@ -2442,6 +2502,77 @@ mod tests {
 
         // Critical 应该排在 Normal 前面
         assert!(item1 > item2);
+    }
+
+    #[test]
+    fn test_update_interval_resets_adaptive_state() {
+        let scheduler = TaskScheduler::new();
+        scheduler.register(
+            TaskMetadata::new("task_a", "Task A", Duration::from_secs(30)),
+            || async { Ok(()) },
+        );
+        assert_eq!(
+            scheduler.task_interval("task_a"),
+            Some(Duration::from_secs(30))
+        );
+
+        // 热更周期：基准 interval 与自适应偏离都应重置
+        assert!(scheduler.update_interval("task_a", Duration::from_secs(5)));
+        assert_eq!(
+            scheduler.task_interval("task_a"),
+            Some(Duration::from_secs(5))
+        );
+        let meta = scheduler
+            .list_tasks()
+            .into_iter()
+            .find(|m| m.id == "task_a")
+            .unwrap();
+        assert_eq!(meta.current_interval_secs, 5);
+        assert_eq!(meta.adaptive_deviation, 1.0);
+
+        // 不存在的任务返回 false
+        assert!(!scheduler.update_interval("no_such", Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_update_category_concurrency_hot() {
+        let scheduler = TaskScheduler::new();
+        let before = scheduler.max_concurrency_for(TaskCategory::Crawl);
+        let cc = CategoryConcurrency {
+            crawl: before + 7,
+            ..CategoryConcurrency::default()
+        };
+        scheduler.update_category_concurrency(cc);
+        assert_eq!(
+            scheduler.max_concurrency_for(TaskCategory::Crawl),
+            before + 7
+        );
+        // 其他分类不受影响
+        assert_eq!(
+            scheduler.max_concurrency_for(TaskCategory::Monitor),
+            CategoryConcurrency::default().monitor
+        );
+    }
+
+    #[test]
+    fn test_update_knobs_hot() {
+        let scheduler = TaskScheduler::new();
+        assert!(!scheduler.summary().adaptive_interval_enabled);
+        let knobs = SchedulerKnobs {
+            adaptive_interval_enabled: true,
+            admission_cpu_threshold: 0.66,
+            ..SchedulerKnobs::default()
+        };
+        scheduler.update_knobs(knobs);
+        assert!(scheduler.summary().adaptive_interval_enabled);
+        // 准入判定读取的是新旋钮（admission_decide 内部读 knobs）
+        let knobs = SchedulerKnobs::default();
+        let meta = TaskMetadata::new("k", "K", Duration::from_secs(1));
+        let sample = LoadSample { cpu: 0.0, io: 0.0 };
+        assert!(matches!(
+            admission_decide(&knobs, &meta, sample, 0),
+            AdmissionDecision::Allow
+        ));
     }
 
     #[tokio::test]

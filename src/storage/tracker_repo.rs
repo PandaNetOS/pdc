@@ -1,4 +1,4 @@
-﻿//! TrackerRepository 实现
+//! TrackerRepository 实现
 //!
 //! 封装 tracker 状态 + SQLite 持久化。
 //!
@@ -26,7 +26,7 @@ pub struct TrackerRepoImpl {
     /// 冷热分层缓存（替代原 FxHashMap 全量存储）
     cache: TieredCache<String, TrackerEntry>,
     /// 持久化脏 tracker 集合（统计数据变化，需要增量持久化到 SQLite）
-    persist_dirty: RwLock<FxHashSet<String>>,
+    persist_dirty: Arc<RwLock<FxHashSet<String>>>,
     /// 评分脏 tracker 集合（评分已更新，供评分系统查询增量评分）
     score_dirty: RwLock<FxHashSet<String>>,
     storage: Arc<Storage>,
@@ -57,7 +57,7 @@ impl TrackerRepoImpl {
     ) -> Self {
         Self {
             cache: TieredCache::new(cache_config),
-            persist_dirty: RwLock::new(FxHashSet::default()),
+            persist_dirty: Arc::new(RwLock::new(FxHashSet::default())),
             score_dirty: RwLock::new(FxHashSet::default()),
             storage,
             gossip: OnceLock::new(),
@@ -347,7 +347,8 @@ impl TrackerRepoImpl {
     pub async fn save_dirty(&self) -> anyhow::Result<()> {
         if let Some(wq) = &self.write_queue {
             // 异步模式：原子取出并清空 dirty，非阻塞入队 WriteQueue
-            let dirty_urls = self.take_dirty_sync();
+            // B3：先快照 dirty（不清空），落库成功后才清
+            let dirty_urls = self.dirty_trackers_sync();
             if dirty_urls.is_empty() {
                 return Ok(());
             }
@@ -357,7 +358,18 @@ impl TrackerRepoImpl {
             }
             let wq = wq.clone();
             let count = batch.len();
-            wq.send(move |conn| Storage::save_trackers_batch_in_tx(conn, &batch));
+            let rows = count;
+            let dirty_arc = self.persist_dirty.clone();
+            let ack = dirty_urls.clone();
+            let _ = wq.send_sized(rows, move |conn| {
+                Storage::save_trackers_batch_in_tx(conn, &batch)?;
+                // 落库成功后才清 dirty；失败保留待重试
+                let mut d = dirty_arc.write();
+                for u in &ack {
+                    d.remove(u);
+                }
+                Ok(())
+            });
             tracing::debug!("[tracker_repo] 异步入队保存 {} 个 dirty tracker", count);
             Ok(())
         } else {

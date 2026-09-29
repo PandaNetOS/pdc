@@ -312,7 +312,9 @@ impl InfohashRepoImpl {
         if let Some(wq) = &self.write_queue {
             // 寮傛妯″紡锛氶潪闃诲鍏ラ槦 WriteQueue
             let count = entries.len();
-            wq.send(move |conn| Storage::save_infohashes_batch_in_tx(conn, &entries));
+            let _ = wq.send_sized(entries.len(), move |conn| {
+                Storage::save_infohashes_batch_in_tx(conn, &entries)
+            });
             tracing::debug!(
                 "[infohash_repo] 寮傛鍏ラ槦鍏ㄩ噺淇濆瓨 {} 涓?infohash",
                 count

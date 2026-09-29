@@ -264,3 +264,54 @@ Federation 分类并发上限 = 8
 ### 已知遗留（未修，下一轮）
 
 tracker 删除墓碑复活闭环、gossip 限流全跳过丢批与 3-tick 重试丢弃、oplog 裁剪越界静默丢 op（min_seq 无人消费）、bootstrap 非 NODE repo 被 `continue` 跳过 delta、bootstrap 块校验「整区间重算」语义在接收方有本地数据时恒失配。
+
+---
+
+## 2026-09-29 配置热重载完整落地（config hot-reload）
+
+> 本节为配置热重载的最新行为基准。此前「简化版：仅记录日志，不实际生效」的描述已过时。
+
+### 机制
+
+`config_reloader` 周期任务（TaskScheduler 注册，间隔 `config_reload_interval_secs`，0=禁用）：
+**mtime 轮询 → 防抖（`config_reload_debounce_ms`，默认 1000ms，mtime 稳定为止）→ `PdcConfig::from_file` 解析 → `diff_configs` 差异对比 → `classify_delta` 分类 → 应用 → 更新快照 + `ControlPlane::update_config` 发布 `Event::ConfigChanged`（ws 转发前端）**。
+
+核心实现：`src/control_plane/config_reload.rs`（ConfigReloader）。同一 apply 管线供两个触发源共用：
+- 文件监听（周期任务）；坏配置不推进 mtime 基线，下个周期自动重试；
+- `POST /api/v1/config/reload`（跳过 mtime 检查立即重载；继承 API token 鉴权）；`GET /api/v1/config` 返回当前快照。
+
+### 参数分类（白名单外一律按「需重启」处理，新增字段默认安全）
+
+| 类别 | 字段 | 应用方式 |
+|---|---|---|
+| A 纯策略 | `crawler.rate_limit_enter_threshold/exit_threshold/min_samples/throttle_skip_ratio` | `RateLimiter::update_config(&self)`（内部可变性，Arc 共享热更） |
+| A 纯策略 | `log_level` | tracing reload 层热替换（另修复：过滤层此前挂链尾不生效，已移至链首） |
+| A 纯策略 | `super_tracker.*`（除 udp_port/relay_port） | `SuperTrackerState::update_config` 整节热替换 |
+| B 调度 | `task_scheduler.intervals.*` | `TaskScheduler::update_interval`；时间单位（秒/毫秒）按「旧值换算==当前周期」反推，推断不出则跳过不猜 |
+| B 调度 | `task_scheduler.*_concurrency` | `TaskScheduler::update_category_concurrency` |
+| B 调度 | `task_scheduler.*`（准入/抖动/预测/自适应旋钮） | `TaskScheduler::update_knobs(SchedulerKnobs::from_config)` |
+| B 调度 | `config_reload_interval_secs` | reloader 改自己的任务周期；`config_reload_debounce_ms` 每轮从快照读取 |
+| C 结构性 | 端口类 / `socket_count` / `*_runtime_threads` / 存储路径等 | 不热切，仅 WARN 提示重启生效 |
+
+### 安全护栏
+
+1. 坏配置绝不应用：解析失败保留旧配置继续运行，连续失败 ≥3 次升级 ERROR；
+2. 防抖防半写入：mtime 变化后等 `config_reload_debounce_ms`，最长 3 轮；
+3. C 类字段只告警不应用；每次重载打 diff 明细（长值截断）；
+4. `TaskScheduler` 的 `knobs`/`max_concurrency` 改为 `RwLock` 内部可变性（读取点已全部改为短临界区，不跨 await 持锁）。
+
+### 新增配置字段（全部带 `#[serde(default)]`，缺省行为与引入前一致）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `crawler.rate_limit_enter_threshold` | 0.15 | 进入限速阈值（此前为模块内常量，本节落地为配置） |
+| `crawler.rate_limit_exit_threshold` | 0.30 | 解除限速阈值 |
+| `crawler.rate_limit_min_samples` | 50 | 限速判断最小样本数 |
+| `crawler.rate_limit_throttle_skip_ratio` | 0.5 | 限速时降频跳过比例 |
+| `config_reload_debounce_ms` | 1000 | 热重载防抖等待（毫秒） |
+
+### ICC 预留（ADR-005）
+
+`ControlSource::{FileWatcher, Api, Icc}` 与 `ConfigDelta.controlled_by` 为 pk/ICC 意图下发预留位；
+ICC P3 接入时在 `ConfigReloader::apply` 插入「pk 意图 > ICC 策略 > 本地文件 > 默认值」优先级仲裁，
+apply 管线结构不变。

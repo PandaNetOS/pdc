@@ -54,6 +54,9 @@ pub struct PdcConfig {
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// 日志滚动/大小治理（A5）
+    #[serde(default)]
+    pub logging: LoggingConfig,
     /// 是否启用端口自动探测（启动时自动探测一组可用端口）
     #[serde(default = "default_port_auto_alloc")]
     pub port_auto_alloc: bool,
@@ -66,6 +69,10 @@ pub struct PdcConfig {
     /// 配置热更新间隔（秒，0=禁用）
     #[serde(default = "default_config_reload_interval_secs")]
     pub config_reload_interval_secs: u64,
+    /// 配置热更新防抖等待（毫秒）。检测到 mtime 变化后等待该时长再读取，
+    /// 规避编辑器半写入（读到写了一半的 YAML）。0 表示不防抖。
+    #[serde(default = "default_config_reload_debounce_ms")]
+    pub config_reload_debounce_ms: u64,
     /// Tokio runtime worker 线程数（0=自动按 CPU 核数，默认 12）
     #[serde(default = "default_runtime_worker_threads")]
     pub runtime_worker_threads: usize,
@@ -365,6 +372,19 @@ pub struct StorageConfig {
     /// 是否启用持久化
     #[serde(default = "default_storage_enabled")]
     pub enabled: bool,
+    /// C1：启动时是否做磁盘画像探测（fsync/随机-顺序比）
+    #[serde(default = "default_storage_disk_probe_enabled")]
+    pub disk_probe_enabled: bool,
+    /// C1：磁盘探测预算（毫秒）
+    #[serde(default = "default_storage_disk_probe_budget_ms")]
+    pub disk_probe_budget_ms: u64,
+}
+
+fn default_storage_disk_probe_enabled() -> bool {
+    true
+}
+fn default_storage_disk_probe_budget_ms() -> u64 {
+    1500
 }
 
 fn default_storage_path() -> String {
@@ -380,6 +400,8 @@ impl Default for StorageConfig {
         Self {
             path: default_storage_path(),
             enabled: default_storage_enabled(),
+            disk_probe_enabled: default_storage_disk_probe_enabled(),
+            disk_probe_budget_ms: default_storage_disk_probe_budget_ms(),
         }
     }
 }
@@ -432,6 +454,22 @@ pub struct SqliteConfig {
     /// 忙等待超时（毫秒，0=不等待）。避免 WAL checkpoint/VACUUM 与写事务并发时直接返回 SQLITE_BUSY。
     #[serde(default = "default_sqlite_busy_timeout_ms")]
     pub busy_timeout_ms: u32,
+    /// v11（A3）：删除 v8 去 Merkle 化后无人查询的 l2_shard 索引（纯写放大）。
+    /// 列与写入路径保留；默认 true，因为可证明全仓库无 `WHERE l2_shard` 查询。
+    #[serde(default = "default_sqlite_drop_unused_indexes")]
+    pub drop_unused_indexes: bool,
+    /// B5-1：一次性 DROP idx_peers_infohash / idx_peers_archive_infohash
+    /// （与 PK 前缀重复，纯写放大；证据见 16 号文档）。幂等，默认 true。
+    #[serde(default = "default_sqlite_drop_redundant_peer_indexes")]
+    pub drop_redundant_peer_indexes: bool,
+}
+
+fn default_sqlite_drop_redundant_peer_indexes() -> bool {
+    true
+}
+
+fn default_sqlite_drop_unused_indexes() -> bool {
+    true
 }
 
 fn default_sqlite_busy_timeout_ms() -> u32 {
@@ -463,6 +501,8 @@ impl Default for SqliteConfig {
             temp_store: default_sqlite_temp_store(),
             synchronous: default_sqlite_synchronous(),
             busy_timeout_ms: default_sqlite_busy_timeout_ms(),
+            drop_unused_indexes: default_sqlite_drop_unused_indexes(),
+            drop_redundant_peer_indexes: default_sqlite_drop_redundant_peer_indexes(),
         }
     }
 }
@@ -513,6 +553,122 @@ pub struct IoSchedulerConfig {
     /// 令牌不足时的重试等待时间（毫秒）
     #[serde(default = "default_io_retry_wait_ms")]
     pub retry_wait_ms: u64,
+
+    // ===== A1/A2: WAL checkpoint 接管与决策 tick =====
+    /// 应用是否接管 WAL checkpoint。true：启动置 wal_autocheckpoint=0 并注册决策 tick；
+    /// false：不注册，恢复 SQLite 自动 checkpoint。禁止两套并存。
+    #[serde(default = "default_io_checkpoint_takeover")]
+    pub checkpoint_takeover: bool,
+    /// 决策 tick 间隔（毫秒，只读原子量+文件尺寸，O(1) 不阻塞）
+    #[serde(default = "default_io_checkpoint_tick_ms")]
+    pub checkpoint_tick_ms: u64,
+    /// 两次 checkpoint 的最小间隔（秒）
+    #[serde(default = "default_io_checkpoint_min_interval_secs")]
+    pub checkpoint_min_interval_secs: u64,
+    /// WAL 软阈值（MB）：达到才允许触发
+    #[serde(default = "default_io_checkpoint_wal_soft_mb")]
+    pub checkpoint_wal_soft_mb: u64,
+    /// WAL 硬阈值（MB）：超过则无视最小间隔强制触发并告警
+    #[serde(default = "default_io_checkpoint_wal_hard_mb")]
+    pub checkpoint_wal_hard_mb: u64,
+    /// 单次 checkpoint 超过此毫秒判定为"慢"
+    #[serde(default = "default_io_checkpoint_slow_ms")]
+    pub checkpoint_slow_ms: u64,
+    /// 慢后退避基准（秒）
+    #[serde(default = "default_io_checkpoint_backoff_base_secs")]
+    pub checkpoint_backoff_base_secs: u64,
+    /// 退避上限（秒）
+    #[serde(default = "default_io_checkpoint_backoff_max_secs")]
+    pub checkpoint_backoff_max_secs: u64,
+    /// 退避系数（next_allowed = base * factor^streak）
+    #[serde(default = "default_io_checkpoint_backoff_factor")]
+    pub checkpoint_backoff_factor: f32,
+    /// 连续慢 N 次 → 发事件 + warn
+    #[serde(default = "default_io_checkpoint_slow_streak_alert")]
+    pub checkpoint_slow_streak_alert: u32,
+    /// TRUNCATE 前的最低 WAL（MB），小于此不做 TRUNCATE
+    #[serde(default = "default_io_checkpoint_truncate_min_wal_mb")]
+    pub checkpoint_truncate_min_wal_mb: u64,
+
+    // ===== A4: bootstrap 导入窗口自适应配额 =====
+    /// 导入窗口 TTL（秒）
+    #[serde(default = "default_io_bootstrap_import_window_ttl_secs")]
+    pub bootstrap_import_window_ttl_secs: u64,
+    /// 起步倍率（原硬编码 ×200）
+    #[serde(default = "default_io_bootstrap_import_budget_start_multiplier")]
+    pub bootstrap_import_budget_start_multiplier: usize,
+    /// 倍率上限
+    #[serde(default = "default_io_bootstrap_import_budget_max_multiplier")]
+    pub bootstrap_import_budget_max_multiplier: usize,
+    /// AIMD 目标耗时（毫秒）
+    #[serde(default = "default_io_adaptive_latency_target_ms")]
+    pub adaptive_latency_target_ms: u64,
+    /// 耗时 EWMA α
+    #[serde(default = "default_io_adaptive_latency_alpha")]
+    pub adaptive_latency_alpha: f32,
+    /// 增窗步长
+    #[serde(default = "default_io_adaptive_budget_grow_step")]
+    pub adaptive_budget_grow_step: usize,
+    /// 连续稳定多少批后增窗
+    #[serde(default = "default_io_adaptive_budget_grow_after_batches")]
+    pub adaptive_budget_grow_after_batches: u32,
+
+    // ===== B1/B2: row-based scheduling & token bucket switch =====
+    /// steady tick interval (ms)
+    #[serde(default = "default_io_steady_tick_ms")]
+    pub steady_tick_ms: u64,
+    /// max requests pulled per tick (request-count ceiling)
+    #[serde(default = "default_io_max_requests_per_tick")]
+    pub max_requests_per_tick: usize,
+    /// row budget per tick (row-based smooth ceiling, 0=unlimited)
+    #[serde(default = "default_io_rows_per_tick")]
+    pub rows_per_tick: usize,
+    /// token bucket master switch (wired, default off for gray rollout)
+    #[serde(default = "default_io_token_bucket_enabled")]
+    pub token_bucket_enabled: bool,
+    /// row-based backpressure low watermark
+    #[serde(default = "default_io_low_watermark_rows")]
+    pub low_watermark_rows: usize,
+    /// row-based backpressure high watermark
+    #[serde(default = "default_io_high_watermark_rows")]
+    pub high_watermark_rows: usize,
+    /// batch latency target (ms)
+    #[serde(default = "default_io_latency_target_ms")]
+    pub latency_target_ms: u64,
+    /// batch latency slow threshold (ms)
+    #[serde(default = "default_io_latency_slow_ms")]
+    pub latency_slow_ms: u64,
+    /// persistence backoff gate: skip periodic_persistence when level exceeds this
+    #[serde(default = "default_io_persistence_backoff_level")]
+    pub persistence_backoff_level: f32,
+}
+
+fn default_io_steady_tick_ms() -> u64 {
+    10
+}
+fn default_io_max_requests_per_tick() -> usize {
+    64
+}
+fn default_io_rows_per_tick() -> usize {
+    5_000
+}
+fn default_io_token_bucket_enabled() -> bool {
+    false
+}
+fn default_io_low_watermark_rows() -> usize {
+    20_000
+}
+fn default_io_high_watermark_rows() -> usize {
+    200_000
+}
+fn default_io_latency_target_ms() -> u64 {
+    50
+}
+fn default_io_latency_slow_ms() -> u64 {
+    500
+}
+fn default_io_persistence_backoff_level() -> f32 {
+    0.7
 }
 
 fn default_io_scheduler_enabled() -> bool {
@@ -551,6 +707,60 @@ fn default_io_idle_wait_ms() -> u64 {
 fn default_io_retry_wait_ms() -> u64 {
     50
 }
+fn default_io_checkpoint_takeover() -> bool {
+    true
+}
+fn default_io_checkpoint_tick_ms() -> u64 {
+    1000
+}
+fn default_io_checkpoint_min_interval_secs() -> u64 {
+    5
+}
+fn default_io_checkpoint_wal_soft_mb() -> u64 {
+    32
+}
+fn default_io_checkpoint_wal_hard_mb() -> u64 {
+    128
+}
+fn default_io_checkpoint_slow_ms() -> u64 {
+    2000
+}
+fn default_io_checkpoint_backoff_base_secs() -> u64 {
+    5
+}
+fn default_io_checkpoint_backoff_max_secs() -> u64 {
+    300
+}
+fn default_io_checkpoint_backoff_factor() -> f32 {
+    2.0
+}
+fn default_io_checkpoint_slow_streak_alert() -> u32 {
+    3
+}
+fn default_io_checkpoint_truncate_min_wal_mb() -> u64 {
+    16
+}
+fn default_io_bootstrap_import_window_ttl_secs() -> u64 {
+    30
+}
+fn default_io_bootstrap_import_budget_start_multiplier() -> usize {
+    8
+}
+fn default_io_bootstrap_import_budget_max_multiplier() -> usize {
+    200
+}
+fn default_io_adaptive_latency_target_ms() -> u64 {
+    200
+}
+fn default_io_adaptive_latency_alpha() -> f32 {
+    0.2
+}
+fn default_io_adaptive_budget_grow_step() -> usize {
+    2
+}
+fn default_io_adaptive_budget_grow_after_batches() -> u32 {
+    32
+}
 
 impl Default for IoSchedulerConfig {
     fn default() -> Self {
@@ -568,6 +778,62 @@ impl Default for IoSchedulerConfig {
             backpressure_poll_interval_secs: default_io_backpressure_poll_interval_secs(),
             idle_wait_ms: default_io_idle_wait_ms(),
             retry_wait_ms: default_io_retry_wait_ms(),
+            checkpoint_takeover: default_io_checkpoint_takeover(),
+            checkpoint_tick_ms: default_io_checkpoint_tick_ms(),
+            checkpoint_min_interval_secs: default_io_checkpoint_min_interval_secs(),
+            checkpoint_wal_soft_mb: default_io_checkpoint_wal_soft_mb(),
+            checkpoint_wal_hard_mb: default_io_checkpoint_wal_hard_mb(),
+            checkpoint_slow_ms: default_io_checkpoint_slow_ms(),
+            checkpoint_backoff_base_secs: default_io_checkpoint_backoff_base_secs(),
+            checkpoint_backoff_max_secs: default_io_checkpoint_backoff_max_secs(),
+            checkpoint_backoff_factor: default_io_checkpoint_backoff_factor(),
+            checkpoint_slow_streak_alert: default_io_checkpoint_slow_streak_alert(),
+            checkpoint_truncate_min_wal_mb: default_io_checkpoint_truncate_min_wal_mb(),
+            bootstrap_import_window_ttl_secs: default_io_bootstrap_import_window_ttl_secs(),
+            bootstrap_import_budget_start_multiplier:
+                default_io_bootstrap_import_budget_start_multiplier(),
+            bootstrap_import_budget_max_multiplier:
+                default_io_bootstrap_import_budget_max_multiplier(),
+            adaptive_latency_target_ms: default_io_adaptive_latency_target_ms(),
+            adaptive_latency_alpha: default_io_adaptive_latency_alpha(),
+            adaptive_budget_grow_step: default_io_adaptive_budget_grow_step(),
+            adaptive_budget_grow_after_batches: default_io_adaptive_budget_grow_after_batches(),
+            steady_tick_ms: default_io_steady_tick_ms(),
+            max_requests_per_tick: default_io_max_requests_per_tick(),
+            rows_per_tick: default_io_rows_per_tick(),
+            token_bucket_enabled: default_io_token_bucket_enabled(),
+            low_watermark_rows: default_io_low_watermark_rows(),
+            high_watermark_rows: default_io_high_watermark_rows(),
+            latency_target_ms: default_io_latency_target_ms(),
+            latency_slow_ms: default_io_latency_slow_ms(),
+            persistence_backoff_level: default_io_persistence_backoff_level(),
+        }
+    }
+}
+
+/// 日志滚动/大小治理配置（A5）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// stdout.log 单文件大小上限（MB），检测到超过时 warn 一次
+    #[serde(default = "default_logging_max_file_mb")]
+    pub max_file_mb: u64,
+    /// 保留的滚动日志份数
+    #[serde(default = "default_logging_rotate_keep")]
+    pub rotate_keep: u32,
+}
+
+fn default_logging_max_file_mb() -> u64 {
+    256
+}
+fn default_logging_rotate_keep() -> u32 {
+    3
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            max_file_mb: default_logging_max_file_mb(),
+            rotate_keep: default_logging_rotate_keep(),
         }
     }
 }
@@ -590,6 +856,10 @@ fn default_auto_firewall_rule() -> bool {
 
 fn default_config_reload_interval_secs() -> u64 {
     30
+}
+
+fn default_config_reload_debounce_ms() -> u64 {
+    1000
 }
 
 fn default_runtime_worker_threads() -> usize {
@@ -734,10 +1004,12 @@ impl Default for PdcConfig {
             io_scheduler: IoSchedulerConfig::default(),
             federation: Default::default(),
             log_level: default_log_level(),
+            logging: LoggingConfig::default(),
             port_auto_alloc: default_port_auto_alloc(),
             port_step: default_port_step(),
             auto_firewall_rule: default_auto_firewall_rule(),
             config_reload_interval_secs: default_config_reload_interval_secs(),
+            config_reload_debounce_ms: default_config_reload_debounce_ms(),
             runtime_worker_threads: default_runtime_worker_threads(),
             tracker_runtime_threads: default_tracker_runtime_threads(),
             api_runtime_threads: default_api_runtime_threads(),
@@ -1107,6 +1379,18 @@ pub struct CrawlerConfig {
     /// 自适应限速滑动窗口大小（秒）
     #[serde(default = "default_rate_limit_window_secs")]
     pub rate_limit_window_secs: u64,
+    /// 进入限速阈值（响应率低于此值进入限速，0.0-1.0）
+    #[serde(default = "default_rate_limit_enter_threshold")]
+    pub rate_limit_enter_threshold: f64,
+    /// 解除限速阈值（响应率高于此值解除限速，0.0-1.0）
+    #[serde(default = "default_rate_limit_exit_threshold")]
+    pub rate_limit_exit_threshold: f64,
+    /// 限速判断最小请求样本数（样本不足时不判断）
+    #[serde(default = "default_rate_limit_min_samples")]
+    pub rate_limit_min_samples: u32,
+    /// 限速时按比例降频跳过（0.5 = 每 2 次发送跳过 1 次）
+    #[serde(default = "default_rate_limit_throttle_skip_ratio")]
+    pub rate_limit_throttle_skip_ratio: f64,
     /// Bootstrap 节点列表
     #[serde(default = "default_crawler_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<(String, u16)>,
@@ -1193,6 +1477,18 @@ fn default_adaptive_rate_limit() -> bool {
 fn default_rate_limit_window_secs() -> u64 {
     60
 }
+fn default_rate_limit_enter_threshold() -> f64 {
+    0.15
+}
+fn default_rate_limit_exit_threshold() -> f64 {
+    0.30
+}
+fn default_rate_limit_min_samples() -> u32 {
+    50
+}
+fn default_rate_limit_throttle_skip_ratio() -> f64 {
+    0.5
+}
 fn default_crawler_bootstrap_nodes() -> Vec<(String, u16)> {
     vec![
         // 主流公共 DHT 路由器
@@ -1242,6 +1538,10 @@ impl Default for CrawlerConfig {
             socket_count: default_crawler_socket_count(),
             adaptive_rate_limit: default_adaptive_rate_limit(),
             rate_limit_window_secs: default_rate_limit_window_secs(),
+            rate_limit_enter_threshold: default_rate_limit_enter_threshold(),
+            rate_limit_exit_threshold: default_rate_limit_exit_threshold(),
+            rate_limit_min_samples: default_rate_limit_min_samples(),
+            rate_limit_throttle_skip_ratio: default_rate_limit_throttle_skip_ratio(),
             bootstrap_nodes: default_crawler_bootstrap_nodes(),
             warmup_node_count: default_warmup_node_count(),
             warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),
@@ -1325,6 +1625,180 @@ impl Default for AdaptiveConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 配置热更新：diff + 分类
+// ---------------------------------------------------------------------------
+
+/// 变更来源（ICC 预留位）。
+///
+/// 当前只有文件监听与 API 手动重载两个触发源；ICC（ADR-005）上线后通过
+/// ControlBus 下发意图时携带 `Icc`，届时 apply 层按「pk 意图 > ICC 策略 >
+/// 本地文件 > 默认值」仲裁是否覆盖运行时值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ControlSource {
+    /// 文件监听（config_reloader 周期任务）
+    FileWatcher,
+    /// API 手动触发（POST /api/v1/config/reload）
+    Api,
+    /// pk/ICC 意图下发（预留，P3 接入）
+    Icc,
+}
+
+/// 变更分类：决定 diff 出的字段如何处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeltaClass {
+    /// 纯策略参数：直接应用到运行时模块（限速阈值、日志级别、超级 Tracker 节配置）
+    ApplyPolicy,
+    /// 调度参数：应用到 TaskScheduler（任务周期、分类并发度、准入/抖动旋钮）
+    ApplyScheduler,
+    /// 结构性参数：不热切，仅告警提示重启生效（端口、socket 数、runtime 线程数等）
+    RestartRequired,
+}
+
+/// 单条配置变更（字段路径 + 新旧值）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigDelta {
+    /// 字段路径，如 `crawler.rate_limit_enter_threshold`、`task_scheduler.intervals.crawler_tick`
+    pub path: String,
+    /// 旧值
+    pub old: serde_json::Value,
+    /// 新值
+    pub new: serde_json::Value,
+    /// 谁触发的变更（ICC 预留位；文件/ API 重载路径恒为对应来源）
+    pub source: ControlSource,
+    /// 该字段当前是否被外部（ICC）持有控制权——P0/P1 恒为 None；
+    /// ICC P3 接入后由 apply 层写入，用于优先级仲裁。
+    pub controlled_by: Option<ControlSource>,
+}
+
+impl ConfigDelta {
+    /// 供日志打印的单行摘要（长值截断，防止 bootstrap_nodes 之类大列表刷屏）
+    pub fn summary(&self) -> String {
+        fmt_value(&self.old, 40) + " -> " + &fmt_value(&self.new, 40)
+    }
+}
+
+fn fmt_value(v: &serde_json::Value, max: usize) -> String {
+    let s = match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if s.len() > max {
+        format!("{}…(len={})", &s[..max], s.len())
+    } else {
+        s
+    }
+}
+
+/// 递归比较两个配置的序列化表示，返回全部变更（含嵌套字段与 map 键）。
+///
+/// 只比较两边都存在的键（同构 struct，serde_json::Value 不含"新增键"语义）；
+/// 列表/标量不一致整体算一条变更，不深入列表内部。
+pub fn diff_configs(old: &PdcConfig, new: &PdcConfig) -> Vec<ConfigDelta> {
+    let old_v = match serde_json::to_value(old) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let new_v = match serde_json::to_value(new) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut deltas = Vec::new();
+    diff_value("", &old_v, &new_v, &mut deltas);
+    deltas
+}
+
+fn diff_value(
+    prefix: &str,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+    out: &mut Vec<ConfigDelta>,
+) {
+    if old == new {
+        return;
+    }
+    match (old, new) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            for (k, bv) in b {
+                match a.get(k) {
+                    Some(av) => {
+                        let path = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{}.{}", prefix, k)
+                        };
+                        diff_value(&path, av, bv, out);
+                    }
+                    None => {
+                        // 旧配置缺失的键（理论上同构 struct 不出现）按整体变更记录
+                        out.push(ConfigDelta {
+                            path: join_path(prefix, k),
+                            old: serde_json::Value::Null,
+                            new: bv.clone(),
+                            source: ControlSource::FileWatcher,
+                            controlled_by: None,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {
+            out.push(ConfigDelta {
+                path: prefix.to_string(),
+                old: old.clone(),
+                new: new.clone(),
+                source: ControlSource::FileWatcher,
+                controlled_by: None,
+            });
+        }
+    }
+}
+
+fn join_path(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{}", prefix, key)
+    }
+}
+
+/// 判定一条变更的分类。
+///
+/// 白名单外一律 [`DeltaClass::RestartRequired`]：未来新增配置字段默认安全，
+/// 不会出现"改了端口竟然真的热切了"的意外。
+pub fn classify_delta(path: &str) -> DeltaClass {
+    // --- A 类：纯策略，直接应用 ---
+    match path {
+        "log_level" => return DeltaClass::ApplyPolicy,
+        "crawler.rate_limit_enter_threshold"
+        | "crawler.rate_limit_exit_threshold"
+        | "crawler.rate_limit_min_samples"
+        | "crawler.rate_limit_throttle_skip_ratio" => return DeltaClass::ApplyPolicy,
+        _ => {}
+    }
+    if path.starts_with("super_tracker.") {
+        // 端口类字段结构性，其余（max_numwant / announce_cache_ttl_secs 等）
+        // 由 SuperTrackerState::update_config 整节热替换
+        return match path {
+            "super_tracker.udp_port" | "super_tracker.relay_port" => DeltaClass::RestartRequired,
+            _ => DeltaClass::ApplyPolicy,
+        };
+    }
+    // --- B 类：调度参数 ---
+    if path.starts_with("task_scheduler.") {
+        return DeltaClass::ApplyScheduler;
+    }
+    match path {
+        // reloader 自身的周期/防抖
+        "config_reload_interval_secs" | "config_reload_debounce_ms" => {
+            return DeltaClass::ApplyScheduler
+        }
+        _ => {}
+    }
+    // --- 其余一律 C 类 ---
+    DeltaClass::RestartRequired
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +1812,103 @@ mod tests {
         assert!(config.discoverers.enable_tracker);
         assert!(config.discoverers.enable_lpd);
         assert!(config.crawler.enabled);
+    }
+
+    #[test]
+    fn test_diff_configs_detects_nested_and_map_changes() {
+        let old = PdcConfig::default();
+        let mut new = PdcConfig::default();
+        new.crawler.rate_limit_enter_threshold = 0.25;
+        new.log_level = "debug".to_string();
+        new.task_scheduler
+            .intervals
+            .insert("crawler_tick".into(), 5);
+        new.server.port = 7000;
+
+        let deltas = diff_configs(&old, &new);
+        let paths: Vec<&str> = deltas.iter().map(|d| d.path.as_str()).collect();
+        assert!(
+            paths.contains(&"crawler.rate_limit_enter_threshold"),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"log_level"));
+        assert!(paths.contains(&"task_scheduler.intervals.crawler_tick"));
+        assert!(paths.contains(&"server.port"));
+        assert_eq!(deltas.len(), 4);
+
+        // 相同配置 → 无变更
+        assert!(diff_configs(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_policy_whitelist() {
+        use DeltaClass::*;
+        // A 类：纯策略白名单
+        assert_eq!(classify_delta("log_level"), ApplyPolicy);
+        assert_eq!(
+            classify_delta("crawler.rate_limit_enter_threshold"),
+            ApplyPolicy
+        );
+        assert_eq!(
+            classify_delta("crawler.rate_limit_min_samples"),
+            ApplyPolicy
+        );
+        assert_eq!(
+            classify_delta("super_tracker.announce_cache_ttl_secs"),
+            ApplyPolicy
+        );
+        assert_eq!(classify_delta("super_tracker.max_numwant"), ApplyPolicy);
+        // A 类中的端口例外
+        assert_eq!(classify_delta("super_tracker.udp_port"), RestartRequired);
+        assert_eq!(classify_delta("super_tracker.relay_port"), RestartRequired);
+        // B 类：调度参数
+        assert_eq!(
+            classify_delta("task_scheduler.crawl_concurrency"),
+            ApplyScheduler
+        );
+        assert_eq!(
+            classify_delta("task_scheduler.intervals.crawler_tick"),
+            ApplyScheduler
+        );
+        assert_eq!(
+            classify_delta("task_scheduler.admission_cpu_threshold"),
+            ApplyScheduler
+        );
+        assert_eq!(
+            classify_delta("config_reload_interval_secs"),
+            ApplyScheduler
+        );
+        assert_eq!(classify_delta("config_reload_debounce_ms"), ApplyScheduler);
+        // C 类：白名单外一律需重启（含未来新增字段）
+        assert_eq!(classify_delta("server.port"), RestartRequired);
+        assert_eq!(classify_delta("crawler.socket_count"), RestartRequired);
+        assert_eq!(classify_delta("runtime_worker_threads"), RestartRequired);
+        assert_eq!(classify_delta("storage.path"), RestartRequired);
+        assert_eq!(classify_delta("some_future_field"), RestartRequired);
+    }
+
+    #[test]
+    fn test_config_delta_summary_truncates_long_values() {
+        let mut old = PdcConfig::default();
+        let mut new = PdcConfig::default();
+        old.crawler.bootstrap_nodes = vec![("very-long-host-name-1.example.com".into(), 1)];
+        new.crawler.bootstrap_nodes = vec![("very-long-host-name-2.example.com".into(), 2)];
+        let deltas = diff_configs(&old, &new);
+        assert_eq!(deltas.len(), 1);
+        let s = deltas[0].summary();
+        assert!(s.contains("…(len="), "长值应被截断: {s}");
+    }
+
+    #[test]
+    fn test_new_hot_reload_config_fields_have_defaults() {
+        let config = PdcConfig::default();
+        assert_eq!(config.config_reload_interval_secs, 30);
+        assert_eq!(config.config_reload_debounce_ms, 1000);
+        let crawler = &config.crawler;
+        assert!((crawler.rate_limit_enter_threshold - 0.15).abs() < f64::EPSILON);
+        assert!((crawler.rate_limit_exit_threshold - 0.30).abs() < f64::EPSILON);
+        assert_eq!(crawler.rate_limit_min_samples, 50);
+        assert!((crawler.rate_limit_throttle_skip_ratio - 0.5).abs() < f64::EPSILON);
     }
 
     /// 带 UTF-8 BOM 的配置文件应被防御性剥离后正常解析

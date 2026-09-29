@@ -235,6 +235,16 @@ pub struct FederationConfig {
     /// 随窗口扩大，直至撞上落库/磁盘上限。
     #[serde(default = "default_bootstrap_window_size")]
     pub bootstrap_window_size: usize,
+    /// D批(D1)：收到对端 bootstrap 清单后，本地按相同 chunk_rows 重建清单并逐块比对 hash，
+    /// hash 一致的块不再请求（只拉差异块）。默认 true；置 false 退回全量盲拉。
+    /// 本地清单重建是全表扫描，内部已 spawn_blocking，不阻塞 tokio worker。
+    #[serde(default = "default_true")]
+    pub bootstrap_skip_identical_chunks: bool,
+    /// D批(D3)：请求方在 bootstrap 块响应成功路径，对每个完成块做的节流 sleep（毫秒）。
+    /// 工程约束「同步不能影响对端正常运行」——16 路窗口满速回包会把对端正常业务挤爆，
+    /// 每收一块退避一小段时间以摊薄压力。0 = 不节流。默认 30ms。
+    #[serde(default = "default_bootstrap_peer_protect_delay_ms")]
+    pub bootstrap_peer_protect_delay_ms: u64,
     /// 发送端 GossipBatch 合并为 bulk 帧的最大 batch 数量。
     /// 同一连接的多个 batch 合并为一个 GossipBatchBulk 发送，减少网络往返。
     #[serde(default = "default_gossip_bulk_max_batches")]
@@ -321,6 +331,27 @@ pub struct FederationConfig {
     /// v9：上述 floor 的硬上限倍数 —— 超过 `retention × 该倍数` 仍强制裁剪，防 oplog 无界增长。
     #[serde(default = "default_oplog_hard_retention_multiplier")]
     pub oplog_hard_retention_multiplier: u64,
+    // ========================================================================
+    // E1/E2：bootstrap 运行时差异复检 + 块窗口空闲看门狗（修复 bootstrap 中途
+    // OOM/超时断裂后永久停在 DELTA、在途块丢失后窗口卡死两个缺陷）
+    // ========================================================================
+    /// E1：bootstrap 中途断裂后，巡检路径用 D2 双向阈值（ratio>1.3 且 diff>50000）
+    /// 重新比对「本地实时行数 vs 对端最近自报行数」，超阈值即重触发 bootstrap。
+    /// 同一 (peer, repo) 在此时长内只重触发一次，防抖动（默认 300s = 5 分钟）。
+    /// 与 v10(F4) 的 `bootstrap_cooldown_secs`（竣工后防死循环）是两条独立冷却：
+    /// F4 管「刚竣工别立刻重打」，本项管「中途断掉后多久允许重打一次」。
+    #[serde(default = "default_bootstrap_rediff_cooldown_secs")]
+    pub bootstrap_rediff_cooldown_secs: u64,
+    /// E2：块传输窗口级空闲看门狗 —— 距最后一块落地超过此时长仍有在途块时，
+    /// 把全部在途块回收进重试队列并重发（默认 60s）。覆盖 OOM 驱逐阻塞 actor 后
+    /// 在途块消息超时丢失、窗口永久卡住的场景；与逐块 `bootstrap_chunk_timeout_secs`
+    /// 互补（后者管「单发块无人应」，本项管「曾有进展后整体停摆」）。
+    #[serde(default = "default_bootstrap_window_idle_timeout_secs")]
+    pub bootstrap_window_idle_timeout_secs: u64,
+    /// E2：窗口空闲恢复的最大次数。连续这么多轮空闲看门狗都没等到新块落地，
+    /// 判定该窗口不可恢复，放弃窗口并重拉清单（默认 3，约 3 个 resume tick）。
+    #[serde(default = "default_bootstrap_window_idle_max_retries")]
+    pub bootstrap_window_idle_max_retries: u32,
 }
 
 fn default_listen_port() -> u16 {
@@ -492,6 +523,10 @@ fn default_bootstrap_rate_bytes_per_sec() -> u64 {
 fn default_bootstrap_window_size() -> usize {
     16
 }
+/// D批(D3)：对端负载保护节流（见 `bootstrap_peer_protect_delay_ms`）。默认 30ms。
+fn default_bootstrap_peer_protect_delay_ms() -> u64 {
+    30
+}
 fn default_gossip_bulk_max_batches() -> usize {
     50
 }
@@ -545,6 +580,19 @@ fn default_gossip_coalesce_batch_size() -> usize {
 fn default_oplog_hard_retention_multiplier() -> u64 {
     4
 }
+/// E1：运行时差异复检的 per-(peer,repo) 重触发冷却（秒）。
+/// 5 分钟足够覆盖一次 bootstrap 断裂后的恢复与下一轮巡检（300s），又不会让差异长期无人补。
+fn default_bootstrap_rediff_cooldown_secs() -> u64 {
+    300
+}
+/// E2：块窗口空闲看门狗阈值（秒）。60s 无新块落地即判定在途块丢失，回收重发。
+fn default_bootstrap_window_idle_timeout_secs() -> u64 {
+    60
+}
+/// E2：窗口空闲恢复最大次数，超过则放弃窗口重拉清单。
+fn default_bootstrap_window_idle_max_retries() -> u32 {
+    3
+}
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
@@ -574,6 +622,8 @@ impl Default for FederationConfig {
             sync_tracker_enabled: default_true(),
             dht_discovery_enabled: default_true(),
             bootstrap_window_size: default_bootstrap_window_size(),
+            bootstrap_skip_identical_chunks: default_true(),
+            bootstrap_peer_protect_delay_ms: default_bootstrap_peer_protect_delay_ms(),
             dht_discovery_interval_secs: default_dht_interval(),
             peer_cache_enabled: default_true(),
             peer_cache_max_nodes: default_peer_cache_max(),
@@ -630,6 +680,9 @@ impl Default for FederationConfig {
             delta_retry_immediately: true,
             oplog_trim_respect_peer_floor: true,
             oplog_hard_retention_multiplier: default_oplog_hard_retention_multiplier(),
+            bootstrap_rediff_cooldown_secs: default_bootstrap_rediff_cooldown_secs(),
+            bootstrap_window_idle_timeout_secs: default_bootstrap_window_idle_timeout_secs(),
+            bootstrap_window_idle_max_retries: default_bootstrap_window_idle_max_retries(),
         }
     }
 }
@@ -659,6 +712,8 @@ mod tests {
         assert_eq!(cfg.dht_discovery_interval_secs, 300);
         assert!(cfg.peer_cache_enabled);
         assert_eq!(cfg.peer_cache_max_nodes, 100);
+        // D批(D3)：对端负载保护节流默认 30ms（必须走 default fn，不能是裸 serde(default)=0）
+        assert_eq!(cfg.bootstrap_peer_protect_delay_ms, 30);
     }
 
     #[test]

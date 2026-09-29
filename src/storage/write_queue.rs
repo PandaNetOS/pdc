@@ -96,27 +96,40 @@ impl WriteQueue {
         }
     }
 
-    /// 发送写入请求
+    /// 发送写入请求（兼容旧调用点，按 1 行计费，忽略入队失败）。
     ///
-    /// - IOScheduler 启用时：以 Normal 优先级提交到 IOScheduler
-    /// - 原始模式：发送到 mpsc 通道，由 writer_loop 攒批写入
+    /// 内部转调 [`WriteQueue::send_sized`]；保留旧签名以避免大面积改动调用点。
     pub fn send<F>(&self, f: F)
     where
         F: FnOnce(&Connection) -> anyhow::Result<()> + Send + 'static,
     {
-        // 统计
+        // B3：旧 send 恒按 1 行计费，失败只 warn（行为与改造前一致）。
+        let _ = self.send_sized(1, f);
+    }
+
+    /// 发送写入请求并声明本次写入的行数（B3 行口径计费）。
+    ///
+    /// - IOScheduler 启用时：以 Normal 优先级提交，`rows` 作为 `size_hint` 进入行口径预算/令牌桶；
+    /// - 原始模式：发送到 mpsc 通道，`rows` 仅用于统计（不改变攒批语义）。
+    ///
+    /// 返回 `Err` 表示入队被拒绝（队列满/通道关闭），调用方应保留 dirty 标记待重试，
+    /// 而不是"先清 dirty 再入队"。
+    pub fn send_sized<F>(&self, rows: usize, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<()> + Send + 'static,
+    {
         self.stats.lock().total_requests += 1;
 
         if let Some(ref sched) = self.io_scheduler {
-            // IOScheduler 模式：以 Normal 优先级提交
-            if let Err(e) = sched.submit(IoPriority::Normal, None, f, 1) {
+            if let Err(e) = sched.submit(IoPriority::Normal, None, f, rows.max(1)) {
                 tracing::warn!("[write_queue] IOScheduler 提交失败: {}", e);
                 self.stats.lock().dropped_requests += 1;
+                return Err(e);
             }
+            Ok(())
         } else {
-            // 原始模式：有界 mpsc 通道，满则丢弃并计数（不阻塞调用方）
             match self.sender.try_send(Box::new(f)) {
-                Ok(()) => {}
+                Ok(()) => Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     let mut s = self.stats.lock();
                     s.dropped_requests += 1;
@@ -125,10 +138,12 @@ impl WriteQueue {
                         WRITE_QUEUE_CAPACITY,
                         s.dropped_requests
                     );
+                    Err(anyhow::anyhow!("写入队列已满"))
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.stats.lock().dropped_requests += 1;
                     tracing::error!("[write_queue] 写入队列已关闭，请求被丢弃");
+                    Err(anyhow::anyhow!("写入队列已关闭"))
                 }
             }
         }

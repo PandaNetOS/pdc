@@ -10,6 +10,7 @@
 //! - 协调聚合器和爬虫引擎
 //! - 健康检查调度
 
+pub mod config_reload;
 pub mod policy;
 
 use std::sync::Arc;

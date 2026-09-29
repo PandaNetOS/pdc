@@ -38,7 +38,7 @@ pub struct NodeRepoImpl {
     /// 鐙珛鑺傜偣瀛樺偍锛堟棤瀹归噺闄愬埗锛屾寜 addr 鍘婚噸锛夆€?FxHashMap 楂樻€ц兘
     nodes: ShardedHashMap<SocketAddr, KBucketEntry>,
     /// 鑴忚妭鐐归泦鍚堬紙缁熻鏁版嵁宸插彉鍖栵紝闇€瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖栵級
-    dirty: RwLock<FxHashSet<SocketAddr>>,
+    dirty: Arc<RwLock<FxHashSet<SocketAddr>>>,
     /// /24 缃戞绱㈠紩锛圛Pv4 鍓?3 瀛楄妭 -> 璇ョ綉娈靛唴鑺傜偣 ID 鍒楄〃锛夛紝鐢ㄤ簬 O(1) 鍙栫綉娈?
     /// 浠?IPv4 鑺傜偣鍏ョ储寮曪紱IPv6 鑺傜偣蹇界暐銆傚鍒犺妭鐐规椂鍚屾缁存姢銆?
     subnet_index: RwLock<FxHashMap<[u8; 3], Vec<NodeId>>>,
@@ -65,7 +65,7 @@ impl NodeRepoImpl {
     ) -> Self {
         Self {
             nodes: ShardedHashMap::new(16),
-            dirty: RwLock::new(FxHashSet::default()),
+            dirty: Arc::new(RwLock::new(FxHashSet::default())),
             subnet_index: RwLock::new(FxHashMap::default()),
             hot_addrs: RwLock::new(FxHashSet::default()),
             cold_addrs: RwLock::new(FxHashSet::default()),
@@ -904,7 +904,8 @@ impl NodeRepository for NodeRepoImpl {
         // 銆愬閲忔寔涔呭寲銆戝彧淇濆瓨 dirty 鑺傜偣锛岄伩鍏嶅叏閲忎繚瀛樺崈涓囩骇鏁版嵁
         if let Some(wq) = &self.write_queue {
             // 寮傛妯″紡锛氬師瀛愬彇鍑哄苟娓呯┖ dirty锛岄潪闃诲鍏ラ槦 WriteQueue
-            let dirty_addrs = self.take_dirty_sync();
+            // B3：先快照 dirty（不清空），落库成功后才在闭包内清 dirty
+            let dirty_addrs = self.dirty_nodes_sync();
             if dirty_addrs.is_empty() {
                 return Ok(());
             }
@@ -914,7 +915,17 @@ impl NodeRepository for NodeRepoImpl {
             }
             let wq = wq.clone();
             let count = batch.len();
-            wq.send(move |conn| Storage::save_dht_nodes_batch_in_tx(conn, &batch));
+            let rows = count;
+            let dirty_arc = self.dirty.clone();
+            let ack = dirty_addrs.clone();
+            let _ = wq.send_sized(rows, move |conn| {
+                Storage::save_dht_nodes_batch_in_tx(conn, &batch)?;
+                // 落库（同事务）成功后才清 dirty；失败保留待重试
+                for a in &ack {
+                    dirty_arc.write().remove(a);
+                }
+                Ok(())
+            });
             tracing::debug!("[node_repo] 寮傛鍏ラ槦淇濆瓨 {} 涓?dirty 鑺傜偣", count);
             Ok(())
         } else {

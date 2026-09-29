@@ -527,20 +527,23 @@ impl TokenBucket {
 /// 「连续 3 次失败重拉清单」陷入死循环 —— 重拉回来的清单仍是对端 DB，接收方的多余行还在，
 /// 永远对不上。一致性校验应交给 range 反熵（v8 下唯一兜底通道）。
 ///
-/// 判定规则：
+/// 判定规则（D批 D3 收紧：防「块返回极少行也判过」的假竣工）：
 /// - 声明 0 行的块必须收到 0 条；
-/// - 声明 N 行的块必须收到 ≥1 条。
+/// - 声明 N 行的块，实收必须达到 ⌊N/2⌋（整除向下取整）才算通过 —— 旧规则只要求
+///   `received > 0`，对端清单重建/NAK 回包即使只回极少几行也被判成功，块窗口照推进、
+///   done 照抬，数据没真落库却「竣工」。
+/// - 超收（`received > N`）自然通过（`received >= ⌊N/2⌋` 恒真）。
 ///
 /// v10(B2)：**活表语义** —— 对端表持续写入，区间实收可能**超过**清单时点的声明行数
 /// （新增 key 落进 [lo,hi)），超收是正常演进、不判失败（此前 `received <= expected`
 /// 在持续写入的大表上必败 → 块 3 次失败 → 重拉清单 → 归零，快照永不传完，
-/// 实测 52/58 NODE 148 块反复归零）。空回包（对端 NAK）仍是唯一失败态；
+/// 实测 52/58 NODE 148 块反复归零）。空回包（对端 NAK）与实收不足半数仍是失败态；
 /// 重叠/缺失行由竣工后的 delta 追尾与 Range 反熵兜底。
 pub fn verify_transport(expected_rows: u64, received: usize) -> bool {
     if expected_rows == 0 {
         return received == 0;
     }
-    received > 0
+    (received as u64) >= expected_rows / 2
 }
 
 /// v10(B2)：在新清单中定位续传起点（key 游标断点）。
@@ -562,6 +565,42 @@ pub fn locate_resume_index(chunks: &[ManifestChunk], last_key: Option<&[u8]>) ->
         .position(|c| c.hi.is_empty() || c.hi.as_slice() > k)
         .map(|i| i as u64)
         .unwrap_or(chunks.len() as u64)
+}
+
+/// D批(D3)：断点继承的「逐块 hash/rows 验证 + 连续前缀裁剪」纯函数。
+///
+/// 输入：远端清单块列表 `remote_chunks` 与本地按相同 `chunk_rows`/水位重建出的清单
+/// `local_mf`。输出二元组：
+/// - `.0` = 验证通过的**最大连续前缀长度**：从 index 0 起逐块确认与本地 hash&rows 一致，
+///   首块不一致即截断（该长度即持久化的 `done_chunks`）；
+/// - `.1` = 全部 hash & rows 与本地一致的远端块 index 集合（含前缀内一致块，也含前缀外
+///   经 hash 比对确认一致的块）——即断点继承 / skip 集合。
+///
+/// 调用方据此构造 ChunkWindow 的 skip 集合（= `.1`）与连续进度（= `.0`）。
+/// 设计动机：旧实现把旧 `done_chunks` 前缀**无条件**继承进 skip 集合、并照写进
+/// `done_chunks`，断点里的块若实际没在本地落库（51 式假竣工）也被当作已完成 →
+/// 全部 seed 覆盖块数时直接写 Done。现在前缀块也必须逐块对得上本地内容才能留在 skip 里，
+/// 对不上的块自然落入待拉集合由 ChunkWindow 补发。
+pub fn align_bootstrap_seed(
+    remote_chunks: &[ManifestChunk],
+    local_mf: &BootstrapManifest,
+) -> (u32, std::collections::HashSet<u32>) {
+    let matching: std::collections::HashSet<u32> = remote_chunks
+        .iter()
+        .filter(|c| {
+            local_mf
+                .chunks
+                .iter()
+                .any(|l| l.index == c.index && l.hash == c.hash && l.rows == c.rows)
+        })
+        .map(|c| c.index)
+        .collect();
+    // 连续前缀：从 index 0 起逐块确认在 matching 中，首块缺失即截断。
+    let mut prefix = 0u32;
+    while matching.contains(&prefix) {
+        prefix += 1;
+    }
+    (prefix, matching)
 }
 
 /// 校验收到的行是否与清单块哈希一致。
@@ -613,6 +652,13 @@ pub struct ChunkWindow {
     attempts: std::collections::HashMap<u32, u32>,
     /// 重试队列（失败/NAK 的块，fill() 优先重发）
     retry: std::collections::VecDeque<u32>,
+    /// E2：最后一块成功落地（on_response）的时刻。窗口级空闲看门狗据此判定
+    /// 「距最后一块落地已超过阈值仍有在途块」→ 在途块丢失（OOM 驱逐阻塞 actor 后
+    /// 消息超时丢帧），回收重发。从未收到过块时为 None（由逐块 sent_at 超时兜底）。
+    last_response_at: Option<Instant>,
+    /// E2：窗口级空闲恢复已执行的次数。超过 `idle_max_retries` 即放弃本窗口重拉清单，
+    /// 避免对端不可达时无限重刷同一批在途块。
+    idle_recoveries: u32,
 }
 
 impl ChunkWindow {
@@ -630,6 +676,36 @@ impl ChunkWindow {
             received,
             attempts: std::collections::HashMap::new(),
             retry: std::collections::VecDeque::new(),
+            last_response_at: None,
+            idle_recoveries: 0,
+        }
+    }
+
+    /// D批(D1)：以「已收块集合」初始化窗口 —— 除连续续传前缀外，还把 hash 比对一致的
+    /// 非连续块标记为已完成，只请求其余块。
+    ///
+    /// `skip` 中 `< total` 的 index 全部进入 `received` 基数；`next_request` 从 0 起，
+    /// [`fill`](Self::fill) 会跳过所有已在 `received` 中的 index。其余字段与 [`new`](Self::new)
+    /// 一致。竣工判定仍为 `received.len() >= total`（与连续/非连续无关）；`done_prefix`
+    /// 仍只反映最大连续前缀，供持久化续传使用。
+    pub fn with_skip(total: u32, window: usize, skip: &std::collections::HashSet<u32>) -> Self {
+        let mut received = std::collections::HashSet::new();
+        for &i in skip {
+            if i < total {
+                received.insert(i);
+            }
+        }
+        Self {
+            total,
+            window: window.max(1),
+            next_request: 0,
+            inflight: std::collections::HashSet::new(),
+            sent_at: std::collections::HashMap::new(),
+            received,
+            attempts: std::collections::HashMap::new(),
+            retry: std::collections::VecDeque::new(),
+            last_response_at: None,
+            idle_recoveries: 0,
         }
     }
 
@@ -658,6 +734,12 @@ impl ChunkWindow {
         while self.next_request < self.total && self.inflight.len() < cap {
             let i = self.next_request;
             self.next_request += 1;
+            // D批(D1)：跳过已在 received 中的块（with_skip 注入的 hash 一致块）。
+            // 对 new() 用法向后兼容：其 received 恰为 0..resume，而 next_request 从 resume
+            // 起，不会命中已收集合。
+            if self.received.contains(&i) {
+                continue;
+            }
             self.inflight.insert(i);
             self.sent_at.insert(i, now);
             out.push(i);
@@ -671,6 +753,7 @@ impl ChunkWindow {
         self.sent_at.remove(&index);
         self.attempts.remove(&index);
         self.received.insert(index);
+        self.last_response_at = Some(Instant::now());
         self.received.len() as u32 >= self.total
     }
 
@@ -705,6 +788,39 @@ impl ChunkWindow {
             self.retry.push_back(*i);
         }
         expired
+    }
+
+    /// E2：窗口级空闲看门狗 —— 距最后一块落地（`on_response`）已超过 `idle_timeout`
+    /// 且仍有在途块时，把全部在途块回收进重试队列（下次 `fill` 优先重发），返回被回收的
+    /// index。覆盖 OOM 驱逐阻塞 bootstrap actor 后、在途块消息超时丢失、窗口永久卡住的
+    /// 场景（与逐块 `reap_timed_out` 互补：后者管单发块无人应，本项管曾有进展后整体停摆）。
+    ///
+    /// 每次真正回收会计一次空闲恢复（`idle_recoveries` 自增）；调用方据此在超过
+    /// `idle_max_retries` 后放弃本窗口、重拉清单。从未收到过块（`last_response_at == None`）
+    /// 时不动作 —— 由逐块 sent_at 超时兜底。
+    pub fn idle_reap(&mut self, idle_timeout: Duration) -> Vec<u32> {
+        let Some(last) = self.last_response_at else {
+            return Vec::new();
+        };
+        if self.inflight.is_empty() {
+            return Vec::new();
+        }
+        if Instant::now().duration_since(last) < idle_timeout {
+            return Vec::new();
+        }
+        let expired: Vec<u32> = self.inflight.iter().copied().collect();
+        for i in &expired {
+            self.inflight.remove(i);
+            self.sent_at.remove(i);
+            self.retry.push_back(*i);
+        }
+        self.idle_recoveries = self.idle_recoveries.saturating_add(1);
+        expired
+    }
+
+    /// E2：窗口级空闲恢复已执行的次数。
+    pub fn idle_recovery_count(&self) -> u32 {
+        self.idle_recoveries
     }
 
     /// 全部块是否收齐。
@@ -813,6 +929,24 @@ mod tests {
             .unwrap();
         assert_eq!(mf.total_rows, 0);
         assert!(mf.chunks.is_empty());
+    }
+
+    /// D批(D3)：verify_transport 50% 收紧规则 —— 实收必须 ≥ ⌊声明/2⌋；
+    /// 声明 0 行必须实收 0；超收自然通过；奇数声明向下取整。
+    #[test]
+    fn test_verify_transport_half_threshold() {
+        // 声明 0 行：实收必须为 0
+        assert!(verify_transport(0, 0));
+        assert!(!verify_transport(0, 1));
+        // 声明 100：门槛 ⌊100/2⌋ = 50
+        assert!(verify_transport(100, 50), "实收恰好半数应通过");
+        assert!(!verify_transport(100, 49), "实收差一行到半数必须失败");
+        assert!(!verify_transport(100, 0), "空回包必须失败");
+        // 奇数声明 101：⌊101/2⌋ = 50（向下取整），实收 50 即通过
+        assert!(verify_transport(101, 50), "奇数声明向下取整为 50");
+        // 超收 / 充足实收正常通过
+        assert!(verify_transport(200, 150), "实收远超半数应通过");
+        assert!(!verify_transport(200, 99), "实收 99 < 门槛 100 必须失败");
     }
 
     #[test]
@@ -972,5 +1106,113 @@ mod tests {
         let batch = w.fill(0);
         assert_eq!(batch.len(), 4, "超时块经重试队列重发");
         assert_eq!(w.inflight_len(), 4);
+    }
+
+    /// E2：窗口长时间无新块落地后，空闲看门狗回收仍在途的未完成块供重发；
+    /// 且每次回收计一次恢复次数，供上层在超上限后放弃窗口。
+    #[test]
+    fn test_chunk_window_idle_reap_requeues_inflight() {
+        let mut w = ChunkWindow::new(10, 4, 0);
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![0, 1, 2, 3]);
+        // 刚发出、尚未收过任何块 → last_response_at 为 None，不动作（逐块超时兜底）
+        assert!(w.idle_reap(Duration::from_secs(60)).is_empty());
+        // 收到一块（刷新 last_response_at），窗口仍有 3 个在途块 1/2/3
+        assert!(!w.on_response(0));
+        assert_eq!(w.inflight_len(), 3);
+        // 刚收过块、未空闲 → 不回收
+        assert!(w.idle_reap(Duration::from_secs(60)).is_empty());
+        assert_eq!(w.idle_recovery_count(), 0);
+        // 把「最后一块落地」拨到 61s 前 → 判定空闲，回收全部在途块
+        w.last_response_at = Some(Instant::now() - Duration::from_secs(61));
+        let reaped = w.idle_reap(Duration::from_secs(60));
+        assert_eq!(reaped.len(), 3, "3 个在途块应被回收");
+        assert_eq!(w.inflight_len(), 0, "回收后在途清空");
+        assert_eq!(w.idle_recovery_count(), 1, "计一次空闲恢复");
+        // fill 从重试队列取出回收块重发，并继续预取新块填满窗口
+        let batch = w.fill(0);
+        assert!(
+            batch.contains(&1) && batch.contains(&2) && batch.contains(&3),
+            "回收块 1/2/3 必须经重试队列重发, got={:?}",
+            batch
+        );
+        assert_eq!(w.inflight_len(), 4, "窗口填满（3 回收块 + 预取新块）");
+    }
+
+    /// D批(D1)：with_skip —— hash 一致的非连续块进入 received 基数，首批 fill 跳过它们，
+    /// 其余块正常请求；补齐后 is_complete()。
+    #[test]
+    fn test_chunk_window_with_skip() {
+        let mut skip = std::collections::HashSet::new();
+        skip.insert(0u32);
+        skip.insert(2u32);
+        skip.insert(5u32);
+        let mut w = ChunkWindow::with_skip(10, 4, &skip);
+        assert_eq!(w.received_count(), 3, "3 个 hash 一致块进入基数");
+        // 首批跳过 0/2/5：应发 1,3,4,6
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![1, 3, 4, 6], "首批不得包含已跳过的 0/2/5");
+        assert_eq!(w.inflight_len(), 4);
+        for &i in &[1, 3, 4, 6] {
+            w.on_response(i);
+        }
+        // 持续推进直到全部收齐
+        loop {
+            let b = w.fill(0);
+            if b.is_empty() {
+                break;
+            }
+            for i in b {
+                w.on_response(i);
+            }
+        }
+        assert!(w.is_complete(), "收齐 10 块应竣工");
+        assert_eq!(w.done_prefix(), 10);
+    }
+
+    /// D批(D1)：本地/对端清单逐块 hash 比对 —— 相同数据 hash/rows 全等；
+    /// 数据变化后至少一块不等（证明比对能识别差异）。
+    #[test]
+    fn test_manifest_hash_compare_detects_diff() {
+        let st = Storage::memory().unwrap();
+        seed_nodes(&st, 500);
+        let mf_a =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 200, 1, 1)
+                .unwrap();
+        let mf_b =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 200, 1, 1)
+                .unwrap();
+        assert_eq!(mf_a.chunks.len(), mf_b.chunks.len());
+        for (a, b) in mf_a.chunks.iter().zip(mf_b.chunks.iter()) {
+            assert_eq!(a.index, b.index);
+            assert_eq!(&a.hash, &b.hash, "相同数据块 {} hash 应一致", a.index);
+            assert_eq!(a.rows, b.rows);
+        }
+        // 追加 300 行（key 与前 500 不冲突）→ 至少一块 hash/rows 变化
+        {
+            let conn = st.connection();
+            let conn = conn.lock().unwrap();
+            for i in 500..800i64 {
+                let ip = format!("10.0.{}.{}", i / 256, i % 256);
+                let id = vec![(i % 256) as u8; 20];
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) VALUES (?1, ?2, ?3, 0, NULL)",
+                    params![id, ip, 6881i64],
+                )
+                .unwrap();
+            }
+        }
+        let mf_c =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 200, 1, 1)
+                .unwrap();
+        let mut any_diff = false;
+        for a in &mf_a.chunks {
+            if let Some(c) = mf_c.chunks.iter().find(|c| c.index == a.index) {
+                if c.hash != a.hash || c.rows != a.rows {
+                    any_diff = true;
+                }
+            }
+        }
+        assert!(any_diff, "数据变化后应至少有一块 hash/rows 不同");
     }
 }

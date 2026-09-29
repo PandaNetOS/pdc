@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
 
     // 1. 初始化日志（级别：RUST_LOG 环境变量 > 配置文件 log_level > info）
     //    双写：stdout（部署侧重定向兜底采集）+ 按天滚动文件 logs/pdc.log.YYYY-MM-DD（磁盘有界）
-    let _log_guard = init_logging(&peek_log_level(&work_dir), &work_dir.logs_dir);
+    let log_guard = init_logging(&peek_log_level(&work_dir), &work_dir.logs_dir);
 
     // 1.5 初始化 Prometheus metrics
     PeerDiscoveryCenter::data_plane::metrics::init_metrics();
@@ -252,6 +252,7 @@ fn main() -> anyhow::Result<()> {
         federation_handle,
         scheduler_handle,
         persistence_handle,
+        log_guard.filter,
     ));
 
     // 关闭 tracker/api/federation/scheduler/persistence runtime（crawler_runtime 随 block_on 返回自然结束）
@@ -282,6 +283,7 @@ async fn async_main(
     federation_handle: tokio::runtime::Handle,
     scheduler_handle: tokio::runtime::Handle,
     persistence_handle: tokio::runtime::Handle,
+    log_filter: PeerDiscoveryCenter::control_plane::config_reload::LogFilterHandle,
 ) -> anyhow::Result<()> {
     // 2.2 加载或生成 PEX/uTP 节点身份（持久化到 work_dir.node_id_file()）
     let pex_node_id = load_or_generate_node_id(&work_dir.node_id_file());
@@ -363,6 +365,67 @@ async fn async_main(
         });
     }
 
+    // 3.5.2 C1：启动磁盘画像探测（fsync/随机-顺序比），选 SSD/HDD/Unknown 三档参数。
+    if config.storage.disk_probe_enabled && config.storage.enabled {
+        let db_path = std::path::PathBuf::from(&config.storage.path);
+        let db_dir = db_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let res = PeerDiscoveryCenter::storage::disk_profile::DiskProbe::detect(
+            &db_dir,
+            std::time::Duration::from_millis(config.storage.disk_probe_budget_ms),
+        );
+        use PeerDiscoveryCenter::storage::disk_profile::DiskClass;
+        let profile = match res.disk_class {
+            DiskClass::Ssd => PeerDiscoveryCenter::storage::io_scheduler::AimdProfile {
+                rows_min: 5_000,
+                rows_max: 50_000,
+                rows_base: 10_000,
+                interval_min: 1,
+                interval_max: 30,
+            },
+            DiskClass::Hdd => PeerDiscoveryCenter::storage::io_scheduler::AimdProfile {
+                rows_min: 1_000,
+                rows_max: 10_000,
+                rows_base: 3_000,
+                interval_min: 5,
+                interval_max: 120,
+            },
+            DiskClass::Unknown => {
+                PeerDiscoveryCenter::storage::io_scheduler::AimdProfile::default()
+            }
+        };
+        PeerDiscoveryCenter::storage::io_scheduler::set_disk_profile(
+            res.disk_class.as_str(),
+            res.fsync_ms_p50,
+        );
+        PeerDiscoveryCenter::storage::io_scheduler::init_aimd_controller(
+            profile,
+            config.io_scheduler.latency_target_ms,
+            config.io_scheduler.latency_slow_ms,
+        );
+        // 落 stats_aggregate
+        if let Ok(conn) = storage.connection().lock() {
+            let _ = conn.execute(
+                "INSERT INTO stats_aggregate(metric,value,updated_at) VALUES('io_disk_class',?,strftime('%s','now'))
+                 ON CONFLICT(metric) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;",
+                [rusqlite::types::Value::Text(res.disk_class.as_str().to_string())],
+            );
+            let _ = conn.execute(
+                "INSERT INTO stats_aggregate(metric,value,updated_at) VALUES('io_fsync_ms_p50',?,strftime('%s','now'))
+                 ON CONFLICT(metric) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;",
+                [rusqlite::types::Value::Real(res.fsync_ms_p50 as f64)],
+            );
+        }
+        info!(
+            "[main] C1 磁盘画像: class={} fsync_p50={:.2}ms rand_seq_ratio={:.2}",
+            res.disk_class.as_str(),
+            res.fsync_ms_p50,
+            res.rand_seq_ratio
+        );
+    }
+
     // 3.6 创建所有数据层 Repo（统一数据归口）
     // P2: 先创建 WriteQueue/IOScheduler，再注入到各 Repo
     let io_scheduler: Option<Arc<PeerDiscoveryCenter::storage::IoScheduler>> =
@@ -382,8 +445,14 @@ async fn async_main(
                 idle_window: std::time::Duration::from_secs(config.io_scheduler.idle_window_secs),
                 idle_wait: std::time::Duration::from_millis(config.io_scheduler.idle_wait_ms),
                 retry_wait: std::time::Duration::from_millis(config.io_scheduler.retry_wait_ms),
-                steady_tick_ms: 10,  // 10ms 时间片，匀速写入
-                writes_per_tick: 10, // 每个时间片最多 10 条写入
+                steady_tick_ms: config.io_scheduler.steady_tick_ms,
+                max_requests_per_tick: config.io_scheduler.max_requests_per_tick,
+                rows_per_tick: config.io_scheduler.rows_per_tick,
+                token_bucket_enabled: config.io_scheduler.token_bucket_enabled,
+                low_watermark_rows: config.io_scheduler.low_watermark_rows,
+                high_watermark_rows: config.io_scheduler.high_watermark_rows,
+                latency_target_us: config.io_scheduler.latency_target_ms.saturating_mul(1_000),
+                latency_slow_us: config.io_scheduler.latency_slow_ms.saturating_mul(1_000),
             };
             let sched = PeerDiscoveryCenter::storage::IoScheduler::new_with_handle(
                 storage.connection(),
@@ -398,6 +467,31 @@ async fn async_main(
         } else {
             None
         };
+
+    // A4：启动时注入一次自适应导入窗口配置（进程生命周期内不变；由 io_scheduler.rs 持有）。
+    PeerDiscoveryCenter::storage::io_scheduler::init_io_adaptive_config(&config.io_scheduler);
+
+    // A1/A2：checkpoint 专用 worker（独立 pdc-ckpt 线程 + 单飞）。
+    // takeover=true：置 wal_autocheckpoint=0 由应用接管；false：不注册决策 tick，沿用 SQLite 自动 checkpoint。
+    let checkpoint_worker: Option<Arc<PeerDiscoveryCenter::storage::CheckpointWorker>> = if config
+        .io_scheduler
+        .checkpoint_takeover
+    {
+        storage.set_wal_autocheckpoint(0)?;
+        info!("[storage] 应用接管 WAL checkpoint（wal_autocheckpoint=0）");
+        Some(PeerDiscoveryCenter::storage::CheckpointWorker::spawn(
+            storage.clone(),
+            PeerDiscoveryCenter::storage::CheckpointWorkerConfig {
+                slow_ms: config.io_scheduler.checkpoint_slow_ms,
+                backoff_base_secs: config.io_scheduler.checkpoint_backoff_base_secs,
+                backoff_max_secs: config.io_scheduler.checkpoint_backoff_max_secs,
+                backoff_factor: config.io_scheduler.checkpoint_backoff_factor,
+            },
+        ))
+    } else {
+        info!("[storage] 未接管 WAL checkpoint（checkpoint_takeover=false，沿用 SQLite 自动 checkpoint）");
+        None
+    };
 
     let write_queue = if let Some(ref sched) = io_scheduler {
         Arc::new(PeerDiscoveryCenter::storage::WriteQueue::with_scheduler(
@@ -921,12 +1015,15 @@ async fn async_main(
     // 统计快照（后台任务定期更新，API 只读）
     let stats_snapshot = Arc::new(stats_snapshot::StatsSnapshot::new());
 
-    let app_state = AppState {
+    // 配置快照共享句柄：AppState 与 config_reloader 共用（热重载后统一更新）
+    let config_shared = Arc::new(RwLock::new(config.clone()));
+
+    let mut app_state = AppState {
         control_plane: control_plane.clone(),
         super_tracker: super_tracker.clone(),
         peer_repo: peer_repo.clone(),
         event_bus: event_bus.clone(),
-        config: Arc::new(RwLock::new(config.clone())),
+        config: config_shared.clone(),
         nat: nat.clone(),
         crawler_state,
         crawler_routing_table,
@@ -949,6 +1046,10 @@ async fn async_main(
         relay_server,
         udp_tracker: udp_tracker_instance,
         stats_snapshot: stats_snapshot.clone(),
+        io_scheduler: io_scheduler.clone(),
+        sync_channels: PeerDiscoveryCenter::federation::sync::channels_status::global().clone(),
+        // config_reloader 在 TaskScheduler 创建后注入（见 8.5.15）
+        config_reloader: None,
     };
     // 保留引用用于 TaskScheduler 注册（已被 move 到 AppState）
     let dht_probe_clone = app_state.dht_probe.clone();
@@ -1036,6 +1137,8 @@ async fn async_main(
         let tr = tracker_repo.clone();
         let ir = infohash_repo.clone();
         let pr = peer_repo.clone();
+        let sched_bp = io_scheduler.clone();
+        let backoff_level = config.io_scheduler.persistence_backoff_level;
         task_scheduler.register(
             TaskMetadata::new(
                 "periodic_persistence",
@@ -1070,7 +1173,19 @@ async fn async_main(
                 let tr = tr.clone();
                 let ir = ir.clone();
                 let pr = pr.clone();
+                let sched_bp = sched_bp.clone();
                 async move {
+                    // B1：IO 背压超过阈值时本轮让路，避免与 checkpoint/导入抢盘
+                    if let Some(ref s) = sched_bp {
+                        if s.backpressure_level() > backoff_level {
+                            debug!(
+                                "[persistence] IO 背压高（level={:.2} > {:.2}），本轮让路",
+                                s.backpressure_level(),
+                                backoff_level
+                            );
+                            return Ok(());
+                        }
+                    }
                     let mut saved = 0u64;
                     match nr.save_dirty().await {
                         Ok(_) => saved += 1,
@@ -1207,40 +1322,65 @@ async fn async_main(
         );
     }
 
-    // 8.5.2b2 WAL checkpoint 高频任务（每100ms，Persistence，PASSIVE模式不阻塞写入）
-    {
-        let storage_clone = storage.clone();
+    // 8.5.2b2 A2：WAL checkpoint 决策 tick（O(1)：读原子量 + WAL 尺寸，不阻塞）。
+    // 仅在 takeover=true 时注册；否则沿用 SQLite 自动 checkpoint（禁止两套并存）。
+    if let Some(ref ckpt_worker) = checkpoint_worker {
+        let worker = ckpt_worker.clone();
+        let storage_ck = storage.clone();
+        let soft_bytes = config.io_scheduler.checkpoint_wal_soft_mb * 1024 * 1024;
+        let hard_bytes = config.io_scheduler.checkpoint_wal_hard_mb * 1024 * 1024;
+        let min_interval =
+            std::time::Duration::from_secs(config.io_scheduler.checkpoint_min_interval_secs);
+        let slow_streak_alert = config.io_scheduler.checkpoint_slow_streak_alert;
+        let last_alerted = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         task_scheduler.register(
             TaskMetadata::new(
-                "wal_checkpoint_steady",
-                "WAL checkpoint 高频稳态",
-                std::time::Duration::from_millis(get_interval_secs(
-                    intervals,
-                    "wal_checkpoint_interval_ms",
-                    100,
-                )),
+                "io_checkpoint_tick",
+                "WAL checkpoint 决策",
+                std::time::Duration::from_millis(config.io_scheduler.checkpoint_tick_ms),
             )
             .with_category(TaskCategory::Persistence)
             .with_priority(TaskPriority::Background)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
                 memory: ResourceLevel::Low,
-                io: ResourceLevel::Medium,
+                io: ResourceLevel::Low,
                 network: ResourceLevel::Low,
                 is_full_task: false,
             })
             .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
                 intervals,
-                "wal_checkpoint_steady_initial_delay",
+                "io_checkpoint_tick_initial_delay",
                 5,
             ))),
             move || {
-                let storage = storage_clone.clone();
+                let worker = worker.clone();
+                let storage = storage_ck.clone();
+                let last_alerted = last_alerted.clone();
                 async move {
-                    // PASSIVE checkpoint 不阻塞写入，高频执行保持 WAL 小巧
-                    match storage.checkpoint() {
-                        Ok(_) => info!("[persistence] WAL checkpoint(PASSIVE) 执行成功"),
-                        Err(e) => warn!("[persistence] WAL checkpoint 失败: {}", e),
+                    let now = std::time::Instant::now();
+                    let stat = worker.stat();
+                    // 连续慢达阈值 → 边沿触发 warn（避免每 tick 刷屏）
+                    if stat.streak >= slow_streak_alert
+                        && last_alerted.load(std::sync::atomic::Ordering::SeqCst) != stat.streak
+                    {
+                        last_alerted.store(stat.streak, std::sync::atomic::Ordering::SeqCst);
+                        warn!(
+                            "[storage] WAL checkpoint 连续慢 {} 次（最近 {}ms），IO 降级，进入退避",
+                            stat.streak, stat.last_ms
+                        );
+                    }
+                    let wal = storage.wal_bytes();
+                    if let Some(mode) = PeerDiscoveryCenter::storage::decide_checkpoint(
+                        &stat,
+                        wal,
+                        worker.inflight(),
+                        now,
+                        soft_bytes,
+                        hard_bytes,
+                        min_interval,
+                    ) {
+                        worker.trigger(mode);
                     }
                     Ok(())
                 }
@@ -1248,13 +1388,17 @@ async fn async_main(
         );
     }
 
-    // 8.5.2b3 WAL TRUNCATE 压缩（每小时一次，Persistence，会短暂阻塞写入但压缩 WAL）
-    {
-        let storage_clone = storage.clone();
+    // 8.5.2b3 A2：WAL TRUNCATE 周期压缩（沿用原小时间隔）。
+    // 仅在 takeover=true 时注册；条件：WAL >= truncate_min_wal_mb 且写队列空（TRUNCATE 需独占，避免与读写互踩放大）。
+    if let Some(ref ckpt_worker) = checkpoint_worker {
+        let worker = ckpt_worker.clone();
+        let storage_ck = storage.clone();
+        let sched_ref = io_scheduler.clone();
+        let truncate_min = config.io_scheduler.checkpoint_truncate_min_wal_mb * 1024 * 1024;
         task_scheduler.register(
             TaskMetadata::new(
                 "wal_checkpoint_hourly_truncate",
-                "WAL TRUNCATE 每小时压缩",
+                "WAL TRUNCATE 周期压缩",
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "wal_checkpoint_truncate_interval_secs",
@@ -1276,14 +1420,23 @@ async fn async_main(
                 60,
             ))),
             move || {
-                let storage = storage_clone.clone();
+                let worker = worker.clone();
+                let storage = storage_ck.clone();
+                let sched_ref = sched_ref.clone();
                 async move {
-                    // TRUNCATE 模式会短暂阻塞写入，但会将 WAL 文件压缩到最小
-                    // 每小时执行一次，平衡 IO 平滑与磁盘/内存占用
-                    match storage.checkpoint_truncate() {
-                        Ok(_) => info!("[persistence] WAL checkpoint(TRUNCATE) 每小时压缩完成"),
-                        Err(e) => warn!("[persistence] WAL TRUNCATE 失败: {}", e),
+                    let wal = storage.wal_bytes();
+                    if wal < truncate_min {
+                        return Ok(());
                     }
+                    // 队列空才做 TRUNCATE（需独占，避免与读者/写者互踩放大成秒级等待）
+                    let queue_empty = sched_ref
+                        .as_ref()
+                        .map(|x| x.queue_len() == 0)
+                        .unwrap_or(true);
+                    if !queue_empty || worker.inflight() {
+                        return Ok(());
+                    }
+                    worker.trigger(PeerDiscoveryCenter::storage::CheckpointMode::Truncate);
                     Ok(())
                 }
             },
@@ -1294,6 +1447,9 @@ async fn async_main(
     if let Some(ref sched) = io_scheduler {
         let sched_clone = sched.clone();
         let rm = task_scheduler.resource_monitor();
+        let ts_clone = task_scheduler.clone();
+        // B4：迟滞边沿触发状态（0=正常,1=降级），0.5 上下跨档才发事件
+        let bp_edge = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
         let bp_interval = config.io_scheduler.backpressure_poll_interval_secs;
         task_scheduler.register(
             TaskMetadata::new(
@@ -1314,9 +1470,124 @@ async fn async_main(
             move || {
                 let s = sched_clone.clone();
                 let r = rm.clone();
+                let ts = ts_clone.clone();
+                let edge = bp_edge.clone();
                 async move {
                     let level = s.backpressure_level();
                     r.set_io_load(level as f64);
+                    // B1：接通 TaskScheduler 外部 IO 背压
+                    ts.set_external_io_backpressure(level);
+                    // B4：0.5 迟滞边沿触发
+                    let now_degraded = if level > 0.5 { 1u8 } else { 0u8 };
+                    let prev = edge.swap(now_degraded, std::sync::atomic::Ordering::AcqRel);
+                    if prev == 0 && now_degraded == 1 {
+                        tracing::warn!(
+                            "[io] 背压升档（level={:.2} > 0.5），TaskScheduler 让路",
+                            level
+                        );
+                    } else if prev == 1 && now_degraded == 0 {
+                        tracing::info!("[io] 背压恢复（level={:.2} <= 0.5）", level);
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    // 8.5.2d A5：IO 基础指标落 stats_aggregate（稳态 info 日志降噪，关键数值改指标）。
+    // 8 个指标：io_wal_bytes / io_checkpoint_ms_last / io_checkpoint_ms_ewma /
+    // io_checkpoint_total / io_checkpoint_slow_total / io_batch_ms_ewma /
+    // io_queue_requests / io_import_budget。
+    {
+        let storage_m = storage.clone();
+        let sched_m = io_scheduler.clone();
+        let worker_m = checkpoint_worker.clone();
+        let logs_dir_m = work_dir.logs_dir.clone();
+        let max_file_mb_val = config.logging.max_file_mb;
+        let max_file_bytes = max_file_mb_val * 1024 * 1024;
+        let log_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        task_scheduler.register(
+            TaskMetadata::new(
+                "io_metrics_poll",
+                "IO 指标采样",
+                std::time::Duration::from_secs(config.stats_snapshot_interval_secs.max(1)),
+            )
+            .with_category(TaskCategory::Monitor)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Low,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::Low,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                &config.task_scheduler.intervals,
+                "io_metrics_poll_initial_delay",
+                5,
+            ))),
+            move || {
+                let storage = storage_m.clone();
+                let sched = sched_m.clone();
+                let worker = worker_m.clone();
+                let logs_dir = logs_dir_m.clone();
+                let log_warned = log_warned.clone();
+                let max_file_bytes = max_file_bytes;
+                let max_file_mb_val = max_file_mb_val;
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let wal = storage.wal_bytes();
+                        let _ = storage.update_aggregate("io_wal_bytes", wal as f64);
+                        let mut ckpt_ewma_ms: u64 = 0;
+                        if let Some(w) = worker.as_ref() {
+                            let st = w.stat();
+                            ckpt_ewma_ms = st.last_ewma_ms as u64;
+                            let _ = storage
+                                .update_aggregate("io_checkpoint_ms_last", st.last_ms as f64);
+                            let _ = storage
+                                .update_aggregate("io_checkpoint_ms_ewma", st.last_ewma_ms);
+                            let _ = storage.update_aggregate("io_checkpoint_total", st.total as f64);
+                            let _ = storage
+                                .update_aggregate("io_checkpoint_slow_total", st.slow_total as f64);
+                        }
+                        // C2：喂一次 AIMD 观测（checkpoint 耗时 EWMA + 队列行数），
+                        // 控制器产出新的 rows_per_tick 并写回调度器动态预算。
+                        if let Some(s) = sched.as_ref() {
+                            s.feed_aimd(ckpt_ewma_ms, s.queue_rows());
+                        }
+                        let batch_ewma_us =
+                            PeerDiscoveryCenter::storage::io_scheduler::io_batch_latency_ewma_us();
+                        let _ = storage
+                            .update_aggregate("io_batch_ms_ewma", batch_ewma_us as f64 / 1000.0);
+                        let budget =
+                            PeerDiscoveryCenter::storage::io_scheduler::io_import_budget_snapshot();
+                        let _ = storage.update_aggregate("io_import_budget", budget as f64);
+                        let queue_req =
+                            sched.as_ref().map(|x| x.queue_len()).unwrap_or(0);
+                        let _ = storage.update_aggregate("io_queue_requests", queue_req as f64);
+
+                        // 日志治理：logs/ 目录总大小超上限时 warn 一次
+                        if !log_warned.load(std::sync::atomic::Ordering::SeqCst) {
+                            if let Ok(rd) = std::fs::read_dir(&logs_dir) {
+                                let mut total: u64 = 0;
+                                for f in rd.flatten() {
+                                    if let Ok(meta) = f.metadata() {
+                                        total += meta.len();
+                                    }
+                                }
+                                if total >= max_file_bytes {
+                                    log_warned.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    warn!(
+                                        "[observability] logs/ 目录已达 {:.1}MB（上限 {}MB），请检查滚动/清理",
+                                        total as f64 / 1024.0 / 1024.0,
+                                        max_file_mb_val
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .ok();
                     Ok(())
                 }
             },
@@ -3103,65 +3374,56 @@ async fn async_main(
         );
     }
 
-    // 8.5.15 配置热更新监听任务（简化版：检查 mtime + 日志，不实际更新运行时参数）
+    // 8.5.15 配置热更新：文件监听任务 + ConfigReloader
+    // 管线：mtime 轮询 → 防抖 → 解析 → diff → 分类（策略/调度/需重启）→ 应用 → 发布 ConfigChanged
+    // 同一 reloader 经 AppState 暴露给 POST /api/v1/config/reload 手动触发。
     {
+        let config_reloader = Arc::new(
+            PeerDiscoveryCenter::control_plane::config_reload::ConfigReloader::new(
+                config_path.clone(),
+                config_shared.clone(),
+                control_plane.clone(),
+                Some(app_state.super_tracker.clone()),
+                Some(task_scheduler.clone()),
+                crawler_ref.clone(),
+                Some(log_filter),
+            ),
+        );
+        app_state.config_reloader = Some(config_reloader.clone());
+
         let reload_interval = std::time::Duration::from_secs(config.config_reload_interval_secs);
         if reload_interval.as_secs() > 0 {
-            let watch_path = config_path.clone();
-            let last_mtime: Arc<std::sync::Mutex<Option<std::time::SystemTime>>> =
-                Arc::new(std::sync::Mutex::new(None));
             task_scheduler.register(
-                TaskMetadata::new(
-                    "config_reloader",
-                    "配置热更新监听",
-                    reload_interval,
-                )
-                .with_category(TaskCategory::Monitor)
-                .with_priority(TaskPriority::Normal)
-                .with_resource(ResourceProfile {
-                    cpu: ResourceLevel::Low,
-                    memory: ResourceLevel::Low,
-                    io: ResourceLevel::Low,
-                    network: ResourceLevel::Low,
-                    is_full_task: false,
-                }),
+                TaskMetadata::new("config_reloader", "配置热更新监听", reload_interval)
+                    .with_category(TaskCategory::Monitor)
+                    .with_priority(TaskPriority::Normal)
+                    .with_resource(ResourceProfile {
+                        cpu: ResourceLevel::Low,
+                        memory: ResourceLevel::Low,
+                        io: ResourceLevel::Low,
+                        network: ResourceLevel::Low,
+                        is_full_task: false,
+                    }),
                 move || {
-                    let watch_path = watch_path.clone();
-                    let last_mtime = last_mtime.clone();
+                    let reloader = config_reloader.clone();
                     async move {
-                        let Some(ref path) = watch_path else { return Ok(()); };
-                        let metadata = match std::fs::metadata(path) {
-                            Ok(m) => m,
-                            Err(_) => return Ok(()),
-                        };
-                        let current_mtime = match metadata.modified() {
-                            Ok(t) => t,
-                            Err(_) => return Ok(()),
-                        };
-                        let mut last = last_mtime.lock().unwrap();
-                        match *last {
-                            None => {
-                                *last = Some(current_mtime);
+                        if let Some(report) = reloader.check_and_reload().await {
+                            if !report.errors.is_empty() {
+                                warn!("[config] 配置热重载未完成: {}", report.summary());
                             }
-                            Some(prev) if prev != current_mtime => {
-                                info!(
-                                    "[config] 检测到配置文件变化: {}（当前简化版仅记录日志，运行时参数暂不生效）",
-                                    path
-                                );
-                                *last = Some(current_mtime);
-                            }
-                            Some(_) => {}
                         }
                         Ok(())
                     }
                 },
             );
             info!(
-                "[main] 配置热更新监听任务已注册（间隔 {} 秒）",
+                "[main] 配置热更新已启用（间隔 {} 秒；限速阈值/日志级别/任务周期热生效，端口类变更提示重启）",
                 config.config_reload_interval_secs
             );
         } else {
-            info!("[main] 配置热更新已禁用（config_reload_interval_secs = 0）");
+            info!(
+                "[main] 配置热更新已禁用（config_reload_interval_secs = 0），API reload 端点仍可用"
+            );
         }
     }
 
@@ -3526,13 +3788,25 @@ fn peek_log_level(work_dir: &WorkDir) -> String {
 ///
 /// 返回的 [`tracing_appender::non_blocking::WorkerGuard`] 须由调用方持有至进程退出，
 /// 提前 drop 会丢失滚动文件中尚未落盘的日志。
-fn init_logging(
-    config_log_level: &str,
-    logs_dir: &std::path::Path,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// 日志初始化产物：滚动文件 guard（必须保活，否则文件日志静默丢失）
+/// + 日志级别热更句柄（config_reloader 应用 log_level 变更）。
+pub struct LoggingGuard {
+    _worker: Option<tracing_appender::non_blocking::WorkerGuard>,
+    pub filter: PeerDiscoveryCenter::control_plane::config_reload::LogFilterHandle,
+}
+
+fn init_logging(config_log_level: &str, logs_dir: &std::path::Path) -> LoggingGuard {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::try_new(config_log_level).unwrap_or_else(|_| EnvFilter::new("info"))
     });
+
+    // reload 包装：拿到热更句柄，config 热重载时替换过滤规则。
+    // 注意 filter 必须挂在 fmt 层之前 —— registry 的过滤器只作用于其后注册的层
+    // （挂在末尾时 stdout/file 层完全不受级别过滤）。
+    let (filter_layer, filter_handle): (
+        tracing_subscriber::reload::Layer<EnvFilter, tracing_subscriber::Registry>,
+        tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+    ) = tracing_subscriber::reload::Layer::new(filter);
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -3556,20 +3830,26 @@ fn init_logging(
                 .with_ansi(false) // 文件落盘不带 ANSI 颜色码
                 .with_writer(file_writer);
             tracing_subscriber::registry()
+                .with(filter_layer)
                 .with(stdout_layer)
                 .with(file_layer)
-                .with(filter)
                 .init();
-            Some(guard)
+            LoggingGuard {
+                _worker: Some(guard),
+                filter: filter_handle,
+            }
         }
         Err(e) => {
             // 滚动文件初始化失败（如 logs 目录不可写）：退回仅 stdout，进程照常运行
             eprintln!("[main] 初始化滚动日志文件失败（{}），退回仅 stdout 输出", e);
             tracing_subscriber::registry()
+                .with(filter_layer)
                 .with(stdout_layer)
-                .with(filter)
                 .init();
-            None
+            LoggingGuard {
+                _worker: None,
+                filter: filter_handle,
+            }
         }
     }
 }

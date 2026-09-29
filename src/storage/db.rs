@@ -5,8 +5,9 @@
 #![allow(clippy::type_complexity)]
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 use tracing::{debug, info};
@@ -30,6 +31,60 @@ pub struct WriteStats {
     pub total_writes: u64,
 }
 
+/// WAL checkpoint 模式（A1）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointMode {
+    /// 不阻塞写入，日常高频
+    Passive,
+    /// 截断 WAL 到 0，会短暂阻塞写入，低频
+    Truncate,
+}
+
+/// 单次 WAL checkpoint 的结果（A1，策略无关，只描述事实）
+#[derive(Debug, Clone)]
+pub struct CheckpointOutcome {
+    pub mode: CheckpointMode,
+    /// PRAGMA 第一个返回值 != 0（有连接阻塞）
+    pub busy: bool,
+    /// WAL 总帧数
+    pub wal_frames: u64,
+    /// 已 checkpoint 的帧数
+    pub checkpointed: u64,
+    /// 本次耗时
+    pub elapsed: Duration,
+    /// 跳过原因："memory"（内存库）/ "inflight"（单飞跳过）
+    pub skipped: Option<&'static str>,
+}
+
+/// A3：v11 要删除的四个 l2_shard 索引（v8 去 Merkle 化后无人查询）。
+const DROPPED_L2_SHARD_INDEXES: &[&str] = &[
+    "idx_dht_nodes_l2_shard",
+    "idx_trackers_l2_shard",
+    "idx_infohashes_l2_shard",
+    "idx_peers_l2_shard",
+];
+
+/// 一次性迁移：DROP 四个 l2_shard 索引（幂等，跑两次不报错）。
+/// 列与写入路径不动；DROP 释放的页进 freelist 后续复用（不做 VACUUM）。
+fn drop_unused_l2_shard_indexes(conn: &Connection) -> anyhow::Result<u32> {
+    for name in DROPPED_L2_SHARD_INDEXES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {};", name), [])?;
+    }
+    Ok(DROPPED_L2_SHARD_INDEXES.len() as u32)
+}
+
+/// B5-1：与 PK 首列重复、纯写放大的两个 peers 索引（证据见 16 号文档）。
+const DROPPED_REDUNDANT_PEER_INDEXES: &[&str] =
+    &["idx_peers_infohash", "idx_peers_archive_infohash"];
+
+/// B5-1：一次性 DROP（幂等）。
+fn run_drop_redundant_peer_indexes(conn: &Connection) -> anyhow::Result<u32> {
+    for name in DROPPED_REDUNDANT_PEER_INDEXES {
+        let _ = conn.execute(&format!("DROP INDEX IF EXISTS {};", name), []);
+    }
+    Ok(DROPPED_REDUNDANT_PEER_INDEXES.len() as u32)
+}
+
 /// 存储层
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
@@ -46,6 +101,10 @@ pub struct Storage {
     /// 统计口径 = `deleted_at IS NULL`（软删墓碑不入数）。内存 repo 为热/温数据，
     /// 冷数据在本 DB；总数以 DB 为唯一权威口径，由周期任务校准（见 main.rs db_entity_stats）。
     pub(crate) entity_counts_cache: [std::sync::atomic::AtomicI64; 5],
+    /// 专用 checkpoint 连接（与写路径不共享锁）；内存库 / 测试为 None
+    ckpt_conn: Option<Arc<Mutex<Connection>>>,
+    /// <db>-wal 路径，用于无锁读取 WAL 尺寸
+    wal_path: Option<PathBuf>,
 }
 
 /// 读连接归还 guard：`Storage::read` 的闭包 panic（unwind）时也把连接放回池，
@@ -109,14 +168,35 @@ impl Storage {
             "[storage] read pool initialized: {} connections",
             read_pool.len()
         );
+
+        // A1：专用 checkpoint 连接（与写路径不共享锁）。
+        // 只设 busy_timeout/synchronous/cache_size；不在 ckpt 连接重复
+        // journal_mode/mmap_size/wal_autocheckpoint（那些由写连接统一负责）。
+        let ckpt_conn = {
+            let c = Connection::open(path_ref)?;
+            c.execute_batch(&format!(
+                "PRAGMA busy_timeout={}; PRAGMA synchronous={}; PRAGMA cache_size=-2048;",
+                config.busy_timeout_ms, config.synchronous,
+            ))?;
+            Some(Arc::new(Mutex::new(c)))
+        };
+        // <db>-wal 路径：append("-wal" 到文件名），用于无锁读取 WAL 尺寸
+        let mut wal_path: PathBuf = path_ref.to_path_buf();
+        wal_path.as_mut_os_string().push("-wal");
+
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             read_pool: Arc::new(Mutex::new(read_pool)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
             entity_counts_cache: Default::default(),
+            ckpt_conn,
+            wal_path: Some(wal_path),
         };
-        storage.init_tables()?;
+        storage.init_tables(
+            config.drop_unused_indexes,
+            config.drop_redundant_peer_indexes,
+        )?;
         info!("[storage] 数据库已打开: {:?}", path_ref);
         Ok(storage)
     }
@@ -130,8 +210,10 @@ impl Storage {
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
             entity_counts_cache: Default::default(),
+            ckpt_conn: None,
+            wal_path: None,
         };
-        storage.init_tables()?;
+        storage.init_tables(true, true)?;
         Ok(storage)
     }
 
@@ -334,22 +416,65 @@ impl Storage {
         }
     }
 
-    /// 手动执行 WAL checkpoint（将 WAL 合并到主数据库文件）
+    /// 手动执行 WAL checkpoint（薄封装，转调专用连接 checkpoint_once）
     /// PASSIVE 模式：不阻塞写入，日常高频使用
     pub fn checkpoint(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        debug!("[storage] WAL checkpoint(PASSIVE) 已执行");
+        self.checkpoint_once(CheckpointMode::Passive)?;
         Ok(())
     }
 
-    /// 执行 WAL checkpoint 并截断 WAL 文件
+    /// 执行 WAL checkpoint 并截断 WAL 文件（薄封装，转调 checkpoint_once）
     /// TRUNCATE 模式：会阻塞写入，但会将 WAL 文件压缩到最小
-    /// 建议低频调用（如每小时一次），避免 IO 尖峰
     pub fn checkpoint_truncate(&self) -> anyhow::Result<()> {
+        self.checkpoint_once(CheckpointMode::Truncate)?;
+        Ok(())
+    }
+
+    /// 单次 WAL checkpoint（阻塞；必须由调用方保证不在 async worker 线程执行）。
+    /// 走专用 ckpt_conn，与写路径不共享锁；内存库（ckpt_conn=None）直接跳过。
+    pub fn checkpoint_once(&self, mode: CheckpointMode) -> anyhow::Result<CheckpointOutcome> {
+        let started = std::time::Instant::now();
+        let Some(ckpt) = &self.ckpt_conn else {
+            return Ok(CheckpointOutcome {
+                mode,
+                busy: false,
+                wal_frames: 0,
+                checkpointed: 0,
+                elapsed: started.elapsed(),
+                skipped: Some("memory"),
+            });
+        };
+        let sql = match mode {
+            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE);",
+            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE);",
+        };
+        let conn = ckpt.lock().unwrap_or_else(|e| e.into_inner());
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            conn.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(CheckpointOutcome {
+            mode,
+            busy: busy != 0,
+            wal_frames: log.max(0) as u64,
+            checkpointed: checkpointed.max(0) as u64,
+            elapsed: started.elapsed(),
+            skipped: None,
+        })
+    }
+
+    /// 读取 <db>-wal 文件尺寸（无锁，O(1)）。
+    pub fn wal_bytes(&self) -> u64 {
+        match &self.wal_path {
+            Some(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// 写连接的 SQLite 自动 checkpoint 开关（接管/交还）。
+    /// takeover=true 启动时置 0（应用接管）；false 时恢复默认页数。
+    pub fn set_wal_autocheckpoint(&self, pages: u32) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-        info!("[storage] WAL checkpoint(TRUNCATE) 已执行，WAL 已压缩");
+        // 注意：PRAGMA 赋值会返回一行结果，必须用 pragma_update（execute 会报 "returned results"）
+        conn.pragma_update(None, "wal_autocheckpoint", pages)?;
         Ok(())
     }
 
@@ -369,7 +494,12 @@ impl Storage {
     }
 
     /// 初始化表结构
-    fn init_tables(&self) -> anyhow::Result<()> {
+    /// `drop_unused_indexes`：A3 迁移开关，true 时删除 v8 后无人查询的 l2_shard 索引。
+    fn init_tables(
+        &self,
+        drop_unused_indexes: bool,
+        drop_redundant_peer_indexes: bool,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(
             r#"
@@ -428,8 +558,7 @@ impl Storage {
                 l2_shard INTEGER DEFAULT 0,
                 PRIMARY KEY (infohash, ip, port)
             );
-            CREATE INDEX IF NOT EXISTS idx_peers_infohash ON peers(infohash);
-
+            -- B5-1: idx_peers_infohash 与 PK(infohash,ip,port) 首列重复，已由末尾一次性迁移 DROP。
             -- 冷数据归档表（超过 2 小时无活跃的 peer 迁移到此，减少主表体积）
             CREATE TABLE IF NOT EXISTS peers_archive (
                 infohash BLOB NOT NULL,
@@ -443,7 +572,7 @@ impl Storage {
                 archived_at INTEGER,
                 PRIMARY KEY (infohash, ip, port)
             );
-            CREATE INDEX IF NOT EXISTS idx_peers_archive_infohash ON peers_archive(infohash);
+            -- B5-1: idx_peers_archive_infohash 与 PK 首列重复，已 DROP。
             CREATE INDEX IF NOT EXISTS idx_peers_archive_last_active ON peers_archive(last_active);
 
             CREATE TABLE IF NOT EXISTS peer_history (
@@ -539,10 +668,8 @@ impl Storage {
         // 是 no-op，紧接着的 CREATE INDEX 会因列尚不存在而报 no such column: l2_shard 导致启动失败。
         conn.execute_batch(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_dht_nodes_l2_shard ON dht_nodes(l2_shard);
-            CREATE INDEX IF NOT EXISTS idx_trackers_l2_shard ON trackers(l2_shard);
-            CREATE INDEX IF NOT EXISTS idx_infohashes_l2_shard ON infohashes(l2_shard);
-            CREATE INDEX IF NOT EXISTS idx_peers_l2_shard ON peers(l2_shard);
+            -- A3（v11）：四个 idx_*_l2_shard 已删除（全仓库无 WHERE l2_shard 查询，纯写放大）。
+            -- 存量库由末尾 drop_unused_l2_shard_indexes() 一次性 DROP（列与写入路径保留）。
             CREATE INDEX IF NOT EXISTS idx_dht_nodes_deleted ON dht_nodes(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_trackers_deleted ON trackers(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_infohashes_deleted ON infohashes(deleted_at);
@@ -667,6 +794,22 @@ impl Storage {
                 "[storage] 表达式索引创建失败（interval 查询将退化为全表排序，性能下降）: {}",
                 e
             );
+        }
+
+        // A3（v11）：删除 v8 去 Merkle 化后无人查询的 l2_shard 索引（纯写放大）。
+        // 列与 save_* 写入路径保留（诊断/联邦口径仍读该列值）。幂等：新库本就没有这些索引。
+        if drop_unused_indexes {
+            let n = drop_unused_l2_shard_indexes(&conn)?;
+            info!(
+                "[storage] 已删除 {} 个无用索引（l2_shard），减少写入放大",
+                n
+            );
+        }
+
+        // B5-1：DROP 与 PK 首列重复的 peers 索引（幂等，有开关）。
+        if drop_redundant_peer_indexes {
+            let n = run_drop_redundant_peer_indexes(&conn)?;
+            info!("[storage] 已删除 {} 个冗余 peers 索引（B5-1）", n);
         }
 
         // P1-2：变更日志表（联邦 delta 同步的权威来源）
@@ -3157,5 +3300,142 @@ mod tests {
             entry_keys, expect_keys,
             "块读取必须与清单扫描同口径（两表合并）"
         );
+    }
+
+    // ---- A1/A3: checkpoint 接管与无用索引迁移 ----
+
+    /// 生成唯一临时目录（避免并行测试互相踩）。测试文件落在系统 temp 下，不污染仓库。
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("pdc_test_{}_{}", tag, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cleanup_temp(dir: &std::path::Path) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for f in rd.flatten() {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn test_checkpoint_once_memory_db_skips() {
+        let s = Storage::memory().unwrap();
+        let out = s.checkpoint_once(CheckpointMode::Passive).unwrap();
+        assert_eq!(out.skipped, Some("memory"));
+        assert!(!out.busy);
+        // 内存库 wal_bytes 恒为 0
+        assert_eq!(s.wal_bytes(), 0);
+    }
+
+    #[test]
+    fn test_wal_autocheckpoint_takeover() {
+        let dir = unique_temp_dir("takeover");
+        let db_path = dir.join("test.db");
+        let cfg = crate::config::SqliteConfig::default();
+        let s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        // 接管：置 0
+        s.set_wal_autocheckpoint(0).unwrap();
+        let conn = s.connection();
+        let c = conn.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: i64 = c
+            .query_row("PRAGMA wal_autocheckpoint;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            pages, 0,
+            "takeover=true 时写连接 wal_autocheckpoint 应读出 0"
+        );
+        drop(c);
+        // checkpoint_once 在文件库上不应返回 skipped=memory
+        drop(s);
+        let _ = std::fs::remove_file(dir.join("test.db-wal"));
+        cleanup_temp(&dir);
+    }
+
+    #[test]
+    fn test_drop_unused_indexes_idempotent() {
+        let dir = unique_temp_dir("dropidx");
+        let db_path = dir.join("test.db");
+        let cfg = crate::config::SqliteConfig::default();
+        // 首次打开（迁移开启）
+        {
+            let _s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        }
+        // 模拟旧库：手动重建四个 l2_shard 索引
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_dht_nodes_l2_shard ON dht_nodes(l2_shard);
+                 CREATE INDEX IF NOT EXISTS idx_trackers_l2_shard ON trackers(l2_shard);
+                 CREATE INDEX IF NOT EXISTS idx_infohashes_l2_shard ON infohashes(l2_shard);
+                 CREATE INDEX IF NOT EXISTS idx_peers_l2_shard ON peers(l2_shard);",
+            )
+            .unwrap();
+        }
+        // 再次打开：迁移再次 DROP，幂等不报错
+        {
+            let _s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        }
+        // 第三次打开：仍然幂等
+        {
+            let _s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        }
+        // 断言索引已不存在
+        let c = Connection::open(&db_path).unwrap();
+        let cnt: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN                  ('idx_dht_nodes_l2_shard','idx_trackers_l2_shard',                  'idx_infohashes_l2_shard','idx_peers_l2_shard')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 0, "l2_shard 索引应被删除");
+        drop(c);
+        let _ = std::fs::remove_file(dir.join("test.db-wal"));
+        cleanup_temp(&dir);
+    }
+
+    #[test]
+    fn test_drop_unused_indexes_disabled_by_config() {
+        let dir = unique_temp_dir("dropidx_off");
+        let db_path = dir.join("test.db");
+        let cfg = crate::config::SqliteConfig {
+            drop_unused_indexes: false,
+            ..Default::default()
+        };
+        // 首次打开（迁移关闭）
+        {
+            let _s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        }
+        // 手动建一个 l2_shard 索引模拟旧库
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_dht_nodes_l2_shard ON dht_nodes(l2_shard);",
+            )
+            .unwrap();
+        }
+        // 再次打开（迁移仍关闭）：索引应保留
+        {
+            let _s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        }
+        let c = Connection::open(&db_path).unwrap();
+        let cnt: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='idx_dht_nodes_l2_shard'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "drop_unused_indexes=false 时不应删除索引");
+        drop(c);
+        let _ = std::fs::remove_file(dir.join("test.db-wal"));
+        cleanup_temp(&dir);
     }
 }

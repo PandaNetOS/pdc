@@ -322,11 +322,60 @@ pub fn routes(state: AppState) -> Router {
             get(federation_relay_setup_handler),
         )
         .route("/api/v1/relay/stats", get(relay_stats_handler))
+        .route("/api/v1/io/status", get(io_status_handler))
+        .route("/api/v1/sync/channels", get(sync_channels_handler))
+        .route("/api/v1/system", get(system_handler))
+        .route("/api/v1/config", get(get_config_handler))
+        .route("/api/v1/config/reload", post(reload_config_handler))
         .route("/metrics", get(crate::data_plane::metrics::metrics_handler))
         .route("/ws", get(crate::data_plane::ws::ws_handler))
         .with_state(state)
         .layer(Extension(event_bus))
         .layer(CorsLayer::permissive())
+}
+
+// ---------------------------------------------------------------------------
+// 配置热重载处理函数
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/config —— 当前生效配置（快照 = 最近一次热重载后的文件状态）
+async fn get_config_handler(State(state): State<AppState>) -> Response {
+    Json(state.config.read().clone()).into_response()
+}
+
+/// POST /api/v1/config/reload —— 立即重新加载配置文件并应用（继承 API token 鉴权）
+async fn reload_config_handler(State(state): State<AppState>) -> Response {
+    match &state.config_reloader {
+        Some(reloader) => {
+            let report = reloader.reload_now().await;
+            if report.errors.is_empty() {
+                Json(serde_json::json!({
+                    "code": 0,
+                    "message": "配置重载完成",
+                    "report": report,
+                }))
+                .into_response()
+            } else {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "code": 1,
+                        "message": "配置重载存在问题（旧配置保留）",
+                        "report": report,
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": 1,
+                "message": "配置热重载器未装配（config_reloader = None）",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1101,63 @@ async fn federation_relay_setup_handler(
 }
 
 /// 中继服务器统计（data_plane RelayServer）
+// B4：GET /api/v1/io/status
+async fn io_status_handler(State(state): State<AppState>) -> Response {
+    use crate::storage::io_scheduler::disk_class;
+    match state.io_scheduler {
+        Some(ref s) => Json(s.status_snapshot()).into_response(),
+        None => Json(serde_json::json!({
+            "enabled": false,
+            "disk_class": disk_class(),
+        }))
+        .into_response(),
+    }
+}
+
+// 联邦同步通道状态轮询：GET /api/v1/sync/channels
+async fn sync_channels_handler(State(state): State<AppState>) -> Response {
+    // parking_lot 同步锁，read() 短时阻塞（与 io_status_handler 读法一致）。
+    Json(state.sync_channels.read().clone()).into_response()
+}
+
+/// GET /api/v1/system：进程运行时信息（内存 / CPU / 线程 / fd）。
+#[derive(serde::Serialize)]
+struct SystemStatus {
+    memory_bytes: u64,
+    memory_mb: f64,
+    cpu_usage_percent: f64,
+    thread_count: u32,
+    fd_count: u32,
+}
+
+async fn system_handler() -> Response {
+    use sysinfo::System;
+    let sys = System::new_all();
+    let pid = match sysinfo::get_current_pid() {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    };
+    let Some(proc) = sys.process(pid) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    };
+    let memory_bytes = proc.memory();
+    let memory_mb = memory_bytes as f64 / 1024.0 / 1024.0;
+    // sysinfo 的 cpu_usage 是两次 refresh 间的差值；进程刚起/首次轮询可能为 0，
+    // 监控面板周期性轮询后第二次即有数。不为它引入全局缓存。
+    let cpu_usage_percent = proc.cpu_usage() as f64;
+    // TODO: sysinfo 0.32 不暴露 thread/fd count，Windows 下需要 NtQuerySystemInformation，暂以默认值占位。
+    let thread_count = u32::default();
+    let fd_count = u32::default();
+    Json(SystemStatus {
+        memory_bytes,
+        memory_mb,
+        cpu_usage_percent,
+        thread_count,
+        fd_count,
+    })
+    .into_response()
+}
+
 async fn relay_stats_handler(State(state): State<AppState>) -> Response {
     match &state.relay_server {
         Some(server) => {

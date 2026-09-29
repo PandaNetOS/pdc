@@ -5,7 +5,7 @@
 //! 响应率 < enter_threshold（默认 15%）进入限速，恢复到 > exit_threshold（默认 30%）解除。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// 默认滑动窗口大小（秒）
@@ -149,17 +149,16 @@ impl Default for SocketRateStats {
 }
 
 /// 多 socket 限速管理器
+///
+/// 配置支持运行时热更：`update_config` 只需 `&self`（`throttle_skip_ratio` 走原子量，
+/// 阈值经每个 socket 自身的 Mutex 下发），因此实例可以 `Arc` 共享给 config reloader
+/// 与发送热路径，无需外层加锁。
 pub struct RateLimiter {
     stats: Vec<parking_lot::Mutex<SocketRateStats>>,
     enabled: bool,
-    /// 进入限速阈值（响应率低于此值进入限速）
-    enter_threshold: f64,
-    /// 解除限速阈值（响应率高于此值解除限速）
-    exit_threshold: f64,
-    /// 限速判断所需最小请求样本数
-    min_samples: usize,
-    /// 限速时跳过比例（0.5 表示每 2 次发送跳过 1 次）
-    throttle_skip_ratio: f64,
+    /// 限速时跳过比例（0.5 表示每 2 次发送跳过 1 次）。
+    /// f64 按 bit 存进原子量，热路径 `should_skip` 无锁读取。
+    throttle_skip_ratio: AtomicU64,
     /// 每个 socket 的降频跳过计数器（与 socket 数量等长）
     throttle_skip_counter: Vec<AtomicUsize>,
 }
@@ -200,10 +199,7 @@ impl RateLimiter {
                 })
                 .collect(),
             enabled,
-            enter_threshold,
-            exit_threshold,
-            min_samples,
-            throttle_skip_ratio,
+            throttle_skip_ratio: AtomicU64::new(throttle_skip_ratio.to_bits()),
             // 每个 socket 一个计数器，初始化为 0
             throttle_skip_counter: (0..socket_count).map(|_| AtomicUsize::new(0)).collect(),
         }
@@ -211,19 +207,17 @@ impl RateLimiter {
 
     /// 运行时热更新限速配置（阈值/样本数/跳过比例）。
     ///
-    /// 会同时把新阈值同步下发给每个 socket 的统计对象，
-    /// `throttle_skip_ratio` 直接作用于后续 `should_skip` 调用。
+    /// `&self`：可经 `Arc<RateLimiter>` 在运行中调用。会同时把新阈值同步下发
+    /// 给每个 socket 的统计对象，`throttle_skip_ratio` 直接作用于后续 `should_skip`。
     pub fn update_config(
-        &mut self,
+        &self,
         enter_threshold: f64,
         exit_threshold: f64,
         min_samples: usize,
         throttle_skip_ratio: f64,
     ) {
-        self.enter_threshold = enter_threshold;
-        self.exit_threshold = exit_threshold;
-        self.min_samples = min_samples;
-        self.throttle_skip_ratio = throttle_skip_ratio;
+        self.throttle_skip_ratio
+            .store(throttle_skip_ratio.to_bits(), Ordering::Relaxed);
         for s in &self.stats {
             s.lock()
                 .set_thresholds(enter_threshold, exit_threshold, min_samples);
@@ -275,7 +269,8 @@ impl RateLimiter {
         };
         let c = counter.fetch_add(1, Ordering::Relaxed);
         // 跳过周期 = round(1 / ratio)。ratio=0.5 → 2；ratio=0.25 → 4
-        let period = (1.0 / self.throttle_skip_ratio).round() as usize;
+        let ratio = f64::from_bits(self.throttle_skip_ratio.load(Ordering::Relaxed));
+        let period = (1.0 / ratio).round() as usize;
         if period == 0 {
             return true;
         }
@@ -482,7 +477,8 @@ mod tests {
 
     #[test]
     fn test_update_config_changes_thresholds() {
-        let mut limiter = RateLimiter::new(1, true, TEST_WINDOW);
+        // Arc 共享下热更（编译期证明 update_config 只需 &self，供 config reloader 使用）
+        let limiter = std::sync::Arc::new(RateLimiter::new(1, true, TEST_WINDOW));
         // 用更严格的进入阈值 0.5（50%）：100 请求 40 响应 = 40% < 50% → 进入限速
         limiter.update_config(0.5, 0.8, 50, 0.5);
         for _ in 0..100 {
@@ -493,5 +489,26 @@ mod tests {
         }
         assert!(limiter.should_skip(0));
         assert!(limiter.throttled_sockets()[0]);
+    }
+
+    #[test]
+    fn test_update_config_changes_skip_ratio() {
+        let limiter = std::sync::Arc::new(RateLimiter::new(1, true, TEST_WINDOW));
+        // 制造限速状态：100 请求 5 响应 = 5% < 15%
+        for _ in 0..100 {
+            limiter.record_request(0);
+        }
+        for _ in 0..5 {
+            limiter.record_response(0);
+        }
+        // 热更跳过比例到 0.25 → 周期 4，20 次调用跳过 5 次
+        limiter.update_config(0.15, 0.30, 50, 0.25);
+        let mut skip_count = 0;
+        for _ in 0..20 {
+            if limiter.should_skip(0) {
+                skip_count += 1;
+            }
+        }
+        assert_eq!(skip_count, 5);
     }
 }

@@ -85,6 +85,13 @@ pub struct AppState {
     pub udp_tracker: Option<Arc<UdpTrackerServer>>,
     /// 统计快照（后台任务定期更新，API 只读）
     pub stats_snapshot: Arc<stats_snapshot::StatsSnapshot>,
+    /// B4：IO 调度器（可选，用于 GET /api/v1/io/status）
+    pub io_scheduler: Option<Arc<crate::storage::IoScheduler>>,
+    /// 联邦同步通道状态（GET /api/v1/sync/channels 轮询；全局单例 Arc）
+    pub sync_channels:
+        Arc<parking_lot::RwLock<crate::federation::sync::channels_status::SyncChannelsStatus>>,
+    /// 配置热重载器（main.rs 装配后注入；POST /api/v1/config/reload 用；None = 未启用）
+    pub config_reloader: Option<Arc<crate::control_plane::config_reload::ConfigReloader>>,
 }
 
 /// 数据面

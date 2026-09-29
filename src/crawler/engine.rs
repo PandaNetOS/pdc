@@ -331,10 +331,14 @@ impl CrawlerEngine {
     pub fn with_sockets(mut self, sockets: Vec<Arc<UdpSocket>>) -> Self {
         self.sockets = sockets;
         if self.config.adaptive_rate_limit && !self.sockets.is_empty() {
-            self.rate_limiter = Some(Arc::new(RateLimiter::new(
+            self.rate_limiter = Some(Arc::new(RateLimiter::with_config(
                 self.sockets.len(),
                 true,
                 std::time::Duration::from_secs(self.config.rate_limit_window_secs),
+                self.config.rate_limit_enter_threshold,
+                self.config.rate_limit_exit_threshold,
+                self.config.rate_limit_min_samples as usize,
+                self.config.rate_limit_throttle_skip_ratio,
             )));
         }
         self
@@ -362,6 +366,11 @@ impl CrawlerEngine {
     /// 路由表引用（供外部访问）
     pub fn routing_table(&self) -> Arc<RwLock<RoutingTable>> {
         self.known_nodes.clone()
+    }
+
+    /// 响应率自适应限速器引用（供 config reloader 热更阈值；未启用时为 None）
+    pub fn rate_limiter(&self) -> Option<Arc<RateLimiter>> {
+        self.rate_limiter.clone()
     }
 
     /// 获取状态的 Arc 引用（用于共享到 HTTP API）

@@ -6,6 +6,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod bootstrap;
+pub mod channels_status;
 pub mod delta;
 pub mod infohash_sync;
 pub mod peer_sync;
@@ -54,6 +55,12 @@ const BOOTSTRAP_CHECK_INTERVAL_SECS: u64 = 300;
 const SNAPSHOT_MIN_ROWS: u64 = 1_000;
 /// v7：快照分流比例阈值（本端比对端多出该比例且差值超阈值 → 快照）。
 const SNAPSHOT_RATIO_THRESHOLD: f64 = 1.2;
+/// D批(D2)：双向快照触发的「大小端比例」阈值（不区分方向，max/min 超过即候选）。
+/// D批(D3)：1.3→1.1 调敏 —— 三端联邦实测 52/62 ratio≈1.11 在 1.3 下永远裁定 DELTA，
+/// 不触发 bootstrap，NODE 表长期不对齐；1.1 配合 diff>50_000 即可覆盖该量级差。
+const SNAPSHOT_BIDIR_RATIO: f64 = 1.1;
+/// D批(D2)：双向快照触发的最小行数绝对差（行）。
+const BOOTSTRAP_BIDIR_MIN_DIFF_ROWS: u64 = 50_000;
 /// v10(F2)：Range 抽样进度的停滞阈值（秒）—— 超过未推进视为对端持续不可达/连接失效，
 /// 弃置该进度、下一轮重新抽样。正常推进时每 tick 刷新，不会触发。
 const RANGE_SAMPLE_STALL_SECS: u64 = 1800;
@@ -68,6 +75,14 @@ const BOOTSTRAP_SERVING_WINDOW_SECS: u64 = 120;
 /// 请求超过 serving 窗口，仅靠 serving 判定会让路失效 → 双向重启震荡
 /// （实测 15:30-15:34 三轮重启循环）。对端安静满该时长才恢复自己的拉取。
 const BOOTSTRAP_YIELD_HOLD_SECS: u64 = 300;
+
+/// 修复（活表竣工死循环）：INFOHASH/PEER 这类 crawler 持续写入的活表，键随机分布、
+/// 插入可落在任意块区间，传输期间本地表一直在变 → 按远端快照清单逐块 hash&rows 全等
+/// 的严格竣工校验永不成立（不写 Done → resume/watchdog 反复重试 = 死循环）。
+/// 对这类表改走宽松竣工判定：只要本地实际行数已达到远端快照总行数的该比例，即视为数据
+/// 已基本落地、允许写 Done 进入 delta 追尾；不足比例则判「块返回极少行」的假竣工，
+/// 仍不写 Done，交由 resume/watchdog 继续推进。NODE/TRACKER 静态表保持严格全等校验。
+const BOOTSTRAP_LIVE_RELAXED_ROW_RATIO: f64 = 0.95;
 
 /// v10(F2)：一轮 Range 抽样对账的进行中状态（断点续跑游标）。
 ///
@@ -212,6 +227,10 @@ pub struct SyncManager {
     bootstrap_cooldown: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v10：bootstrap 发起互斥 —— (peer, repo) → 发起时刻（TTL 内重复触发直接拒绝）。
     bootstrap_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// E1：运行时差异复检重触发冷却 —— (peer, repo) → 最近一次因运行时行数差超 D2 阈值
+    /// 而重触发 bootstrap 的时刻。冷却期内不再重复点火（防抖），与 v10(F4) 的
+    /// `bootstrap_cooldown`（竣工后防死循环）相互独立。
+    bootstrap_rediff_cooldown: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// v10：本端节点身份（双向引导冲突时按 node_id 字典序确定性让路）。
     local_node_id: NodeId,
     /// v10(A)：响应方活动标记 —— (peer, repo) → 最近一次响应对方 bootstrap 请求的时刻。
@@ -356,6 +375,7 @@ impl SyncManager {
             range_progress: RwLock::new(FxHashMap::default()),
             bootstrap_cooldown: RwLock::new(FxHashMap::default()),
             bootstrap_inflight: RwLock::new(FxHashMap::default()),
+            bootstrap_rediff_cooldown: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
             range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
@@ -525,6 +545,12 @@ impl SyncManager {
         if applied > 0 {
             self.metrics.record_sync_entries(applied as u64);
             self.metrics.record_node_sync(applied as u64);
+            {
+                let s = crate::federation::sync::channels_status::global();
+                let mut g = s.write();
+                g.delta.sync_entries_applied =
+                    g.delta.sync_entries_applied.saturating_add(applied as u64);
+            }
             debug!("[federation] Node 同步应用 {} 条", applied);
         }
     }
@@ -846,6 +872,12 @@ impl SyncManager {
             };
             if let Err(e) = conn.send_message(MessageType::OpsBatchV2, &batch).await {
                 warn!("[delta] 发送 OpsBatchV2 失败 to={}: {}", conn.node_id, e);
+                {
+                    crate::federation::sync::channels_status::global()
+                        .write()
+                        .delta
+                        .batch_send_failures += 1;
+                }
             } else {
                 self.metrics.record_message_sent();
             }
@@ -859,6 +891,12 @@ impl SyncManager {
             };
             if let Err(e) = conn.send_message(MessageType::OpsBatch, &batch).await {
                 warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
+                {
+                    crate::federation::sync::channels_status::global()
+                        .write()
+                        .delta
+                        .batch_send_failures += 1;
+                }
             } else {
                 self.metrics.record_message_sent();
             }
@@ -930,6 +968,10 @@ impl SyncManager {
                 conn.node_id, repo, missing, cur, peer_min_seq
             );
             self.delta_gap.write().insert((conn.node_id, repo));
+            crate::federation::sync::channels_status::global()
+                .write()
+                .delta
+                .oplog_gap_detected = true;
         } else if batch_empty {
             // 空批 = 对端该 repo 已无更新可给 ⇒ 不存在待补空洞，清除标记
             // （旧写法只在「本批非空且间距小」时清除，空批会让标记永久粘滞）。
@@ -952,6 +994,14 @@ impl SyncManager {
     ) {
         if !entries.is_empty() {
             self.handle_sync_batch(repo, &entries);
+        }
+        // 联邦同步通道状态：oplog 水位 + 对端拉取水位（DB 查询在写锁外做）
+        {
+            let oplog_len = self.delta_storage().oplog_len().unwrap_or(0);
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.delta.oplog_len = oplog_len;
+            g.delta.since_seq = g.delta.since_seq.max(next_seq);
         }
         // 推进版本向量（仅前进，不回退）
         if let Err(e) =
@@ -1233,6 +1283,111 @@ impl SyncManager {
         m.contains_key(&(*peer, repo))
     }
 
+    /// E1：该 (peer, repo) 是否处于「运行时差异复检重触发」冷却期内。
+    fn rediff_in_cooldown(&self, peer: &NodeId, repo: u8) -> bool {
+        let mut m = self.bootstrap_rediff_cooldown.write();
+        let ttl = self.config.bootstrap_rediff_cooldown_secs.max(1);
+        m.retain(|_, t| t.elapsed().as_secs() < ttl);
+        m.contains_key(&(*peer, repo))
+    }
+
+    /// E1：标记 (peer, repo) 刚因运行时差异超阈值重触发 bootstrap（写入冷却起点）。
+    fn mark_rediff_triggered(&self, peer: &NodeId, repo: u8) {
+        self.bootstrap_rediff_cooldown
+            .write()
+            .insert((*peer, repo), Instant::now());
+    }
+
+    /// E1：巡检里挑出下一个「本地实时行数 vs 对端最近自报行数」已超 D2 双向阈值、
+    /// 且无在途 bootstrap、不在 F4 竣工冷却 / E1 重触发冷却中的 (peer, repo) 候选。
+    /// 纯判定（不含连接/发送 IO），便于单测。阈值直接复用 D2 的 `should_bootstrap_by_volume`
+    /// （ratio>1.1 且 diff>50000，冷启动一端为 0 也算），不另写一套。
+    fn next_rediff_candidate(
+        &self,
+        local: &[u32],
+        states: &[(NodeId, Vec<RepoSyncState>)],
+        running: &[bootstrap::BootstrapProgress],
+    ) -> Option<(NodeId, u8)> {
+        for (peer, repos) in states {
+            for st in repos {
+                let repo = st.repo;
+                if !(repo_type::NODE..=repo_type::TRACKER).contains(&repo) {
+                    continue;
+                }
+                let idx = (repo - repo_type::NODE) as usize;
+                let local_n = local.get(idx).copied().unwrap_or(0) as u64;
+                let remote_n = st.row_count;
+                // 方向保护（修复 E1 双向反向拉数）：`should_bootstrap_by_volume` 是双向判定
+                // （协商裁定 `decide_strategies` 仍按应答方视角保持双向，本体不动）；但巡检
+                // 重触发若不辨方向，数据多的一方（如 422 万行）会因 ratio>1.1 向数据少的一方
+                // （350 万行）反向发起 bootstrap —— 拉来的几乎全是对方已有行，纯浪费带宽还占槽。
+                // 这里只在「本地少、对端多」（local_n < remote_n，本地确需向对端补数）才可能成候选；
+                // local_n >= remote_n 直接跳过。冷启动 local=0 & remote>SNAPSHOT_MIN_ROWS 仍满足
+                // local<remote 而触发；remote=0 & local>=SNAPSHOT_MIN_ROWS 因 local>=remote 被拦。
+                if local_n >= remote_n {
+                    continue;
+                }
+                if !Self::should_bootstrap_by_volume(local_n, remote_n) {
+                    continue;
+                }
+                if self.bootstrap_running_fresh(running, *peer, repo) {
+                    continue;
+                }
+                if self.snapshot_in_cooldown(peer, repo) {
+                    continue;
+                }
+                if self.rediff_in_cooldown(peer, repo) {
+                    continue;
+                }
+                return Some((*peer, repo));
+            }
+        }
+        None
+    }
+
+    /// E1：bootstrap 中途断裂（OOM/消息超时）后的运行时差异复检 —— 用对端最近一次
+    /// 协商自报行数（`peer_negotiate_state`，每次协商刷新）与本地实时行数再比一次，
+    /// 超 D2 阈值即重触发一次 bootstrap。落点与 `check_and_trigger_bootstrap` 同一巡检
+    /// 节流点（`BOOTSTRAP_CHECK_INTERVAL_SECS`），避免每次 resume tick 都做全表计数。
+    ///
+    /// 背景：旧 `decide_strategies` 只在连接建立/协商时裁定一次；bootstrap 因 OOM 中途
+    /// 断掉后，后续协商永久落在 DELTA，差百万行只能靠 range 对账慢补。本方法把
+    /// 「已竣工冷却 / 在途 bootstrap / 重触发冷却」三道闸都过了才点火。
+    async fn rediff_bootstrap_recheck(self: &Arc<Self>) {
+        if !self.config.bootstrap_enabled {
+            return;
+        }
+        let local = self.local_entry_counts();
+        let states: Vec<(NodeId, Vec<RepoSyncState>)> = {
+            let g = self.peer_negotiate_state.read();
+            g.iter().map(|(p, v)| (*p, v.clone())).collect()
+        };
+        if states.is_empty() {
+            return;
+        }
+        let running = self.delta_storage().bootstrap_list().unwrap_or_default();
+        let Some((peer, repo)) = self.next_rediff_candidate(&local, &states, &running) else {
+            return;
+        };
+        if self.sessions.get_connection(&peer).is_none() {
+            return;
+        }
+        self.mark_rediff_triggered(&peer, repo);
+        let idx = (repo - repo_type::NODE) as usize;
+        let local_n = local.get(idx).copied().unwrap_or(0) as u64;
+        let remote_n = states
+            .iter()
+            .find(|(p, _)| *p == peer)
+            .and_then(|(_, v)| v.iter().find(|s| s.repo == repo))
+            .map(|s| s.row_count)
+            .unwrap_or(0);
+        info!(
+            "[bootstrap] E1 运行时差异复检超 D2 阈值 local={} remote={} → 重触发 bootstrap: peer={} repo={}",
+            local_n, remote_n, peer, repo
+        );
+        self.clone().start_bootstrap(peer, repo).await;
+    }
+
     /// v10(F5)：快照发起前的水位校验。
     ///
     /// 对端自报 oplog 保留窗口 `[min_seq, max_seq]`（`peer_negotiate_state`）；
@@ -1259,12 +1414,24 @@ impl SyncManager {
         cursor < st.min_seq
     }
 
+    /// D批(D2)：双向快照阈值判定 —— 不区分方向（我多或你多），差异够大即走 bootstrap。
+    /// 冷启动（一端为 0、另一端有量）同样触发。双零与冷却期判定在调用处；本函数只负责
+    /// 「是否按数据量走快照」，便于纯函数单测。
+    fn should_bootstrap_by_volume(local: u64, peer_count: u64) -> bool {
+        let ratio = local.max(peer_count) as f64 / local.min(peer_count).max(1) as f64;
+        let diff = local.abs_diff(peer_count);
+        (local == 0 && peer_count > SNAPSHOT_MIN_ROWS)
+            || (peer_count == 0 && local >= SNAPSHOT_MIN_ROWS)
+            || (ratio > SNAPSHOT_BIDIR_RATIO && diff > BOOTSTRAP_BIDIR_MIN_DIFF_ROWS)
+    }
+
     /// v7：协商策略决策（Ack 发送方视角：为「对端应如何从我这里取数」裁定）。
     ///
-    /// 规则（对齐架构评审稿 §追平分流）：
-    /// - 对端该 repo 为空且本端有量 → `BOOTSTRAP`（冷启动走快照）；
-    /// - 本端比对端多 20% 以上且差 > `range_bulk_threshold_rows` → `BOOTSTRAP`（大差集走快照）；
-    /// - 其余 → `DELTA`（稳态水位续拉）；双方皆空 → `NONE`。
+    /// 规则（D批 D2 已改为双向）：
+    /// - 双方皆空 → `NONE`；冷却期 → `DELTA`；
+    /// - 一端为空另一端有量（冷启动），或 `max/min > 1.1` 且绝对差 > 50_000 行
+    ///   （不区分方向，我多或你多都触发）→ `BOOTSTRAP`（大差集走快照）；
+    /// - 其余 → `DELTA`（稳态水位续拉）。
     /// - v10(F4)：该 (peer,repo) 处于快照冷却期时一律 `DELTA` —— 竣工清协商（B5）后
     ///   裁定输入（行数）不会立刻变化，无冷却必然重裁 BOOTSTRAP。
     fn decide_strategies(&self, peer: &NodeId, remote: &SyncNegotiateMessage) -> Vec<RepoStrategy> {
@@ -1287,11 +1454,8 @@ impl SyncManager {
                 } else if self.snapshot_in_cooldown(peer, repo) {
                     // v10(F4)：冷却期内强制 DELTA（快照刚竣工，追尾是正确路径）
                     protocol::STRATEGY_DELTA
-                } else if (peer_count == 0 && local >= SNAPSHOT_MIN_ROWS)
-                    || (local as f64 / peer_count.max(1) as f64 > SNAPSHOT_RATIO_THRESHOLD
-                        && local.saturating_sub(peer_count) > self.config.range_bulk_threshold_rows)
-                {
-                    // 冷启动（对端为空且本端有量）或大差集 → 走 bootstrap 快照通道
+                } else if Self::should_bootstrap_by_volume(local, peer_count) {
+                    // D批(D2)：双向大差集（不区分方向）或冷启动 → 走 bootstrap 快照通道
                     protocol::STRATEGY_BOOTSTRAP
                 } else {
                     protocol::STRATEGY_DELTA
@@ -2179,6 +2343,12 @@ impl SyncManager {
                     conn.node_id, repo, count
                 );
                 self.metrics.record_sync_entries(count as u64);
+                {
+                    let s = crate::federation::sync::channels_status::global();
+                    let mut g = s.write();
+                    g.delta.sync_entries_applied =
+                        g.delta.sync_entries_applied.saturating_add(count as u64);
+                }
             }
             Err(e) => {
                 warn!("[range] 处理通用推送失败 from={}: {}", conn.node_id, e);
@@ -2478,6 +2648,20 @@ impl SyncManager {
         let repairs = self
             .range_repair_triggers
             .load(std::sync::atomic::Ordering::Relaxed);
+        // 联邦同步通道状态：镜像累计对账计数（原子量已在上方读出）
+        {
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.range_reconcile.leaf_compares = leaf_ranges;
+            g.range_reconcile.local_extra = local_only;
+            g.range_reconcile.remote_extra = remote_only;
+            g.range_reconcile.repairs_triggered = repairs;
+            g.range_reconcile.mode = if self.config.range_reconcile_diagnostic_only {
+                "diagnostic".to_string()
+            } else {
+                "repair".to_string()
+            };
+        }
         let stats = format!(
             "累计 叶级对账={} 本地多={} 对端多={} 触发修复={} 模式={}",
             leaf_ranges,
@@ -2491,6 +2675,10 @@ impl SyncManager {
             }
         );
         if done {
+            crate::federation::sync::channels_status::global()
+                .write()
+                .range_reconcile
+                .rounds_completed += 1;
             info!(
                 "[range] repo={} 抽样对账一轮发送完成 to={}（{} 个区间）| {}",
                 repo, conn.node_id, total, stats
@@ -2799,23 +2987,11 @@ impl SyncManager {
         let lo = Self::range_bound(&chunk.lo);
         let hi = Self::range_bound(&chunk.hi);
         let storage = self.delta_storage();
-        // ① 内容哈希：与建清单同源（(key, data_hash) 有序流）—— v7 全 repo 通用
-        let hash_rows = match storage.load_repo_key_hashes_in_range(
-            req.repo,
-            lo,
-            hi,
-            chunk.rows as usize + 1,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("[bootstrap] 取块哈希失败 index={}: {}", req.index, e);
-                self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk hash failed")
-                    .await;
-                return;
-            }
-        };
-        let take = hash_rows.len().min(chunk.rows as usize);
-        let hash = bootstrap::chunk_hash(&hash_rows[..take]);
+        // D批(D3)：删除对端「取块哈希」第二次 SELECT —— 客户端从 manifest 已知块 hash，
+        // 对端不必重算 blake3。传输完整性由 verify_transport + Range 反熵兜底（见 P0-4：
+        // 落地后重算本地区间摘要必然因活表 ~2% 独立行差异失配 → 3 次失败重拉清单死循环）。
+        // 响应线协议仍保留 hash 字段，但客户端从不读取，固定填零占位。
+        let hash = [0u8; 32];
         // ② 完整条目（含 payload，供接收方批量 upsert）—— v7 全 repo 通用
         let entries: Vec<SyncEntry> = match storage.load_repo_sync_entries_in_range(
             req.repo,
@@ -2909,28 +3085,73 @@ impl SyncManager {
             }
             _ => (0, "none"),
         };
+        // D批(D1)/D批(D3)：块级 hash 比较 + 断点继承前缀逐块验证。
+        // skip=true 时按相同 chunk_rows 重建本地清单（全表扫描，spawn_blocking），用纯函数
+        // `align_bootstrap_seed` 算出「全部 hash&rows 一致块集合」与「验证通过的连续前缀」：
+        //   - seed = 全部一致块（前缀块一旦与本地不一致即被剔除，落入待拉集合由窗口补发）；
+        //   - done_chunks = 验证通过的连续前缀（不再无条件信任旧 done_chunks）；
+        //   - 本地清单重建失败 → 完全不继承（seed 空、done=0，退回全量拉取）。
+        // skip=false 时保留旧行为：无条件继承 0..same_done。
+        let total_chunks = mf.chunks.len() as u32;
+        let do_verify = self.config.bootstrap_skip_identical_chunks;
+        let (seed, done_chunks): (std::collections::HashSet<u32>, u64) = if do_verify {
+            let storage = self.delta_storage();
+            let w0 = storage.oplog_max_seq_for_repo(mf.repo).unwrap_or(0).max(0) as u64;
+            let version = w0.wrapping_add(1) as u32;
+            let chunk_rows = mf.chunk_rows;
+            let repo = mf.repo;
+            let built = tokio::task::spawn_blocking(move || {
+                bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
+            })
+            .await;
+            match built {
+                Ok(Ok(local_mf)) => {
+                    let (prefix, matching) = bootstrap::align_bootstrap_seed(&mf.chunks, &local_mf);
+                    (matching, prefix as u64)
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "[bootstrap] 本地清单重建失败，不继承任何断点、退回全量拉取: repo={} peer={}: {}",
+                        mf.repo, conn.node_id, e
+                    );
+                    (std::collections::HashSet::new(), 0)
+                }
+                Err(e) => {
+                    warn!(
+                        "[bootstrap] 本地清单重建任务 join 失败，不继承任何断点、退回全量拉取: repo={} peer={}: {}",
+                        mf.repo, conn.node_id, e
+                    );
+                    (std::collections::HashSet::new(), 0)
+                }
+            }
+        } else {
+            // skip=false：无条件继承旧进度（旧行为，不做本地校验）
+            ((0..same_done as u32).collect(), same_done)
+        };
         let now = chrono::Utc::now().timestamp_millis();
         let mut progress = bootstrap::BootstrapProgress::new(mf.repo, conn.node_id.0.to_vec(), now);
         progress.phase = bootstrap::BootstrapPhase::Transfer;
         progress.version = mf.version;
         progress.w0_seq = mf.w0_seq;
         progress.total_chunks = mf.chunks.len() as u64;
-        progress.done_chunks = same_done;
-        if same_done > 0 {
+        progress.done_chunks = done_chunks;
+        if done_chunks > 0 || !seed.is_empty() {
             info!(
-                "[bootstrap] 断点继承（来源 {}）done={}/{}: peer={} repo={}",
+                "[bootstrap] 断点继承/对齐验证（来源 {}）verified_done={}/{} 跳过/继承块={}: peer={} repo={}",
                 resume_src,
-                same_done,
+                done_chunks,
                 mf.chunks.len(),
+                seed.len(),
                 conn.node_id,
                 mf.repo
             );
         }
-        // v10(B2)：继承判定已覆盖全部块（对端全量此前已落地）→ 直接竣工，
-        // 不再发越界块请求空转；竣工推进游标并切 delta 追尾。
-        if !mf.chunks.is_empty() && same_done >= mf.chunks.len() as u64 {
+        // v10(B2)/D批(D1)/D批(D3)：对齐验证覆盖全部块（seed 逐块 hash&rows 与本地一致 = 全量）
+        // → 直接竣工，不再发越界块请求空转；竣工推进游标并切 delta 追尾。
+        // D批(D3)：此处 seed 必须是**验证后**的集合，未验证的旧 done_chunks 不再直接竣工。
+        if !mf.chunks.is_empty() && seed.len() >= total_chunks as usize {
             info!(
-                "[bootstrap] 继承判定快照已全部落地，直接竣工: peer={} repo={}",
+                "[bootstrap] 对齐验证快照已全部落地（逐块 hash/rows 一致），直接竣工: peer={} repo={}",
                 conn.node_id, mf.repo
             );
             let _ = self.delta_storage().bootstrap_save(&progress, Some(&mf));
@@ -2949,23 +3170,40 @@ impl SyncManager {
             .write()
             .remove(&(conn.node_id, mf.repo));
         info!(
-            "[bootstrap] 收到清单 from={}: 总行={}, 块数={}, w0={}, 续传起点={}",
+            "[bootstrap] 收到清单 from={}: 总行={}, 块数={}, w0={}, 续传前缀={}, hash一致跳过块={}",
             conn.node_id,
             mf.total_rows,
             mf.chunks.len(),
             mf.w0_seq,
-            progress.done_chunks
+            progress.done_chunks,
+            seed.len()
         );
+
+        // 联邦同步通道状态：清单到达 → bootstrap 活跃
+        {
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.bootstrap.active = true;
+            g.bootstrap.peer_id = conn
+                .node_id
+                .0
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            g.bootstrap.repo = mf.repo as u64;
+            g.bootstrap.total_chunks = mf.chunks.len() as u64;
+            g.bootstrap.done_chunks = progress.done_chunks;
+            g.bootstrap.phase = "transfer".to_string();
+            g.bootstrap.skipped_identical = seed.len() as u64;
+        }
         // v10(C)：窗口化并发预取 —— 建立窗口状态机（resume_from = 继承的连续前缀），
         // fill 出首批在途块并批量请求。旧实现链式传输（收一块才请求下一块）把吞吐
         // 钉死在单块「生成+传输+RTT」线性叠加（实测 0.33MB/s）；窗口化后吞吐随
         // 窗口扩大，直至撞上落库/磁盘上限。窗口大小配置化（bootstrap_window_size）。
         let window_size = self.config.bootstrap_window_size.max(1);
-        let mut cw = bootstrap::ChunkWindow::new(
-            mf.chunks.len() as u32,
-            window_size,
-            progress.done_chunks as u32,
-        );
+        // D批(D1)/D批(D3)：以 seed（逐块验证 hash&rows 一致块）初始化窗口，只请求剩余差异块。
+        // done_chunks 为**验证通过**的连续前缀，非连续 skip 不持久化（重启后由清单响应重算）。
+        let mut cw = bootstrap::ChunkWindow::with_skip(total_chunks, window_size, &seed);
         let first_batch = cw.fill(0);
         self.chunk_windows
             .write()
@@ -3048,6 +3286,12 @@ impl SyncManager {
         // 是否完整到达，不再重算本地 [lo,hi) 区间摘要与清单 hash 比对。
         let ok = bootstrap::verify_transport(chunk.rows, resp.entries.len());
         if ok {
+            // D批(D3)：对端负载保护 —— 每收到一个完成块，按配置节流 sleep，避免 16 路窗口
+            // 满速回包把对端正常业务挤爆（工程约束「同步不能影响对端正常运行」）。
+            let d = self.config.bootstrap_peer_protect_delay_ms;
+            if d > 0 {
+                tokio::time::sleep(Duration::from_millis(d)).await;
+            }
             // 成功路径：统计字节、记录 key 游标、推进阶段。
             // done_chunks 不在此处按链式语义 (index+1) 推进 —— 窗口化乱序到达，
             // done_chunks 必须等于 cw.done_prefix()（最大连续前缀），否则持久化进度会跳号。
@@ -3100,6 +3344,23 @@ impl SyncManager {
         self.bootstrap_chunk_attempt
             .write()
             .remove(&(conn.node_id, resp.repo));
+        // 联邦同步通道状态：刷新 done/inflight/phase
+        {
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.bootstrap.active = true;
+            g.bootstrap.peer_id = conn
+                .node_id
+                .0
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            g.bootstrap.repo = resp.repo as u64;
+            g.bootstrap.done_chunks = progress.done_chunks;
+            g.bootstrap.total_chunks = mf.chunks.len() as u64;
+            g.bootstrap.inflight = cw.inflight_len() as u32;
+            g.bootstrap.phase = "transfer".to_string();
+        }
         let batch = cw.fill(0);
         self.chunk_windows
             .write()
@@ -3152,9 +3413,78 @@ impl SyncManager {
         }
     }
 
+    /// D批(D3)：竣工前/断点继承共用的「逐块对齐校验」—— 按与断点继承相同方式重建本地清单，
+    /// 判断 `remote_mf.chunks` 全部块是否都能在本地找到 index/hash/rows 全等的块。
+    /// 纯判定逻辑（不含水位抬升/清计数等副作用），便于单测；重建失败返回 false。
+    /// 活表（crawler 持续写入、键随机分布）：竣工校验不能要求逐块 hash&rows 全等。
+    /// INFOHASH(3)/PEER(2) 的插入可落在任意块区间，传输期间本地表一直在变，严格全等
+    /// 永远不成立 → 死循环。NODE(1)/TRACKER(4) 是静态表，保持严格全等校验。
+    fn repo_is_live_for_relaxed_finish(repo: u8) -> bool {
+        repo == repo_type::INFOHASH || repo == repo_type::PEER
+    }
+
+    /// 活表宽松竣工兜底（纯判定）：本地重建清单总行数 ≥ 远端快照总行数 ×
+    /// `BOOTSTRAP_LIVE_RELAXED_ROW_RATIO`。远端为空（total_rows==0）天然通过，与严格路径
+    /// 对空清单的放行口径一致。不叠加「连续前缀块存在」要求：infohash 随机键插入会让
+    /// 任意块区间（含前缀块 0）都可能在传输中变化，再加前缀全等会把死锁原样请回来。
+    fn live_finish_rows_enough(local_total: u64, remote_total: u64) -> bool {
+        if remote_total == 0 {
+            return true;
+        }
+        local_total as f64 >= remote_total as f64 * BOOTSTRAP_LIVE_RELAXED_ROW_RATIO
+    }
+
+    async fn bootstrap_manifest_aligned(
+        &self,
+        repo: u8,
+        remote_mf: &bootstrap::BootstrapManifest,
+    ) -> bool {
+        let storage = self.delta_storage();
+        let w0 = storage.oplog_max_seq_for_repo(repo).unwrap_or(0).max(0) as u64;
+        let version = w0.wrapping_add(1) as u32;
+        let chunk_rows = remote_mf.chunk_rows;
+        let remote_chunks = remote_mf.chunks.clone();
+        let remote_total = remote_mf.total_rows;
+        let built = tokio::task::spawn_blocking(move || {
+            bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
+        })
+        .await;
+        match built {
+            Ok(Ok(local_mf)) => {
+                // 活表（INFOHASH/PEER）：键随机分布致块边界/hash 在传输期间漂移，逐块全等
+                // 永不成立。改用行数兜底 —— 本地行数已达远端快照 95% 即视为基本落地，放行
+                // 写 Done；不足则判假竣工（块返回极少行），不写 Done 交由 resume/watchdog。
+                if Self::repo_is_live_for_relaxed_finish(repo) {
+                    return Self::live_finish_rows_enough(local_mf.total_rows, remote_total);
+                }
+                // 静态表（NODE/TRACKER）：保持严格逐块 hash&rows 全等（空清单天然通过）。
+                let matched = bootstrap::align_bootstrap_seed(&remote_chunks, &local_mf).1;
+                matched.len() == remote_chunks.len()
+            }
+            _ => false,
+        }
+    }
+
     /// 完成 ③④ 后进入 ⑤ 追尾（复用 P1-3 delta 通道拉 `seq > w0`）。
     async fn finish_bootstrap(self: &Arc<Self>, conn: &PeerConn, repo: u8, w0_seq: u64) {
         let now = chrono::Utc::now().timestamp_millis();
+        // D批(D3)：竣工前强制对齐校验 —— 防「假竣工」（块返回极少行、断点未真落库却写 Done）。
+        // skip=true 且本地存有清单时，按与断点继承相同方式重建本地清单，逐块 hash&rows 核对
+        // mf.chunks 全部块。任一不一致或重建失败 → warn 后直接 return：不写 Done、不抬水位、
+        // 不清尝试/失败计数、不插冷却、不 trigger_delta，交由现有 resume/watchdog 继续推进。
+        if self.config.bootstrap_skip_identical_chunks {
+            if let Ok(Some((_, Some(mf)))) =
+                self.delta_storage().bootstrap_load(&conn.node_id.0, repo)
+            {
+                if !self.bootstrap_manifest_aligned(repo, &mf).await {
+                    warn!(
+                        "[bootstrap] 竣工前对齐校验失败（块 hash/rows 与本地不一致或清单重建失败），不写 Done，交由 resume/watchdog 推进: peer={} repo={}",
+                        conn.node_id, repo
+                    );
+                    return;
+                }
+            }
+        }
         if let Ok(Some((mut p, mf))) = self.delta_storage().bootstrap_load(&conn.node_id.0, repo) {
             p.phase = bootstrap::BootstrapPhase::Done;
             p.updated_ms = now;
@@ -3175,6 +3505,18 @@ impl SyncManager {
         self.delta_gap.write().remove(&(conn.node_id, repo));
         // v10(C)：清掉窗口状态机 —— 全部块已收齐，避免泄漏。
         self.chunk_windows.write().remove(&(conn.node_id, repo));
+        // 联邦同步通道状态：切 delta 追尾 → bootstrap 进入「已完成」终态。
+        // 修复：旧实现只置 active=false，done/total/inflight/phase 残留上一次
+        // 块响应时的中间值，监控进度条永远停在半途（实测 202/207 卡死）。
+        // 现在统一写成完整终态：done=total（进度条 100%）、phase=done。
+        {
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.bootstrap.active = false;
+            g.bootstrap.done_chunks = g.bootstrap.total_chunks;
+            g.bootstrap.inflight = 0;
+            g.bootstrap.phase = "done".to_string();
+        }
         // v9：追尾不受协商策略门控 —— 进入 bootstrap 的判定之一恰是
         // 「策略 = BOOTSTRAP」，而 `delta_channel_allowed` 要求策略 = DELTA，
         // 旧实现因此让竣工后的追尾被同一条策略静默拒绝（B5）。这里清掉协商结果，
@@ -3243,6 +3585,18 @@ impl SyncManager {
         reset.error = Some(format!("stalled {}s (v9 watchdog)", age_ms / 1000));
         let _ = st.bootstrap_save(&reset, None);
         self.bootstrap_chunk_attempt.write().remove(&(peer, repo));
+        // 联邦同步通道状态：停滞 → bootstrap 进入「闲置」终态。
+        // 修复：旧实现只改 DB 进度，不更新 channels 状态，监控里 active 残留
+        // true、进度条停在停滞前的数值看起来像卡死。现在补完整终态写入。
+        {
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.bootstrap.active = false;
+            g.bootstrap.done_chunks = p.done_chunks;
+            g.bootstrap.total_chunks = p.total_chunks;
+            g.bootstrap.inflight = 0;
+            g.bootstrap.phase = "idle".to_string();
+        }
         false
     }
 
@@ -3290,6 +3644,46 @@ impl SyncManager {
                             p.repo,
                             timed_out
                         );
+                    }
+                    // E2：窗口级空闲看门狗 —— 距最后一块落地超过阈值仍有在途块 → 回收重发。
+                    let idle_timeout =
+                        Duration::from_secs(self.config.bootstrap_window_idle_timeout_secs.max(1));
+                    let idle = cw.idle_reap(idle_timeout);
+                    if !idle.is_empty() {
+                        warn!(
+                            "[bootstrap] 窗口空闲看门狗：{}s 无新块落地，回收 {} 个在途块重发: peer={} repo={} blocks={:?} 恢复次数={}",
+                            self.config.bootstrap_window_idle_timeout_secs,
+                            idle.len(),
+                            peer,
+                            p.repo,
+                            idle,
+                            cw.idle_recovery_count()
+                        );
+                    }
+                    // 联邦同步通道状态：窗口空闲看门狗回收
+                    {
+                        let s = crate::federation::sync::channels_status::global();
+                        let mut g = s.write();
+                        g.bootstrap.active = true;
+                        g.bootstrap.peer_id = peer.0.iter().map(|b| format!("{:02x}", b)).collect();
+                        g.bootstrap.repo = p.repo as u64;
+                        g.bootstrap.idle_recoveries = cw.idle_recovery_count();
+                        g.bootstrap.inflight = cw.inflight_len() as u32;
+                        g.bootstrap.phase = "transfer".to_string();
+                    }
+                    // E2：空闲恢复次数达上限 → 放弃本窗口，重拉清单自愈（防对端不可达时无限重刷）。
+                    if cw.idle_recovery_count()
+                        >= self.config.bootstrap_window_idle_max_retries.max(1)
+                    {
+                        warn!(
+                            "[bootstrap] 窗口连续 {} 次空闲无进展，放弃窗口并重拉清单: peer={} repo={}",
+                            cw.idle_recovery_count(),
+                            peer,
+                            p.repo
+                        );
+                        self.chunk_windows.write().remove(&(peer, p.repo));
+                        self.clone().start_bootstrap(peer, p.repo).await;
+                        continue;
                     }
                     let batch = cw.fill(0);
                     self.chunk_windows.write().insert((peer, p.repo), cw);
@@ -3346,6 +3740,8 @@ impl SyncManager {
         };
         if due_check {
             self.check_and_trigger_bootstrap().await;
+            // E1：bootstrap 中途断裂后的运行时差异复检（同 5 分钟巡检节流，复用 D2 阈值）。
+            self.rediff_bootstrap_recheck().await;
         }
     }
 
@@ -3922,7 +4318,10 @@ mod tests {
         {
             let conn = storage.connection();
             let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            for i in 0..200i64 {
+            // D批(D2)：双向阈值要求绝对差 > 50_000 行才触发 BOOTSTRAP，故事务包裹批量灌
+            // ~6 万行，使「无冷却 → BOOTSTRAP、冷却 → DELTA」的对照仍成立。
+            conn.execute_batch("BEGIN").unwrap();
+            for i in 0..60_000i64 {
                 conn.execute(
                     "INSERT INTO peers (infohash, ip, port, source) VALUES (?1, ?2, ?3, 'test')",
                     rusqlite::params![
@@ -3933,6 +4332,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            conn.execute_batch("COMMIT").unwrap();
         }
         let mut cfg = make_config();
         cfg.range_bulk_threshold_rows = 10;
@@ -3965,7 +4365,7 @@ mod tests {
             timestamp_ms: 0,
         };
 
-        // 无冷却：本地 200 / 对端 100 = 2.0 > 1.2 且差 100 > 10 → BOOTSTRAP
+        // 无冷却：本地 60000 / 对端 100，ratio 与绝对差(59900)均超 D2 双向阈值 → BOOTSTRAP
         let s = mgr.decide_strategies(&peer, &remote);
         assert_eq!(
             s.iter()
@@ -3998,6 +4398,110 @@ mod tests {
                 .strategy,
             protocol::STRATEGY_NONE
         );
+    }
+
+    /// D批(D2/D3)：双向快照阈值 —— 不区分方向。max/min > 1.1 且绝对差 > 50_000 才触发；
+    /// 冷启动（一端为 0、另一端有量）触发；小比例差走 DELTA。
+    #[test]
+    fn test_bidir_bootstrap_by_volume_threshold() {
+        // local 10 万 vs peer 150001：ratio≈1.5、diff=50001 → 触发（对端更多）
+        assert!(SyncManager::should_bootstrap_by_volume(100_000, 150_001));
+        // 对称方向（我更多）同结果
+        assert!(SyncManager::should_bootstrap_by_volume(150_001, 100_000));
+        // ratio=1.2、diff=2 万 → 不触发（绝对差门槛仍拦住，即使 ratio 已 > 1.1）
+        assert!(!SyncManager::should_bootstrap_by_volume(100_000, 120_000));
+        // 冷启动：本地 0、对端 5000 (>1000) → 触发
+        assert!(SyncManager::should_bootstrap_by_volume(0, 5_000));
+        // 冷启动：本地 5000、对端 0 → 触发
+        assert!(SyncManager::should_bootstrap_by_volume(5_000, 0));
+        // 边界：对端恰好 == SNAPSHOT_MIN_ROWS(1000) 而本地 0 → 不触发（需 >）
+        assert!(!SyncManager::should_bootstrap_by_volume(0, 1_000));
+        // 双方接近且都非 0 → 不触发
+        assert!(!SyncManager::should_bootstrap_by_volume(100_000, 100_000));
+
+        // D批(D3) 新阈值（ratio>1.1 且 diff>50_000，AND）边界：
+        // 30 万 vs 36 万：ratio=1.2、diff=6 万 → 触发
+        assert!(SyncManager::should_bootstrap_by_volume(300_000, 360_000));
+        // 30 万 vs 35.1 万：ratio=1.17、diff=5.1 万 → 触发
+        assert!(SyncManager::should_bootstrap_by_volume(300_000, 351_000));
+        // 30 万 vs 33 万：ratio 恰好 1.1（要求 >1.1）→ 不触发
+        assert!(!SyncManager::should_bootstrap_by_volume(300_000, 330_000));
+        // 30 万 vs 35 万：diff 恰好 5 万（要求 >50_000）→ 不触发（ratio 虽 >1.1）
+        assert!(!SyncManager::should_bootstrap_by_volume(300_000, 350_000));
+        // 50 万 vs 55 万：ratio 恰好 1.1 → 不触发
+        assert!(!SyncManager::should_bootstrap_by_volume(500_000, 550_000));
+    }
+
+    /// E1：运行时差异复检 —— 本地 vs 对端行数差超 D2 阈值时挑出 (peer,repo) 候选；
+    /// 标记重触发后冷却期内不再重复挑出；未达阈值则不挑。
+    #[test]
+    fn test_rediff_candidate_threshold_and_cooldown() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch("BEGIN").unwrap();
+            for i in 0..60_000i64 {
+                conn.execute(
+                    "INSERT INTO peers (infohash, ip, port, source) VALUES (?1, ?2, ?3, 'test')",
+                    rusqlite::params![
+                        [0xddu8; 20],
+                        format!("10.3.{}.{}", i / 250, i % 250),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let mut cfg = make_config();
+        cfg.bootstrap_rediff_cooldown_secs = 300;
+        let mgr = make_sync_manager(storage, cfg);
+
+        let peer = NodeId([7; 20]);
+        // 对端 PEER 行数 130_000 vs 本地 ~60_000：ratio≈2.17、diff≈70_000 → 超 D2 阈值。
+        let states = vec![(
+            peer,
+            vec![RepoSyncState {
+                repo: repo_type::PEER,
+                row_count: 130_000,
+                max_seq: 10,
+                min_seq: 1,
+                retention_secs: 3600,
+            }],
+        )];
+        let local = mgr.local_entry_counts();
+        let running: Vec<bootstrap::BootstrapProgress> = Vec::new();
+
+        // 1) 无冷却 → 挑出候选
+        let cand = mgr.next_rediff_candidate(&local, &states, &running);
+        assert_eq!(
+            cand,
+            Some((peer, repo_type::PEER)),
+            "差异超 D2 阈值应挑出重触发候选"
+        );
+
+        // 2) 标记重触发后 → 冷却期内不再挑出
+        mgr.mark_rediff_triggered(&peer, repo_type::PEER);
+        let cand2 = mgr.next_rediff_candidate(&local, &states, &running);
+        assert_eq!(cand2, None, "重触发冷却期内不得重复挑出");
+        assert!(mgr.rediff_in_cooldown(&peer, repo_type::PEER));
+
+        // 3) 未达阈值的对端（diff=2000 < 50000）→ 不挑
+        let small = vec![(
+            peer,
+            vec![RepoSyncState {
+                repo: repo_type::PEER,
+                row_count: 62_000,
+                max_seq: 10,
+                min_seq: 1,
+                retention_secs: 3600,
+            }],
+        )];
+        mgr.bootstrap_rediff_cooldown.write().clear();
+        let cand3 = mgr.next_rediff_candidate(&local, &small, &running);
+        assert_eq!(cand3, None, "差异未达 D2 阈值不应挑出");
     }
 
     /// F5(水位守卫)：我方游标 ≥ 对端 oplog 保留窗口起点(min_seq) → 欠账全在窗口内，
@@ -4190,5 +4694,303 @@ mod tests {
         mgr.handle_sync_batch(repo_type::PEER, &[]);
         mgr.handle_sync_batch(repo_type::INFOHASH, &[]);
         mgr.handle_sync_batch(repo_type::TRACKER, &[]);
+    }
+
+    /// D批(D3)：断点继承的逐块验证纯函数（`align_bootstrap_seed`，即 handle_bootstrap_manifest_response
+    /// 实际走的代码路径）——全一致时前缀=全量、所有块进 skip（可直接竣工）；中间一块 hash
+    /// 被改时前缀在该块截断、该块不得进 skip（需重拉），前缀外一致块仍跳过；有块不一致时
+    /// skip 集合不足全量 → 不得直接竣工。
+    #[test]
+    fn test_align_bootstrap_seed_verifies_inherited_prefix() {
+        use crate::federation::protocol::repo_type;
+        let st = crate::storage::Storage::memory().unwrap();
+        {
+            let conn = st.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..1000u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.0.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        // chunk_rows=200 → 1000 行 = 5 块
+        let local = bootstrap::build_repo_manifest_impl(&st, repo_type::NODE, 200, 1, 1).unwrap();
+        assert_eq!(local.chunks.len(), 5);
+
+        // 1) 全一致（远端==本地）→ 前缀=5，skip 集合含全部 5 块 → 可直接竣工
+        let (prefix, skip) = bootstrap::align_bootstrap_seed(&local.chunks, &local);
+        assert_eq!(prefix, 5, "全一致时连续前缀应覆盖全部块");
+        assert_eq!(skip.len(), 5, "全一致时 5 块都进 skip");
+        assert!(
+            skip.len() >= local.chunks.len(),
+            "全一致 → seed 覆盖全量 → 直接竣工"
+        );
+
+        // 2) 块 2 的 hash 被篡改（远端清单与本地不一致）→ 前缀在块 2 截断
+        let mut remote = local.clone();
+        remote.chunks[2].hash = [0xffu8; 32];
+        let (prefix2, skip2) = bootstrap::align_bootstrap_seed(&remote.chunks, &local);
+        assert_eq!(prefix2, 2, "块 2 不一致 → 验证通过的连续前缀应为 0,1");
+        assert!(
+            !skip2.contains(&2),
+            "块 2 hash 不一致 → 不得进 skip（需重拉）"
+        );
+        assert!(
+            skip2.contains(&0) && skip2.contains(&1),
+            "前缀内一致块仍跳过"
+        );
+        assert!(
+            skip2.contains(&3) && skip2.contains(&4),
+            "前缀外一致块仍跳过"
+        );
+        assert!(
+            skip2.len() < remote.chunks.len(),
+            "块 2 不一致 → skip 不足全量 → 不得直接竣工"
+        );
+    }
+
+    /// D批(D3)：竣工前对齐校验 `bootstrap_manifest_aligned`（finish_bootstrap 实际走的判定）——
+    /// 本地与远端清单同源 → true；本地表内容变化致远端末块 hash/rows 失配 → false。
+    /// false 时 finish_bootstrap 在写 phase=Done 之前 return（不抬水位/不清计数/不追尾）。
+    #[tokio::test]
+    async fn test_finish_bootstrap_alignment_gate() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..550u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.0.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let mgr = make_sync_manager(storage.clone(), make_config());
+        // chunk_rows=200：550 行 = 2 满块(400) + 1 残块(150)
+        let remote =
+            bootstrap::build_repo_manifest_impl(&storage, repo_type::NODE, 200, 1, 1).unwrap();
+        assert_eq!(remote.chunks.len(), 3);
+        assert!(
+            mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote)
+                .await,
+            "本地与远端清单同源时应判定对齐"
+        );
+        // 再追加 300 行 → 末块(残块)边界/行数漂移，远端第 3 块与本地重建不一致 → 失配
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 550..850u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.0.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            !mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote)
+                .await,
+            "本地表变化致远端末块 hash/rows 失配时应判定不对齐（finish_bootstrap 不写 Done）"
+        );
+    }
+
+    /// 修复（活表竣工死循环）：INFOHASH 走宽松竣工判定。
+    /// (i) 严格会失败、宽松应通过：先灌 250 行 infohash 建远端清单（chunk_rows=100 →
+    ///     末块残 50 行），再追加 100 行使末块行数漂移 → 逐块全等必败，但本地行数已达
+    ///     远端 95% → 宽松放行写 Done（不再死循环）。
+    /// (ii) 假竣工兜底：远端清单 total_rows 远大于本地实际行数（本地仅 ~10%）→ 仍判 false。
+    /// (iii) NODE 静态表未被豁免：本地追加行致块漂移 → 严格全等仍判 false。
+    #[tokio::test]
+    async fn test_bootstrap_infohash_relaxed_finish() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        // (i) 灌 250 行 infohash（u64 大端键，天然不撞、按数值升序）。
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..250u64 {
+                conn.execute(
+                    "INSERT INTO infohashes (infohash) VALUES (?1)",
+                    rusqlite::params![i.to_be_bytes().to_vec()],
+                )
+                .unwrap();
+            }
+        }
+        let mgr = make_sync_manager(storage.clone(), make_config());
+        // chunk_rows=100：250 行 = 2 满块(200) + 1 残块(50)。
+        let remote =
+            bootstrap::build_repo_manifest_impl(&storage, repo_type::INFOHASH, 100, 0, 1).unwrap();
+        assert_eq!(remote.total_rows, 250);
+        assert_eq!(remote.chunks.len(), 3);
+
+        // 再追加 100 行（键 250..349，排在尾部）→ 末块(残 50)被填满成 100 行并溢出出新块，
+        // 远端第 3 块(rows=50)与本地重建(rows=100)失配 —— 严格全等在此必然失败。
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 250..350u64 {
+                conn.execute(
+                    "INSERT INTO infohashes (infohash) VALUES (?1)",
+                    rusqlite::params![i.to_be_bytes().to_vec()],
+                )
+                .unwrap();
+            }
+        }
+        // 旁证（锁定修复前提）：严格全等路径此刻必失败 —— 远端末块 rows=50 已对不上本地。
+        {
+            let w0 = storage
+                .oplog_max_seq_for_repo(repo_type::INFOHASH)
+                .unwrap_or(0)
+                .max(0) as u64;
+            let local_mf = bootstrap::build_repo_manifest_impl(
+                &storage,
+                repo_type::INFOHASH,
+                remote.chunk_rows,
+                w0,
+                w0.wrapping_add(1) as u32,
+            )
+            .unwrap();
+            let strict = bootstrap::align_bootstrap_seed(&remote.chunks, &local_mf)
+                .1
+                .len();
+            assert!(
+                strict < remote.chunks.len(),
+                "前提：活表漂移后严格逐块全等必然不成立（否则宽松无意义）"
+            );
+        }
+        // (i) 本地 350 行 >= 远端 250 行 ×0.95=237.5 → 宽松放行。
+        assert!(
+            mgr.bootstrap_manifest_aligned(repo_type::INFOHASH, &remote)
+                .await,
+            "活表行数已达远端 95% → 宽松竣工应放行（不再死循环）"
+        );
+
+        // (iii) NODE 静态表保持严格全等，未被宽松豁免。
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..550u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) \
+                     VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.6.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let remote_node =
+            bootstrap::build_repo_manifest_impl(&storage, repo_type::NODE, 200, 0, 1).unwrap();
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 550..850u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) \
+                     VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.6.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            !mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote_node)
+                .await,
+            "NODE 静态表未被豁免：块漂移后严格全等必须 false"
+        );
+
+        // (ii) 假竣工兜底：独立 storage 仅 100 行，远端清单却报 1000 行（本地 ~10%）→ false。
+        let s2 = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = s2.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..100u64 {
+                conn.execute(
+                    "INSERT INTO infohashes (infohash) VALUES (?1)",
+                    rusqlite::params![(i + 5000).to_be_bytes().to_vec()],
+                )
+                .unwrap();
+            }
+        }
+        let mgr2 = make_sync_manager(s2, make_config());
+        let bogus_remote = bootstrap::BootstrapManifest {
+            repo: repo_type::INFOHASH,
+            version: 1,
+            w0_seq: 0,
+            chunk_rows: 100,
+            total_rows: 1000,
+            chunks: vec![],
+        };
+        assert!(
+            !mgr2
+                .bootstrap_manifest_aligned(repo_type::INFOHASH, &bogus_remote)
+                .await,
+            "本地仅约 10% 行 → 假竣工兜底必须 false（不写 Done）"
+        );
+    }
+
+    /// 修复（E1 双向反向拉数）：`next_rediff_candidate` 方向保护 —— 只在「本地少、对端多」
+    /// （local < remote）才挑候选。用空 running、无冷却的 mgr，结果只由阈值+方向决定。
+    #[test]
+    fn test_rediff_candidate_direction_guard() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage, make_config());
+        let peer = NodeId([9; 20]);
+        let running: Vec<bootstrap::BootstrapProgress> = Vec::new();
+        // local[1] = PEER 计数（idx = repo - NODE = 2-1 = 1）。
+        let case = |local_peer: u32, remote_peer: u64| {
+            let local = vec![0u32, local_peer, 0, 0];
+            let states = vec![(
+                peer,
+                vec![RepoSyncState {
+                    repo: repo_type::PEER,
+                    row_count: remote_peer,
+                    max_seq: 10,
+                    min_seq: 1,
+                    retention_secs: 3600,
+                }],
+            )];
+            mgr.next_rediff_candidate(&local, &states, &running)
+        };
+        // (i) 本地 10 万 < 对端 20 万（ratio=2、diff=10 万 > 5 万）→ 候选
+        assert_eq!(case(100_000, 200_000), Some((peer, repo_type::PEER)));
+        // (ii) 本地 20 万 > 对端 10 万（同阈值，但方向反）→ None，不得反向拉数
+        assert_eq!(
+            case(200_000, 100_000),
+            None,
+            "本地多→对端少时不得反向重触发 bootstrap"
+        );
+        // (iii) 冷启动 local=0 & remote=5000(>SNAPSHOT_MIN_ROWS=1000) → Some
+        assert_eq!(case(0, 5_000), Some((peer, repo_type::PEER)));
+        // (iv) remote=0 & local=5000(>=1000) → None（local>=remote 被方向保护拦）
+        assert_eq!(
+            case(5_000, 0),
+            None,
+            "对端空→本地多时不得反向重触发 bootstrap"
+        );
     }
 }

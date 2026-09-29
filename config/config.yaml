@@ -130,3 +130,65 @@ log_level: info
 port_auto_alloc: true
 port_step: 10
 auto_firewall_rule: true
+
+# ===== A 批自适应 IO（2026-09-28 事故整改）=====
+# 以下键均有代码内默认值，此处仅作参考；与默认值一致时无需取消注释。
+# io_scheduler:
+#   checkpoint_takeover: true            # 应用接管 WAL checkpoint（启动置 wal_autocheckpoint=0）
+#   checkpoint_tick_ms: 1000             # 决策 tick 间隔（O(1)，只读原子量+WAL 尺寸）
+#   checkpoint_min_interval_secs: 5      # 两次 checkpoint 最小间隔
+#   checkpoint_wal_soft_mb: 32          # WAL 软阈值，达到才允许触发
+#   checkpoint_wal_hard_mb: 128         # WAL 硬阈值，超过无视最小间隔强制触发
+#   checkpoint_slow_ms: 2000            # 单次超过判定为慢
+#   checkpoint_backoff_base_secs: 5     # 慢后退避基准
+#   checkpoint_backoff_max_secs: 300    # 退避上限
+#   checkpoint_backoff_factor: 2.0      # 退避系数
+#   checkpoint_slow_streak_alert: 3    # 连续慢 N 次 → warn
+#   checkpoint_truncate_min_wal_mb: 16   # TRUNCATE 前最低 WAL
+#   bootstrap_import_window_ttl_secs: 30
+#   bootstrap_import_budget_start_multiplier: 8   # 起步倍率（原硬编码 ×200）
+#   bootstrap_import_budget_max_multiplier: 200
+#   adaptive_latency_target_ms: 200
+#   adaptive_latency_alpha: 0.2
+#   adaptive_budget_grow_step: 2
+#   adaptive_budget_grow_after_batches: 32
+#   # B1/B2 行口径调度与令牌桶（默认值即 15 号 §5 表，灰度再开）
+#   steady_tick_ms: 10
+#   max_requests_per_tick: 64
+#   rows_per_tick: 5000
+#   token_bucket_enabled: false          # 接线后默认关，灰度再开
+#   low_watermark_rows: 20000
+#   high_watermark_rows: 200000
+#   latency_target_ms: 50
+#   latency_slow_ms: 500
+#   persistence_backoff_level: 0.7       # level 超过则 periodic_persistence 让路
+# storage:
+#   disk_probe_enabled: true             # C1：启动磁盘画像（fsync/随机-顺序比）
+#   disk_probe_budget_ms: 1500
+# sqlite:
+#   drop_unused_indexes: true            # A3：删除无人查询的 l2_shard 索引
+#   drop_redundant_peer_indexes: true    # B5-1：DROP 与 PK 首列重复的 peers 索引（幂等）
+# logging:
+#   max_file_mb: 256                     # logs/ 目录大小上限，超过 warn 一次
+#   rotate_keep: 3
+
+# ============================================================
+# 冷热分层内存限制（2026-09-29 统一调至 2000MB）
+# tier.memory_limit_mb 为全局内存硬限制（默认 1024），达到阈值触发紧急驱逐防 OOM。
+# 其余 tier 字段（hot_max_count/warm_max_count 等）走代码默认。
+# ============================================================
+tier:
+  memory_limit_mb: 2000
+
+# ===== 配置热重载（2026-09-29 落地）=====
+# 以下键均有代码内默认值，此处仅作参考；与默认值一致时无需取消注释。
+# 热更新间隔 config_reload_interval_secs 已在上方（30 秒，0=禁用）。
+# 分类：crawler.rate_limit_* / log_level / super_tracker.*（除端口）→ 热生效；
+#       task_scheduler.* → 调度器热生效；端口/socket_count/runtime 线程数 → 需重启。
+# crawler:
+#   rate_limit_enter_threshold: 0.15   # 进入限速阈值（响应率低于此值）
+#   rate_limit_exit_threshold: 0.30    # 解除限速阈值
+#   rate_limit_min_samples: 50         # 限速判断最小样本数
+#   rate_limit_throttle_skip_ratio: 0.5 # 限速时降频跳过比例
+# config_reload_debounce_ms: 1000      # 检测到文件变化后的防抖等待（毫秒）
+# 手动立即重载: POST /api/v1/config/reload （API token 鉴权继承）

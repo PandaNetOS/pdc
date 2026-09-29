@@ -313,7 +313,9 @@ impl PeerRepoImpl {
             drop(buffer);
             if let Some(ref wq) = self.write_queue {
                 // 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛圢ormal 浼樺厛绾э級
-                wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
+                let _ = wq.send_sized(batch.len(), move |conn| {
+                    Storage::save_peer_history_batch_in_tx(conn, &batch)
+                });
             } else {
                 let storage = self.storage.clone();
                 tokio::spawn(async move {
@@ -389,7 +391,9 @@ impl PeerRepoImpl {
         }
         let count = batch.len();
         if let Some(ref wq) = self.write_queue {
-            wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
+            let _ = wq.send_sized(batch.len(), move |conn| {
+                Storage::save_peer_history_batch_in_tx(conn, &batch)
+            });
         } else {
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || storage.save_peer_history_batch(&batch)).await??;
@@ -538,7 +542,9 @@ impl PeerRepoImpl {
         if let Some(wq) = &self.write_queue {
             // 寮傛妯″紡锛氶潪闃诲鍏ラ槦 WriteQueue/IOScheduler
             let count = batch.len();
-            wq.send(move |conn| Storage::save_peers_batch_in_tx(conn, &batch));
+            let _ = wq.send_sized(batch.len(), move |conn| {
+                Storage::save_peers_batch_in_tx(conn, &batch)
+            });
             tracing::debug!("[peer_repo] 寮傛鍏ラ槦淇濆瓨 {} 涓?peer", count);
             Ok(())
         } else {
@@ -750,7 +756,9 @@ impl PeerRepository for PeerRepoImpl {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
             if let Some(ref wq) = self.write_queue {
-                wq.send(move |conn| Storage::save_peer_history_batch_in_tx(conn, &batch));
+                let _ = wq.send_sized(batch.len(), move |conn| {
+                    Storage::save_peer_history_batch_in_tx(conn, &batch)
+                });
             } else {
                 let storage = self.storage.clone();
                 tokio::spawn(async move {
