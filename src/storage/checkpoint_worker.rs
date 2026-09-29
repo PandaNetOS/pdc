@@ -14,8 +14,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+use tracing::{info, warn};
 
 use crate::storage::db::{CheckpointMode, CheckpointOutcome, Storage};
+
+/// 每累计多少次成功 checkpoint 输出一条 INFO（成败可观测：连续静默成功会让人无法
+/// 判断 worker 是否存活，.52 事故 WAL 298MB 穿透阈值时全天零日志）。
+// [ALLOWED-HARDCODED: 日志频率常量，非业务可调参数]
+const SUCCESS_LOG_EVERY: u64 = 20;
 
 /// 执行线程所需的策略参数（从 `IoSchedulerConfig` 裁出来，避免 worker 持有整份配置）。
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +53,18 @@ pub struct WorkerStat {
     pub total: u64,
     /// checkpoint 耗时 EWMA（ms）
     pub last_ewma_ms: f64,
+    /// 累计成功次数（执行完成且未被跳过）
+    pub ok_total: u64,
+    /// 累计失败次数（执行闭包返回 Err）
+    pub fail_total: u64,
+    /// 累计 busy 次数（PRAGMA 报告有连接阻塞，部分完成）
+    pub busy_total: u64,
+    /// 最近一次成功 TRUNCATE 完成时刻
+    pub last_truncate_at: Option<Instant>,
+    /// 最近一次成功 TRUNCATE 耗时（ms）
+    pub last_truncate_ms: u64,
+    /// 最近一次成功 TRUNCATE 时 WAL 中剩余帧数
+    pub last_truncate_wal_frames: u64,
 }
 
 struct Job {
@@ -118,6 +136,28 @@ impl CheckpointWorker {
     pub fn stat(&self) -> WorkerStat {
         self.stat.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// 最近一次成功 TRUNCATE checkpoint 的记录（供决策 tick / 观测任务查询）。
+    /// 从未成功执行过 TRUNCATE 时返回 None。
+    pub fn last_truncate_success(&self) -> Option<TruncateRecord> {
+        let st = self.stat();
+        Some(TruncateRecord {
+            at: st.last_truncate_at?,
+            elapsed_ms: st.last_truncate_ms,
+            wal_frames: st.last_truncate_wal_frames,
+        })
+    }
+}
+
+/// 最近一次成功 TRUNCATE checkpoint 的信息。
+#[derive(Debug, Clone, Copy)]
+pub struct TruncateRecord {
+    /// 完成时刻
+    pub at: Instant,
+    /// 耗时（ms）
+    pub elapsed_ms: u64,
+    /// 完成时 WAL 中剩余帧数（TRUNCATE 成功后通常为 0）
+    pub wal_frames: u64,
 }
 
 /// worker 主循环：串行处理 job，执行完回填 stat 后释放 inflight。
@@ -132,19 +172,23 @@ fn worker_loop<F>(
     F: Fn(&Storage, CheckpointMode) -> anyhow::Result<CheckpointOutcome>,
 {
     for job in rx {
-        let out = match runner(&storage, job.mode) {
-            Ok(o) => o,
-            Err(_e) => CheckpointOutcome {
-                mode: job.mode,
-                busy: true,
-                wal_frames: 0,
-                checkpointed: 0,
-                elapsed: Duration::ZERO,
-                skipped: Some("error"),
-            },
+        // 成败可观测：runner 的 Err 不能像旧实现那样静默吞掉（.52 全天零成败日志的教训）
+        let (out, fail_msg) = match runner(&storage, job.mode) {
+            Ok(o) => (o, None),
+            Err(e) => {
+                let synthetic = CheckpointOutcome {
+                    mode: job.mode,
+                    busy: true,
+                    wal_frames: 0,
+                    checkpointed: 0,
+                    elapsed: Duration::ZERO,
+                    skipped: Some("error"),
+                };
+                (synthetic, Some(e.to_string()))
+            }
         };
-        // 回填统计（持锁极短）
-        {
+        // 回填统计（持锁极短），日志素材锁内采集、锁外输出
+        let log = {
             let mut st = stat.lock().unwrap_or_else(|e| e.into_inner());
             st.total += 1;
             let ms = out.elapsed.as_millis() as u64;
@@ -157,7 +201,8 @@ fn worker_loop<F>(
             } else {
                 EWMA_ALPHA * ms as f64 + (1.0 - EWMA_ALPHA) * st.last_ewma_ms
             };
-            if ms >= cfg.slow_ms {
+            let is_slow = ms >= cfg.slow_ms;
+            if is_slow {
                 st.streak += 1;
                 st.slow_total += 1;
             } else {
@@ -170,6 +215,62 @@ fn worker_loop<F>(
                 cfg.backoff_factor,
                 Duration::from_secs(cfg.backoff_max_secs),
             ));
+            // 分类计数：失败 / 跳过（如内存库）/ 真实成功（含 busy 部分完成）
+            match &fail_msg {
+                Some(_) => st.fail_total += 1,
+                None => match out.skipped {
+                    Some(_) => {}
+                    None => {
+                        st.ok_total += 1;
+                        if out.busy {
+                            st.busy_total += 1;
+                        }
+                        if job.mode == CheckpointMode::Truncate {
+                            st.last_truncate_at = Some(now);
+                            st.last_truncate_ms = ms;
+                            st.last_truncate_wal_frames = out.wal_frames;
+                        }
+                    }
+                },
+            }
+            // 日志素材：失败/慢判定 WARN；每 SUCCESS_LOG_EVERY 次成功一条 INFO
+            if let Some(msg) = &fail_msg {
+                Some(CkptLog::Fail(st.fail_total, msg.clone(), job.mode))
+            } else if is_slow {
+                Some(CkptLog::Slow(
+                    ms,
+                    cfg.slow_ms,
+                    st.streak,
+                    st.slow_total,
+                    job.mode,
+                ))
+            } else if out.skipped.is_none() && st.ok_total.is_multiple_of(SUCCESS_LOG_EVERY) {
+                Some(CkptLog::Periodic(
+                    st.ok_total,
+                    out.wal_frames,
+                    st.busy_total,
+                    ms,
+                    st.last_ewma_ms,
+                    job.mode,
+                ))
+            } else {
+                None
+            }
+        };
+        match log {
+            Some(CkptLog::Fail(fail_total, msg, mode)) => warn!(
+                "[checkpoint] 执行失败（累计 {} 次）：{}，mode={:?}",
+                fail_total, msg, mode
+            ),
+            Some(CkptLog::Slow(ms, slow_ms, streak, slow_total, mode)) => warn!(
+                "[checkpoint] 慢判定：mode={:?} 耗时 {}ms ≥ 慢阈值 {}ms，连续慢 {} 次，累计慢 {} 次",
+                mode, ms, slow_ms, streak, slow_total
+            ),
+            Some(CkptLog::Periodic(ok_total, wal_frames, busy_total, ms, ewma_ms, mode)) => info!(
+                "[checkpoint] 累计成功 {} 次：mode={:?} wal_frames={} busy累计={} 本次耗时 {}ms，EWMA {:.0}ms",
+                ok_total, mode, wal_frames, busy_total, ms, ewma_ms
+            ),
+            None => {}
         }
         // 先释放单飞，再回结果（顺序无关紧要，但避免持锁发送）
         inflight.store(false, Ordering::SeqCst);
@@ -177,6 +278,16 @@ fn worker_loop<F>(
             let _ = tx.send(out);
         }
     }
+}
+
+/// 单次执行完成后的日志素材（锁内采集、锁外输出，避免日志宏耗时占锁）。
+enum CkptLog {
+    /// 执行失败：累计失败次数、错误信息、模式
+    Fail(u64, String, CheckpointMode),
+    /// 慢判定：本次耗时、慢阈值、连续慢次数、累计慢次数、模式
+    Slow(u64, u64, u32, u64, CheckpointMode),
+    /// 周期性成功汇报：累计成功、WAL 帧数、busy 累计、本次耗时 ms、EWMA ms、模式
+    Periodic(u64, u64, u64, u64, f64, CheckpointMode),
 }
 
 /// 纯函数：根据上次完成时刻与连续慢次数，计算下次允许触发时刻。

@@ -20,13 +20,26 @@
 //! 任何 oplog 写入失败都只告警，**绝不阻断业务写入**。
 
 use rusqlite::{params, Connection};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::federation::protocol::{operation, SyncEntry};
 
 /// 本地节点 origin（20B node_id）。由联邦层启动时注入；未注入时为空（仅用于诊断）。
 static LOCAL_ORIGIN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// 裁剪 INFO 的节流间隔（毫秒）。裁剪路径可能被高频调用（delta tick / 定时裁剪），
+/// 逐条 INFO 会刷屏；节流窗口内的裁剪量合并累计，到点一次性输出。
+// [ALLOWED-HARDCODED: 日志节流常量，非业务可调参数]
+const TRIM_LOG_INTERVAL_MS: i64 = 60_000;
+
+/// 上次裁剪 INFO 输出时刻（unix 毫秒，0 = 从未输出过）。
+/// 说明：Storage 字段定义在 db.rs（本轮不动主线程文件），故节流状态放模块级 static；
+/// 进程级粒度对日志节流足够。
+static TRIM_LOG_LAST_MS: AtomicI64 = AtomicI64::new(0);
+
+/// 自上次裁剪 INFO 以来的累计裁剪条数（输出时清零）。
+static TRIM_COUNT_SINCE_LOG: AtomicU64 = AtomicU64::new(0);
 
 /// 注入本地节点 origin（幂等，仅首次生效）。
 pub fn set_local_origin(origin: Vec<u8>) {
@@ -326,10 +339,35 @@ impl super::db::Storage {
         )?;
         drop(conn);
         if n > 0 {
-            debug!("[oplog] 裁剪 {} 条（ts_ms < {}）", n, older_than_ms);
             self.bump_oplog_len(-(n as i64));
+            // 裁剪成功日志原来是 debug 级，线上（info）完全不可见，无法确认大表是否在被
+            // 裁剪（.62 实测 302 万条 oplog 无从判断）。改为按节流间隔输出 INFO。
+            self.log_trim_throttled(n);
         }
         Ok(n)
+    }
+
+    /// 裁剪可观测：累计裁剪条数，按 [`TRIM_LOG_INTERVAL_MS`] 节流输出 INFO。
+    ///
+    /// 输出内容为「节流窗口内累计裁剪条数 + 裁剪后 oplog 长度」；并发调用通过 CAS
+    /// 抢占输出权，窗口内只打一条。
+    fn log_trim_throttled(&self, trimmed: usize) {
+        TRIM_COUNT_SINCE_LOG.fetch_add(trimmed as u64, Ordering::Relaxed);
+        let now = now_millis();
+        let last = TRIM_LOG_LAST_MS.load(Ordering::Relaxed);
+        if now - last < TRIM_LOG_INTERVAL_MS {
+            return;
+        }
+        if TRIM_LOG_LAST_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            // 并发调用已有赢家居先输出（或刚刷新窗口），本次只累计
+            return;
+        }
+        let total = TRIM_COUNT_SINCE_LOG.swap(0, Ordering::Relaxed);
+        let len = self.oplog_len().unwrap_or(0);
+        info!("[oplog] 累计裁剪 {} 条，当前长度 {}", total, len);
     }
 
     /// 仅当 oplog 行数缓存已初始化（>= 0）时增量调整它。
@@ -466,13 +504,26 @@ impl super::db::Storage {
         }
         drop(conn);
         if n > 0 {
-            info!(
+            self.bump_oplog_len(-(n as i64));
+            // 明细（cutoff/floor 等）保留 debug 级；INFO 走节流汇总，避免高频调用刷屏
+            debug!(
                 "[oplog] 感知对端进度裁剪 {} 条（cutoff={}, hard_cutoff={}，floor={:?}，安全余量={}）",
                 n, cutoff, hard_cutoff, &floors[1..], FLOOR_SAFETY_MARGIN
             );
-            self.bump_oplog_len(-(n as i64));
+            self.log_trim_throttled(n);
         }
         Ok(n)
+    }
+
+    /// oplog 状态摘要（单行文本，供 main.rs 定时观测任务 / 监控面板输出）。
+    ///
+    /// 长度走 O(1) 缓存；min/max seq 走主键索引端点，恒为 O(log n)，不扫表。
+    /// 返回格式：`[oplog] 长度=N seq范围=[min, max]`。
+    pub fn status_line(&self) -> String {
+        let len = self.oplog_len().unwrap_or(0);
+        let min_seq = self.oplog_min_seq().unwrap_or(0);
+        let max_seq = self.oplog_max_seq().unwrap_or(0);
+        format!("[oplog] 长度={} seq范围=[{}, {}]", len, min_seq, max_seq)
     }
 }
 
@@ -588,5 +639,35 @@ mod tests {
         // 这里只断言接口可用且计数合理（floor 语义由上一个用例覆盖）。
         let removed = st.trim_oplog_guarded(1, true, 4).unwrap();
         assert!(removed <= 5);
+    }
+
+    /// 可观测：status_line 返回单行摘要，长度/seq 范围与实际数据一致。
+    #[test]
+    fn test_status_line_reflects_len_and_seq_range() {
+        let st = super::super::db::Storage::memory().unwrap();
+        let line_empty = st.status_line();
+        assert!(
+            line_empty.contains("长度=0"),
+            "空库摘要应含 长度=0，实际: {}",
+            line_empty
+        );
+        let entries: Vec<_> = (0..3)
+            .map(|i| entry(format!("k{}", i).as_bytes(), operation::UPSERT, b"v", 1))
+            .collect();
+        st.append_ops_from_entries(2, &entries).unwrap();
+        let line = st.status_line();
+        assert!(line.contains("长度=3"), "实际: {}", line);
+        assert!(
+            line.contains("[1, 3]"),
+            "seq 范围应为 [1, 3]，实际: {}",
+            line
+        );
+        // 裁剪后再取摘要，长度应随之下降
+        st.trim_oplog(now_millis() + 1).unwrap();
+        assert!(
+            st.status_line().contains("长度=0"),
+            "裁剪后摘要应反映空表，实际: {}",
+            st.status_line()
+        );
     }
 }

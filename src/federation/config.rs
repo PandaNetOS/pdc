@@ -352,6 +352,46 @@ pub struct FederationConfig {
     /// 判定该窗口不可恢复，放弃窗口并重拉清单（默认 3，约 3 个 resume tick）。
     #[serde(default = "default_bootstrap_window_idle_max_retries")]
     pub bootstrap_window_idle_max_retries: u32,
+    // ========================================================================
+    // bootstrap 活锁治理（2026-09-30）：传输失败退避 / 重拉熔断 / 进度继承 /
+    // 停滞让路解除 / 多 repo 触发。背景：三节点两两互拉 bootstrap 全部卡死，
+    // 单节点一天重拉 1846 次、0 块完成，range 反熵被永久让路。
+    // ========================================================================
+    /// 活锁治理(任务1)：块传输类失败（send 失败/超时/无会话）的退避基数（秒）。
+    /// 第 n 次连续失败后的等待 = `base × 2^(n-1)`，封顶 `bootstrap_backoff_max_secs`。
+    /// 传输类失败**永不**触发重拉清单；重拉仅保留 hash 校验失败与结构性漂移两个触发条件。
+    #[serde(default = "default_bootstrap_backoff_base_secs")]
+    pub bootstrap_backoff_base_secs: u64,
+    /// 活锁治理(任务1)：块传输退避封顶（秒）。默认 600（10 分钟）。
+    #[serde(default = "default_bootstrap_backoff_max_secs")]
+    pub bootstrap_backoff_max_secs: u64,
+    /// 活锁治理(任务2)：同一 (peer, repo) 连续重拉清单达到该次数且期间无任何块成功落地，
+    /// 判定 bootstrap 停滞：置通道窗口 inactive、error! 告警并进入
+    /// `bootstrap_repull_circuit_cooldown_secs` 冷却（resume tick 见冷却直接跳过）。
+    #[serde(default = "default_bootstrap_repull_circuit_threshold")]
+    pub bootstrap_repull_circuit_threshold: u32,
+    /// 活锁治理(任务2)：重拉熔断冷却（秒）。默认 1800（30 分钟）。
+    #[serde(default = "default_bootstrap_repull_circuit_cooldown_secs")]
+    pub bootstrap_repull_circuit_cooldown_secs: u64,
+    /// 活锁治理(任务4)：bootstrap 停滞判定阈值（秒）——非 Done 进度距最近一次块成功落地
+    /// (`last_progress_ms`) 超过该时长即判定停滞，range 反熵**不再让路**（打破
+    /// 「bootstrap 永久 active → 反熵永不运行」死锁）。注意与 v9 的 `bootstrap_stall_secs`
+    /// （delta 放行判定，180s）相互独立、口径不同。
+    #[serde(default = "default_bootstrap_stall_threshold_secs")]
+    pub bootstrap_stall_threshold_secs: u64,
+    /// 活锁治理(任务1-b)：重拉回来的清单 `total_rows` 与上次相比变化超过该百分比（%），
+    /// 判定结构性漂移（允许从零重传并告警）。默认 1%。0 = 关闭该判定。
+    #[serde(default = "default_bootstrap_structural_drift_rows_percent")]
+    pub bootstrap_structural_drift_rows_percent: u32,
+    /// 活锁治理(任务3)：重拉清单时新旧 `total_chunks` 差异 ≤ 该百分比（%），
+    /// 旧进度（已完成块）按 index 继承不归零（块内容幂等重传安全）。默认 2%。
+    #[serde(default = "default_bootstrap_inherit_tolerance_percent")]
+    pub bootstrap_inherit_tolerance_percent: u32,
+    /// 活锁治理(任务5)：启用 bootstrap 追赶的 repo 列表。resume tick 对列表内每个 repo，
+    /// 若无活跃进度且不在熔断冷却期，从已连接对端发起 bootstrap。
+    /// 默认仅 `[1]`（NODE），与引入前行为一致；加入 2/3/4 可让 PEER/INFOHASH/TRACKER 走快照追赶。
+    #[serde(default = "default_bootstrap_enable_repos")]
+    pub bootstrap_enable_repos: Vec<u8>,
 }
 
 fn default_listen_port() -> u16 {
@@ -593,6 +633,39 @@ fn default_bootstrap_window_idle_timeout_secs() -> u64 {
 fn default_bootstrap_window_idle_max_retries() -> u32 {
     3
 }
+/// 活锁治理(任务1)：退避基数 30s（序列 30→60→120→240→480→600 封顶）。
+fn default_bootstrap_backoff_base_secs() -> u64 {
+    30
+}
+/// 活锁治理(任务1)：退避封顶 600s（10 分钟），避免对端长慢时请求风暴。
+fn default_bootstrap_backoff_max_secs() -> u64 {
+    600
+}
+/// 活锁治理(任务2)：连续 10 次重拉且零块落地即熔断（现场实测一天 1846 次）。
+fn default_bootstrap_repull_circuit_threshold() -> u32 {
+    10
+}
+/// 活锁治理(任务2)：熔断冷却 30 分钟。
+fn default_bootstrap_repull_circuit_cooldown_secs() -> u64 {
+    1_800
+}
+/// 活锁治理(任务4)：停滞判定 300s——覆盖慢盘上一次正常的分块往返后仍有充足余量，
+/// 又能在真停滞时及时释放 range 反熵。
+fn default_bootstrap_stall_threshold_secs() -> u64 {
+    300
+}
+/// 活锁治理(任务1-b)：total_rows 变化 >1% 判结构性漂移。
+fn default_bootstrap_structural_drift_rows_percent() -> u32 {
+    1
+}
+/// 活锁治理(任务3)：total_chunks 差 ≤2% 按旧进度继承。
+fn default_bootstrap_inherit_tolerance_percent() -> u32 {
+    2
+}
+/// 活锁治理(任务5)：默认仅 NODE(1)，与引入前行为一致。
+fn default_bootstrap_enable_repos() -> Vec<u8> {
+    vec![1]
+}
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
@@ -683,6 +756,16 @@ impl Default for FederationConfig {
             bootstrap_rediff_cooldown_secs: default_bootstrap_rediff_cooldown_secs(),
             bootstrap_window_idle_timeout_secs: default_bootstrap_window_idle_timeout_secs(),
             bootstrap_window_idle_max_retries: default_bootstrap_window_idle_max_retries(),
+            bootstrap_backoff_base_secs: default_bootstrap_backoff_base_secs(),
+            bootstrap_backoff_max_secs: default_bootstrap_backoff_max_secs(),
+            bootstrap_repull_circuit_threshold: default_bootstrap_repull_circuit_threshold(),
+            bootstrap_repull_circuit_cooldown_secs: default_bootstrap_repull_circuit_cooldown_secs(
+            ),
+            bootstrap_stall_threshold_secs: default_bootstrap_stall_threshold_secs(),
+            bootstrap_structural_drift_rows_percent:
+                default_bootstrap_structural_drift_rows_percent(),
+            bootstrap_inherit_tolerance_percent: default_bootstrap_inherit_tolerance_percent(),
+            bootstrap_enable_repos: default_bootstrap_enable_repos(),
         }
     }
 }
@@ -714,6 +797,38 @@ mod tests {
         assert_eq!(cfg.peer_cache_max_nodes, 100);
         // D批(D3)：对端负载保护节流默认 30ms（必须走 default fn，不能是裸 serde(default)=0）
         assert_eq!(cfg.bootstrap_peer_protect_delay_ms, 30);
+        // 活锁治理（2026-09-30）：退避/熔断/继承/停滞/多 repo 默认值
+        assert_eq!(cfg.bootstrap_backoff_base_secs, 30);
+        assert_eq!(cfg.bootstrap_backoff_max_secs, 600);
+        assert_eq!(cfg.bootstrap_repull_circuit_threshold, 10);
+        assert_eq!(cfg.bootstrap_repull_circuit_cooldown_secs, 1_800);
+        assert_eq!(cfg.bootstrap_stall_threshold_secs, 300);
+        assert_eq!(cfg.bootstrap_structural_drift_rows_percent, 1);
+        assert_eq!(cfg.bootstrap_inherit_tolerance_percent, 2);
+        assert_eq!(
+            cfg.bootstrap_enable_repos,
+            vec![1],
+            "默认仅 NODE(1)，保持现行为"
+        );
+    }
+
+    /// 活锁治理（2026-09-30）：yaml 省略新字段时全部回退默认值（向后兼容），
+    /// 且 `bootstrap_enable_repos` 可显式扩展到 PEER/INFOHASH/TRACKER。
+    #[test]
+    fn test_bootstrap_livelock_fields_default_and_roundtrip() {
+        let cfg: FederationConfig = serde_yaml::from_str("listen_port: 7000").unwrap();
+        assert_eq!(cfg.bootstrap_backoff_base_secs, 30);
+        assert_eq!(cfg.bootstrap_backoff_max_secs, 600);
+        assert_eq!(cfg.bootstrap_repull_circuit_threshold, 10);
+        assert_eq!(cfg.bootstrap_repull_circuit_cooldown_secs, 1_800);
+        assert_eq!(cfg.bootstrap_stall_threshold_secs, 300);
+        assert_eq!(cfg.bootstrap_structural_drift_rows_percent, 1);
+        assert_eq!(cfg.bootstrap_inherit_tolerance_percent, 2);
+        assert_eq!(cfg.bootstrap_enable_repos, vec![1]);
+
+        let cfg2: FederationConfig =
+            serde_yaml::from_str("bootstrap_enable_repos: [1, 2, 3]").unwrap();
+        assert_eq!(cfg2.bootstrap_enable_repos, vec![1, 2, 3]);
     }
 
     #[test]

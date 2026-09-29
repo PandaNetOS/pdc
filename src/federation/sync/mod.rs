@@ -21,7 +21,7 @@ use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::event_bus::EventBus;
 use crate::federation::config::FederationConfig;
@@ -206,12 +206,13 @@ pub struct SyncManager {
     /// 租约期内重复到达的清单请求**直接复用缓存**，不再全表重排 —— 旧实现每次请求都重建，
     /// 请求方每 60s 一次即形成「自持 DB 风暴」（实测单次重建 >131s，期间块请求被静默丢弃）。
     bootstrap_manifest_at: RwLock<FxHashMap<(NodeId, u8), Instant>>,
-    /// v9：分块请求的在途/失败跟踪 —— (peer, repo) → (当前 index, 连续尝试次数, 首次尝试时刻)。
+    /// v9：分块请求的在途/失败跟踪 —— (peer, repo) → 退避重试状态。
     ///
-    /// 旧实现只会在 resume 周期里重发同一个 index，**没有次数与时间上限**，也不会升级；
-    /// 应答方一旦静默（租约跳过 / index 越界 / DB 读失败），`done_chunks` 就永远停在原处
-    /// （实测：`phase=transfer, done=0` 持续存在，两天内 `收到清单` 仅 1 次）。
-    bootstrap_chunk_attempt: RwLock<FxHashMap<(NodeId, u8), (u32, u32, Instant)>>,
+    /// 活锁治理(任务1)重定义：旧结构 (index, 次数, 首次时刻) 按「无响应次数」计数并
+    /// 升级重拉清单，是三节点互拉活锁的第一环。现改为 [`bootstrap::ChunkRetryState`]：
+    /// 只记**传输类失败**（send 失败/超时/无会话），resume tick 按指数退避表决定何时重发，
+    /// 永不因此重拉清单；成功收到任意响应即整条清零。
+    bootstrap_chunk_attempt: RwLock<FxHashMap<(NodeId, u8), bootstrap::ChunkRetryState>>,
     /// v9：Range 修复去重 —— (peer, repo, lo, hi) → 上次修复时刻。
     /// 同一批差异在多个 tick 里被重复推拉（叠加 NODE 内容差异无法收敛时）会白白吃带宽。
     range_repair_recent: RwLock<FxHashMap<(NodeId, u8, Vec<u8>, Vec<u8>), Instant>>,
@@ -247,6 +248,15 @@ pub struct SyncManager {
     delta_gap: RwLock<FxHashSet<(NodeId, u8)>>,
     /// P1-4：range 反熵全局并发闸（请求/响应/拉/推 handler 共用），削平突发帧风暴。
     range_gate: Arc<tokio::sync::Semaphore>,
+    /// 活锁治理(任务2)：重拉熔断 —— (peer, repo) → (连续重拉次数, 冷却到点)。
+    /// 同一 (peer, repo) 连续 `bootstrap_repull_circuit_threshold` 次重拉清单且期间
+    /// 无任何块成功落地 → 判定 bootstrap 停滞：置通道窗口 inactive、error! 告警、
+    /// 冷却 `bootstrap_repull_circuit_cooldown_secs`（resume tick 见冷却直接跳过）。
+    /// 任一块成功落地即清零计数并解除冷却。
+    bootstrap_repull_circuit: RwLock<FxHashMap<(NodeId, u8), (u32, Option<Instant>)>>,
+    /// 活锁治理(任务4)：range 让路的「bootstrap 停滞」WARN 已打标记（防刷屏）。
+    /// 转入停滞打一次 WARN；恢复活跃时清除标记并打一次 INFO。
+    bootstrap_stall_warned: std::sync::atomic::AtomicBool,
 }
 
 impl SyncManager {
@@ -379,6 +389,8 @@ impl SyncManager {
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
             range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
+            bootstrap_repull_circuit: RwLock::new(FxHashMap::default()),
+            bootstrap_stall_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1296,6 +1308,119 @@ impl SyncManager {
         self.bootstrap_rediff_cooldown
             .write()
             .insert((*peer, repo), Instant::now());
+    }
+
+    // ========================================================================
+    // 活锁治理（2026-09-30）：退避重试 / 重拉熔断 / 停滞判定
+    // ========================================================================
+
+    /// 活锁治理(任务1)：记录一次分块传输类失败（send 失败/超时/无会话）。
+    /// 换块即重置连续失败计数；成功收到任意响应时由调用方整条清零。
+    fn record_chunk_transport_fail(&self, peer: &NodeId, repo: u8, index: u32) {
+        let mut m = self.bootstrap_chunk_attempt.write();
+        let st = m
+            .entry((*peer, repo))
+            .or_insert(bootstrap::ChunkRetryState {
+                index,
+                fails: 0,
+                last_fail_at: Instant::now(),
+            });
+        if st.index != index {
+            st.index = index;
+            st.fails = 0;
+        }
+        st.fails = st.fails.saturating_add(1);
+        st.last_fail_at = Instant::now();
+    }
+
+    /// 活锁治理(任务1)：该 (peer, repo) 的退避是否已到期（可重发）。
+    /// 无失败记录或失败已清零 → 立即放行；否则按 `backoff_delay` 指数退避表判断。
+    fn chunk_backoff_ready(&self, peer: &NodeId, repo: u8) -> bool {
+        let m = self.bootstrap_chunk_attempt.read();
+        match m.get(&(*peer, repo)) {
+            Some(st) if st.fails > 0 => {
+                let delay = bootstrap::backoff_delay(
+                    Duration::from_secs(self.config.bootstrap_backoff_base_secs.max(1)),
+                    Duration::from_secs(self.config.bootstrap_backoff_max_secs.max(1)),
+                    st.fails,
+                );
+                st.last_fail_at.elapsed() >= delay
+            }
+            _ => true,
+        }
+    }
+
+    /// 活锁治理(任务2)：记录一次重拉（清单请求发起）。返回 true = 本次触发即熔断
+    /// （连续次数达阈值且期间无任何块成功落地）。
+    fn record_bootstrap_repull(&self, peer: &NodeId, repo: u8) -> bool {
+        let threshold = self.config.bootstrap_repull_circuit_threshold.max(1);
+        let mut tripped = false;
+        {
+            let mut m = self.bootstrap_repull_circuit.write();
+            let e = m.entry((*peer, repo)).or_insert((0, None));
+            // 仍在冷却中：不累计、不延长（到期后的一次重拉会立即重新熔断，
+            // 形成「每冷却期至多一次试探」的慢速循环）
+            if matches!(e.1, Some(until) if Instant::now() < until) {
+                return false;
+            }
+            // 冷却已到期 → 解除冷却但**保留历史计数**：到期后的首次重拉即达阈值重新熔断
+            if e.1.is_some() {
+                e.1 = None;
+            }
+            e.0 = e.0.saturating_add(1);
+            if e.0 >= threshold {
+                e.1 = Some(
+                    Instant::now()
+                        + Duration::from_secs(
+                            self.config.bootstrap_repull_circuit_cooldown_secs.max(1),
+                        ),
+                );
+                tripped = true;
+            }
+        }
+        if tripped {
+            // 熔断动作：error! 告警 + 置通道窗口 inactive（防「bootstrap 永久 active」
+            // 把 range 反熵永久让路）；进度行保留（冷却到期后可从断点续传）。
+            error!(
+                "[bootstrap] 重拉熔断：peer={} repo={} 连续 {} 次重拉且零块落地，判定停滞 —— 置 inactive 并冷却 {}s（期间 resume tick 跳过，range 反熵接管）",
+                peer,
+                repo,
+                threshold,
+                self.config.bootstrap_repull_circuit_cooldown_secs
+            );
+            self.chunk_windows.write().remove(&(*peer, repo));
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.bootstrap.active = false;
+            g.bootstrap.inflight = 0;
+            g.bootstrap.phase = "circuit_open".to_string();
+        }
+        tripped
+    }
+
+    /// 活锁治理(任务2)：该 (peer, repo) 是否处于重拉熔断冷却期。
+    fn bootstrap_repull_in_cooldown(&self, peer: &NodeId, repo: u8) -> bool {
+        let m = self.bootstrap_repull_circuit.read();
+        matches!(m.get(&(*peer, repo)), Some((_, Some(until))) if Instant::now() < *until)
+    }
+
+    /// 活锁治理(任务2)：任一块成功落地 → 清零该 (peer, repo) 的连续重拉计数并解除冷却。
+    fn clear_bootstrap_repull(&self, peer: &NodeId, repo: u8) {
+        self.bootstrap_repull_circuit.write().remove(&(*peer, repo));
+    }
+
+    /// 活锁治理(任务4)：转入停滞时打一次 WARN（返回 true = 本次调用打了 WARN）。
+    fn mark_bootstrap_stall_warned(&self) -> bool {
+        !self
+            .bootstrap_stall_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 活锁治理(任务4)：恢复活跃时清除停滞标记（返回 true = 之前曾 WARN 过，
+    /// 调用方补打一次 INFO）。
+    fn clear_bootstrap_stall_warned(&self) -> bool {
+        self.bootstrap_stall_warned
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// E1：巡检里挑出下一个「本地实时行数 vs 对端最近自报行数」已超 D2 双向阈值、
@@ -2371,10 +2496,27 @@ impl SyncManager {
         // v10(F2b)：bootstrap 传输期让路 —— 快照是全量 IO（实测 NODE 128 块 × 2 万行），
         // 与反熵区间扫描争同一 SQLite 读池，会把 tick 从毫秒级拖到 300s 超时
         // （2026-09-27 实测：快照期连续两个 tick 飞满 300s 被杀）。铁律 1（低优先级
-        // 可抢占）：快照在途时反熵让路，竣工/停滞判定失效后自动恢复。
+        // 可抢占）：快照在途时反熵让路。
+        // 活锁治理(任务4)：让路必须以「bootstrap 仍在推进」为前提 —— 现场实测三节点
+        // 互拉全部卡死时 bootstrap 永久 active，让路逻辑使 range 反熵永不运行（唯一
+        // 兜底通道失效）。现在距最近一次块成功落地超过 `bootstrap_stall_threshold_secs`
+        // 即判定停滞：不再让路，转入停滞打一次 WARN（防刷屏），恢复活跃补一次 INFO。
         if self.bootstrap_transfer_active() {
-            debug!("[range] bootstrap 传输进行中，本轮反熵让路");
-            return;
+            if self.bootstrap_transfer_stalled() {
+                if self.mark_bootstrap_stall_warned() {
+                    warn!(
+                        "[range] bootstrap 距最近块落地超过 {}s 判定停滞，反熵不再让路（详见 /sync-observability bootstrap.stalled）",
+                        self.config.bootstrap_stall_threshold_secs
+                    );
+                }
+                // 不 return：继续执行本轮反熵
+            } else {
+                if self.clear_bootstrap_stall_warned() {
+                    info!("[range] bootstrap 恢复推进，反熵重新让路");
+                }
+                debug!("[range] bootstrap 传输进行中，本轮反熵让路");
+                return;
+            }
         }
         // v9：单轮最多处理 `range_repos_per_tick` 个 repo（默认 1）。
         // 旧实现一轮把 4 个 repo 全部串行跑完（各 160+ 个区间、合计约 505 帧），
@@ -2466,6 +2608,33 @@ impl SyncManager {
         let fresh_ms = self.config.bootstrap_stall_secs.max(1) as i64 * 1000;
         rows.iter().any(|p| {
             !matches!(p.phase, bootstrap::BootstrapPhase::Done) && now_ms - p.updated_ms <= fresh_ms
+        })
+    }
+
+    /// 活锁治理(任务4)：bootstrap 是否整体停滞 —— 存在非 Done 进度，但**没有任何**
+    /// (peer, repo) 在 `bootstrap_stall_threshold_secs` 内成功落过块。
+    ///
+    /// 与 `bootstrap_transfer_active`（基于 `updated_ms`，会被清单往返刷新）不同，
+    /// 本判定基于 `last_progress_ms`（仅块成功落地时推进）—— 活锁场景下重拉循环
+    /// 会不断刷新 `updated_ms` 让 active 永真，但 `last_progress_ms` 暴露真实停滞。
+    fn bootstrap_transfer_stalled(&self) -> bool {
+        let rows = self.delta_storage().bootstrap_list().unwrap_or_default();
+        let has_active = rows
+            .iter()
+            .any(|p| !matches!(p.phase, bootstrap::BootstrapPhase::Done));
+        if !has_active {
+            return false;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let threshold_ms = self.config.bootstrap_stall_threshold_secs.max(1) as i64 * 1000;
+        !rows.iter().any(|p| {
+            !matches!(p.phase, bootstrap::BootstrapPhase::Done)
+                && !bootstrap::progress_stalled(
+                    p.last_progress_ms,
+                    p.updated_ms,
+                    now_ms,
+                    threshold_ms,
+                )
         })
     }
 
@@ -3075,7 +3244,7 @@ impl SyncManager {
             .bootstrap_load(&conn.node_id.0, mf.repo)
             .ok()
             .flatten();
-        let (same_done, resume_src) = match loaded {
+        let (same_done, resume_src) = match &loaded {
             Some((p, _)) if p.peer.as_slice() == conn.node_id.0 && p.version == mf.version => {
                 (p.done_chunks.min(mf.chunks.len() as u64), "version")
             }
@@ -3092,9 +3261,36 @@ impl SyncManager {
         //   - done_chunks = 验证通过的连续前缀（不再无条件信任旧 done_chunks）；
         //   - 本地清单重建失败 → 完全不继承（seed 空、done=0，退回全量拉取）。
         // skip=false 时保留旧行为：无条件继承 0..same_done。
+        // 活锁治理(任务1-b/任务3)：新旧清单漂移判定 —— total_rows 变化 > 配置百分比
+        // 判**结构性漂移**（重拉的第二个合法触发证据：对端数据量级已变，旧断点无意义，
+        // 允许从零重传并告警）；total_chunks 差 ≤ 容差则旧进度可按 index 继承。
+        let (old_rows, old_chunks, old_done) = match &loaded {
+            Some((p, Some(om))) if p.peer.as_slice() == conn.node_id.0 => {
+                (om.total_rows, om.chunks.len() as u64, p.done_chunks)
+            }
+            _ => (0, 0, 0),
+        };
         let total_chunks = mf.chunks.len() as u32;
+        let (structural_drift, inheritable) = bootstrap::manifest_drift(
+            old_rows,
+            old_chunks,
+            mf.total_rows,
+            total_chunks as u64,
+            self.config.bootstrap_structural_drift_rows_percent,
+            self.config.bootstrap_inherit_tolerance_percent,
+        );
+        if structural_drift {
+            warn!(
+                "[bootstrap] 结构性漂移：total_rows {} → {}（变化 >{}%），旧进度作废从零重传（块内容幂等重传安全）: peer={} repo={}",
+                old_rows,
+                mf.total_rows,
+                self.config.bootstrap_structural_drift_rows_percent,
+                conn.node_id,
+                mf.repo
+            );
+        }
         let do_verify = self.config.bootstrap_skip_identical_chunks;
-        let (seed, done_chunks): (std::collections::HashSet<u32>, u64) = if do_verify {
+        let (mut seed, done_chunks): (std::collections::HashSet<u32>, u64) = if do_verify {
             let storage = self.delta_storage();
             let w0 = storage.oplog_max_seq_for_repo(mf.repo).unwrap_or(0).max(0) as u64;
             let version = w0.wrapping_add(1) as u32;
@@ -3128,6 +3324,30 @@ impl SyncManager {
             // skip=false：无条件继承旧进度（旧行为，不做本地校验）
             ((0..same_done as u32).collect(), same_done)
         };
+        // 活锁治理(任务3)：重拉进度继承 —— 新旧清单 total_chunks 差 ≤ 容差（非结构性漂移）
+        // 时，旧进度（已完成块）按 index 继承不归零，与 D3 验证前缀取 max。
+        // 继承块同时并入 skip 集合，保证窗口 received 与持久化 done_chunks 一致
+        // （不再重发已继承块；未真正落地的残留差异由竣工对齐校验与 range 反熵兜底）。
+        let inherited_done = bootstrap::inherit_done_chunks(
+            old_done,
+            total_chunks as u64,
+            inheritable && !structural_drift,
+            done_chunks,
+        );
+        if inherited_done > done_chunks {
+            for i in 0..inherited_done as u32 {
+                seed.insert(i);
+            }
+            info!(
+                "[bootstrap] 重拉进度继承（任务3）：旧进度 done={} 按 index 继承（新清单 {} 块，差异 ≤{}%）: peer={} repo={}",
+                old_done,
+                total_chunks,
+                self.config.bootstrap_inherit_tolerance_percent,
+                conn.node_id,
+                mf.repo
+            );
+        }
+        let done_chunks = inherited_done;
         let now = chrono::Utc::now().timestamp_millis();
         let mut progress = bootstrap::BootstrapProgress::new(mf.repo, conn.node_id.0.to_vec(), now);
         progress.phase = bootstrap::BootstrapPhase::Transfer;
@@ -3148,7 +3368,9 @@ impl SyncManager {
         }
         // v10(B2)/D批(D1)/D批(D3)：对齐验证覆盖全部块（seed 逐块 hash&rows 与本地一致 = 全量）
         // → 直接竣工，不再发越界块请求空转；竣工推进游标并切 delta 追尾。
-        // D批(D3)：此处 seed 必须是**验证后**的集合，未验证的旧 done_chunks 不再直接竣工。
+        // 活锁治理(任务3)：seed 现在还可能含「按 index 继承」的旧进度块（未经本轮 hash
+        // 验证）；全覆盖触发的直接竣工仍要过 finish_bootstrap 的竣工前对齐校验
+        // （静态表严格逐块全等 / 活表行数 ≥95% 兜底），假进度不会写 Done。
         if !mf.chunks.is_empty() && seed.len() >= total_chunks as usize {
             info!(
                 "[bootstrap] 对齐验证快照已全部落地（逐块 hash/rows 一致），直接竣工: peer={} repo={}",
@@ -3298,6 +3520,10 @@ impl SyncManager {
             self.bootstrap_verify_fails
                 .write()
                 .remove(&(conn.node_id, resp.repo));
+            // 活锁治理(任务4)：块成功落地 → touch 停滞判定时钟；
+            // 活锁治理(任务2)：任一块成功落地 → 清零重拉熔断计数并解除冷却。
+            progress.last_progress_ms = chrono::Utc::now().timestamp_millis();
+            self.clear_bootstrap_repull(&conn.node_id, resp.repo);
             progress.last_key = Some(chunk.hi.clone());
             progress.bytes += resp
                 .entries
@@ -3323,16 +3549,41 @@ impl SyncManager {
                 cw.done_prefix(),
                 mf.chunks.len()
             );
+            // 活锁治理(任务1-a)：唯一保留的块级重拉触发 —— 对端回带**非零** hash 且与
+            // 清单块 hash 不符 = 真实数据漂移证据（当前服务端恒填零占位，本分支为协议
+            // 预留；真漂移证据主走竣工前 D3 对齐校验路径，见 finish_bootstrap）。
+            if resp.hash != [0u8; 32] && resp.hash != chunk.hash {
+                warn!(
+                    "[bootstrap] 块 {} hash 校验失败（真实数据漂移证据），重拉清单: repo={} peer={}",
+                    resp.index, resp.repo, conn.node_id
+                );
+                progress.done_chunks = cw.done_prefix() as u64;
+                progress.updated_ms = chrono::Utc::now().timestamp_millis();
+                let _ = self.delta_storage().bootstrap_save(&progress, None);
+                self.chunk_windows
+                    .write()
+                    .insert((conn.node_id, resp.repo), cw);
+                self.record_bootstrap_repull(&conn.node_id, resp.repo);
+                self.clone().start_bootstrap(conn.node_id, resp.repo).await;
+                return;
+            }
             let attempts = cw.on_failure(resp.index);
             if attempts >= self.config.bootstrap_chunk_max_attempts.max(1) {
+                // 活锁治理(任务1)：连续失败**不再升级重拉清单**（旧实现此处 start_bootstrap，
+                // 与会话闪断叠加形成「重拉→清零→再失败」死循环，单节点一天 1846 次）。
+                // 改为记入退避表：resume tick 按指数退避表（30s→…→600s 封顶）推迟重发；
+                // 一致性由 range 反熵兜底（v8/v9 基准）。
                 warn!(
-                    "[bootstrap] 块 {} 连续 {} 次失败，判定清单漂移/边界失配，重拉清单: repo={}, peer={}",
+                    "[bootstrap] 块 {} 连续 {} 次失败，转入指数退避重试（不重拉清单）: repo={} peer={}",
                     resp.index, attempts, resp.repo, conn.node_id
                 );
-                self.bootstrap_verify_fails
+                self.record_chunk_transport_fail(&conn.node_id, resp.repo, resp.index);
+                progress.done_chunks = cw.done_prefix() as u64;
+                progress.updated_ms = chrono::Utc::now().timestamp_millis();
+                let _ = self.delta_storage().bootstrap_save(&progress, None);
+                self.chunk_windows
                     .write()
-                    .remove(&(conn.node_id, resp.repo));
-                self.clone().start_bootstrap(conn.node_id, resp.repo).await;
+                    .insert((conn.node_id, resp.repo), cw);
                 return;
             }
         }
@@ -3391,25 +3642,23 @@ impl SyncManager {
             );
             return;
         }
-        // v9：记录 (index, 次数, 首次时刻)。resume tick 据此判定「对端一直不回帧」
-        // 并升级为「重拉清单」——旧实现无计数、无超时，只会在 60s 周期里无限重发同一 index。
-        {
-            let mut m = self.bootstrap_chunk_attempt.write();
-            let e = m
-                .entry((conn.node_id, repo))
-                .or_insert((index, 0, Instant::now()));
-            if e.0 != index {
-                *e = (index, 0, Instant::now());
-            }
-            e.1 = e.1.saturating_add(1);
-        }
+        // 活锁治理(任务1)：旧实现此处对**每次发送**累加「无响应次数」并按
+        // `bootstrap_chunk_max_attempts` 升级重拉清单（活锁第一环）。现在发送前不再计数；
+        // 仅发送失败（传输类）时记入退避表，resume tick 按指数退避表决定何时重发，
+        // 永不因此重拉清单。
         let req = BootstrapChunkRequestMessage { repo, index };
         match conn
             .send_message(MessageType::BootstrapChunkRequest, &req)
             .await
         {
             Ok(()) => self.metrics.record_message_sent(),
-            Err(e) => warn!("[bootstrap] 请求块 {} 失败: {}", index, e),
+            Err(e) => {
+                warn!(
+                    "[bootstrap] 请求块 {} 失败（传输类，计入退避重试）: peer={} repo={} err={}",
+                    index, conn.node_id, repo, e
+                );
+                self.record_chunk_transport_fail(&conn.node_id, repo, index);
+            }
         }
     }
 
@@ -3477,10 +3726,15 @@ impl SyncManager {
                 self.delta_storage().bootstrap_load(&conn.node_id.0, repo)
             {
                 if !self.bootstrap_manifest_aligned(repo, &mf).await {
+                    // 活锁治理(任务1-a)：D3 逐块对齐校验失败 = 真实数据漂移证据，
+                    // 是重拉清单的两个合法触发条件之一（另一为 total_rows 结构性漂移）。
+                    // 熔断计数与冷却在 start_bootstrap 内统一记账，连续无进展会被熔断。
                     warn!(
-                        "[bootstrap] 竣工前对齐校验失败（块 hash/rows 与本地不一致或清单重建失败），不写 Done，交由 resume/watchdog 推进: peer={} repo={}",
+                        "[bootstrap] 竣工前对齐校验失败（块 hash/rows 与本地不一致或清单重建失败），不写 Done，重拉清单: peer={} repo={}",
                         conn.node_id, repo
                     );
+                    self.record_bootstrap_repull(&conn.node_id, repo);
+                    self.clone().start_bootstrap(conn.node_id, repo).await;
                     return;
                 }
             }
@@ -3617,6 +3871,15 @@ impl SyncManager {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(&p.peer);
             let peer = NodeId(arr);
+            // 活锁治理(任务2)：重拉熔断冷却期内直接跳过 —— 不重发、不重拉、不重建窗口。
+            if self.bootstrap_repull_in_cooldown(&peer, p.repo) {
+                continue;
+            }
+            // 活锁治理(任务1)：退避未到期 → 本轮不重发（指数退避表决定重发时机，
+            // 30s 起逐次翻倍至 `bootstrap_backoff_max_secs` 封顶）。
+            if !self.chunk_backoff_ready(&peer, p.repo) {
+                continue;
+            }
             // v10(C)：窗口化续传 —— 不依赖链式「从 done_chunks 请求一块」，而是：
             //   ① 若内存中已有 ChunkWindow（传输进行中）：回收超时在途块，fill 补发。
             //   ② 若无 ChunkWindow（重启/异常掉出）：从持久化 done_chunks 重建窗口并填满。
@@ -3671,18 +3934,22 @@ impl SyncManager {
                         g.bootstrap.inflight = cw.inflight_len() as u32;
                         g.bootstrap.phase = "transfer".to_string();
                     }
-                    // E2：空闲恢复次数达上限 → 放弃本窗口，重拉清单自愈（防对端不可达时无限重刷）。
+                    // E2 + 活锁治理(任务1)：连续空闲恢复达上限 → 记入退避表推迟重发，
+                    // **不再重拉清单**。旧实现此处 start_bootstrap，对端不可达时形成
+                    // 重拉风暴；且空闲计数已在块成功落地（on_response）时归零，
+                    // 能达到上限说明对端真不可达，重拉同清单毫无收益。
                     if cw.idle_recovery_count()
                         >= self.config.bootstrap_window_idle_max_retries.max(1)
                     {
+                        let anchor = cw.first_inflight().unwrap_or(p.done_chunks as u32);
                         warn!(
-                            "[bootstrap] 窗口连续 {} 次空闲无进展，放弃窗口并重拉清单: peer={} repo={}",
+                            "[bootstrap] 窗口连续 {} 次空闲无进展，按退避表推迟重发（不重拉清单）: peer={} repo={}",
                             cw.idle_recovery_count(),
                             peer,
                             p.repo
                         );
-                        self.chunk_windows.write().remove(&(peer, p.repo));
-                        self.clone().start_bootstrap(peer, p.repo).await;
+                        self.record_chunk_transport_fail(&peer, p.repo, anchor);
+                        self.chunk_windows.write().insert((peer, p.repo), cw);
                         continue;
                     }
                     let batch = cw.fill(0);
@@ -3724,6 +3991,11 @@ impl SyncManager {
             }
         }
 
+        // 活锁治理(任务5)：多 repo bootstrap 触发 —— 对 enable_repos 里每个 repo，
+        // 若无活跃进度且不在熔断冷却期，从已连接对端选一个发起 bootstrap
+        // （让 PEER(repo=2)/INFOHASH/TRACKER 也能通过快照通道追赶，不再只限 NODE）。
+        self.trigger_enabled_repo_bootstraps().await;
+
         // 定期检查（批次 3：独立节流）—— 对比本地与对端各 repo 总数，差 20% 以上触发 bootstrap。
         // 该巡检是 DB 级全表计数比对：原先挂在 resume tick 里**每轮**都跑，把本该秒级返回的
         // 续传任务单次占槽拉到 max 164.36s，同分类（Federation 8/8）的 delta / gossip
@@ -3743,6 +4015,73 @@ impl SyncManager {
             // E1：bootstrap 中途断裂后的运行时差异复检（同 5 分钟巡检节流，复用 D2 阈值）。
             self.rediff_bootstrap_recheck().await;
         }
+    }
+
+    /// 活锁治理(任务5)：多 repo bootstrap 触发 —— 对 `bootstrap_enable_repos` 里每个
+    /// repo，若无任何活跃（非 Done）进度且无内存窗口，从已连接对端选一个发起
+    /// bootstrap。方向守卫 / 双向让路 / 发起互斥 / 熔断冷却全部由 `start_bootstrap`
+    /// 内部统一把关，这里只做「该 repo 是否需要发起」与对端初选。
+    async fn trigger_enabled_repo_bootstraps(self: &Arc<Self>) {
+        if self.config.bootstrap_enable_repos.is_empty() {
+            return;
+        }
+        let rows = self.delta_storage().bootstrap_list().unwrap_or_default();
+        for repo in self.config.bootstrap_enable_repos.clone() {
+            // 非法 repo 值跳过（start_bootstrap 也有同款校验，这里提前省 IO）
+            if !(repo_type::NODE..=repo_type::TRACKER).contains(&repo) {
+                continue;
+            }
+            // 该 repo 已有活跃进度（任意对端）→ 快照已在途，不重复发起（每 repo 串行）
+            if rows
+                .iter()
+                .any(|p| p.repo == repo && !matches!(p.phase, bootstrap::BootstrapPhase::Done))
+            {
+                continue;
+            }
+            // 该 repo 已有内存窗口（传输进行中）→ 同上
+            if self.chunk_windows.read().keys().any(|(_, r)| *r == repo) {
+                continue;
+            }
+            let conns = self.sessions.all_connections();
+            if let Some(peer) = self.pick_bootstrap_peer(repo, &conns) {
+                info!(
+                    "[bootstrap] 任务5：repo={} 无活跃进度，从已连接对端发起 bootstrap: peer={}",
+                    repo, peer
+                );
+                self.clone().start_bootstrap(peer, repo).await;
+            }
+        }
+    }
+
+    /// 活锁治理(任务5)：为某 repo 初选一个已连接对端。优先「对端自报行数 > 本端」
+    /// 的方向（start_bootstrap 的方向守卫会再校验一次），无自报状态时回退到第一条
+    /// 支持 bootstrap 的连接。全部候选都在熔断冷却期 → None。
+    fn pick_bootstrap_peer(&self, repo: u8, conns: &[Arc<PeerConn>]) -> Option<NodeId> {
+        let idx = (repo - repo_type::NODE) as usize;
+        let local_rows = self.local_entry_counts().get(idx).copied().unwrap_or(0) as u64;
+        let mut fallback: Option<NodeId> = None;
+        for c in conns {
+            if !c.supports_bootstrap() {
+                continue;
+            }
+            if self.bootstrap_repull_in_cooldown(&c.node_id, repo) {
+                continue;
+            }
+            let remote_rows = self
+                .peer_negotiate_state
+                .read()
+                .get(&c.node_id)
+                .and_then(|v| v.iter().find(|s| s.repo == repo).map(|s| s.row_count))
+                .unwrap_or(0);
+            // 方向优先：对端确有本端缺的存量
+            if remote_rows > local_rows {
+                return Some(c.node_id);
+            }
+            if fallback.is_none() {
+                fallback = Some(c.node_id);
+            }
+        }
+        fallback
     }
 
     /// 定期检查本地与对端各 repo 总数差异，差 20% 以上自动触发 bootstrap
@@ -3853,6 +4192,15 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // 活锁治理(任务2)：重拉熔断冷却期内拒绝发起 —— 所有触发路径（协商 / 巡检 /
+        // resume 续传欠账 / 竣工对齐失败）的单点闸，冷却期内不产生任何清单请求。
+        if self.bootstrap_repull_in_cooldown(&peer, repo) {
+            debug!(
+                "[bootstrap] 熔断冷却期内，拒绝发起: peer={} repo={}",
+                peer, repo
+            );
+            return;
+        }
         // v10(B2)：方向守卫（所有发起路径的单点判定，含 resume 恢复/续传）——
         // 对端自报行数不多于本端时，快照拉来的几乎全是本端已有行（行集近似包含），
         // 数 GB 传输零收益，还会占住带宽与响应能力、阻塞对端真正需要的第一优先拉取。
@@ -3916,6 +4264,10 @@ impl SyncManager {
             return;
         }
         info!("[bootstrap] 向 {} 请求 repo={} 清单", peer, repo);
+        // 活锁治理(任务2)：记账本次清单拉取。连续 `bootstrap_repull_circuit_threshold`
+        // 次且期间无任何块成功落地 → 熔断（error! + 置 inactive + 冷却）；任一块成功
+        // 落地即清零。首次发起同样记账 ——「清单永远拉不回来」与「拉回来传不动」同属停滞。
+        self.record_bootstrap_repull(&peer, repo);
         let req = BootstrapManifestRequestMessage { repo };
         match conn
             .send_message(MessageType::BootstrapManifestRequest, &req)
@@ -4564,6 +4916,214 @@ mod tests {
             mgr.bootstrap_transfer_active(),
             "快照传输活跃期反熵必须让路"
         );
+    }
+
+    /// 活锁治理(任务1)：传输失败退避 —— 记入 `bootstrap_chunk_attempt` 后，
+    /// `chunk_backoff_ready` 在退避窗口内拒绝重发、到期放行；换块重置计数；
+    /// 成功收到响应（此处模拟为直接清零入口）后立即放行。
+    #[test]
+    fn test_chunk_transport_backoff_gate() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage, make_config());
+        let peer = NodeId([5; 20]);
+        let repo = repo_type::NODE;
+
+        // 无失败记录 → 放行
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+        // 第 1 次失败 → 退避 30s 内不放行
+        mgr.record_chunk_transport_fail(&peer, repo, 0);
+        assert!(!mgr.chunk_backoff_ready(&peer, repo), "退避窗口内不得重发");
+        // 把 last_fail_at 拨到 31s 前 → 第 1 档（30s）到期放行
+        {
+            let mut m = mgr.bootstrap_chunk_attempt.write();
+            let st = m.get_mut(&(peer, repo)).unwrap();
+            st.last_fail_at = Instant::now() - Duration::from_secs(31);
+        }
+        assert!(mgr.chunk_backoff_ready(&peer, repo), "退避到期应放行");
+        // 连续失败累计：第 4 次失败 → 240s 档，31s 前的失败时刻不放行
+        mgr.record_chunk_transport_fail(&peer, repo, 0);
+        mgr.record_chunk_transport_fail(&peer, repo, 0);
+        mgr.record_chunk_transport_fail(&peer, repo, 0);
+        {
+            let mut m = mgr.bootstrap_chunk_attempt.write();
+            let st = m.get_mut(&(peer, repo)).unwrap();
+            assert_eq!(st.fails, 4, "同块连续失败应累计");
+            st.last_fail_at = Instant::now() - Duration::from_secs(31);
+        }
+        assert!(
+            !mgr.chunk_backoff_ready(&peer, repo),
+            "第 4 次失败的退避档（240s）未到不得重发"
+        );
+        // 换块 → 计数重置为 1（30s 档）
+        mgr.record_chunk_transport_fail(&peer, repo, 7);
+        {
+            let m = mgr.bootstrap_chunk_attempt.read();
+            let st = m.get(&(peer, repo)).unwrap();
+            assert_eq!(st.fails, 1, "换块必须重置连续失败计数");
+            assert_eq!(st.index, 7);
+        }
+        // 成功收到任意响应 → 整条清零（生产路径为 map.remove，此处等价验证放行语义）
+        mgr.bootstrap_chunk_attempt.write().remove(&(peer, repo));
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+    }
+
+    /// 活锁治理(任务2)：重拉熔断 —— 连续重拉达到阈值且无块落地 → 进入冷却；
+    /// 冷却期内 resume/start 全部跳过（`bootstrap_repull_in_cooldown`）；
+    /// 任一块成功落地（`clear_bootstrap_repull`）即清零计数解除冷却；
+    /// 冷却到期后下一次重拉立即重新熔断（每冷却期至多一次试探）。
+    #[test]
+    fn test_repull_circuit_breaker() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mut cfg = make_config();
+        cfg.bootstrap_repull_circuit_threshold = 3;
+        cfg.bootstrap_repull_circuit_cooldown_secs = 1_800;
+        let mgr = make_sync_manager(storage, cfg);
+        let peer = NodeId([6; 20]);
+        let repo = repo_type::PEER;
+
+        // 前两次重拉：未达阈值，不冷却
+        assert!(!mgr.record_bootstrap_repull(&peer, repo));
+        assert!(!mgr.record_bootstrap_repull(&peer, repo));
+        assert!(!mgr.bootstrap_repull_in_cooldown(&peer, repo));
+        // 第 3 次（达阈值）→ 熔断进入冷却
+        assert!(
+            mgr.record_bootstrap_repull(&peer, repo),
+            "达到阈值本次应返回 tripped"
+        );
+        assert!(
+            mgr.bootstrap_repull_in_cooldown(&peer, repo),
+            "熔断后必须处于冷却期"
+        );
+        // 冷却期内继续记账不重复累计、不延长冷却
+        assert!(!mgr.record_bootstrap_repull(&peer, repo));
+        // 任一块成功落地 → 清零并解除冷却
+        mgr.clear_bootstrap_repull(&peer, repo);
+        assert!(!mgr.bootstrap_repull_in_cooldown(&peer, repo));
+        // 冷却到期（把冷却到点拨到过去）→ 下一次重拉立即重新熔断
+        mgr.record_bootstrap_repull(&peer, repo);
+        mgr.record_bootstrap_repull(&peer, repo);
+        {
+            let mut m = mgr.bootstrap_repull_circuit.write();
+            let e = m.get_mut(&(peer, repo)).unwrap();
+            e.0 = 2;
+            e.1 = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(
+            !mgr.bootstrap_repull_in_cooldown(&peer, repo),
+            "冷却到点已过应视为不在冷却"
+        );
+        assert!(
+            mgr.record_bootstrap_repull(&peer, repo),
+            "冷却到期后的首次重拉应立即重新熔断（保留历史计数）"
+        );
+        // 熔断按 (peer, repo) 隔离：其他 repo 不受影响
+        assert!(!mgr.bootstrap_repull_in_cooldown(&peer, repo_type::NODE));
+    }
+
+    /// 活锁治理(任务4)：bootstrap 停滞判定解除 range 让路死锁 ——
+    /// 非 Done 进度且最近块成功落地在阈值内 → active 且不停滞（让路）；
+    /// 距最近块落地超过阈值 → 停滞（反熵不再让路）；旧进度行（无 last_progress_ms）
+    /// 回落 updated_ms；Done 进度既不 active 也不停滞。
+    #[test]
+    fn test_bootstrap_transfer_stalled_breaks_range_yield() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mut cfg = make_config();
+        cfg.bootstrap_stall_threshold_secs = 300;
+        cfg.bootstrap_stall_secs = 3600; // 隔离变量：v9 fresh 窗口调大，只看任务4判定
+        let mgr = make_sync_manager(storage.clone(), cfg);
+        let peer = NodeId([8; 20]);
+
+        // 无进度 → 不 active、不停滞
+        assert!(!mgr.bootstrap_transfer_active());
+        assert!(!mgr.bootstrap_transfer_stalled());
+
+        let now = chrono::Utc::now().timestamp_millis();
+        // 活跃传输：updated/last_progress 都新鲜 → active（让路）且不停滞
+        let mut p = bootstrap::BootstrapProgress::new(repo_type::PEER, peer.0.to_vec(), now);
+        p.phase = bootstrap::BootstrapPhase::Transfer;
+        p.total_chunks = 100;
+        p.done_chunks = 10;
+        storage.bootstrap_save(&p, None).unwrap();
+        assert!(mgr.bootstrap_transfer_active());
+        assert!(
+            !mgr.bootstrap_transfer_stalled(),
+            "最近有块落地（last_progress 新鲜）不得判停滞"
+        );
+
+        // 活锁形态：清单往返持续刷新 updated_ms（保持 active），但 last_progress_ms
+        // 停在 400s 前（>300s 阈值）→ 判停滞，反熵不再让路
+        let mut stalled = p.clone();
+        stalled.last_progress_ms = now - 400_000;
+        stalled.updated_ms = now; // 重拉循环会刷新 updated_ms
+        storage.bootstrap_save(&stalled, None).unwrap();
+        assert!(
+            mgr.bootstrap_transfer_active(),
+            "updated_ms 新鲜时 active 判定与引入前一致"
+        );
+        assert!(
+            mgr.bootstrap_transfer_stalled(),
+            "块落地停摆超过阈值必须判停滞（打破 range 让路死锁）"
+        );
+
+        // 旧进度行（last_progress_ms=0，serde 回退）→ 回落 updated_ms 判定
+        let mut legacy = p.clone();
+        legacy.last_progress_ms = 0;
+        storage.bootstrap_save(&legacy, None).unwrap();
+        assert!(
+            !mgr.bootstrap_transfer_stalled(),
+            "旧行回落 updated_ms（新鲜）不得判停滞"
+        );
+        legacy.updated_ms = now - 400_000;
+        storage.bootstrap_save(&legacy, None).unwrap();
+        assert!(
+            mgr.bootstrap_transfer_stalled(),
+            "旧行 updated 过期同样判停滞"
+        );
+
+        // Done → 既不 active 也不停滞
+        legacy.phase = bootstrap::BootstrapPhase::Done;
+        storage.bootstrap_save(&legacy, None).unwrap();
+        assert!(!mgr.bootstrap_transfer_active());
+        assert!(!mgr.bootstrap_transfer_stalled());
+    }
+
+    /// 活锁治理(任务5)：多 repo bootstrap 触发 —— 默认 enable_repos 仅 [1]（NODE，
+    /// 与引入前一致）；无连接时对端初选返回 None（不发起）；repo 已有活跃进度时不触发。
+    #[test]
+    fn test_bootstrap_enable_repos_default_and_peer_pick() {
+        use crate::federation::protocol::repo_type;
+        // 默认配置：仅 NODE(1)，现行为不变
+        let cfg = make_config();
+        assert_eq!(cfg.bootstrap_enable_repos, vec![repo_type::NODE]);
+
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage.clone(), make_config());
+        // 测试 SessionsHandle 无连接 → 初选 None（tick 内不发起任何 bootstrap）
+        let conns = mgr.sessions.all_connections();
+        assert!(conns.is_empty());
+        assert_eq!(
+            mgr.pick_bootstrap_peer(repo_type::PEER, &conns),
+            None,
+            "无连接时不得选出发起对端"
+        );
+
+        // repo=2（PEER）已有非 Done 活跃进度 → 触发器的活跃检查应跳过
+        // （直接验证判据：bootstrap_list 中存在该 repo 非 Done 行）
+        let mut p = bootstrap::BootstrapProgress::new(
+            repo_type::PEER,
+            NodeId([9; 20]).0.to_vec(),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        p.phase = bootstrap::BootstrapPhase::Transfer;
+        storage.bootstrap_save(&p, None).unwrap();
+        let rows = mgr.delta_storage().bootstrap_list().unwrap_or_default();
+        assert!(rows
+            .iter()
+            .any(|r| r.repo == repo_type::PEER
+                && !matches!(r.phase, bootstrap::BootstrapPhase::Done)));
     }
 
     /// v10(B2)：key 游标续传定位 —— 块边界随活表写入漂移（块数 129→130、边界 key

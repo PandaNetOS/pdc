@@ -124,6 +124,18 @@ pub struct NodeInfo {
     pub last_seen_secs_ago: u64,
 }
 
+/// 把「最后见到」的 UNIX 秒时间戳换算成「几秒前」
+///
+/// - `last_seen == 0` 表示从未见过，返回 `u64::MAX`；
+/// - 时钟回拨（`last_seen > now`）时饱和为 0。
+fn last_seen_ago_secs(last_seen: u64, now: u64) -> u64 {
+    if last_seen > 0 {
+        now.saturating_sub(last_seen)
+    } else {
+        u64::MAX
+    }
+}
+
 /// 同步统计
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SyncStats {
@@ -605,6 +617,12 @@ impl FederationService {
         // 节点列表（最多100个）
         let nodes_all = self.node_table.all_nodes();
         let _total_nodes = nodes_all.len();
+        // `last_seen` 是原始 UNIX 秒时间戳，必须换算成「几秒前」再输出
+        // （直接输出会读到 17.9 亿秒 ≈ 56 年前的荒谬值）
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let nodes: Vec<NodeInfo> = nodes_all
             .iter()
             .take(100)
@@ -613,7 +631,7 @@ impl FederationService {
                 addr: e.info.preferred_addr().map(|a| a.to_string()),
                 status: format!("{:?}", e.status),
                 rtt_ms: e.rtt_ms,
-                last_seen_secs_ago: e.info.last_seen,
+                last_seen_secs_ago: last_seen_ago_secs(e.info.last_seen, now_secs),
             })
             .collect();
 
@@ -910,6 +928,16 @@ mod tests {
         assert_eq!(pk1, pk2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_last_seen_ago_secs() {
+        // 正常：100 秒前见过
+        assert_eq!(last_seen_ago_secs(1_000_000_100, 1_000_000_200), 100);
+        // 从未见过（last_seen=0）→ u64::MAX
+        assert_eq!(last_seen_ago_secs(0, 1_000_000_200), u64::MAX);
+        // 时钟回拨（last_seen > now）→ 饱和为 0
+        assert_eq!(last_seen_ago_secs(1_000_000_300, 1_000_000_200), 0);
     }
 
     #[test]

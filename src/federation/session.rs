@@ -451,6 +451,49 @@ pub fn session_config_from(config: &FederationConfig, listen: bool) -> SessionCo
     }
 }
 
+/// 心跳节奏校验：确保调度周期与保活探测间隔都**显著小于**空闲超时
+///
+/// 两条硬规则（任一违反即 `Err`）：
+/// - 调度周期 × 3 ≤ `idle_timeout`：SDK `tick` 内**空闲回收分支先于探测分支执行**，
+///   若两次 tick 之间 idle 已超限，会话会先被空闲回收误杀，探测帧根本没有发出机会。
+///   这是 `fed_heartbeat` 周期接线（`main.rs`）时的硬前提；
+/// - 探测间隔 × 3 ≤ `idle_timeout`：[`session_config_from`] 硬不变式注释的推广——
+///   主动发探测帧不刷新 idle，只有对端应答（Pong）被收到才刷新，
+///   探测间隔过大则连接会被自己的空闲回收误杀。
+///
+/// 建议在装配期调用（如 `main.rs` 接线 `fed_heartbeat` 周期后），
+/// 配置热重载调整相关周期时也应复检。
+pub fn validate_heartbeat_pacing(
+    tick_interval: Duration,
+    cfg: &SessionConfig,
+) -> Result<(), String> {
+    // 建议值：空闲超时的 1/3（与 session_config_from 的探测间隔推导同源）
+    let suggest = cfg.idle_timeout / 3;
+    if tick_interval * 3 > cfg.idle_timeout {
+        return Err(format!(
+            "fed_heartbeat 调度周期 {:?} 过大：周期×3 = {:?} > idle_timeout {:?}，\
+             会话会在两次调度之间被 SDK 空闲回收误杀（空闲回收分支先于探测分支执行）。\
+             建议调度周期 ≤ {:?}",
+            tick_interval,
+            tick_interval * 3,
+            cfg.idle_timeout,
+            suggest
+        ));
+    }
+    if cfg.heartbeat_interval * 3 > cfg.idle_timeout {
+        return Err(format!(
+            "会话探测间隔 {:?} 过大：间隔×3 = {:?} > idle_timeout {:?}，\
+             主动探测帧不刷新 idle（仅对端应答刷新），连接会被自己的空闲回收误杀。\
+             建议探测间隔 ≤ {:?}",
+            cfg.heartbeat_interval,
+            cfg.heartbeat_interval * 3,
+            cfg.idle_timeout,
+            suggest
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 薄转发门面
 // ---------------------------------------------------------------------------
@@ -1008,6 +1051,72 @@ mod tests {
                 sc.idle_timeout
             );
         }
+    }
+
+    #[test]
+    fn test_validate_heartbeat_pacing_30s_tick_90s_idle_passes() {
+        // 30s tick + 90s idle：周期×3 = 90s ≤ idle；
+        // 探测间隔（idle/3 = 30s）×3 = 90s ≤ idle → 通过
+        let cfg = session_config_from(
+            &FederationConfig {
+                heartbeat_timeout_secs: 90,
+                ..Default::default()
+            },
+            false,
+        );
+        validate_heartbeat_pacing(Duration::from_secs(30), &cfg)
+            .expect("30s tick + 90s idle 应通过校验");
+    }
+
+    #[test]
+    fn test_validate_heartbeat_pacing_30s_tick_30s_idle_rejected() {
+        // 30s tick + 30s idle：周期×3 = 90s > idle → 拒绝（两次调度之间即被空闲回收误杀）
+        let cfg = session_config_from(
+            &FederationConfig {
+                heartbeat_timeout_secs: 30,
+                ..Default::default()
+            },
+            false,
+        );
+        let err = validate_heartbeat_pacing(Duration::from_secs(30), &cfg)
+            .expect_err("tick×3 > idle_timeout 必须报错");
+        assert!(err.contains("调度周期"), "错误信息应指向调度周期: {}", err);
+    }
+
+    #[test]
+    fn test_validate_heartbeat_pacing_10s_tick_30s_idle_passes() {
+        // 10s tick + 30s idle：周期×3 = 30s ≤ idle；
+        // 探测间隔 = max(30/3, 5s) = 10s，×3 = 30s ≤ idle → 通过（边界恰好满足）
+        let cfg = session_config_from(
+            &FederationConfig {
+                heartbeat_timeout_secs: 30,
+                ..Default::default()
+            },
+            false,
+        );
+        validate_heartbeat_pacing(Duration::from_secs(10), &cfg)
+            .expect("10s tick + 30s idle 应通过校验");
+    }
+
+    #[test]
+    fn test_validate_heartbeat_pacing_rejects_large_probe_interval() {
+        // 规则二独立验证：即使调度周期合格，探测间隔×3 > idle_timeout 也必须拒绝
+        let cfg = SessionConfig {
+            heartbeat_interval: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(90),
+            ..Default::default()
+        };
+        let err = validate_heartbeat_pacing(Duration::from_secs(10), &cfg)
+            .expect_err("探测间隔×3 > idle_timeout 必须报错");
+        assert!(err.contains("探测间隔"), "错误信息应指向探测间隔: {}", err);
+    }
+
+    #[test]
+    fn test_validate_heartbeat_pacing_default_config_self_consistent() {
+        // 默认联邦配置（idle=300s，探测间隔=100s）在 idle/3 的调度周期下应自洽通过
+        let cfg = session_config_from(&FederationConfig::default(), false);
+        validate_heartbeat_pacing(cfg.idle_timeout / 3, &cfg)
+            .expect("默认配置 + idle/3 调度周期应通过校验");
     }
 
     #[test]

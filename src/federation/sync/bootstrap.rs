@@ -95,6 +95,11 @@ pub struct BootstrapProgress {
     /// `None` = 旧进度无游标（归零重来）；`Some(空 vec)` = 已传到 +∞（全量完成）。
     #[serde(default)]
     pub last_key: Option<Vec<u8>>,
+    /// 活锁治理(任务4)：最近一次**块成功落地**的时刻（毫秒时间戳）。停滞判定
+    /// （`progress_stalled`，range 反熵让路解除）据此计算；旧进度行缺该字段时
+    /// serde 回退 0，判定函数自动回落 `updated_ms`。
+    #[serde(default)]
+    pub last_progress_ms: i64,
     /// 失败原因（`phase == Failed` 时非空）。
     pub error: Option<String>,
 }
@@ -111,6 +116,7 @@ impl BootstrapProgress {
             done_chunks: 0,
             bytes: 0,
             last_key: None,
+            last_progress_ms: now_ms,
             started_ms: now_ms,
             updated_ms: now_ms,
             error: None,
@@ -123,6 +129,16 @@ impl BootstrapProgress {
             0.0
         } else {
             (self.done_chunks as f64 / self.total_chunks as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    /// 活锁治理(任务4)：参与停滞判定的「最近块落地时刻」。旧进度行（无
+    /// `last_progress_ms`，serde 回退 0）回落 `updated_ms`，行为与引入前一致。
+    pub fn effective_progress_ms(&self) -> i64 {
+        if self.last_progress_ms > 0 {
+            self.last_progress_ms
+        } else {
+            self.updated_ms
         }
     }
 }
@@ -625,6 +641,100 @@ fn hex32(b: &[u8; 32]) -> String {
 }
 
 // ========================================================================
+// 活锁治理（2026-09-30）：传输失败退避 / 清单漂移与进度继承 / 停滞判定。
+// 纯函数，便于单测；SyncManager 侧只做状态读写与 IO 编排。
+// ========================================================================
+
+/// 活锁治理(任务1)：分块传输失败的退避重试状态。
+///
+/// 存放于 SyncManager 的 `bootstrap_chunk_attempt` 表（(peer, repo) → 状态）。
+/// 传输类失败（send 失败/超时/无会话）只记入本状态做指数退避重发，
+/// **永不**升级为重拉清单（旧实现按失败次数升级重拉，是三节点互拉活锁的第一环）。
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkRetryState {
+    /// 当前关注的块 index（换块即重置连续失败计数）。
+    pub index: u32,
+    /// 连续传输类失败次数（成功收到任意响应即整条清零）。
+    pub fails: u32,
+    /// 最近一次失败时刻。resume tick 据此按 [`backoff_delay`] 决定何时重发。
+    pub last_fail_at: Instant,
+}
+
+/// 活锁治理(任务1)：第 `fails` 次连续失败后的退避等待时长。
+///
+/// `min(initial × 2^(fails-1), max)`：默认 30s 基数、600s 封顶，
+/// 序列 30→60→120→240→480→600→600…。`fails == 0` 视为首次失败（返回 initial）。
+pub fn backoff_delay(initial: Duration, max: Duration, fails: u32) -> Duration {
+    let exp = fails.max(1).saturating_sub(1).min(31);
+    initial.saturating_mul(1u32 << exp).min(max.max(initial))
+}
+
+/// 活锁治理(任务4)：bootstrap 停滞判定（纯函数）。
+///
+/// 距「最近一次块成功落地」超过 `threshold_ms` 即停滞。`last_progress_ms <= 0`
+/// 的旧进度行回落 `updated_ms`（与引入前口径一致）。
+pub fn progress_stalled(
+    last_progress_ms: i64,
+    updated_ms: i64,
+    now_ms: i64,
+    threshold_ms: i64,
+) -> bool {
+    let base = if last_progress_ms > 0 {
+        last_progress_ms
+    } else {
+        updated_ms
+    };
+    now_ms.saturating_sub(base) > threshold_ms
+}
+
+/// 活锁治理(任务1-b/任务3)：重拉清单与上次清单的漂移判定（纯函数）。
+///
+/// 返回 `(是否结构性漂移, 是否可继承旧进度)`：
+/// - 结构性漂移：`total_rows` 变化超过 `rows_pct%`（重拉的合法触发条件之一，
+///   说明对端数据量级变了，旧断点已无意义）；
+/// - 可继承：`total_chunks` 差异 ≤ `chunk_pct%`（分块结构未变，旧进度按 index
+///   继承不归零；块内容幂等重传安全）。
+pub fn manifest_drift(
+    old_rows: u64,
+    old_chunks: u64,
+    new_rows: u64,
+    new_chunks: u64,
+    rows_pct: u32,
+    chunk_pct: u32,
+) -> (bool, bool) {
+    // 无旧清单（首次 bootstrap）→ 无漂移、无可继承
+    if old_chunks == 0 {
+        return (false, false);
+    }
+    let structural = if rows_pct == 0 {
+        false
+    } else {
+        let base = old_rows.max(1);
+        let drift = new_rows.abs_diff(old_rows).saturating_mul(100);
+        drift > base.saturating_mul(rows_pct as u64)
+    };
+    let chunk_drift = new_chunks.abs_diff(old_chunks).saturating_mul(100);
+    let inheritable = chunk_drift <= old_chunks.max(1).saturating_mul(chunk_pct as u64);
+    (structural, inheritable)
+}
+
+/// 活锁治理(任务3)：重拉清单后的继承进度（纯函数）。
+///
+/// `inheritable == true` 时旧进度 `old_done` 按 index 继承（clamp 到新清单块数），
+/// 与 D3 逐块验证出的 `verified_done` 取 max；结构性漂移则从零（保留验证值）。
+pub fn inherit_done_chunks(
+    old_done: u64,
+    new_total: u64,
+    inheritable: bool,
+    verified_done: u64,
+) -> u64 {
+    if !inheritable {
+        return verified_done;
+    }
+    verified_done.max(old_done.min(new_total))
+}
+
+// ========================================================================
 // v10(C)：块传输窗口调度器 —— 窗口化并发预取的状态机（纯逻辑，可单测）。
 // ========================================================================
 
@@ -754,6 +864,9 @@ impl ChunkWindow {
         self.attempts.remove(&index);
         self.received.insert(index);
         self.last_response_at = Some(Instant::now());
+        // 活锁治理(任务1)：E2 的「连续」空闲恢复计数在真进度出现时归零 ——
+        // 否则窗口生命周期内累计 3 次就放弃，长传输（数百块）中途一次慢段即被误判不可恢复。
+        self.idle_recoveries = 0;
         self.received.len() as u32 >= self.total
     }
 
@@ -849,6 +962,12 @@ impl ChunkWindow {
 
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
+    }
+
+    /// 活锁治理(任务1)：任取一个在途 index（无序集合取最小，仅为退避记录提供
+    /// 「当前卡在哪个块」的稳定锚点；空在途返回 None）。
+    pub fn first_inflight(&self) -> Option<u32> {
+        self.inflight.iter().copied().min()
     }
 
     pub fn total(&self) -> u32 {
@@ -1214,5 +1333,110 @@ mod tests {
             }
         }
         assert!(any_diff, "数据变化后应至少有一块 hash/rows 不同");
+    }
+
+    /// 活锁治理(任务1)：传输失败退避表 —— 30s 基数逐次翻倍，600s 封顶；
+    /// 首次失败（fails=0 按首次算）返回基数。
+    #[test]
+    fn test_backoff_delay_doubles_and_caps() {
+        let base = Duration::from_secs(30);
+        let max = Duration::from_secs(600);
+        assert_eq!(backoff_delay(base, max, 0), Duration::from_secs(30));
+        assert_eq!(backoff_delay(base, max, 1), Duration::from_secs(30));
+        assert_eq!(backoff_delay(base, max, 2), Duration::from_secs(60));
+        assert_eq!(backoff_delay(base, max, 3), Duration::from_secs(120));
+        assert_eq!(backoff_delay(base, max, 4), Duration::from_secs(240));
+        assert_eq!(backoff_delay(base, max, 5), Duration::from_secs(480));
+        assert_eq!(
+            backoff_delay(base, max, 6),
+            Duration::from_secs(600),
+            "封顶"
+        );
+        assert_eq!(
+            backoff_delay(base, max, 50),
+            Duration::from_secs(600),
+            "长期失败恒为封顶值"
+        );
+        // 非法配置兜底：max < base 时不得产出小于基数的等待
+        assert_eq!(backoff_delay(base, Duration::from_secs(1), 2), base);
+    }
+
+    /// 活锁治理(任务1-b/任务3)：清单漂移判定 —— total_rows >1% 判结构性漂移；
+    /// total_chunks 差 ≤2% 可继承；无旧清单（首次）两者皆否；rows_pct=0 关闭判定。
+    #[test]
+    fn test_manifest_drift_and_inheritance() {
+        // 同结构小漂移：1000 行 → 1005 行（0.5% ≤ 1%）、块数不变 → 非结构性、可继承
+        let (structural, inheritable) = manifest_drift(1000, 50, 1005, 50, 1, 2);
+        assert!(!structural);
+        assert!(inheritable);
+        // 行数漂移 2%（>1%）→ 结构性漂移；块数差 4%（>2%）→ 不可继承
+        let (structural, inheritable) = manifest_drift(1000, 50, 1020, 52, 1, 2);
+        assert!(structural, "total_rows 变化 >1% 必须判结构性漂移");
+        assert!(!inheritable, "total_chunks 差 >2% 不得继承");
+        // 边界：块数恰差 2% → 可继承
+        let (_, inheritable) = manifest_drift(100_000, 50, 100_000, 51, 1, 2);
+        assert!(inheritable, "块数差 2%（1/50）应可继承");
+        // 首次 bootstrap（无旧清单）→ 无漂移、无可继承
+        let (structural, inheritable) = manifest_drift(0, 0, 5000, 10, 1, 2);
+        assert!(!structural && !inheritable);
+        // rows_pct=0 关闭行数漂移判定
+        let (structural, _) = manifest_drift(1000, 50, 2000, 50, 0, 2);
+        assert!(!structural, "rows_pct=0 应关闭结构性漂移判定");
+        // 继承值 clamp：旧进度 40、新清单 50 块、验证前缀 3 → 继承 40；
+        // 结构性漂移 → 只保留验证前缀 3；旧进度超新清单块数 → clamp 到新块数
+        assert_eq!(inherit_done_chunks(40, 50, true, 3), 40);
+        assert_eq!(inherit_done_chunks(40, 50, false, 3), 3);
+        assert_eq!(inherit_done_chunks(60, 50, true, 3), 50);
+    }
+
+    /// 活锁治理(任务4)：停滞判定 —— 距最近块落地超过阈值即停滞；
+    /// 旧行（last_progress_ms=0）回落 updated_ms；新进度不停滞。
+    #[test]
+    fn test_progress_stalled() {
+        let now = 1_700_000_000_000i64;
+        // 301s 前落地，阈值 300s → 停滞
+        assert!(progress_stalled(now - 301_000, now - 301_000, now, 300_000));
+        // 299s 前落地 → 未停滞
+        assert!(!progress_stalled(
+            now - 299_000,
+            now - 299_000,
+            now,
+            300_000
+        ));
+        // last_progress 新、updated 旧 → 以 last_progress 为准（未停滞）
+        assert!(!progress_stalled(now - 1_000, now - 900_000, now, 300_000));
+        // 旧行回落 updated_ms：updated 在 400s 前 → 停滞
+        assert!(progress_stalled(0, now - 400_000, now, 300_000));
+        // 旧行 updated 新鲜 → 未停滞
+        assert!(!progress_stalled(0, now - 100_000, now, 300_000));
+    }
+
+    /// 活锁治理(任务1)：E2 空闲恢复计数在真进度（on_response）后归零 ——
+    /// 长传输中途一次慢段不再被累计成「连续 3 次放弃窗口」。
+    #[test]
+    fn test_chunk_window_idle_recoveries_reset_on_progress() {
+        let mut w = ChunkWindow::new(10, 4, 0);
+        let batch = w.fill(0);
+        assert_eq!(batch, vec![0, 1, 2, 3]);
+        assert!(!w.on_response(0));
+        // 拨动时钟制造一次空闲回收
+        w.last_response_at = Some(Instant::now() - Duration::from_secs(61));
+        assert_eq!(w.idle_reap(Duration::from_secs(60)).len(), 3);
+        assert_eq!(w.idle_recovery_count(), 1);
+        // 回收块经重试队列重发，重新进入在途（3 回收块 + 1 预取新块）
+        let batch = w.fill(0);
+        assert_eq!(batch.len(), 4);
+        // 新块落地 → 连续空闲计数归零
+        assert!(!w.on_response(1));
+        assert_eq!(w.idle_recovery_count(), 0, "真进度必须清零连续空闲恢复计数");
+        assert_eq!(
+            w.first_inflight(),
+            Some(2),
+            "剩余在途块的最小 index（2/3/4 中取 2）"
+        );
+        w.on_response(2);
+        w.on_response(3);
+        w.on_response(4);
+        assert_eq!(w.first_inflight(), None, "无在途块时返回 None");
     }
 }

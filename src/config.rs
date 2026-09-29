@@ -1409,6 +1409,11 @@ pub struct CrawlerConfig {
     /// 入站来源节点集合上限（超过时清空，防止无界增长）
     #[serde(default = "default_inbound_sources_max")]
     pub inbound_sources_max: usize,
+    /// 是否启用主动 PEX 请求器（BEP-11 向 DHT 节点主动请求 PEX）。
+    /// 实测该通道对 DHT 节点恒无 PEX 响应（2026-09-30 三节点实证：全天 0 条消息、
+    /// 0 peer 产出），默认关闭；修复为挂在真实 peer 连接的 extended handshake 后再开启。
+    #[serde(default)]
+    pub active_pex_enabled: bool,
 }
 
 /// NAT 穿透配置
@@ -1548,6 +1553,7 @@ impl Default for CrawlerConfig {
             max_concurrent_msg_handlers: default_max_concurrent_msg_handlers(),
             concurrent_sockets: default_concurrent_sockets(),
             inbound_sources_max: default_inbound_sources_max(),
+            active_pex_enabled: false,
         }
     }
 }

@@ -25,7 +25,7 @@ const OPLOG_LEN_PREWARM_DELAY_SECS: u64 = 5;
 use parking_lot::RwLock;
 use rand::Rng;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -1333,6 +1333,7 @@ async fn async_main(
             std::time::Duration::from_secs(config.io_scheduler.checkpoint_min_interval_secs);
         let slow_streak_alert = config.io_scheduler.checkpoint_slow_streak_alert;
         let last_alerted = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let last_stall_alert_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         task_scheduler.register(
             TaskMetadata::new(
                 "io_checkpoint_tick",
@@ -1357,6 +1358,7 @@ async fn async_main(
                 let worker = worker.clone();
                 let storage = storage_ck.clone();
                 let last_alerted = last_alerted.clone();
+                let last_stall_alert_ms = last_stall_alert_ms.clone();
                 async move {
                     let now = std::time::Instant::now();
                     let stat = worker.stat();
@@ -1381,6 +1383,28 @@ async fn async_main(
                         min_interval,
                     ) {
                         worker.trigger(mode);
+                    }
+                    // v10(G)：WAL 超硬阈值且 TRUNCATE 长期未成功 → ERROR 告警（10 分钟一条）。
+                    // 长读事务（bootstrap 全表快照）会钉死 WAL，PASSIVE/TRUNCATE 永远
+                    // 完不成——.52 实证 WAL 298MB 穿透 128MB 硬阈值且全程静默。
+                    if wal > hard_bytes {
+                        let since_ok_ms = worker
+                            .last_truncate_success()
+                            .map(|t| t.at.elapsed().as_millis() as u64)
+                            .unwrap_or(u64::MAX);
+                        if since_ok_ms > 600_000 {
+                            let last = last_stall_alert_ms.load(std::sync::atomic::Ordering::Relaxed);
+                            let now_ms = now.elapsed().as_millis() as u64;
+                            if now_ms.saturating_sub(last) > 600_000 {
+                                last_stall_alert_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                error!(
+                                    "[storage] WAL {}MB 超过硬阈值 {}MB 且超过 10 分钟无成功 TRUNCATE（{}），疑似长读事务钉死 WAL",
+                                    wal / (1024 * 1024),
+                                    hard_bytes / (1024 * 1024),
+                                    if since_ok_ms == u64::MAX { "从未成功" } else { "久未成功" }
+                                );
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -2037,14 +2061,12 @@ async fn async_main(
                 let tr = tr.clone();
                 let st = st.clone();
                 async move {
-                    use sysinfo::System;
-                    // 使用 new_all 确保在 SYSTEM 账户下也能获取进程信息
-                    let sys = System::new_all();
-                    let pid = sysinfo::get_current_pid().unwrap();
-                    if let Some(proc) = sys.process(pid) {
-                        // sysinfo memory() 在 Windows 返回字节，转换为 MB
-                        let memory_mb = proc.memory() / (1024 * 1024);
-                        let threshold_mb = (memory_limit_mb as f64 * emergency_threshold) as u64;
+                    // v10(G)：改用共享缓存快照——原 System::new_all() 每轮全量枚举
+                    // 进程/磁盘，重负载下单轮可卡 451s（.51 实证），且与 API 层
+                    // 每请求 new_all() 叠加导致 api_runtime 整体停摆。
+                    let snap = PeerDiscoveryCenter::services::system_stats::snapshot();
+                    let memory_mb = snap.mem_bytes / (1024 * 1024);
+                    let threshold_mb = (memory_limit_mb as f64 * emergency_threshold) as u64;
                         tracing::info!(
                             "[memory_monitor] 内存检测: {}MB / 阈值 {}MB",
                             memory_mb,
@@ -2102,13 +2124,10 @@ async fn async_main(
                                 _total_evicted_3 += evict_3;
                                 _total_evicted_4 += evict_4;
 
-                                // 重新检测内存
-                                let sys = System::new_all();
-                                let pid = sysinfo::get_current_pid().unwrap();
-                                let current_mb = if let Some(proc) = sys.process(pid) {
-                                    proc.memory() / (1024 * 1024)
-                                } else {
-                                    memory_mb
+                                // 重新检测内存（走共享缓存，禁止 new_all）
+                                let current_mb = {
+                                    let s = PeerDiscoveryCenter::services::system_stats::snapshot();
+                                    s.mem_bytes / (1024 * 1024)
                                 };
                                 tracing::info!(
                                     "[memory_monitor] 第{}轮驱逐完成: node驱逐{}，内存{}MB",
@@ -2129,9 +2148,6 @@ async fn async_main(
                                 h2_start, w2_start, h2a, w2a, total_evicted_2
                             );
                         }
-                    } else {
-                        tracing::warn!("[memory_monitor] 无法获取当前进程信息 (pid={:?})", pid);
-                    }
                     Ok(())
                 }
             },
@@ -2141,27 +2157,39 @@ async fn async_main(
     // 8.8 联邦任务注册（心跳/节点同步/DHT发现等）
     if let Some(ref fed) = federation_service {
         // fed_heartbeat
+        // v10(G)：周期必须显著小于 idle_timeout（session_config_from 的 30s 回收线），
+        // 否则 SDK tick 的空闲回收分支先于探测分支执行，慢响应期会话必然被误杀
+        // （2026-09-30 三节点实证：2803 次「无活跃会话」/天）。
+        let fed_heartbeat_interval =
+            std::time::Duration::from_secs(get_interval_secs(intervals, "fed_heartbeat", 10));
         let cm = fed.sessions.clone();
+        if let Err(e) = PeerDiscoveryCenter::federation::session::validate_heartbeat_pacing(
+            fed_heartbeat_interval,
+            &PeerDiscoveryCenter::federation::session::session_config_from(
+                &config.federation,
+                true,
+            ),
+        ) {
+            error!("[main] 联邦心跳节奏校验失败（会话将被空闲回收误杀）: {}", e);
+        }
         task_scheduler.register(
-            TaskMetadata::new(
-                "fed_heartbeat",
-                "联邦心跳",
-                std::time::Duration::from_secs(get_interval_secs(intervals, "fed_heartbeat", 30)),
-            )
-            .with_category(TaskCategory::Federation)
-            .with_priority(TaskPriority::Important)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Low,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Low,
-                network: ResourceLevel::Low,
-                is_full_task: false,
-            })
-            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "fed_heartbeat_jitter",
-                5,
-            ))),
+            TaskMetadata::new("fed_heartbeat", "联邦心跳", fed_heartbeat_interval)
+                .with_category(TaskCategory::Federation)
+                .with_priority(TaskPriority::Important)
+                .with_keepalive()
+                .non_deferrable()
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Low,
+                    is_full_task: false,
+                })
+                .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "fed_heartbeat_jitter",
+                    2,
+                ))),
             move || {
                 let cm = cm.clone();
                 async move {
@@ -2337,10 +2365,12 @@ async fn async_main(
             // 放宽到 900s 只是让它「合法」占住 Federation 分类槽更久，反而放大了
             // 槽饥饿（诊断：Federation 8/8 槽满 493 次/窗口，bootstrap 续传 32 次
             // 被延迟 / 仅 3 次执行）。v8 下 range 是唯一兜底通道，占槽时长必须克制。
+            // v10(G)：实测活表大库单轮可超 300s 被 watchdog 强杀（.51 实证 457s），
+            // 放宽到 900s；配合帧数预算（每轮限量）控制占槽。
             .with_timeout(std::time::Duration::from_secs(get_interval_secs(
                 intervals,
                 "fed_range_reconcile_timeout",
-                300,
+                900,
             )))
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
@@ -2382,6 +2412,12 @@ async fn async_main(
             )
             .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
+            // v10(G)：慢响应退避单次等待可达 600s，300s 会被 watchdog 误判泄漏强杀
+            .with_timeout(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "fed_bootstrap_resume_timeout",
+                900,
+            )))
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
                 memory: ResourceLevel::Low,
@@ -2754,6 +2790,9 @@ async fn async_main(
                             Ok(_) => {}
                             Err(e) => warn!("[oplog] 裁剪失败: {}", e),
                         }
+                        // v10(G)：每轮打一条可观测摘要（此前全 debug，线上无法确认
+                        // 裁剪是否在跑——.62 曾积压 302 万条无人知晓）
+                        info!("[oplog] {}", st.status_line());
                         Ok(())
                     }
                 },
@@ -2948,36 +2987,42 @@ async fn async_main(
     }
 
     // 8.14 active_pex: 主动PEX请求（30s）
+    // v10(G)：默认禁用——三节点实证对 DHT 节点主动请求 PEX 恒无响应（全天 0 消息
+    // 0 peer 产出），纯占 Network 槽位；修复为挂真实 peer extended handshake 后再开。
     if let Some(ref ap) = active_pex_clone {
-        let a = ap.clone();
-        task_scheduler.register(
-            TaskMetadata::new(
-                "active_pex",
-                "主动PEX请求",
-                std::time::Duration::from_secs(get_interval_secs(intervals, "active_pex", 30)),
-            )
-            .with_category(TaskCategory::Network)
-            .with_priority(TaskPriority::Normal)
-            .with_resource(ResourceProfile {
-                cpu: ResourceLevel::Low,
-                memory: ResourceLevel::Low,
-                io: ResourceLevel::Low,
-                network: ResourceLevel::Medium,
-                is_full_task: false,
-            })
-            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
-                intervals,
-                "active_pex_initial_delay",
-                30,
-            ))),
-            move || {
-                let a = a.clone();
-                async move {
-                    a.run_once().await;
-                    Ok(())
-                }
-            },
-        );
+        if !config.crawler.active_pex_enabled {
+            info!("[main] 主动 PEX 请求器已禁用（crawler.active_pex_enabled = false）");
+        } else {
+            let a = ap.clone();
+            task_scheduler.register(
+                TaskMetadata::new(
+                    "active_pex",
+                    "主动PEX请求",
+                    std::time::Duration::from_secs(get_interval_secs(intervals, "active_pex", 30)),
+                )
+                .with_category(TaskCategory::Network)
+                .with_priority(TaskPriority::Normal)
+                .with_resource(ResourceProfile {
+                    cpu: ResourceLevel::Low,
+                    memory: ResourceLevel::Low,
+                    io: ResourceLevel::Low,
+                    network: ResourceLevel::Medium,
+                    is_full_task: false,
+                })
+                .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "active_pex_initial_delay",
+                    30,
+                ))),
+                move || {
+                    let a = a.clone();
+                    async move {
+                        a.run_once().await;
+                        Ok(())
+                    }
+                },
+            );
+        }
     }
 
     // 8.15 http_tracker_cleanup: HTTP Tracker过期peer清理（60s）

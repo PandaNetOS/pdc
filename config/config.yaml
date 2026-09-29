@@ -67,10 +67,12 @@ crawler:
 nat:
   enabled: true
   lease_duration: 3600
+  # v10(G)：IP 直列绕过 DNS 失败（域名 STUN 在现场解析失败导致 NAT 误判）
   stun_servers:
-  - stun.l.google.com:19302
-  - stun1.l.google.com:19302
-  - stun.ekiga.net:3478
+  - 111.206.174.3:3478
+  - 106.12.71.140:3478
+  - 124.222.49.56:3478
+  - 162.159.207.0:3478
   enable_reachability_check: true
 storage:
   path: ./data/pdc.db
@@ -88,12 +90,12 @@ federation:
   target_neighbors: 8
   heartbeat_timeout_secs: 90
   nat_mapping_enabled: true
+  # v10(G)：同上，国内可达 IP 直列（.51 实测 nat_type=Symmetric 判定成功）
   stun_servers:
-  - stun.miwifi.com:3478
-  - stun.chat.bilibili.com:3478
-  - stun.qq.com:3478
-  - stun.cloudflare.com:3478
-  - stun.l.google.com:19302
+  - 111.206.174.3:3478
+  - 106.12.71.140:3478
+  - 124.222.49.56:3478
+  - 162.159.207.0:3478
   enable_relay: true
   relay_bandwidth_limit_mbps: 10
   relay_max_connections: 5

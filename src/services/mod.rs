@@ -12,6 +12,7 @@ pub mod pex_service;
 pub mod probe_service;
 pub mod scrape_service;
 pub mod subscription_service;
+pub mod system_stats;
 pub mod tracker_fetcher;
 pub mod tracker_service;
 
@@ -24,5 +25,6 @@ pub use pex_service::PexService;
 pub use probe_service::ProbeService;
 pub use scrape_service::{ScrapeResult, ScrapeService};
 pub use subscription_service::{SubscriptionConfig, SubscriptionService};
+pub use system_stats::SystemSnapshot;
 pub use tracker_fetcher::TrackerPeerFetcher;
 pub use tracker_service::TrackerService;

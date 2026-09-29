@@ -1128,32 +1128,28 @@ struct SystemStatus {
     cpu_usage_percent: f64,
     thread_count: u32,
     fd_count: u32,
+    /// 快照数据距今的毫秒数（system_stats 缓存按 1 秒限频刷新，通常落在 0~1000）
+    staleness_ms: u64,
 }
 
 async fn system_handler() -> Response {
-    use sysinfo::System;
-    let sys = System::new_all();
-    let pid = match sysinfo::get_current_pid() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR).into_response(),
-    };
-    let Some(proc) = sys.process(pid) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
-    };
-    let memory_bytes = proc.memory();
-    let memory_mb = memory_bytes as f64 / 1024.0 / 1024.0;
-    // sysinfo 的 cpu_usage 是两次 refresh 间的差值；进程刚起/首次轮询可能为 0，
-    // 监控面板周期性轮询后第二次即有数。不为它引入全局缓存。
-    let cpu_usage_percent = proc.cpu_usage() as f64;
+    // 从全局缓存读取（内部仅做"自身进程"最小刷新并按 1 秒限频）。
+    // 严禁在请求路径执行 System::new_all()：Windows 全量枚举单次可达数秒到数分钟，
+    // 监控面板持续轮询曾把 api_runtime 全部 worker park 死（2026-09-30 .51 事故）。
+    let snap = crate::services::system_stats::snapshot();
+    let memory_mb = snap.mem_bytes as f64 / 1024.0 / 1024.0;
+    // cpu_usage 由缓存周期刷新维护（两次刷新间的差值），首次轮询为 0，第二次起有效。
+    let cpu_usage_percent = snap.cpu_usage_percent;
     // TODO: sysinfo 0.32 不暴露 thread/fd count，Windows 下需要 NtQuerySystemInformation，暂以默认值占位。
     let thread_count = u32::default();
     let fd_count = u32::default();
     Json(SystemStatus {
-        memory_bytes,
+        memory_bytes: snap.mem_bytes,
         memory_mb,
         cpu_usage_percent,
         thread_count,
         fd_count,
+        staleness_ms: snap.staleness_ms,
     })
     .into_response()
 }
