@@ -1379,13 +1379,34 @@ impl SyncManager {
             }
         }
         if tripped {
+            // 取证：读进度行与缓存清单，区分「清单都没拿到（重拉打空）」与
+            // 「清单拿到了但块请求零落地（对端不回块/NAK/会话闪断）」两类停滞。
+            let evidence = match self.delta_storage().bootstrap_load(&peer.0, repo) {
+                Ok(Some((p, mf))) => {
+                    let age_s = (chrono::Utc::now().timestamp_millis() - p.updated_ms) / 1000;
+                    let mdesc = match mf {
+                        Some(m) => format!("清单={}块/{}行", m.chunks.len(), m.total_rows),
+                        None => "清单=无(未持久化)".to_string(),
+                    };
+                    format!(
+                        "phase={} done={}/{} updated {}s 前 {}",
+                        p.phase.as_str(),
+                        p.done_chunks,
+                        p.total_chunks,
+                        age_s,
+                        mdesc
+                    )
+                }
+                _ => "无进度行".to_string(),
+            };
             // 熔断动作：error! 告警 + 置通道窗口 inactive（防「bootstrap 永久 active」
             // 把 range 反熵永久让路）；进度行保留（冷却到期后可从断点续传）。
             error!(
-                "[bootstrap] 重拉熔断：peer={} repo={} 连续 {} 次重拉且零块落地，判定停滞 —— 置 inactive 并冷却 {}s（期间 resume tick 跳过，range 反熵接管）",
+                "[bootstrap] 重拉熔断：peer={} repo={} 连续 {} 次重拉且零块落地，判定停滞（{}）—— 置 inactive 并冷却 {}s（期间 resume tick 跳过，range 反熵接管）",
                 peer,
                 repo,
                 threshold,
+                evidence,
                 self.config.bootstrap_repull_circuit_cooldown_secs
             );
             self.chunk_windows.write().remove(&(*peer, repo));
@@ -3234,6 +3255,29 @@ impl SyncManager {
             );
             return;
         }
+        // 停摆修复（2026-09-30 第二轮）：退避期 / 熔断冷却期内丢弃清单响应。
+        // 本 handler 后续的 D3 对齐验证是全表扫描（spawn_blocking 但全程持有全局
+        // SQLite 连接锁）。「继承全覆盖 → 直接竣工 → 校验失败 → 重拉」循环在旧实现下
+        // 按发起互斥 TTL（60s）固定节奏每轮跑 1~2 次扫描，把 api_runtime 的 DB 只读
+        // handler 全部 park 在连接锁上直至 worker 耗尽（现场实证 /metrics、/health 全超时）。
+        // 在任何重 IO 之前拦下，让重试节奏服从指数退避表（30s 起倍增，600s 封顶）。
+        if !self.chunk_backoff_ready(&conn.node_id, mf.repo) {
+            warn!(
+                "[bootstrap] 传输退避期内丢弃清单响应（抑制全表扫描风暴）: peer={} repo={} 总行={} 块数={}",
+                conn.node_id,
+                mf.repo,
+                mf.total_rows,
+                mf.chunks.len()
+            );
+            return;
+        }
+        if self.bootstrap_repull_in_cooldown(&conn.node_id, mf.repo) {
+            warn!(
+                "[bootstrap] 重拉熔断冷却期内丢弃清单响应: peer={} repo={}",
+                conn.node_id, mf.repo
+            );
+            return;
+        }
         // v10(B2)：断点继承 —— version 相同（同一快照）直接继承 done_chunks；
         // version 不同（w0 漂移，对端 oplog 持续写则必然）时用 **key 游标** 在新清单
         // 中定位续传起点：块边界随活表写入漂移，边界比对必然失配 → 归零循环
@@ -3520,6 +3564,12 @@ impl SyncManager {
             self.bootstrap_verify_fails
                 .write()
                 .remove(&(conn.node_id, resp.repo));
+            // 停摆修复：成功响应同样清退避状态 —— 收到任何块响应都证明链路活着；
+            // 否则窗口竣工进入 finish_bootstrap 时可能带着陈旧失败计数，被
+            // 「退避期内跳过竣工校验」短路段误拦，快照永远差最后一块写不了 Done。
+            self.bootstrap_chunk_attempt
+                .write()
+                .remove(&(conn.node_id, resp.repo));
             // 活锁治理(任务4)：块成功落地 → touch 停滞判定时钟；
             // 活锁治理(任务2)：任一块成功落地 → 清零重拉熔断计数并解除冷却。
             progress.last_progress_ms = chrono::Utc::now().timestamp_millis();
@@ -3717,21 +3767,44 @@ impl SyncManager {
     /// 完成 ③④ 后进入 ⑤ 追尾（复用 P1-3 delta 通道拉 `seq > w0`）。
     async fn finish_bootstrap(self: &Arc<Self>, conn: &PeerConn, repo: u8, w0_seq: u64) {
         let now = chrono::Utc::now().timestamp_millis();
+        // 停摆修复（2026-09-30 第二轮）：退避期内跳过竣工前 D3 全表校验与重拉。
+        // 正常块落地路径收到**任何**块响应都会清退避状态（见 handle_bootstrap_chunk_response
+        // ok 分支），能带着活跃退避进入这里的只剩「继承全覆盖 → 直接竣工 → 校验失败 →
+        // 重拉」循环本身 —— 该循环每轮要跑两次全表扫描（清单对齐验证 + 本处竣工校验，
+        // spawn_blocking 但全程持有全局 SQLite 连接锁，259 万行实测 ~38s/次），把
+        // api_runtime 的 DB 只读 handler（sync-observability/stats 轮询）全部 park 在
+        // 连接锁上，4 个 worker 耗尽后连 /metrics、/health 都无 worker 可响应
+        // （现场实证：api 整体超时、IOScheduler 背压升档后 9 分钟不恢复、Monitor 饿死）。
+        if !self.chunk_backoff_ready(&conn.node_id, repo) {
+            debug!(
+                "[bootstrap] 传输退避期内跳过竣工校验与重拉（抑制全表扫描风暴）: peer={} repo={}",
+                conn.node_id, repo
+            );
+            return;
+        }
         // D批(D3)：竣工前强制对齐校验 —— 防「假竣工」（块返回极少行、断点未真落库却写 Done）。
         // skip=true 且本地存有清单时，按与断点继承相同方式重建本地清单，逐块 hash&rows 核对
         // mf.chunks 全部块。任一不一致或重建失败 → warn 后直接 return：不写 Done、不抬水位、
         // 不清尝试/失败计数、不插冷却、不 trigger_delta，交由现有 resume/watchdog 继续推进。
         if self.config.bootstrap_skip_identical_chunks {
-            if let Ok(Some((_, Some(mf)))) =
+            if let Ok(Some((p, Some(mf)))) =
                 self.delta_storage().bootstrap_load(&conn.node_id.0, repo)
             {
                 if !self.bootstrap_manifest_aligned(repo, &mf).await {
                     // 活锁治理(任务1-a)：D3 逐块对齐校验失败 = 真实数据漂移证据，
                     // 是重拉清单的两个合法触发条件之一（另一为 total_rows 结构性漂移）。
+                    // 停摆修复：校验失败同时计入退避表（锚点 = 当前 done_chunks）——
+                    // 退避在清单响应入口与本入口双重拦截，扫描频率随退避指数衰减，
+                    // 而不是按发起互斥 TTL（60s）固定节奏狂扫直到熔断。
                     // 熔断计数与冷却在 start_bootstrap 内统一记账，连续无进展会被熔断。
                     warn!(
-                        "[bootstrap] 竣工前对齐校验失败（块 hash/rows 与本地不一致或清单重建失败），不写 Done，重拉清单: peer={} repo={}",
+                        "[bootstrap] 竣工前对齐校验失败（块 hash/rows 与本地不一致或清单重建失败），不写 Done，重拉清单（计入退避）: peer={} repo={}",
                         conn.node_id, repo
+                    );
+                    self.record_chunk_transport_fail(
+                        &conn.node_id,
+                        repo,
+                        p.done_chunks.min(u32::MAX as u64) as u32,
                     );
                     self.record_bootstrap_repull(&conn.node_id, repo);
                     self.clone().start_bootstrap(conn.node_id, repo).await;
@@ -4964,6 +5037,81 @@ mod tests {
             assert_eq!(st.index, 7);
         }
         // 成功收到任意响应 → 整条清零（生产路径为 map.remove，此处等价验证放行语义）
+        mgr.bootstrap_chunk_attempt.write().remove(&(peer, repo));
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+    }
+
+    /// 停摆修复（2026-09-30 第二轮）回归：「继承全覆盖 → 直接竣工 → D3 校验失败 →
+    /// 重拉」循环必须被退避表指数衰减 —— 每轮校验失败以相同锚点（done_chunks，继承
+    /// 全覆盖后恒定）记一次退避失败，第 3 轮起退避（120s）超过发起互斥 TTL（60s），
+    /// 清单响应入口 / 竣工入口（chunk_backoff_ready）在退避期内拒绝，全表扫描频率
+    /// 随退避衰减，而不是按 60s 固定节奏狂扫直到熔断（现场 api_runtime 停摆根因：
+    /// 每轮 1~2 次全表扫描持全局 SQLite 连接锁 ~40s，api 的 DB 只读 handler 全部
+    /// park 直至 worker 耗尽，连 /metrics、/health 都无 worker 可响应）。
+    #[test]
+    fn test_gate_fail_backoff_damps_direct_finish_loop() {
+        use crate::federation::protocol::repo_type;
+        let storage = Arc::new(crate::storage::Storage::memory().unwrap());
+        let mgr = make_sync_manager(storage, make_config());
+        let peer = NodeId([11; 20]);
+        let repo = repo_type::NODE;
+        let anchor = 148u32; // 继承全覆盖后 done_chunks 恒定，循环内锚点不变
+
+        // 初始入口放行（首轮扫描允许 —— 需要它区分漂移是否真实）
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+
+        // 第 1 轮校验失败 → 退避 30s：60s TTL 内到达的清单响应被入口丢弃
+        mgr.record_chunk_transport_fail(&peer, repo, anchor);
+        assert!(
+            !mgr.chunk_backoff_ready(&peer, repo),
+            "首轮失败后入口必须关闭"
+        );
+        // 拨到 31s 后：放行（第 2 轮扫描）
+        {
+            let mut m = mgr.bootstrap_chunk_attempt.write();
+            m.get_mut(&(peer, repo)).unwrap().last_fail_at =
+                Instant::now() - Duration::from_secs(31);
+        }
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+
+        // 第 2 轮失败 → 退避 60s；61s 后放行（第 3 轮扫描）
+        mgr.record_chunk_transport_fail(&peer, repo, anchor);
+        {
+            let mut m = mgr.bootstrap_chunk_attempt.write();
+            m.get_mut(&(peer, repo)).unwrap().last_fail_at =
+                Instant::now() - Duration::from_secs(61);
+        }
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+
+        // 第 3 轮失败 → 退避 120s > 60s TTL：按 60s 节奏到达的清单响应一律入口丢弃，
+        // 不再触发任何全表扫描
+        mgr.record_chunk_transport_fail(&peer, repo, anchor);
+        {
+            let mut m = mgr.bootstrap_chunk_attempt.write();
+            m.get_mut(&(peer, repo)).unwrap().last_fail_at =
+                Instant::now() - Duration::from_secs(61);
+        }
+        assert!(
+            !mgr.chunk_backoff_ready(&peer, repo),
+            "120s 退避档必须覆盖 60s 的重拉节奏（扫描频率衰减的关键断言）"
+        );
+        // 拨到 121s 后恢复放行；锚点恒定 → fails 连续累计未被换块重置
+        {
+            let mut m = mgr.bootstrap_chunk_attempt.write();
+            m.get_mut(&(peer, repo)).unwrap().last_fail_at =
+                Instant::now() - Duration::from_secs(121);
+        }
+        assert!(mgr.chunk_backoff_ready(&peer, repo));
+        {
+            let m = mgr.bootstrap_chunk_attempt.read();
+            assert_eq!(
+                m.get(&(peer, repo)).unwrap().fails,
+                3,
+                "同锚点循环失败必须连续累计"
+            );
+        }
+
+        // 任一块成功落地（ok 路径清退避）→ 入口立即恢复放行（正常竣工不被误拦）
         mgr.bootstrap_chunk_attempt.write().remove(&(peer, repo));
         assert!(mgr.chunk_backoff_ready(&peer, repo));
     }
