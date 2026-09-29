@@ -1,305 +1,180 @@
-# PeerDiscoveryCenter
+# pdc（Peer Discovery Center）
 
-统一的 BitTorrent Peer 发现中心：Tracker + DHT + PEX 三合一。
+PandaNetOS 生态的**节点发现 Agent**：超级 Tracker + DHT 爬虫 + 多协议发现器 + 联邦同步。
 
-PeerDiscoveryCenter 是 PandaNetOS 生态中的核心组件，提供统一的 peer 发现接口，内部整合了三种发现机制，支持高并发、智能调度、自动健康检查。
+pdc（原 PeerDiscoveryCenter，已重命名）是 Agent 级独立进程，注册到 pnos-runtime，负责 P2P 网络中的节点发现、peer 查询与多实例数据同步。当前版本 **v0.2.0**。
 
-## 功能特性
+## 核心能力
 
-- **三合一发现机制**：Tracker（HTTP/UDP）+ DHT（Kademlia）+ PEX（Peer Exchange）统一封装
-- **并发调度**：所有发现器并发运行，自动合并、去重、按优先级排序
-- **智能缓存**：按 infohash 分组缓存，支持过期清理、连接反馈、LRU 淘汰
-- **健康检查**：后台任务定期检查所有发现器健康状态，自动故障转移
-- **统一接口**：`PeerDiscoverer` trait 统一所有发现机制，易于扩展新协议
-- **统计监控**：完整的请求统计、成功率、响应时间、peer 发现数监控
-- **协议无关**：上层架构与具体协议解耦，未来可扩展其他 peer 发现协议
-
-## 标准库路径约定
-
-本项目依赖 PandaNetOS 标准库，必须使用 path 依赖（本地开发）：
-
-```toml
-[dependencies]
-pandanetos = { path = "../PandaNetOS/crates/pandanetos" }
-```
-
-**禁止使用 git 依赖**，所有项目必须与 PandaNetOS 标准库同级目录放置。
-
-PandaNetOS 标准库提供：
-- 统一的协议定义（`pandanetos::protocol`）
-- 统一的错误处理（`pandanetos::error`）
-- 统一的配置管理（`pandanetos::config`）
-- 统一的日志规范（`pandanetos::logging`）
+- **超级 Tracker**：TCP + UDP 双协议，标准 `/announce`、`/scrape` 接口（兼容 qBittorrent 等），按活跃时间排序 + 缓存加速响应
+- **DHT 爬虫**：多 socket 架构（`socket_count` 可配，上限 10），tid 高位编码 socket 索引；自适应限速（按响应率动态启停）+ 预测式控制器（SGD 模型预测发送倍率）
+- **多协议发现器**：Tracker（HTTP/UDP）、DHT（Kademlia）、PEX、LPD 多播，统一 `PeerDiscoverer` trait 插件化接入
+- **联邦同步**：多实例互联，Gossip 实时推送 + delta（oplog 增量）+ Range 反熵（唯一兜底通道）+ bootstrap 全量引导（协议 v8 去 Merkle 化，v9 收敛修复）
+- **智能层**：TaskScheduler 统一提调全部周期任务（按分类分级并发）、IOScheduler 平滑 IO、WAL checkpoint 两层机制、冷热分层（TierSystem）框架
+- **控制层**：HTTP API + WebSocket 实时监控、配置热重载（文件监听 + `POST /api/v1/config/reload`）
+- **存储**：SQLite（WAL 模式）+ WriteQueue 异步写入 + 增量持久化，NodeRepo / PeerRepo / InfohashRepo / TrackerRepo 四大仓库
 
 ## 生态定位
 
-PeerDiscoveryCenter 位于 PandaNetOS 架构的**多 Agent 连接层**，与 spde Agent 并列，作为 **Peer 发现 Agent** 接入 pk 主控台：
-
 ```
-用户 / 第三方系统
-        │  HTTP API / WebSocket
-   ┌────▼──────────────────────────────────────┐
-   │            pk（主控台）                    │
-   └────┬──────────────────────────────────────┘
-        │  多 Agent 连接（统一接入协议）
-   ┌────┴──────────────────┐
-   ▼                       ▼
-spde Agent ×N      PeerDiscoveryCenter Agent ×N
-（下载执行）        （Peer 发现：Tracker + DHT + PEX）
+用户 / Web 前端
+        │
+   pnos-runtime（系统级运行时：注册中心 / 服务发现 / 事件总线）
+        │
+  ┌─────┼──────────────┐
+  ▼     ▼              ▼
+ pk    pdc           spde
+（主控）（节点发现）  （下载执行）
 ```
 
-### 接入 pk 的方式
-
-与 spde 使用**完全相同**的接入协议，pk 侧无需改造：
-
-| 阶段 | 接口 | 说明 |
-|------|------|------|
-| 注册 | `POST /api/v1/agent/register` | 上报能力清单：peer 发现机制、缓存策略、健康检查状态、并发与超时参数 |
-| 长连接 | `WS /api/v1/agent/ws` | 实时状态与 peer 查询通道 |
-| 心跳 | `POST /api/v1/agent/heartbeat` | 保活，并领取待处理的发现任务 |
-| 上报 | `POST /api/v1/agent/report` | 回写发现结果、成功率、响应时间等统计 |
-
-未指定 master 时，Agent 会自动扫描局域网发现主控。
-
-### 与 spde 的协作
-
-- spde 执行 BT / 磁力下载时，向 PeerDiscoveryCenter 查询 peer 列表
-- PeerDiscoveryCenter 内部并发调度 Tracker / DHT / PEX 三种发现器，合并去重后按优先级返回
-- 支持两种部署形态：作为 spde 的本地依赖同机部署，或独立部署为共享的 peer 发现服务
+pdc 与 pk、spde 并列注册到 pnos-runtime；pk↔pdc 智能层（ICC）统一走 pnos-sdk（决策见 `docs/adr/005-intelligent-control-center.md`）。
 
 ## 快速开始
 
 ### 环境要求
 
-- Rust 1.75+（建议使用最新稳定版）
-- Cargo 包管理器
-- Git
-- 网络连接（用于下载依赖和 peer 发现）
-
-### 安装/构建
-
-```bash
-# 克隆仓库（与 PandaNetOS 同级目录）
-git clone https://github.com/pandamelive/PeerDiscoveryCenter.git
-cd PeerDiscoveryCenter
-
-# 构建
-cargo build --release
-
-# 运行测试
-cargo test
-```
-
-### 使用示例
-
-```rust
-use PeerDiscoveryCenter::aggregator::{PeerDiscoveryAggregator, PeerDiscoveryConfig};
-use PeerDiscoveryCenter::tracker::TrackerDiscoverer;
-use PeerDiscoveryCenter::dht::DhtDiscoverer;
-use PeerDiscoveryCenter::pex::PexDiscoverer;
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // 1. 创建聚合器
-    let config = PeerDiscoveryConfig::default();
-    let aggregator = Arc::new(PeerDiscoveryAggregator::new(config));
-
-    // 2. 添加发现器
-    aggregator.add_discoverer(Box::new(TrackerDiscoverer::with_default_config()));
-    aggregator.add_discoverer(Box::new(DhtDiscoverer::with_default_config()));
-    aggregator.add_discoverer(Box::new(PexDiscoverer::with_default_config()));
-
-    // 3. 发现 peer
-    let infohash = [0u8; 20]; // 替换为实际的 infohash
-    let result = aggregator.discover_peers(&infohash, 100).await?;
-
-    // 4. 处理结果
-    for peer in &result.peers {
-        // 连接 peer 并下载数据
-    }
-
-    Ok(())
-}
-```
-
-## 配置说明
-
-### PeerDiscoveryConfig
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `peer_ttl` | `Duration` | 24小时 | Peer 过期时间 |
-| `discovery_timeout` | `Duration` | 30秒 | 单次发现超时 |
-| `max_concurrent_discoverers` | `usize` | 10 | 并发发现器数量限制 |
-| `enable_tracker` | `bool` | true | 是否启用 Tracker |
-| `enable_dht` | `bool` | true | 是否启用 DHT |
-| `enable_pex` | `bool` | true | 是否启用 PEX |
-| `max_peers_per_discovery` | `usize` | 200 | 每次发现的最大 peer 数 |
-
-### TrackerConfig
-
-- `trackers`: Tracker URL 列表（默认包含 100+ 公共 Tracker）
-- `timeout`: 请求超时（默认 15 秒）
-- `max_concurrent_requests`: 最大并发请求数（默认 10）
-- `max_consecutive_failures`: 连续失败阈值（默认 3 次后临时禁用）
-- `cooldown_duration`: 禁用恢复时间（默认 5 分钟）
-
-### DhtConfig
-
-- `bootstrap_nodes`: Bootstrap 节点列表
-- `listen_port`: DHT 监听端口（默认 6881）
-- `refresh_interval`: 路由表刷新间隔（默认 5 分钟）
-- `node_ttl`: 节点过期时间（默认 1 小时）
-
-### PexConfig
-
-- `max_connected_peers`: 最大已连接 peer 数（默认 50）
-- `pex_request_interval`: PEX 请求间隔（默认 60 秒）
-- `max_peers_per_request`: 每个 peer 每次返回的最大 peer 数（默认 50）
-
-## 项目结构
-
-```
-PeerDiscoveryCenter/
-├── src/
-│   ├── lib.rs              # 库入口，模块声明和重新导出
-│   ├── types.rs            # 公共数据结构（PeerInfo、PeerSource 等）
-│   ├── traits.rs           # 统一的 PeerDiscoverer trait 定义
-│   ├── cache.rs            # Peer 缓存（去重、优先级、过期、LRU）
-│   ├── aggregator.rs       # 核心聚合器（并发调度、合并排序）
-│   ├── health_check.rs     # 健康检查后台任务
-│   ├── tracker/            # Tracker 发现机制
-│   │   ├── mod.rs
-│   │   └── client.rs       # Tracker 客户端（HTTP/UDP）
-│   ├── dht/                # DHT 发现机制
-│   │   ├── mod.rs
-│   │   └── client.rs       # DHT 客户端（Kademlia）
-│   └── pex/                # PEX 发现机制
-│       ├── mod.rs
-│       └── client.rs       # PEX 客户端
-├── Cargo.toml              # 项目配置
-├── README.md               # 项目说明
-└── .github/
-    └── workflows/          # CI/CD 工作流
-        ├── cargo-test.yml
-        ├── cargo-format.yml
-        ├── cargo-clippy.yml
-        ├── compliance.yml
-        └── tag-guard.yml
-```
-
-## 开发指南
+- Rust 1.75+（建议最新稳定版）
+- 本地工作区需与 `pnos-spec/`、`pnos-sdk/` 同级（path 依赖）
 
 ### 构建
 
 ```bash
-# Debug 构建
-cargo build
-
-# Release 构建
 cargo build --release
-
-# 检查编译（不生成二进制）
-cargo check
 ```
 
-### 测试
+### 运行
 
 ```bash
-# 运行所有测试
-cargo test
-
-# 运行特定模块的测试
-cargo test cache
-
-# 运行测试并显示输出
-cargo test -- --nocapture
+./target/release/pdc
+# 首次运行自动创建工作目录（config/data/logs）、生成 node_id 与数据库
 ```
 
-### 代码格式
+- 监控页：`http://127.0.0.1:6880`（HTTP API + WebSocket 实时监控）
+- 更换工作目录：`--work-dir <dir>`；指定配置：`--config <path>`
+
+### 默认端口
+
+| 端口 | 用途 | 配置字段 |
+|---|---|---|
+| 6880 | HTTP 监控；UDP Tracker 未配置时回退此端口 | `server.port` |
+| 6886 | TCP API | `server.api_port` |
+| 6881 | DHT 发现器 / 中继（relay） | `discoverers.dht_listen_port` / `super_tracker.relay_port` |
+| 6882 | DHT 爬虫监听 | `crawler.listen_port` |
+| 6883 | uTP | `crawler.utp_port` |
+| 6884 | TCP-PEX | `crawler.tcp_pex_port` |
+| 6885 | 联邦同步 | `federation.listen_port` |
+| 6771 | LPD 多播 | `discoverers.lpd_multicast_port` |
+
+多 socket 爬虫的端口由 PortAllocator 按百位段整组偏移自动分配（`port_auto_alloc`）。
+
+## 配置
+
+配置文件：`config/config.yaml`，不存在或解析失败时使用代码内默认值（全部字段带 `#[serde(default)]`）。
+
+```rust
+PdcConfig::from_file(path)      // 从指定路径加载
+PdcConfig::load_or_default()    // 不存在或失败时用默认值
+```
+
+**配置热重载**：`config_reload_interval_secs`（默认 30，0=禁用）周期轮询配置文件 mtime，防抖后对比差异分类应用——纯策略/调度类参数即时生效，端口等结构性参数提示重启。也可通过 `POST /api/v1/config/reload` 立即重载。
+
+关键配置段：`server`（端口）、`super_tracker`（UDP Tracker/缓存）、`crawler`（socket 数量、并发、限速阈值、预热）、`task_scheduler`（分类并发、checkpoint 间隔）、`federation`（同步通道开关、并发）、`io_scheduler`（背压采样）。
+
+## 工作目录
+
+遵循生态统一 WorkDir 规范：
+
+```
+<root>/
+├── config/config.yaml    # 配置文件（缺失自动生成默认配置）
+├── data/pdc.db           # SQLite 数据库
+├── data/node_id          # 节点身份（十六进制 40 字符，自动生成）
+└── logs/                 # stdout.log / stderr.log / crash.log
+```
+
+Standalone 模式根目录为 `<work_dir>/pdc-agent/`；设置 `PNOS_APP_ID` 环境变量进入应用商店 Managed 模式。
+
+## 项目结构
+
+```
+pdc/
+├── src/
+│   ├── main.rs            # 入口，TaskScheduler 任务注册中心
+│   ├── config.rs          # 全量配置定义（端口/间隔均可配置）
+│   ├── lib.rs             # 库入口（crate 名 PeerDiscoveryCenter 为历史遗留）
+│   ├── aggregator.rs      # 发现器聚合（并发调度、合并去重）
+│   ├── crawler/           # DHT 爬虫（engine、rate_limiter）
+│   ├── intelligence/      # 智能层（task_scheduler、adaptive_controller 等）
+│   ├── control_plane/     # HTTP API、WebSocket、配置热重载
+│   ├── data_plane/        # UDP Tracker、中继
+│   ├── discoverers/       # dht / tracker / pex / lpd 发现器
+│   ├── federation/        # 多实例同步（Gossip / delta / Range 反熵 / bootstrap）
+│   ├── storage/           # NodeRepo / PeerRepo / WriteQueue 等
+│   ├── net/、nat/         # socket 选项、NAT、连接管理
+│   └── event_bus.rs       # 事件驱动总线
+├── config/config.yaml     # 配置文件
+├── docs/architecture/     # 架构文档（00-overview ~ 08-intelligent-control-center）
+└── docs/adr/              # 架构决策记录（ADR）
+```
+
+## 库模式
+
+除 Agent 独立进程外，也可作为库嵌入：
+
+```rust
+use PeerDiscoveryCenter::aggregator::{PeerDiscoveryAggregator, PeerDiscoveryConfig};
+use PeerDiscoveryCenter::discoverers::DiscovererRegistry;
+use PeerDiscoveryCenter::event_bus::EventBus;
+
+let aggregator = PeerDiscoveryAggregator::new(PeerDiscoveryConfig::default());
+// 注册发现器并调用 discover_peers(&infohash, max_peers) 查询
+```
+
+## 依赖
+
+- `pnos`（path：`../pnos-spec`）— 生态系统级标准库
+- `pnos-net`（path：`../pnos-sdk/crates/pnos-net`）— 网络传输层
+
+## 开发指南
 
 ```bash
-# 检查格式
-cargo fmt --all -- --check
-
-# 自动格式化
-cargo fmt --all
+cargo build --release        # Release 构建
+cargo test --all             # 全部测试
+cargo fmt --all -- --check   # 格式检查
+cargo clippy --all-targets -- -D warnings   # 静态分析
 ```
 
-### Clippy 检查
-
-```bash
-# 运行 Clippy
-cargo clippy --all-targets
-
-# 严格模式（警告视为错误）
-cargo clippy --all-targets -- -D warnings
-```
+测试须在 `D:\test\pdc\` 目录下运行，禁止在仓库目录执行（工作目录约束）。
 
 ### 合规检查
 
-所有提交必须通过 PandaNetOS 生态合规检查：
+提交/推送前必须通过生态合规检查（`pandanetos-meta/check-compliance.ps1`，26 项静态检查 + 行为冒烟）：
 
-```bash
-# 运行合规检查（在项目根目录）
-bash ../PandaNetOS/scripts/check_compliance.sh .
+```powershell
+.\check-compliance.ps1 -ProjectPath D:\PNOS\pdc
 ```
 
-合规检查包含 10 项：
-1. 标准库依赖检查
-2. 目录布局检查
-3. README 规范检查
-4. 代码格式检查
-5. Clippy 检查
-6. 单元测试
-7. 敏感信息检查
-8. 代码规范检查
-9. Tag Guard 工作流检查
-10. CI/CD 工作流完整性检查
-
-## 贡献指南
-
-欢迎提交 Issue 和 Pull Request！
-
-### 提交规范
-
-- 所有代码必须通过 `cargo fmt` 和 `cargo clippy` 检查
-- 所有公共 API 必须有文档注释
-- 新增功能必须包含单元测试
-- 提交信息遵循 Conventional Commits 规范
-- PR 必须通过所有 CI 检查才能合并
-
-### 开发流程
-
-1. Fork 本仓库
-2. 创建特性分支（`git checkout -b feature/amazing-feature`）
-3. 提交更改（`git commit -m 'feat: add amazing feature'`）
-4. 推送到分支（`git push origin feature/amazing-feature`）
-5. 开启 Pull Request
+提交信息遵循 Conventional Commits 规范（`feat:` / `fix:` / `docs:` 等）。
 
 ## 变更日志
 
-### 规划中（unreleased）
+### v0.2.0（当前开发版本）
 
-- 作为 Agent 接入 pk 主控台（register / ws / heartbeat / report）
-- 能力清单上报（`--manifest`），符合 PandaNetOS 自描述能力清单标准
+- 重命名为 pdc，作为节点发现 Agent 注册到 pnos-runtime
+- 超级 Tracker（TCP+UDP）、多 socket DHT 爬虫、PEX/LPD 发现器
+- 联邦同步：v8 去 Merkle 化（Range 反熵为唯一兜底）→ v9 收敛修复
+- 智能层：TaskScheduler 统一提调、IOScheduler、预测式自适应控制器、WAL checkpoint 两层机制
+- 性能五轮改造（增量持久化、锁分片、对象池、冷热分层框架）
+- 配置热重载完整落地
 
-### v0.1.0 (2026-09-02)
+### v0.1.0（2026-09-02）
 
-- 初始版本发布
-- 实现 Tracker 发现机制（HTTP/HTTPS）
-- 实现 DHT 发现机制骨架（Kademlia）
-- 实现 PEX 发现机制骨架
-- 实现统一的 PeerDiscoverer trait
-- 实现核心聚合器（并发调度、合并去重、优先级排序）
-- 实现 Peer 缓存（过期清理、连接反馈、LRU 淘汰）
-- 实现健康检查后台任务
-- 完整的单元测试覆盖
-- PandaNetOS 生态合规
+- 初始版本：Tracker/DHT/PEX 三合一发现、聚合器、缓存、健康检查
+
+### 规划中
+
+- ICC（智能控制中心）实施（ADR-005）：统一提调资源 / 统一安排任务 / 统一协调模块
 
 ## 许可证
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件。
-
-Copyright (c) 2026 PandaNetOS
+MIT - 详见 [LICENSE](LICENSE)。
