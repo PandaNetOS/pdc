@@ -111,7 +111,10 @@ federation:
   dht_discovery_interval_secs: 300
   peer_cache_enabled: true
   peer_cache_max_nodes: 100
-  transport_write_timeout_secs: 5
+  # v11：5→30s —— 单连接 writer 上 1.5MB 数据帧后面的小消息（OpsRequest/协商）排队
+  # 时 5s 误杀重试风暴（2026-10-01 三节点实测：双向 5s 超时循环 + RTT 13s）。与
+  # DELTA_INFLIGHT_TIMEOUT_SECS=30 对齐；代码默认值（default_transport_write_timeout）本就是 30。
+  transport_write_timeout_secs: 30
   # Range 块/键批量发送超时（秒）。bootstrap 块发送走 bootstrap_chunk_timeout_secs；
   # 消息型（心跳/协商/控制）发送走 transport_write_timeout_secs。
   range_send_timeout_secs: 30

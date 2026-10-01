@@ -1008,31 +1008,45 @@ impl SyncManager {
         {
             debug!("[delta] 记录对端 ack 失败（不影响服务）: {}", e);
         }
-        let records = match self.delta_storage().load_ops_since(req.repo, since, limit) {
-            Ok(r) => r,
-            Err(e) => {
+        // v11(J1)：oplog 读取 + 批组装移入 spawn_blocking —— rusqlite 是同步调用，
+        // 直接跑在 federation runtime worker 上时，百万行表的排序扫描会把 worker 阻塞
+        // 秒级（实测区间摘要 ~9s/个），worker 耗尽后连发送/接收任务都无法 poll
+        // （5s 写超时风暴、keepalive RTT 13s 的共同根因）。阻塞池与 worker 池隔离，语义不变。
+        let repo_id = req.repo;
+        let storage = self.delta_storage();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let records = storage.load_ops_since(repo_id, since, limit)?;
+            let mut ops = delta::records_to_entries(&records);
+            // v7：字节上限 —— 大 value 场景防批帧失控（对齐 gossip_bulk_max_bytes 量级）。
+            // 截断时 has_more 仍为 true，下一批从同一 seq 续拉（不丢数据，不空转：至少保留 1 条）。
+            let mut truncated = false;
+            let mut total = 0usize;
+            let mut cut = ops.len();
+            for (i, o) in ops.iter().enumerate() {
+                total += o.key.len() + o.value.len() + 32;
+                if total > delta::DELTA_BATCH_MAX_BYTES {
+                    cut = i;
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                ops.truncate(cut.max(1));
+            }
+            Ok::<_, anyhow::Error>((ops, truncated))
+        })
+        .await;
+        let (ops, truncated) = match loaded {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 warn!("[delta] 加载 oplog 失败 repo={}: {}", req.repo, e);
                 return;
             }
-        };
-        let ops = delta::records_to_entries(&records);
-        // v7：字节上限 —— 大 value 场景防批帧失控（对齐 gossip_bulk_max_bytes 量级）。
-        // 截断时 has_more 仍为 true，下一批从同一 seq 续拉（不丢数据，不空转：至少保留 1 条）。
-        let mut truncated = false;
-        let mut total = 0usize;
-        let mut cut = ops.len();
-        for (i, o) in ops.iter().enumerate() {
-            total += o.key.len() + o.value.len() + 32;
-            if total > delta::DELTA_BATCH_MAX_BYTES {
-                cut = i;
-                truncated = true;
-                break;
+            Err(e) => {
+                warn!("[delta] 加载 oplog 任务异常 repo={}: {}", req.repo, e);
+                return;
             }
-        }
-        let mut ops = ops;
-        if truncated {
-            ops.truncate(cut.max(1));
-        }
+        };
         let next_seq = ops.last().map(|o| o.seq).unwrap_or(req.since_seq);
         let has_more = !ops.is_empty() && (ops.len() >= limit || truncated);
         // F2：回带「本机在该 repo 上的」oplog 水位（= 该 repo 最后一条变更的 seq；无则 0）。
@@ -1222,7 +1236,15 @@ impl SyncManager {
         entries: Vec<SyncEntry>,
     ) {
         if !entries.is_empty() {
-            self.handle_sync_batch(repo, &entries);
+            // v11(J2)：批应用移入 spawn_blocking（同 J1：同步 DB 调用不占 runtime worker）。
+            // 须 await 完成后再推进版本向量，保持「先应用后推进」的原有顺序语义。
+            let sm = self.clone();
+            let es = entries.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || sm.handle_sync_batch(repo, &es)).await
+            {
+                warn!("[delta] 批应用任务异常 repo={}: {}", repo, e);
+            }
         }
         // 联邦同步通道状态：oplog 水位 + 对端拉取水位（DB 查询在写锁外做）
         {
@@ -2075,8 +2097,14 @@ impl SyncManager {
                 e.2 = Some(Instant::now() + interval * DELTA_WATCHDOG_PAUSE_MULT);
             }
             // 清除协商结果 → 大通道全停，下一轮 ensure_negotiation 重发 → 重新裁定
-            self.negotiated.write().remove(&peer);
-            self.negotiation_sent_at.write().remove(&peer);
+            // v11(J7)：仅当现裁定不是 DELTA 时才清 —— DELTA 策略下重协商只会得到同一
+            // 结果，却要付出「协商通过前大通道全停」+ strategy_min_conn_secs 稳定门 +
+            // 60s 重发节流的黑窗（实测每 5-6 分钟一轮、单日 550 行 negotiate 日志，
+            // 停摆反而被重协商循环拉长）。bootstrap 裁定失败的场景仍清，保留重裁路径。
+            if self.strategy_for(&peer, repo) != Some(protocol::STRATEGY_DELTA) {
+                self.negotiated.write().remove(&peer);
+                self.negotiation_sent_at.write().remove(&peer);
+            }
             return false;
         }
         ok
@@ -2329,15 +2357,28 @@ impl SyncManager {
                 req.leaf_rows as usize
             };
             // 多取 1 条以判断是否超过叶级阈值
-            let rows = match self.delta_storage().load_repo_key_hashes_in_range(
-                req.repo,
-                Self::range_bound(&req.lo),
-                Self::range_bound(&req.hi),
-                leaf_rows + 1,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
+            // v11(J3)：区间行加载移入 spawn_blocking（同 J1；此处是 ~9s/区间全表扫描的执行点）。
+            let storage = self.delta_storage();
+            let req_lo = req.lo.clone();
+            let req_hi = req.hi.clone();
+            let req_repo = req.repo;
+            let loaded = tokio::task::spawn_blocking(move || {
+                storage.load_repo_key_hashes_in_range(
+                    req_repo,
+                    Self::range_bound(&req_lo),
+                    Self::range_bound(&req_hi),
+                    leaf_rows + 1,
+                )
+            })
+            .await;
+            let rows = match loaded {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     warn!("[range] 加载区间失败 repo={}: {}", req.repo, e);
+                    return;
+                }
+                Err(e) => {
+                    warn!("[range] 加载区间任务异常 repo={}: {}", req.repo, e);
                     return;
                 }
             };
@@ -2432,17 +2473,28 @@ impl SyncManager {
                 return;
             }
             let leaf_rows = self.leaf_rows_for_repo(resp.repo) as usize;
-            let lo = Self::range_bound(&resp.lo);
-            let hi = Self::range_bound(&resp.hi);
-            let local = match self.delta_storage().load_repo_key_hashes_in_range(
-                resp.repo,
-                lo,
-                hi,
-                range_reconcile::MAX_LEAF_ENTRIES + 1,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
+            // v11(J4)：请求方本地区间加载同样移入 spawn_blocking（同 J3）。
+            let storage = self.delta_storage();
+            let resp_repo = resp.repo;
+            let resp_lo = resp.lo.clone();
+            let resp_hi = resp.hi.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                storage.load_repo_key_hashes_in_range(
+                    resp_repo,
+                    Self::range_bound(&resp_lo),
+                    Self::range_bound(&resp_hi),
+                    range_reconcile::MAX_LEAF_ENTRIES + 1,
+                )
+            })
+            .await;
+            let local = match loaded {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     warn!("[range] 请求方加载区间失败: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    warn!("[range] 请求方加载区间任务异常: {}", e);
                     return;
                 }
             };
@@ -2581,13 +2633,23 @@ impl SyncManager {
                         if sub_lo == sub_hi {
                             continue;
                         }
-                        let rows = match self.delta_storage().load_repo_key_hashes_in_range(
-                            resp.repo,
-                            Self::range_bound(&sub_lo),
-                            Self::range_bound(&sub_hi),
-                            leaf_rows + 1,
-                        ) {
-                            Ok(r) => r,
+                        // v11(J5)：下钻前的本地区间加载移入 spawn_blocking（同 J3）。
+                        let storage = self.delta_storage();
+                        let d_repo = resp.repo;
+                        let d_lo = sub_lo.clone();
+                        let d_hi = sub_hi.clone();
+                        let loaded = tokio::task::spawn_blocking(move || {
+                            storage.load_repo_key_hashes_in_range(
+                                d_repo,
+                                Self::range_bound(&d_lo),
+                                Self::range_bound(&d_hi),
+                                leaf_rows + 1,
+                            )
+                        })
+                        .await;
+                        let rows = match loaded {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(_)) => continue,
                             Err(_) => continue,
                         };
                         let digest = range_reconcile::range_digest(&rows);
@@ -3148,15 +3210,31 @@ impl SyncManager {
         for i in prog.next..end {
             let lo = prog.bounds[i].clone();
             let hi = prog.bounds[i + 1].clone();
-            let rows = match storage.load_repo_key_hashes_in_range(
-                repo,
-                Self::range_bound(&lo),
-                Self::range_bound(&hi),
-                prog.leaf_rows as usize + 1,
-            ) {
-                Ok(r) => r,
-                Err(_) => {
+            // v11(J6)：抽样批内每区间的本地加载移入 spawn_blocking（同 J3；本循环是
+            // 单 tick 32 区间 × ~9s 全表扫描的执行点，此前直接占死 runtime worker）。
+            let st = storage.clone();
+            let b_lo = lo.clone();
+            let b_hi = hi.clone();
+            let b_repo = repo;
+            let b_leaf = prog.leaf_rows as usize + 1;
+            let loaded = tokio::task::spawn_blocking(move || {
+                st.load_repo_key_hashes_in_range(
+                    b_repo,
+                    Self::range_bound(&b_lo),
+                    Self::range_bound(&b_hi),
+                    b_leaf,
+                )
+            })
+            .await;
+            let rows = match loaded {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => {
                     // 本地读失败：跳过该区间（与旧行为一致），游标照常推进。
+                    advanced = i + 1;
+                    continue;
+                }
+                Err(_) => {
+                    // 任务异常：同上跳过，游标照常推进。
                     advanced = i + 1;
                     continue;
                 }
@@ -5226,6 +5304,90 @@ mod tests {
         assert_eq!(node_repo.len_sync(), 0);
         mgr.apply_node_sync(&entries);
         assert_eq!(node_repo.len_sync(), 1);
+    }
+
+    /// v11(J7) 回归：delta 看门狗触发暂停时——
+    /// 1) 现裁定为 DELTA 的 (peer, repo)：协商状态必须保留（暂停≠重协商；
+    ///    否则每次暂停都付「协商通过前大通道全停 + strategy_min_conn_secs 稳定门」
+    ///    的代价，实测形成每 5-6 分钟一轮的重协商风暴，停摆被拉长）；
+    /// 2) 现裁定为 BOOTSTRAP 的：仍清除协商，保留重新裁定路径。
+    #[test]
+    fn test_delta_watchdog_pause_keeps_delta_negotiation() {
+        let node_repo = make_node_repo();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let cm = SessionsHandle::new_for_test();
+        let gossip = Arc::new(GossipEngine::new(
+            cm.clone(),
+            make_config(),
+            NodeId([1; 20]),
+            Arc::new(FederationMetrics::new()),
+            shutdown_tx.clone(),
+        ));
+        let mgr = SyncManager::new(
+            cm,
+            node_repo.clone(),
+            make_config(),
+            shutdown_tx,
+            gossip,
+            Arc::new(FederationMetrics::new()),
+            NodeId([1; 20]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let interval = Duration::from_secs(60);
+        let stall_limit = mgr.config.delta_watchdog_stall_ticks.max(1) as usize;
+
+        // 场景1：DELTA 裁定 —— 暂停后协商必须仍在
+        let peer_delta = NodeId([9; 20]);
+        mgr.negotiated.write().insert(
+            peer_delta,
+            vec![crate::federation::protocol::RepoStrategy {
+                repo: 1,
+                strategy: crate::federation::protocol::STRATEGY_DELTA,
+                rate_bytes_per_sec: 0,
+                batch_limit: 1000,
+            }],
+        );
+        // 有欠账（水位 200 > 已同步 100）、无 in-flight → 连续 stall_limit 个周期触发暂停
+        mgr.delta_storage()
+            .set_peer_seq(&peer_delta.0, 1, 100)
+            .unwrap();
+        for _ in 0..stall_limit - 1 {
+            assert!(mgr.delta_watchdog_ok(peer_delta, 1, interval, 200));
+        }
+        assert!(!mgr.delta_watchdog_ok(peer_delta, 1, interval, 200)); // 触发暂停
+        assert_eq!(
+            mgr.strategy_for(&peer_delta, 1),
+            Some(crate::federation::protocol::STRATEGY_DELTA),
+            "DELTA 裁定不得因看门狗暂停被清除（J7）"
+        );
+
+        // 场景2：BOOTSTRAP 裁定 —— 暂停后仍清除，保留重裁路径
+        let peer_boot = NodeId([10; 20]);
+        mgr.negotiated.write().insert(
+            peer_boot,
+            vec![crate::federation::protocol::RepoStrategy {
+                repo: 2,
+                strategy: crate::federation::protocol::STRATEGY_BOOTSTRAP,
+                rate_bytes_per_sec: 0,
+                batch_limit: 1000,
+            }],
+        );
+        mgr.delta_storage()
+            .set_peer_seq(&peer_boot.0, 2, 100)
+            .unwrap();
+        for _ in 0..stall_limit - 1 {
+            assert!(mgr.delta_watchdog_ok(peer_boot, 2, interval, 200));
+        }
+        assert!(!mgr.delta_watchdog_ok(peer_boot, 2, interval, 200));
+        assert_eq!(
+            mgr.strategy_for(&peer_boot, 2),
+            None,
+            "BOOTSTRAP 裁定暂停后应清除以触发重裁"
+        );
     }
 
     /// F8/v9 回归：delta 通道 version 透传后，「对既有条目的更新」能正常落地，
