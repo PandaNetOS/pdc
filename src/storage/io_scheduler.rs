@@ -1211,6 +1211,22 @@ pub struct IoStatusSnapshot {
     pub fsync_ms_p50: f32,
     pub recent_decisions: Vec<AimdDecisionRecord>,
     pub stats: IoSchedulerStatsJson,
+    // ─── E1：bootstrap 发送端观测（随 /io/status 暴露；面板同步通道块另从这里取）───
+    /// 当前在途（已发出未确认）的 bootstrap 发送数。
+    pub bootstrap_send_in_flight: usize,
+    /// bootstrap 发送失败累计次数（用于失败率 = failures_total / total）。
+    pub bootstrap_send_failures_total: u64,
+    /// bootstrap 发送累计总数（分母）。
+    pub bootstrap_send_total: u64,
+    /// 触发熔断、暂停 bootstrap 发送的对端数。
+    pub bootstrap_send_circuit_open_peers: usize,
+    // ─── E6：读连接池观测（进程级静态，见 crate::storage::db）───
+    /// 当前可用（未借出）的只读连接数。
+    pub read_pool_available: usize,
+    /// 读池配置大小（= READ_POOL_SIZE）。
+    pub read_pool_total: usize,
+    /// 读池空、回退写连接取数的累计次数（池饥饿信号）。
+    pub read_pool_starved: u64,
 }
 
 /// B4：统计快照的可序列化投影。
@@ -1316,6 +1332,16 @@ pub fn io_status_snapshot(
             token_starved_ticks: stats.token_starved_ticks,
             rows_deferred_by_tokens: stats.rows_deferred_by_tokens,
         },
+        // E1：bootstrap 发送端观测（契约函数由 sync/mod.rs 实现，同 crate 直接调用）。
+        bootstrap_send_in_flight: crate::federation::sync::bootstrap_send_in_flight(),
+        bootstrap_send_failures_total: crate::federation::sync::bootstrap_send_failures_total(),
+        bootstrap_send_total: crate::federation::sync::bootstrap_send_total(),
+        bootstrap_send_circuit_open_peers:
+            crate::federation::sync::bootstrap_send_circuit_open_peers(),
+        // E6：读连接池进程级观测（见 crate::storage::db 的静态读取函数）。
+        read_pool_available: crate::storage::db::read_pool_available(),
+        read_pool_total: crate::storage::db::read_pool_total(),
+        read_pool_starved: crate::storage::db::read_pool_starved(),
     }
 }
 
@@ -1993,5 +2019,22 @@ mod tests {
         assert!(v.get("queue_len").is_some());
         assert!(v.get("disk_class").is_some());
         assert!(v.get("recent_decisions").unwrap().is_array());
+        // E1：bootstrap 发送端观测字段
+        for k in [
+            "bootstrap_send_in_flight",
+            "bootstrap_send_failures_total",
+            "bootstrap_send_total",
+            "bootstrap_send_circuit_open_peers",
+        ] {
+            assert!(v.get(k).is_some(), "缺少 E1 字段: {}", k);
+        }
+        // E6：读池观测字段
+        for k in [
+            "read_pool_available",
+            "read_pool_total",
+            "read_pool_starved",
+        ] {
+            assert!(v.get(k).is_some(), "缺少 E6 字段: {}", k);
+        }
     }
 }

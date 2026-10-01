@@ -7,7 +7,6 @@
 //! - GET /api/v1/discoverers - 发现器列表
 //! - GET /api/v1/cache/{infohash} - 查询缓存
 
-use crate::intelligence::scorer_traits::HealthScorer;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -327,6 +326,8 @@ pub fn routes(state: AppState) -> Router {
         .route("/api/v1/system", get(system_handler))
         .route("/api/v1/config", get(get_config_handler))
         .route("/api/v1/config/reload", post(reload_config_handler))
+        // E7：实时状态轮询端点（与 WS status 推送同构，含 node_repo.tier/peer_repo.tier 等）
+        .route("/api/v1/status", get(status_handler))
         .route("/metrics", get(crate::data_plane::metrics::metrics_handler))
         .route("/ws", get(crate::data_plane::ws::ws_handler))
         .with_state(state)
@@ -409,43 +410,21 @@ async fn health_handler(State(state): State<AppState>) -> Response {
             0.0
         }
     });
-    // 使用 HealthScorerImpl 统一计算健康度（唯一计算路径，评分统一收口）
-    let health_scorer = crate::intelligence::health_scorer::HealthScorerImpl::new();
-    let system_health = if let (Some(node_repo), Some(tracker_repo), Some(infohash_repo)) = (
-        state.node_repo.as_ref(),
-        state.tracker_repo.as_ref(),
-        state.infohash_repo.as_ref(),
-    ) {
-        let report = health_scorer
-            .calculate(
-                tracker_repo.as_ref() as &dyn crate::storage::repo_traits::TrackerRepository,
-                node_repo.as_ref() as &dyn crate::storage::repo_traits::NodeRepository,
-                state.peer_repo.as_ref() as &dyn crate::storage::repo_traits::PeerRepository,
-                infohash_repo.as_ref() as &dyn crate::storage::repo_traits::InfohashRepository,
-            )
-            .await;
-        let status = crate::health_check::SystemHealth::from_score(report.overall);
-        crate::health_check::SystemHealth {
-            overall_score: report.overall,
-            status,
-            tracker_layer_score: report.tracker_layer,
-            dht_layer_score: report.dht_layer,
-            peer_layer_score: report.peer_layer,
-            active_trackers: report.active_trackers,
-            total_trackers: report.total_trackers,
-            avg_tracker_score: report.avg_tracker_score,
-        }
-    } else {
-        crate::health_check::SystemHealth {
-            overall_score: 0.0,
-            status: crate::health_check::HealthStatus::Unhealthy,
-            tracker_layer_score: 0.0,
-            dht_layer_score: 0.0,
-            peer_layer_score: 0.0,
-            active_trackers: 0,
-            total_trackers: 0,
-            avg_tracker_score: 0.0,
-        }
+    // C：健康分改由后台统计快照纯计算（health_report_from_snapshot）。
+    // 不再在 API 线程实时 HealthScorerImpl::calculate()（同步遍历全部 Repo，是 API 卡死元凶之一）。
+    // 语义差异：输入为后台快照（最长约 1 个快照周期陈旧）；
+    // repo 未启用时对应层自然为 0（tracker 无快照则 tracker_layer=0，node 无快照则 dht_layer=0）。
+    let snap = state.stats_snapshot.get();
+    let report = crate::data_plane::stats_snapshot::health_report_from_snapshot(&snap);
+    let system_health = crate::health_check::SystemHealth {
+        overall_score: report.overall,
+        status: crate::health_check::SystemHealth::from_score(report.overall),
+        tracker_layer_score: report.tracker_layer,
+        dht_layer_score: report.dht_layer,
+        peer_layer_score: report.peer_layer,
+        active_trackers: report.active_trackers,
+        total_trackers: report.total_trackers,
+        avg_tracker_score: report.avg_tracker_score,
     };
 
     let resp = HealthResponse {
@@ -485,6 +464,18 @@ async fn stats_handler(State(state): State<AppState>) -> Response {
     };
 
     Json(resp).into_response()
+}
+
+/// GET /api/v1/status —— 实时状态（与 WS `status` 推送的 `data` 同构）。
+///
+/// 面板 tier 轮询主路径（前端另由代理加 HTTP 轮询 + WS fallback）。
+/// 直接复用 [`crate::data_plane::ws::collect_status`]：内部已用后台 stats_snapshot
+/// 纯组装、JSON 构造放 spawn_blocking，handler 不在 API 线程做任何 DB/全量克隆。
+/// 输出含 `node_repo.tier` / `peer_repo.tier` / `infohash_repo.tier` / `tracker_repo.tier`
+/// 等嵌套冷热分层结构（面板 tier 所需）。
+async fn status_handler(State(state): State<AppState>) -> Response {
+    let data = crate::data_plane::ws::collect_status(&state).await;
+    Json(data).into_response()
 }
 
 /// 主动发现 peer
@@ -768,35 +759,42 @@ async fn peer_history_handler(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    match state.storage.query_peer_history(&infohash, 100) {
-        Ok(history) => {
-            #[derive(Serialize)]
-            struct PeerHistoryItem {
-                ip: String,
-                port: u16,
-                source: String,
-                score: f64,
-                discovered_at: i64,
+    // SQLite 查询移到 blocking 线程：避免 API worker 被 DB 读阻塞（历史事故：DB 调用钉死 api_runtime）
+    let storage = state.storage.clone();
+    let history =
+        match tokio::task::spawn_blocking(move || storage.query_peer_history(&infohash, 100)).await
+        {
+            Ok(Ok(history)) => history,
+            Ok(Err(e)) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
-            let items: Vec<PeerHistoryItem> = history
-                .into_iter()
-                .map(|h| PeerHistoryItem {
-                    ip: h.ip,
-                    port: h.port,
-                    source: h.source,
-                    score: h.score,
-                    discovered_at: h.discovered_at,
-                })
-                .collect();
-            Json(serde_json::json!({
-                "infohash": infohash_hex,
-                "count": items.len(),
-                "peers": items,
-            }))
-            .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+    #[derive(Serialize)]
+    struct PeerHistoryItem {
+        ip: String,
+        port: u16,
+        source: String,
+        score: f64,
+        discovered_at: i64,
     }
+    let items: Vec<PeerHistoryItem> = history
+        .into_iter()
+        .map(|h| PeerHistoryItem {
+            ip: h.ip,
+            port: h.port,
+            source: h.source,
+            score: h.score,
+            discovered_at: h.discovered_at,
+        })
+        .collect();
+    Json(serde_json::json!({
+        "infohash": infohash_hex,
+        "count": items.len(),
+        "peers": items,
+    }))
+    .into_response()
 }
 
 /// 统计历史查询
@@ -804,30 +802,38 @@ async fn stats_history_handler(
     State(state): State<AppState>,
     Path(metric): Path<String>,
 ) -> Response {
-    match state.storage.query_stats_history(&metric, 24) {
-        Ok(points) => {
-            #[derive(Serialize)]
-            struct StatsPoint {
-                timestamp: i64,
-                value: f64,
+    // SQLite 查询移到 blocking 线程：避免 API worker 被 DB 读阻塞
+    let storage = state.storage.clone();
+    let metric_q = metric.clone();
+    let points =
+        match tokio::task::spawn_blocking(move || storage.query_stats_history(&metric_q, 24)).await
+        {
+            Ok(Ok(points)) => points,
+            Ok(Err(e)) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
-            let items: Vec<StatsPoint> = points
-                .into_iter()
-                .map(|(ts, val)| StatsPoint {
-                    timestamp: ts,
-                    value: val,
-                })
-                .collect();
-            Json(serde_json::json!({
-                "metric": metric,
-                "hours": 24,
-                "count": items.len(),
-                "points": items,
-            }))
-            .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+    #[derive(Serialize)]
+    struct StatsPoint {
+        timestamp: i64,
+        value: f64,
     }
+    let items: Vec<StatsPoint> = points
+        .into_iter()
+        .map(|(ts, val)| StatsPoint {
+            timestamp: ts,
+            value: val,
+        })
+        .collect();
+    Json(serde_json::json!({
+        "metric": metric,
+        "hours": 24,
+        "count": items.len(),
+        "points": items,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -853,6 +859,42 @@ mod tests {
     fn test_parse_infohash_invalid_hex() {
         let result = parse_infohash(&"g".repeat(40));
         assert!(result.is_err());
+    }
+
+    // ---- E7：/api/v1/status 关键字段契约（面板 tier 数据）----
+    // 说明：完整端点集成测试需要构造 AppState（SQLite + 全部 Repo + EventBus），
+    // 当前 rest_api 测试基建无此装配（既有 3 个测试均为 parse_infohash 纯函数），
+    // 故此处只对面板依赖的 tier 数据结构做纯序列化契约测试。
+    // collect_status 的兜底逻辑（超时/join 失败回退 LAST_STATUS_DATA）依赖 tokio
+    // 运行时与全局静态缓存，同样无法在无 AppState 下单测，见交付报告。
+
+    #[test]
+    fn repo_tier_stats_serializes_to_panel_shape() {
+        // 面板 tier 需要 {total, hot, warm, cold} 四元组；序列化名必须稳定。
+        let tier = RepoTierStats {
+            total: 10_000,
+            hot: 200,
+            warm: 300,
+            cold: 9_500,
+        };
+        let v = serde_json::to_value(&tier).expect("RepoTierStats 应可序列化");
+        assert_eq!(v["total"], 10_000);
+        assert_eq!(v["hot"], 200);
+        assert_eq!(v["warm"], 300);
+        assert_eq!(v["cold"], 9_500);
+        // 四个键缺一不可（前端按这四个键渲染 tier 分层）
+        for k in ["total", "hot", "warm", "cold"] {
+            assert!(v.get(k).is_some(), "RepoTierStats 缺少键 {}", k);
+        }
+    }
+
+    #[test]
+    fn repo_tier_cold_is_total_minus_hot_warm() {
+        // 与 stats_snapshot::collect_stats 中 RepoTierStats 的 cold 推导一致：
+        // cold = total - hot - warm（饱和减法）。
+        let (total, hot, warm) = (5000u64, 100usize, 200usize);
+        let cold = total.saturating_sub(hot as u64).saturating_sub(warm as u64);
+        assert_eq!(cold, 4700);
     }
 }
 
@@ -923,10 +965,27 @@ async fn federation_status_handler(State(state): State<AppState>) -> Response {
         }
     };
 
-    // F9: 统计字段以 DB 为唯一权威口径（内存 repo = 热/温子集）。
-    // total = 冷 DB 有效行数（deleted_at IS NULL）+ 内存未落库部分；hot_* = 纯内存计数。
-    let db_counts = state.storage.entity_counts_cached();
-    status.node_repo_total = (db_counts[0].max(0) as u64)
+    // 新口径（2026-09-30）：API 线程零 DB 接触——本 handler 不再引用 state.storage，
+    // 杜绝 entity_counts_cached() 在读池耗尽时回退抢全局写锁（曾致 /federation/status 4s+ 超时）。
+    // *_total = 后台 stats_snapshot 维护的 DB 总行数（count_table = 表总行数，含软删墓碑，
+    // 与旧 entity_counts 的"有效行"口径有微小差异：软删行会多计入；peer_repo_total 相比旧口径
+    // 缺少 peers_archive 部分，因无内存侧来源）+ 内存原子增量（write_queue_len = 未落库部分）；
+    // hot_total / active 为纯内存计数。快照字段缺失时用各 repo 内存原子读兜底，字段永不缺省。
+    let snap = state.stats_snapshot.get();
+
+    // node_repo_total = 快照 DB 总行数 + 未落库增量；快照 None 则 stats_sync().total 兜底
+    let node_db_total = snap
+        .node_repo_metrics
+        .as_ref()
+        .map(|m| m.tier.total)
+        .unwrap_or_else(|| {
+            state
+                .node_repo
+                .as_ref()
+                .map(|r| r.stats_sync().total as u64)
+                .unwrap_or(0)
+        });
+    status.node_repo_total = node_db_total
         + state
             .node_repo
             .as_ref()
@@ -937,23 +996,40 @@ async fn federation_status_handler(State(state): State<AppState>) -> Response {
         .as_ref()
         .map(|r| r.len_sync() as u64)
         .unwrap_or(0);
-    status.peer_repo_total = (db_counts[1].max(0) as u64) + (db_counts[2].max(0) as u64);
+
+    // peer_repo_total = 快照 DB 总行数（peers 表）；快照 None 则内存 peer_repo.len() 兜底
+    status.peer_repo_total = snap
+        .peer_repo_metrics
+        .as_ref()
+        .map(|m| m.tier.total)
+        .unwrap_or_else(|| state.peer_repo.len() as u64);
     status.peer_repo_hot_total = state.peer_repo.len() as u64;
-    // 计算活跃 peer 数（最近1小时内有活跃）
-    {
-        let all = state.peer_repo.all_peers_sync();
-        let now = std::time::SystemTime::now();
-        status.peer_repo_active = all
-            .iter()
-            .filter(|p| {
-                now.duration_since(p.last_active)
-                    .map(|d| d.as_secs() < 3600)
-                    .unwrap_or(false)
-            })
-            .count() as u64;
-    }
-    status.infohash_repo_total = db_counts[3].max(0) as u64;
-    status.tracker_repo_total = db_counts[4].max(0) as u64;
+    // 活跃 peer 数（近 1h）：O(1) 原子读，PeerRepo 记账维护 + 后台 60s sweep 兜底
+    status.peer_repo_active = state.peer_repo.active_1h_count();
+
+    // infohash / tracker 总行数：快照优先，None 时 count_sync() 内存原子兜底
+    status.infohash_repo_total = snap
+        .infohash_repo_metrics
+        .as_ref()
+        .map(|m| m.tier.total)
+        .unwrap_or_else(|| {
+            state
+                .infohash_repo
+                .as_ref()
+                .map(|r| r.count_sync() as u64)
+                .unwrap_or(0)
+        });
+    status.tracker_repo_total = snap
+        .tracker_repo_metrics
+        .as_ref()
+        .map(|m| m.tier.total)
+        .unwrap_or_else(|| {
+            state
+                .tracker_repo
+                .as_ref()
+                .map(|r| r.count_sync() as u64)
+                .unwrap_or(0)
+        });
 
     Json(status).into_response()
 }
@@ -963,67 +1039,82 @@ async fn federation_nodes_handler(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    match &state.federation {
-        Some(fed) => {
-            let limit: usize = params
-                .get("limit")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(50);
-            let snapshot = fed.snapshot();
-            let total = snapshot.nodes.len();
-            let nodes: Vec<_> = snapshot.nodes.into_iter().take(limit).collect();
-            Json(serde_json::json!({
-                "total": total,
-                "returned": nodes.len(),
-                "nodes": nodes,
-            }))
-            .into_response()
+    let fed = match &state.federation {
+        Some(fed) => fed.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "federation not enabled" })),
+            )
+                .into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "federation not enabled" })),
-        )
-            .into_response(),
-    }
+    };
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    // fed.snapshot() 内部 clone 全量 node_table（known nodes 可能上千），放 blocking 线程
+    let snapshot = match tokio::task::spawn_blocking(move || fed.snapshot()).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let total = snapshot.nodes.len();
+    let nodes: Vec<_> = snapshot.nodes.into_iter().take(limit).collect();
+    Json(serde_json::json!({
+        "total": total,
+        "returned": nodes.len(),
+        "nodes": nodes,
+    }))
+    .into_response()
 }
 
 /// 联邦连接列表
 async fn federation_connections_handler(State(state): State<AppState>) -> Response {
-    match &state.federation {
-        Some(fed) => {
-            let snapshot = fed.snapshot();
-            Json(serde_json::json!({
-                "count": snapshot.connections.len(),
-                "connections": snapshot.connections,
-            }))
-            .into_response()
+    let fed = match &state.federation {
+        Some(fed) => fed.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "federation not enabled" })),
+            )
+                .into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "federation not enabled" })),
-        )
-            .into_response(),
-    }
+    };
+    // fed.snapshot() 内部 clone 全量 node_table，放 blocking 线程
+    let snapshot = match tokio::task::spawn_blocking(move || fed.snapshot()).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    Json(serde_json::json!({
+        "count": snapshot.connections.len(),
+        "connections": snapshot.connections,
+    }))
+    .into_response()
 }
 
 /// 联邦同步统计 + 中继统计 + metrics
 async fn federation_sync_stats_handler(State(state): State<AppState>) -> Response {
-    match &state.federation {
-        Some(fed) => {
-            let snapshot = fed.snapshot();
-            Json(serde_json::json!({
-                "sync_stats": snapshot.sync_stats,
-                "relay_stats": snapshot.relay_stats,
-                "metrics": snapshot.status.metrics,
-            }))
-            .into_response()
+    let fed = match &state.federation {
+        Some(fed) => fed.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "federation not enabled" })),
+            )
+                .into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "federation not enabled" })),
-        )
-            .into_response(),
-    }
+    };
+    // fed.snapshot() 内部 clone 全量 node_table，放 blocking 线程
+    let snapshot = match tokio::task::spawn_blocking(move || fed.snapshot()).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    Json(serde_json::json!({
+        "sync_stats": snapshot.sync_stats,
+        "relay_stats": snapshot.relay_stats,
+        "metrics": snapshot.status.metrics,
+    }))
+    .into_response()
 }
 
 /// P2-3：同步面可观测性（P1-2/P1-3/P1-4/P2-1 的运维观测点）。
@@ -1032,14 +1123,22 @@ async fn federation_sync_stats_handler(State(state): State<AppState>) -> Respons
 /// 未完成的 bootstrap 进度（`{phase, chunks_done/total, bytes, eta 由 ratio 推得}`）、
 /// range 反熵访问区间数（`reconcile_nodes_visited`）与各开关状态。
 async fn federation_sync_observability_handler(State(state): State<AppState>) -> Response {
-    match &state.federation {
-        Some(fed) => Json(fed.sync_observability()).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "federation not enabled" })),
-        )
-            .into_response(),
-    }
+    let fed = match &state.federation {
+        Some(fed) => fed.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "federation not enabled" })),
+            )
+                .into_response()
+        }
+    };
+    // sync_observability 内部读 oplog（SQLite），放 blocking 线程
+    let value = match tokio::task::spawn_blocking(move || fed.sync_observability()).await {
+        Ok(value) => value,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    Json(value).into_response()
 }
 
 /// 手动触发与指定已连接节点建立联邦中继通道（运维/验证用）。

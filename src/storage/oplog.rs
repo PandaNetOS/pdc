@@ -226,9 +226,10 @@ impl super::db::Storage {
         let mut last = since_seq;
         while out.len() < limit {
             let shard = SHARD_ROWS.min(limit - out.len());
-            let rows: Vec<OpRecord> = {
-                let conn = self.connection();
-                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            // G1：分片读取改走读连接池（WAL 只读连接不抢全局写锁）。
+            // 每片借一条读连接、闭包结束由 PoolReturn RAII 归还（panic 也归还）；
+            // 池空（内存库/极端耗尽）由 read() 回退写连接。片间 sleep 保留（见下）。
+            let rows: Vec<OpRecord> = self.read(|conn| -> anyhow::Result<Vec<OpRecord>> {
                 let mut stmt = if repo == u8::MAX {
                     conn.prepare(
                         "SELECT seq, op, repo, key, value, version, ts_ms, origin FROM feed_oplog \
@@ -261,8 +262,8 @@ impl super::db::Storage {
                 for r in rows {
                     v.push(r?);
                 }
-                v
-            }; // ← 锁在此 drop
+                Ok(v)
+            })?; // ← 读连接在此归还读池（PoolReturn Drop）
             if rows.is_empty() {
                 break;
             }
@@ -272,7 +273,9 @@ impl super::db::Storage {
             if !full_shard {
                 break;
             }
-            // 片间让锁：给 apply / API 一个窗口（短 sleep，非周期热路径）
+            // 片间让出：读连接已归还读池，此处短 sleep 仅为避免频繁轮询 DB（非周期热路径），
+            // 语义与改造前一致——原设计是「释放写锁给 apply/API」，现在读路径本就不占写锁，
+            // sleep 保留以防对慢盘高频分片查询造成压力。
             std::thread::sleep(std::time::Duration::from_millis(SHARD_YIELD_MS));
         }
         Ok(out)
@@ -280,12 +283,14 @@ impl super::db::Storage {
 
     /// 当前最大 seq（无记录时 0）。
     pub fn oplog_max_seq(&self) -> anyhow::Result<i64> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM feed_oplog", [], |r| {
-            r.get(0)
-        })?;
-        Ok(v)
+        // G1：只读 MAX(seq) 走读连接池，不抢写锁。
+        self.read(|conn| -> anyhow::Result<i64> {
+            Ok(
+                conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM feed_oplog", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
     }
 
     /// 指定 repo 的最大 seq（该 repo 最后一条变更的 seq；该 repo 无记录时 0）。
@@ -294,24 +299,26 @@ impl super::db::Storage {
     /// （`delta_peer_seq(peer, repo)`），因此「落后量」必须与同一 repo 的水位相减，
     /// 否则 op 稀疏的 repo 会虚高（F2）。走 `idx_feed_oplog_repo_seq(repo, seq)` 索引。
     pub fn oplog_max_seq_for_repo(&self, repo: u8) -> anyhow::Result<i64> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM feed_oplog WHERE repo = ?1",
-            params![repo as i64],
-            |r| r.get(0),
-        )?;
-        Ok(v)
+        // G1：只读 MAX(seq) 走读连接池，不抢写锁（走 idx_feed_oplog_repo_seq 索引）。
+        self.read(|conn| -> anyhow::Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM feed_oplog WHERE repo = ?1",
+                params![repo as i64],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// 最小 seq（无记录时 0）。
     pub fn oplog_min_seq(&self) -> anyhow::Result<i64> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: i64 = conn.query_row("SELECT COALESCE(MIN(seq), 0) FROM feed_oplog", [], |r| {
-            r.get(0)
-        })?;
-        Ok(v)
+        // G1：只读 MIN(seq) 走读连接池，不抢写锁。
+        self.read(|conn| -> anyhow::Result<i64> {
+            Ok(
+                conn.query_row("SELECT COALESCE(MIN(seq), 0) FROM feed_oplog", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
     }
 
     /// 指定 repo 的最小 seq（保留窗口内该 repo 最早一条变更；无记录时 0）。
@@ -319,14 +326,14 @@ impl super::db::Storage {
     /// v8 F1：协商消息按 repo 上报水位；min_seq 供对端判断欠账是否仍在保留窗口内
     ///（可 delta 续拉）还是已被裁剪（必须 bootstrap）。走 `idx_feed_oplog_repo_seq` 索引。
     pub fn oplog_min_seq_for_repo(&self, repo: u8) -> anyhow::Result<i64> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: i64 = conn.query_row(
-            "SELECT COALESCE(MIN(seq), 0) FROM feed_oplog WHERE repo = ?1",
-            params![repo as i64],
-            |r| r.get(0),
-        )?;
-        Ok(v)
+        // G1：只读 MIN(seq) 走读连接池，不抢写锁（走 idx_feed_oplog_repo_seq 索引）。
+        self.read(|conn| -> anyhow::Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COALESCE(MIN(seq), 0) FROM feed_oplog WHERE repo = ?1",
+                params![repo as i64],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// 裁剪 `ts_ms < older_than_ms` 的 op，返回删除条数。
@@ -390,10 +397,12 @@ impl super::db::Storage {
         if cached >= 0 {
             return Ok(cached as u64);
         }
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: i64 = conn.query_row("SELECT COUNT(*) FROM feed_oplog", [], |r| r.get(0))?;
-        drop(conn);
+        // G1：冷缓存 COUNT(*) 校准改走读连接池（大表慢盘上可能数十秒，走读池不抢写锁、
+        // 不阻塞业务写路径）。WAL 快照隔离下读到的是某一已提交版本的一致快照；校准发生在
+        // 启动预热阶段（写流量尚未起来），此后由 bump_oplog_len 在写/裁剪点增量维护。
+        let v: i64 = self.read(|conn| -> anyhow::Result<i64> {
+            Ok(conn.query_row("SELECT COUNT(*) FROM feed_oplog", [], |r| r.get(0))?)
+        })?;
         self.oplog_len_cache.store(v, Ordering::Relaxed);
         Ok(v.max(0) as u64)
     }
@@ -418,14 +427,16 @@ impl super::db::Storage {
     /// v9：本机某 repo 的「最小对端已确认位点」（所有对端 ack 的最小值）。
     /// 无任何对端记录时返回 `None`（表示无 floor，退化为纯时间裁剪）。
     pub fn peer_ack_floor(&self, repo: u8) -> anyhow::Result<Option<i64>> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: Option<i64> = conn.query_row(
-            "SELECT MIN(acked_seq) FROM oplog_peer_ack WHERE repo = ?1",
-            params![repo as i64],
-            |r| r.get(0),
-        )?;
-        Ok(v)
+        // G1：只读 MIN(acked_seq) 走读连接池，不抢写锁。
+        // 注意：trim_oplog_guarded 在拿写连接 DELETE 之前先逐 repo 调本方法取 floor，
+        // 读连接与后续写连接互不阻塞（WAL 读写不互斥）。
+        self.read(|conn| -> anyhow::Result<Option<i64>> {
+            Ok(conn.query_row(
+                "SELECT MIN(acked_seq) FROM oplog_peer_ack WHERE repo = ?1",
+                params![repo as i64],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// 按保留窗口（秒）裁剪 oplog。`retention_secs = 0` 时不做任何裁剪。

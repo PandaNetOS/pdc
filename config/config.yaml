@@ -112,6 +112,9 @@ federation:
   peer_cache_enabled: true
   peer_cache_max_nodes: 100
   transport_write_timeout_secs: 5
+  # Range 块/键批量发送超时（秒）。bootstrap 块发送走 bootstrap_chunk_timeout_secs；
+  # 消息型（心跳/协商/控制）发送走 transport_write_timeout_secs。
+  range_send_timeout_secs: 30
   gossip_max_consecutive_failures: 3
   reconnect_cooldown_secs: 30
   heavy_task_max_concurrency: 8

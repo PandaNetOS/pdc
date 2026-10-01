@@ -48,7 +48,7 @@ use crate::federation::node_id::{NodeId, NodeIdentity, Reachability};
 use crate::federation::node_table::{NodeStatus, NodeTable};
 use crate::federation::peer_caps::{PeerCaps, PeerCapsTable};
 use crate::federation::peer_conn::PeerConn;
-use crate::federation::protocol::{HelloMessage, MessageType, HELLO_PROTOCOL_VERSION};
+use crate::federation::protocol::{HelloMessage, MessageType, PingMessage, HELLO_PROTOCOL_VERSION};
 
 /// 握手超时（与旧 `ConnectionManager::HANDSHAKE_TIMEOUT` 等值迁移）
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -323,15 +323,22 @@ impl PeerAuthenticator for FederationAuthenticator {
         self.adopt_addresses(&hello);
 
         // 入站次优路径（NAT 回环）检测：对端本可局域网直连，却走了网关回环。
-        // node_table 已通过 adopt 存入对端 Lan 地址；此处拒绝该连接，
-        // 连接维护任务（connection_maintainer_tick）会用 Lan 地址主动重连。
+        //
+        // 2026-09-30 决策：此处由「拒绝」改为「放行（降级标记）」。
+        // 背景：对端经公网地址连入时，其 TCP 源 IP 被对端侧 NAT 网关改写为网关内网地址
+        // （典型：对端 192.168.30.52 经公网 183.159.108.161:6885 连入，源被改写成
+        // 192.168.30.10）。旧实现 bail 拒绝并引导对端走 Lan 重连，但对端最终发起地址由其
+        // SDK 连接引擎决定，pdc 仓内无法可靠控制（endpoint fail_count 写入在外部 crate
+        // pnos-sdk peer_cache.rs），导致对端反复从公网重连 → 会话反复重建 → 清单重建风暴
+        // （实测 ~44 次/天）。回环路径 TCP 可达、链路稳定，故会话稳定优先于路径最优：
+        // 检测命中后不再 bail，直接放行，仅记 warn 作为降级标记；
+        // 后续可配合地址选择改进，让对端主动切到 Lan 直连。
         if let Some(peer_addr) = io.peer_addr() {
             if let Some(lan_addr) = self.detect_suboptimal_path(peer_addr, &hello) {
                 warn!(
-                    "[federation] 入站连接走了次优路径（NAT 回环）：当前源={}，对端局域网地址={}，拒绝并等待局域网重连",
+                    "[federation] 入站连接走了次优路径（NAT 回环）：放行（降级标记），当前源={}，对端局域网地址={}",
                     peer_addr, lan_addr
                 );
-                anyhow::bail!("入站次优路径，需局域网重连至 {}", lan_addr);
             }
         }
 
@@ -418,6 +425,12 @@ impl PeerPolicy for FederationPolicy {
 ///
 /// `listen` 为 `false` 时不监听入站（供 G4 适配期使用；切换期由 SDK 独占端口）。
 pub fn session_config_from(config: &FederationConfig, listen: bool) -> SessionConfig {
+    // C2（2026-09-30 实证）：51 侧 90s / 52 侧 30s 的旧 idle_timeout 会对 bootstrap / range
+    // 长任务会话误杀——这类会话在大块 DB 落盘 / 区间对账期间线上长时间静默，实测 108s /
+    // 318s 才被断（空闲检查周期 + 保活应答把实际断开拖长于配置值）。
+    // 配置侧代理已把 `heartbeat_timeout_secs` 默认值提高到 600s 作为全局兜底；
+    // 本侧再叠加会话级豁免（见 [`FederationSessions::tick`] 的在途协议请求空闲豁免），
+    // 双保险避免长任务会话被空闲回收误杀。
     let idle_timeout = Duration::from_secs(config.heartbeat_timeout_secs);
     // 保活探测间隔：取空闲超时的 1/3。
     // - 下限 `MIN_HEARTBEAT_INTERVAL` 避免探测过密；
@@ -498,6 +511,31 @@ pub fn validate_heartbeat_pacing(
 // 薄转发门面
 // ---------------------------------------------------------------------------
 
+/// G3 会话级空闲豁免判定（纯逻辑，可单测）。
+///
+/// 返回 `true` 表示：该会话已接近空闲回收线，且对端正持有**在途协议请求**
+/// （bootstrap / delta / range 等长任务），本轮应**豁免**空闲回收
+/// （保活续命、跳过断开，下次 tick 再判）。
+///
+/// 判据：
+/// - 对端无在途协议请求 → 不豁免，按 SDK 正常空闲回收；
+/// - 对端有在途协议请求且空闲已达回收线的一半 → 豁免（留足 Pong 回程余量，
+///   避免恰好卡在 `idle_limit` 上时本轮已被 SDK 回收）。
+///
+/// G3 扩展：豁免对象由 C1 的「仅 bootstrap 在途」放宽为「任意在途协议请求」。
+/// `inflight_active` 由 [`FederationSessions::tick`] 预扫算出——只要该对端正持有任一
+/// 在途长任务（bootstrap 通道精确 per-peer 覆盖；delta/range 在途期由全局
+/// `heartbeat_timeout_secs=600s` 兜底，见 tick 注释）即置 `true`。
+///
+/// 与 [`FederationSessions::tick`] 的预扫配合：纯函数不触碰网络/注册表，故可在单测里
+/// 覆盖阈值与在途开关的全部组合。
+fn idle_exempt_for_inflight_work(idle_ms: u64, idle_limit_ms: u64, inflight_active: bool) -> bool {
+    if !inflight_active || idle_limit_ms == 0 {
+        return false;
+    }
+    idle_ms.saturating_mul(2) >= idle_limit_ms
+}
+
 /// 联邦会话门面（**无状态**，只转发到 SDK + 能力表）
 ///
 /// 设计决定 K1：保留一个薄适配器而非让 80+ 调用点直连 SDK——
@@ -507,6 +545,9 @@ pub struct FederationSessions {
     mgr: Arc<SessionManager>,
     caps: Arc<PeerCapsTable>,
     metrics: Arc<crate::federation::metrics::FederationMetrics>,
+    /// 会话空闲超时（由 [`session_config_from`] 映射而来）。
+    /// G3：会话级「任意在途协议请求」空闲豁免据此判定「哪些会话即将被 SDK 空闲回收」。
+    idle_timeout: Duration,
 }
 
 impl FederationSessions {
@@ -514,8 +555,14 @@ impl FederationSessions {
         mgr: Arc<SessionManager>,
         caps: Arc<PeerCapsTable>,
         metrics: Arc<crate::federation::metrics::FederationMetrics>,
+        idle_timeout: Duration,
     ) -> Self {
-        Self { mgr, caps, metrics }
+        Self {
+            mgr,
+            caps,
+            metrics,
+            idle_timeout,
+        }
     }
 
     /// 底层 `SessionManager`（调度注册、事件订阅用）
@@ -549,7 +596,43 @@ impl FederationSessions {
     }
 
     /// 心跳探测（轻量：仅保活 + 空闲回收，不含补链）
+    ///
+    /// G3：先于 SDK 的空闲回收分支做一次「任意在途协议请求空闲豁免」预扫
+    /// （C1 原为「仅 bootstrap 在途」，G3 放宽为 bootstrap/delta/range 等任意在途长任务）。
+    /// SDK 的空闲回收在 `mgr.tick()` 内部（pnos-net session/heartbeat.rs：`idle_ms >
+    /// idle_timeout` 即断开），pdc 无法对单条会话注入豁免谓词；本层在 SDK 回收前，对
+    /// 已接近回收线、但对端正持有在途长任务的会话，主动发一个零载荷 Ping
+    /// 逼出对端 SDK 的 Pong——Pong 到达即触发接收循环 `touch_recv` 刷新 `last_recv_ms`，
+    /// 使 SDK 本轮不再判它空闲超时。在途任务结束后豁免自然失效，会话回落到正常回收。
+    ///
+    /// 覆盖口径（连接层可观测的在途信号）：
+    /// - **bootstrap**：channels_status 通道记录 per-peer `active + peer_id`（发送/接收
+    ///   方向都写），[`crate::federation::sync::has_active_bootstrap_work`] 精确判定；
+    /// - **delta / range**：其在途游标（`delta_inflight` / `range_progress`）在 sync 模块
+    ///   私有、连接层无访问器，channels_status 的 delta/range 通道仅镜像累计计数、无
+    ///   per-peer 在途位。故 delta/range 在途期的 per-peer 精确豁免本层接不到信号，
+    ///   由全局 `heartbeat_timeout_secs=600s`（配置已对齐）兜底——零进展期间会话最多空闲
+    ///   600s 才被回收，远超 delta watchdog / range 续跑周期。后续如需 per-peer 精确豁免，
+    ///   应在 sync 模块补一个 `pub(crate)` 在途谓词并在此 OR 进来。
     pub async fn tick(&self) {
+        let idle_limit_ms = self.idle_timeout.as_millis() as u64;
+        for info in self.mgr.sessions() {
+            let peer = from_sdk_node_id(info.peer_id);
+            // G3：在途协议请求判定——bootstrap per-peer 精确覆盖；delta/range 由全局 600s 兜底。
+            let inflight_active = crate::federation::sync::has_active_bootstrap_work(&peer);
+            if idle_exempt_for_inflight_work(info.idle_ms, idle_limit_ms, inflight_active) {
+                debug!(
+                    "[federation] 空闲豁免：{} 有在途协议请求（bootstrap/delta/range 长任务，\
+                     idle={}ms/{}ms），本轮跳过空闲断开并保活续命，下次 tick 再判",
+                    peer, info.idle_ms, idle_limit_ms
+                );
+                // 逼出 Pong 刷新 idle（best-effort；发送失败不影响后续 SDK tick）。
+                // Ping(kind=2) 即 SDK 保活探测帧，对端 SDK 内部消化并自动回 Pong。
+                let _ = self
+                    .send_to(&peer, MessageType::Ping, &PingMessage { timestamp: 0 })
+                    .await;
+            }
+        }
         self.mgr.tick().await;
     }
 
@@ -634,8 +717,16 @@ impl FederationSessions {
     // ---------------------------------------------------------------
 
     /// 当前活跃会话数（对应旧 `connection_count()`）
+    ///
+    /// 2026-09-30 B2（连接数真实化）：改为读实时注册表快照 `mgr.sessions().len()`，
+    /// 与 `/federation/connections`（[`Self::connections`] / [`Self::active_peers`]）同源。
+    ///
+    /// 旧实现读 `mgr.stats().active`（SDK 内部 established−closed 的事件累加）。该计数仅在
+    /// debug 构建下由 `debug_assert!` 自检一致性；release 构建下一旦出现"会话被静默摘出注册表
+    /// 却未 record_closed"的路径，累加值就会高于注册表真实长度（实证：面板显示 7，registry
+    /// 实际 2 条）。注册表 `len` 是事实来源，不随事件计数漂移，故此处直接以它为准。
     pub fn connection_count(&self) -> usize {
-        self.mgr.stats().active as usize
+        self.mgr.sessions().len()
     }
 
     /// 事件驱动的生命周期计数快照（established / closed / active 满足恒等）
@@ -939,15 +1030,17 @@ pub async fn bind_federation_sessions(
     ));
     let policy: Arc<dyn PeerPolicy> =
         Arc::new(FederationPolicy::new(node_table, config.max_connections));
+    let session_cfg = session_config_from(config, listen);
+    let idle_timeout = session_cfg.idle_timeout;
     let mgr = SessionManager::bind(
         to_sdk_node_id(local_id),
-        session_config_from(config, listen),
+        session_cfg,
         net_agent,
         auth,
         policy,
     )
     .await?;
-    Ok(FederationSessions::new(mgr, caps, metrics))
+    Ok(FederationSessions::new(mgr, caps, metrics, idle_timeout))
 }
 
 #[cfg(test)]
@@ -1119,6 +1212,62 @@ mod tests {
             .expect("默认配置 + idle/3 调度周期应通过校验");
     }
 
+    // ------------------------------------------------------------------
+    // G3：会话级「任意在途协议请求」空闲豁免判定（纯逻辑，全分支覆盖）。
+    // 实际保活 nudge 在 FederationSessions::tick 里发 Ping→Pong，需网络栈无法单测；
+    // 此处只覆盖「是否豁免」的纯判定（inflight_active 由 tick 预扫 bootstrap/delta/range
+    // 在途信号后给出，本纯函数只负责阈值半线判定）。
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_idle_exempt_requires_inflight_work() {
+        // 对端无在途协议请求 → 无论多空闲都不豁免，按 SDK 正常回收。
+        let limit = 600_000u64;
+        for idle in [0u64, 1, limit / 2, limit, limit + 10_000] {
+            assert!(
+                !idle_exempt_for_inflight_work(idle, limit, false),
+                "对端空闲时 idle={}ms 不应豁免",
+                idle
+            );
+        }
+    }
+
+    #[test]
+    fn test_idle_exempt_zero_limit_is_noop() {
+        // 边界：回收线为 0（未配置）时不得豁免，防除零/误判。
+        assert!(!idle_exempt_for_inflight_work(100, 0, true));
+    }
+
+    #[test]
+    fn test_idle_exempt_threshold_boundary() {
+        // 回收线 600s：对端有在途协议请求时，
+        // - idle < 300s（线的一半）→ 尚未到「即将被回收」区间，不豁免（正常保活即可）；
+        // - idle >= 300s（含边界恰好一半）→ 豁免，保活续命。
+        let limit = 600_000u64;
+        assert!(
+            !idle_exempt_for_inflight_work(299_999, limit, true),
+            "差 1ms 不到一半不应豁免"
+        );
+        assert!(
+            idle_exempt_for_inflight_work(300_000, limit, true),
+            "恰好一半应豁免（边界含）"
+        );
+        assert!(
+            idle_exempt_for_inflight_work(limit, limit, true),
+            "已达回收线必豁免"
+        );
+        assert!(
+            idle_exempt_for_inflight_work(limit + 60_000, limit, true),
+            "超过回收线仍豁免续命"
+        );
+    }
+
+    #[test]
+    fn test_idle_exempt_saturating_never_panics() {
+        // 极大 idle 不得因乘法溢出 panic（saturating）。
+        assert!(idle_exempt_for_inflight_work(u64::MAX, 600_000, true));
+    }
+
     #[test]
     fn test_sessions_handle_starts_unbound() {
         let h = SessionsHandle::new();
@@ -1137,5 +1286,77 @@ mod tests {
         let h = SessionsHandle::new();
         assert!(h.current().is_none());
         assert!(!h.is_ready());
+    }
+
+    // ------------------------------------------------------------------
+    // 修复4：NAT 回环入站路径检测（detect_suboptimal_path）三场景。
+    //
+    // 说明：放行行为本身发生在 authenticate_inbound 调用点（命中后不再 bail、
+    // 直接 Ok 完成握手），该路径需要 SDK 的 FrameTransport 网络栈，无法在纯单测里
+    // 构造；此处覆盖其判定函数的三场景语义，放行/no-bail 由调用点 diff 代码审查保证。
+    // ------------------------------------------------------------------
+
+    /// 构造一个仅含指定 Lan 地址的 HelloMessage。
+    /// detect_suboptimal_path 只读 hello.addresses，签名/时间戳/nonce 等置零即可。
+    fn hello_with_lan_addr(lan: SocketAddr) -> HelloMessage {
+        HelloMessage {
+            node_id: [0x62u8; 20],
+            public_key: [0u8; 32],
+            addresses: vec![crate::federation::node_id::NodeAddress {
+                node_id: [0x62u8; 20],
+                ipv4_addr: Some(lan),
+                ipv6_addr: None,
+                reachability: Reachability::Unknown,
+                last_seen: 0,
+                nat_type: None,
+                endpoints: vec![],
+            }],
+            version: HELLO_PROTOCOL_VERSION,
+            is_relay: false,
+            timestamp_ms: 0,
+            nonce: [0u8; 16],
+            signature: [0u8; 64],
+        }
+    }
+
+    /// 构造一个仅用于调用 detect_suboptimal_path 的 authenticator 实例。
+    /// 该函数是纯函数（不触碰 identity / node_table / metrics），这里给空依赖即可。
+    fn test_authenticator() -> FederationAuthenticator {
+        FederationAuthenticator::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::new(NodeTable::new(1024)),
+            Arc::new(FederationMetrics::new()),
+        )
+    }
+
+    #[test]
+    fn test_detect_suboptimal_path_flags_nat_loopback_from_gateway() {
+        // 对端声明 Lan=192.168.30.52:6885，实际入站源是同 /24 的网关 192.168.30.10
+        // （NAT 回环改写）→ 应返回该 Lan 地址作为降级标记。
+        let auth = test_authenticator();
+        let lan: SocketAddr = "192.168.30.52:6885".parse().unwrap();
+        let hello = hello_with_lan_addr(lan);
+        let src: SocketAddr = "192.168.30.10:54321".parse().unwrap();
+        assert_eq!(auth.detect_suboptimal_path(src, &hello), Some(lan));
+    }
+
+    #[test]
+    fn test_detect_suboptimal_path_none_for_direct_lan_source() {
+        // 入站源就是对端声明的 Lan IP 本身 → 正常局域网直连，放行（None）。
+        let auth = test_authenticator();
+        let lan: SocketAddr = "192.168.30.52:6885".parse().unwrap();
+        let hello = hello_with_lan_addr(lan);
+        let src: SocketAddr = "192.168.30.52:54321".parse().unwrap();
+        assert_eq!(auth.detect_suboptimal_path(src, &hello), None);
+    }
+
+    #[test]
+    fn test_detect_suboptimal_path_none_for_public_source() {
+        // 入站源为公网 IP（与 Lan 不同 /24）→ 公网连入，放行（None）。
+        let auth = test_authenticator();
+        let lan: SocketAddr = "192.168.30.52:6885".parse().unwrap();
+        let hello = hello_with_lan_addr(lan);
+        let src: SocketAddr = "183.159.108.161:54321".parse().unwrap();
+        assert_eq!(auth.detect_suboptimal_path(src, &hello), None);
     }
 }

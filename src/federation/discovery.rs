@@ -786,8 +786,25 @@ impl DiscoveryService {
             }
 
             let msg = ExchangeNodesMessage { nodes };
-            if let Err(e) = conn.send_message(MessageType::ExchangeNodes, &msg).await {
-                debug!("[federation] PEX 交换发送失败 to {}: {}", conn.node_id, e);
+            // 对端 TCP 不消费时 send_message 写阻塞会挂起（实测 355s+ 占联邦槽位），
+            // 加 10s 超时释放槽位与 worker；超时记 warn 后自然 continue 下一个连接。
+            // [ALLOWED-HARDCODED: 对端不消费时的发送兜底超时，短超时是设计意图，非业务可调参数]
+            let send = tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                conn.send_message(MessageType::ExchangeNodes, &msg),
+            );
+            match send.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!("[federation] PEX 交换发送失败 to {}: {}", conn.node_id, e);
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "[federation] PEX 交换发送超时（10s），跳过 to {} (addr={:?})",
+                        conn.node_id,
+                        conn.addr()
+                    );
+                }
             }
         }
 
@@ -1053,5 +1070,30 @@ mod tests {
         let mut n = make_node_address(3, 6885);
         n.ipv4_addr = None;
         assert!(DiscoveryService::strip_local_addrs(&n, &my).is_some());
+    }
+
+    // ---- PEX 发送超时不 panic：语义回归 ----
+    //
+    // 生产代码 pex_exchange_tick 用 tokio::time::timeout(10s) 包裹 conn.send_message。
+    // 现有测试基建（SessionsHandle::new_for_test）构造不出 send_message 真正挂起的
+    // PeerConn（需对端 TCP 不消费的活会话），故这里用与生产完全一致的 timeout+match
+    // 结构，对一个永不完结的 future 施加 50ms 超时，断言命中超时分支且不 panic。
+    // 覆盖边界：验证的是"timeout 包裹 + match 三分支"的语义，而非真实网络发送路径。
+    #[tokio::test]
+    async fn test_pex_send_timeout_does_not_panic() {
+        use std::future::pending;
+        use std::time::Duration;
+
+        // 模拟对端 TCP 不消费时 send_message 写阻塞挂起（永不完结）。
+        let pending_send = async { pending::<anyhow::Result<()>>().await };
+
+        let out = tokio::time::timeout(Duration::from_millis(50), pending_send).await;
+        match out {
+            Ok(Ok(())) => panic!("超时分支应被命中，此处不应完成"),
+            Ok(Err(e)) => panic!("超时分支应被命中，此处不应返回发送错误: {e}"),
+            Err(_elapsed) => {
+                // 命中超时分支：这正是生产代码 warn! + continue 的路径。
+            }
+        }
     }
 }

@@ -84,6 +84,168 @@ const BOOTSTRAP_YIELD_HOLD_SECS: u64 = 300;
 /// 仍不写 Done，交由 resume/watchdog 继续推进。NODE/TRACKER 静态表保持严格全等校验。
 const BOOTSTRAP_LIVE_RELAXED_ROW_RATIO: f64 = 0.95;
 
+// ========================================================================
+// 核心运行时切片（2026-09-30）：bootstrap 发送端并发上限 / 发送超时 / per-peer 熔断 /
+// 内存反压联动。根因：52 内存峰值 6.5GB = bootstrap 发送 handler 无并发上限 +
+// send_message 无快速失败，对端 HDD 慢时已加载的 2 万行 SyncEntry 在任务中无限堆积。
+// 全部为进程级全局状态（与 channels_status 同模式），面板/内存监控直接读，无需改
+// io_scheduler 接口。
+// ========================================================================
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// A1/A4：当前在途（已加载 entries、尚未发送完成）的 bootstrap 发送任务数。
+static BOOTSTRAP_SEND_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// A2/面板：发送尝试累计（成功+失败），供面板算失败率。
+static BOOTSTRAP_SEND_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// A2/面板：发送失败累计（send_message Err 或超时）。
+static BOOTSTRAP_SEND_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// A4：内存反压联动 override —— >0 时在途上限取此值（内存超阈值时由 memory_monitor
+/// 置 1 把发送压到串行）；0 = 恢复使用配置值 `bootstrap_send_concurrency`。
+static BOOTSTRAP_SEND_CONCURRENCY_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+/// D1：range handler 执行体超时累计次数（计数落点：模块静态，面板可经可观测性读取）。
+static RANGE_HANDLER_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// A1：非阻塞地把 `counter` 从 `cur` CAS 到 `cur+1`，仅当 `cur < limit` 时成功。
+/// 这是「在途发送数」的有界获取：拿不到立即返回 false（调用方 NAK、不排队）。
+/// 抽成纯函数便于单测（生产用全局 `BOOTSTRAP_SEND_IN_FLIGHT`，测试用本地 AtomicUsize）。
+fn try_inc_bounded(counter: &AtomicUsize, limit: usize) -> bool {
+    let limit = limit.max(1);
+    let mut cur = counter.load(Ordering::Acquire);
+    loop {
+        if cur >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// A3：per-peer 发送熔断状态（纯数据，便于单测）。
+///
+/// 连续发送失败达阈值即熔断：新块请求直接 NAK("circuit open")；按
+/// [`bootstrap::backoff_delay`]（30s 基数、600s 封顶）做指数退避，退避到期后半开探测；
+/// 成功发送一次即整条清零。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SendCircuitState {
+    /// 连续发送失败次数（成功一次即归零）。
+    pub fails: u32,
+    /// 最近一次记录失败/熔断的时刻；据此按指数退避表决定半开探测时机。
+    pub marked_at: Option<Instant>,
+}
+
+impl SendCircuitState {
+    /// 记录一次发送失败：失败计数 +1，刷新标记时刻。
+    pub fn record_failure(&self, now: Instant) -> Self {
+        Self {
+            fails: self.fails.saturating_add(1),
+            marked_at: Some(now),
+        }
+    }
+    /// 发送成功：整条清零（解除熔断）。
+    ///
+    /// 仅测试用 —— 生产路径的成功清零走 `send_circuits().write().remove(&peer)`
+    /// （见 handle_bootstrap_chunk_request 发送成功分支），无需构造新状态。
+    #[cfg(test)]
+    pub fn record_success() -> Self {
+        Self {
+            fails: 0,
+            marked_at: None,
+        }
+    }
+    /// 当前是否仍处于熔断开放期：fails 达阈值且指数退避未到期。
+    pub fn is_open(&self, threshold: u32, now: Instant, base: Duration, max: Duration) -> bool {
+        if self.fails < threshold {
+            return false;
+        }
+        let Some(marked) = self.marked_at else {
+            return false;
+        };
+        let backoff = bootstrap::backoff_delay(base, max, self.fails);
+        now.duration_since(marked) < backoff
+    }
+}
+
+/// A3：per-peer 发送熔断表（全局单例，与 channels_status 同模式）。
+static SEND_CIRCUITS: std::sync::OnceLock<
+    parking_lot::RwLock<FxHashMap<NodeId, SendCircuitState>>,
+> = std::sync::OnceLock::new();
+
+fn send_circuits() -> &'static parking_lot::RwLock<FxHashMap<NodeId, SendCircuitState>> {
+    SEND_CIRCUITS.get_or_init(|| parking_lot::RwLock::new(FxHashMap::default()))
+}
+
+/// A5：serving 标记是否已 idle 过期（纯判定）。`now - last >= idle` 即应移除。
+fn serving_entry_expired(last: Instant, now: Instant, idle: Duration) -> bool {
+    now.duration_since(last) >= idle
+}
+
+/// A1/A4：当前生效的在途发送上限 —— override>0 时取 override（内存反压压到 1），
+/// 否则取配置默认值。
+fn effective_send_limit(config_concurrency: usize) -> usize {
+    let ov = BOOTSTRAP_SEND_CONCURRENCY_OVERRIDE.load(Ordering::Acquire);
+    if ov > 0 {
+        ov
+    } else {
+        config_concurrency
+    }
+}
+
+// === 跨代理契约（供面板 / session.rs / memory_monitor 调用）===
+// 注：main.rs 是独立 bin crate，与 lib 分离，故对外可见性用 pub（非 pub(crate)），
+// 否则 bin 端 memory_monitor 无法调用 override set/get。
+
+/// 当前在途 bootstrap 发送任务数（A1 计数器实时值）。
+pub fn bootstrap_send_in_flight() -> usize {
+    BOOTSTRAP_SEND_IN_FLIGHT.load(Ordering::Acquire)
+}
+/// 发送尝试累计（成功+失败），供面板算失败率。
+pub fn bootstrap_send_total() -> u64 {
+    BOOTSTRAP_SEND_TOTAL.load(Ordering::Acquire)
+}
+/// 发送失败累计。
+pub fn bootstrap_send_failures_total() -> u64 {
+    BOOTSTRAP_SEND_FAILURES_TOTAL.load(Ordering::Acquire)
+}
+/// 当前处于熔断开放期的对端数。
+pub fn bootstrap_send_circuit_open_peers() -> usize {
+    send_circuits()
+        .read()
+        .values()
+        .filter(|s| s.fails > 0)
+        .count()
+}
+/// A4：设置内存反压在途并发 override（0 = 恢复配置值；>0 = 收缩到此值）。
+pub fn set_bootstrap_send_concurrency_override(n: usize) {
+    BOOTSTRAP_SEND_CONCURRENCY_OVERRIDE.store(n, Ordering::Release);
+}
+/// A4：当前 override 值（0 = 未启用）。
+pub fn bootstrap_send_concurrency_override() -> usize {
+    BOOTSTRAP_SEND_CONCURRENCY_OVERRIDE.load(Ordering::Acquire)
+}
+
+/// 跨代理契约：该对端是否有未过期的 bootstrap 工作（发送或接收），供 session.rs
+/// 空闲会话豁免 —— 有在途工作的连接不得被 idle_timeout 误杀。
+///
+/// 自由函数（session.rs 经 `crate::federation::sync::has_active_bootstrap_work(&peer)` 调用）。
+/// 最小实现：读全局通道状态 —— 当前 bootstrap 槽位 active 且 peer_id 对端一致即视为
+/// 有未过期工作（发送/接收方向均会写 `active=true + peer_id`，E3 覆盖两方向）。
+pub(crate) fn has_active_bootstrap_work(node_id: &NodeId) -> bool {
+    let s = crate::federation::sync::channels_status::global();
+    let g = s.read();
+    g.bootstrap.active && g.bootstrap.peer_id == node_id.to_hex()
+}
+
+/// A1：在途发送槽 RAII 守卫 —— drop 时递减全局在途计数（覆盖 early-return 路径）。
+struct BootstrapSendPermit;
+
+impl Drop for BootstrapSendPermit {
+    fn drop(&mut self) {
+        BOOTSTRAP_SEND_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// v10(F2)：一轮 Range 抽样对账的进行中状态（断点续跑游标）。
 ///
 /// 旧实现一个 tick 内同步发完全部 161 个区间，在百万行库上单轮 >300s，
@@ -257,6 +419,11 @@ pub struct SyncManager {
     /// 活锁治理(任务4)：range 让路的「bootstrap 停滞」WARN 已打标记（防刷屏）。
     /// 转入停滞打一次 WARN；恢复活跃时清除标记并打一次 INFO。
     bootstrap_stall_warned: std::sync::atomic::AtomicBool,
+    /// 永动治理(任务5b)：各 repo 最近一次 bootstrap 竣工时刻（仅触发器用于竣工冷却）。
+    /// 对端活表持续增长时，无冷却的差距触发会让 bootstrap 竣工后立即再开火，
+    /// 永动挤占 range 让路窗口（2026-09-30 三节点实证）。
+    #[allow(dead_code)] // H批：并行 WIP 尚未接线（构造器已初始化），待任务5b 落地后移除
+    repo_done_at: RwLock<FxHashMap<u8, Instant>>,
 }
 
 impl SyncManager {
@@ -391,6 +558,7 @@ impl SyncManager {
             range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
             bootstrap_repull_circuit: RwLock::new(FxHashMap::default()),
             bootstrap_stall_warned: std::sync::atomic::AtomicBool::new(false),
+            repo_done_at: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -780,17 +948,32 @@ impl SyncManager {
             since_seq: since,
             limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
         };
-        match conn.send_message(MessageType::OpsRequest, &req).await {
-            Ok(()) => {
+        // G2：发送统一加超时兜底（复用 transport_write_timeout_secs）—— 对端 writer 锁
+        // 卡死时 send_message 无限 await 会把调度任务挂死，进而触发 watchdog/idle_timeout
+        // 断连循环。超时与发送失败同路径：解除 in-flight，下一 tick 重发，绝不无限挂起。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::OpsRequest, &req),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
                 self.metrics.record_message_sent();
                 debug!(
                     "[delta] 发起增量拉取: peer={}, repo={}, since_seq={}",
                     peer, repo, since
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("[delta] 发送 OpsRequest 失败 peer={}: {}", peer, e);
                 // v8 F4：发送失败不会有响应回来，立即解除 in-flight 以便下轮重试
+                self.delta_inflight.write().remove(&(peer, repo));
+            }
+            Err(_) => {
+                warn!(
+                    "[delta] 发送 OpsRequest 超时 peer={}（{}s），解除 in-flight 待下轮重发",
+                    peer, self.config.transport_write_timeout_secs
+                );
                 self.delta_inflight.write().remove(&(peer, repo));
             }
         }
@@ -882,16 +1065,33 @@ impl SyncManager {
                 has_more,
                 server_max_seq,
             };
-            if let Err(e) = conn.send_message(MessageType::OpsBatchV2, &batch).await {
-                warn!("[delta] 发送 OpsBatchV2 失败 to={}: {}", conn.node_id, e);
-                {
+            // G2：发送超时兜底（复用 transport_write_timeout_secs）——超时按发送失败计。
+            let send_res = tokio::time::timeout(
+                Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+                conn.send_message(MessageType::OpsBatchV2, &batch),
+            )
+            .await;
+            match send_res {
+                Ok(Ok(())) => {
+                    self.metrics.record_message_sent();
+                }
+                Ok(Err(e)) => {
+                    warn!("[delta] 发送 OpsBatchV2 失败 to={}: {}", conn.node_id, e);
                     crate::federation::sync::channels_status::global()
                         .write()
                         .delta
                         .batch_send_failures += 1;
                 }
-            } else {
-                self.metrics.record_message_sent();
+                Err(_) => {
+                    warn!(
+                        "[delta] 发送 OpsBatchV2 超时 to={}（{}s），按发送失败计",
+                        conn.node_id, self.config.transport_write_timeout_secs
+                    );
+                    crate::federation::sync::channels_status::global()
+                        .write()
+                        .delta
+                        .batch_send_failures += 1;
+                }
             }
         } else {
             let batch = OpsBatchMessage {
@@ -901,16 +1101,33 @@ impl SyncManager {
                 has_more,
                 server_max_seq,
             };
-            if let Err(e) = conn.send_message(MessageType::OpsBatch, &batch).await {
-                warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
-                {
+            // G2：发送超时兜底（复用 transport_write_timeout_secs）——超时按发送失败计。
+            let send_res = tokio::time::timeout(
+                Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+                conn.send_message(MessageType::OpsBatch, &batch),
+            )
+            .await;
+            match send_res {
+                Ok(Ok(())) => {
+                    self.metrics.record_message_sent();
+                }
+                Ok(Err(e)) => {
+                    warn!("[delta] 发送 OpsBatch 失败 to={}: {}", conn.node_id, e);
                     crate::federation::sync::channels_status::global()
                         .write()
                         .delta
                         .batch_send_failures += 1;
                 }
-            } else {
-                self.metrics.record_message_sent();
+                Err(_) => {
+                    warn!(
+                        "[delta] 发送 OpsBatch 超时 to={}（{}s），按发送失败计",
+                        conn.node_id, self.config.transport_write_timeout_secs
+                    );
+                    crate::federation::sync::channels_status::global()
+                        .write()
+                        .delta
+                        .batch_send_failures += 1;
+                }
             }
         }
     }
@@ -1039,22 +1256,42 @@ impl SyncManager {
                 since_seq: next_seq,
                 limit: delta::DELTA_BATCH_LIMIT_DEFAULT,
             };
-            if let Err(e) = conn.send_message(MessageType::OpsRequest, &req).await {
-                warn!("[delta] 续拉 OpsRequest 失败 to={}: {}", conn.node_id, e);
-                // v9：续拉失败必须留下待续标记 —— 旧实现只 warn，而唯一的补救路径
-                // （tick 的节流重发）此前又被 `use_bootstrap → continue` 关闭，
-                // 于是任何一次写超时都会把该 (peer,repo) 的游标永久冻结。
-                if self.config.delta_retry_immediately {
-                    self.delta_request_at.write().remove(&(conn.node_id, repo));
+            // G2：发送超时兜底（复用 transport_write_timeout_secs）——超时与发送失败同路径，
+            // 留下待续标记由 tick 重发，绝不无限挂起。
+            let send_res = tokio::time::timeout(
+                Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+                conn.send_message(MessageType::OpsRequest, &req),
+            )
+            .await;
+            match send_res {
+                Ok(Ok(())) => {
+                    self.metrics.record_message_sent();
+                    // v8 F4：续拉同样标记 in-flight（防与下一轮 tick 叠加）
+                    self.delta_inflight
+                        .write()
+                        .insert((conn.node_id, repo), Instant::now());
                     self.delta_has_more.write().insert((conn.node_id, repo));
                 }
-            } else {
-                self.metrics.record_message_sent();
-                // v8 F4：续拉同样标记 in-flight（防与下一轮 tick 叠加）
-                self.delta_inflight
-                    .write()
-                    .insert((conn.node_id, repo), Instant::now());
-                self.delta_has_more.write().insert((conn.node_id, repo));
+                Ok(Err(e)) => {
+                    warn!("[delta] 续拉 OpsRequest 失败 to={}: {}", conn.node_id, e);
+                    // v9：续拉失败必须留下待续标记 —— 旧实现只 warn，而唯一的补救路径
+                    // （tick 的节流重发）此前又被 `use_bootstrap → continue` 关闭，
+                    // 于是任何一次写超时都会把该 (peer,repo) 的游标永久冻结。
+                    if self.config.delta_retry_immediately {
+                        self.delta_request_at.write().remove(&(conn.node_id, repo));
+                        self.delta_has_more.write().insert((conn.node_id, repo));
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        "[delta] 续拉 OpsRequest 超时 to={}（{}s），按发送失败留待续标记",
+                        conn.node_id, self.config.transport_write_timeout_secs
+                    );
+                    if self.config.delta_retry_immediately {
+                        self.delta_request_at.write().remove(&(conn.node_id, repo));
+                        self.delta_has_more.write().insert((conn.node_id, repo));
+                    }
+                }
             }
         }
     }
@@ -1152,8 +1389,14 @@ impl SyncManager {
             .write()
             .insert(conn.node_id, Instant::now());
         let msg = self.build_negotiate_message();
-        match conn.send_message(MessageType::SyncNegotiate, &msg).await {
-            Ok(()) => {
+        // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起协商 tick。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::SyncNegotiate, &msg),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
                 self.metrics.record_message_sent();
                 info!(
                     "[negotiate] 已发送协商请求 to={}（存活 {}s）",
@@ -1161,7 +1404,11 @@ impl SyncManager {
                     conn.connected_secs()
                 );
             }
-            Err(e) => warn!("[negotiate] 发送协商请求失败 to={}: {}", conn.node_id, e),
+            Ok(Err(e)) => warn!("[negotiate] 发送协商请求失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[negotiate] 发送协商请求超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            ),
         }
     }
 
@@ -1415,6 +1662,8 @@ impl SyncManager {
             g.bootstrap.active = false;
             g.bootstrap.inflight = 0;
             g.bootstrap.phase = "circuit_open".to_string();
+            // E3：熔断终态复位方向。
+            g.bootstrap.direction = String::new();
         }
         tripped
     }
@@ -1651,9 +1900,19 @@ impl SyncManager {
                 .unwrap()
                 .as_millis() as u64,
         };
-        match conn.send_message(MessageType::SyncNegotiateAck, &ack).await {
-            Ok(()) => self.metrics.record_message_sent(),
-            Err(e) => warn!("[negotiate] 发送 Ack 失败 to={}: {}", conn.node_id, e),
+        // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::SyncNegotiateAck, &ack),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => self.metrics.record_message_sent(),
+            Ok(Err(e)) => warn!("[negotiate] 发送 Ack 失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[negotiate] 发送 Ack 超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            ),
         }
     }
 
@@ -2051,73 +2310,98 @@ impl SyncManager {
             return;
         }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
-        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+        let permit = match self.range_gate.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
         };
-        // v7：统一 range 反熵 —— 4 个 repo 全部走 range 通道（key 编码与各 repo Merkle 一致）。
-        if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
-            return;
-        }
-        let leaf_rows = if req.leaf_rows == 0 {
-            range_reconcile::DEFAULT_LEAF_ROWS as usize
-        } else {
-            req.leaf_rows as usize
-        };
-        // 多取 1 条以判断是否超过叶级阈值
-        let rows = match self.delta_storage().load_repo_key_hashes_in_range(
-            req.repo,
-            Self::range_bound(&req.lo),
-            Self::range_bound(&req.hi),
-            leaf_rows + 1,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("[range] 加载区间失败 repo={}: {}", req.repo, e);
+        // H3：执行体超时兜底 —— 到点只放闸、不中断对账：
+        // 后台任务继续跑完，把存量差距补完；闸释放后别的 range 任务可立即进入。
+        let range_handler_timeout = self.config.range_handler_timeout_secs;
+        let __range_deadline = Duration::from_secs(range_handler_timeout.max(1));
+        let __range_body = async move {
+            // v7：统一 range 反熵 —— 4 个 repo 全部走 range 通道（key 编码与各 repo Merkle 一致）。
+            if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
                 return;
             }
-        };
-        let is_leaf = rows.len() <= leaf_rows;
-        let resp = if is_leaf {
-            RangeReconcileResponseMessage {
-                repo: req.repo,
-                lo: req.lo.clone(),
-                hi: req.hi.clone(),
-                digest: range_reconcile::range_digest(&rows),
-                split_points: Vec::new(),
-                entries: rows
-                    .into_iter()
-                    .take(range_reconcile::MAX_LEAF_ENTRIES)
-                    .collect(),
-                is_leaf: true,
-                depth: req.depth,
+            let leaf_rows = if req.leaf_rows == 0 {
+                range_reconcile::DEFAULT_LEAF_ROWS as usize
+            } else {
+                req.leaf_rows as usize
+            };
+            // 多取 1 条以判断是否超过叶级阈值
+            let rows = match self.delta_storage().load_repo_key_hashes_in_range(
+                req.repo,
+                Self::range_bound(&req.lo),
+                Self::range_bound(&req.hi),
+                leaf_rows + 1,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[range] 加载区间失败 repo={}: {}", req.repo, e);
+                    return;
+                }
+            };
+            let is_leaf = rows.len() <= leaf_rows;
+            let resp = if is_leaf {
+                RangeReconcileResponseMessage {
+                    repo: req.repo,
+                    lo: req.lo.clone(),
+                    hi: req.hi.clone(),
+                    digest: range_reconcile::range_digest(&rows),
+                    split_points: Vec::new(),
+                    entries: rows
+                        .into_iter()
+                        .take(range_reconcile::MAX_LEAF_ENTRIES)
+                        .collect(),
+                    is_leaf: true,
+                    depth: req.depth,
+                }
+            } else {
+                let sp = range_reconcile::split_points(
+                    &rows,
+                    self.config.range_reconcile_max_splits as usize,
+                );
+                RangeReconcileResponseMessage {
+                    repo: req.repo,
+                    lo: req.lo.clone(),
+                    hi: req.hi.clone(),
+                    digest: range_reconcile::range_digest(&rows),
+                    split_points: sp,
+                    entries: Vec::new(),
+                    is_leaf: false,
+                    depth: req.depth,
+                }
+            };
+            if let Err(e) = conn
+                .send_message(MessageType::RangeReconcileResponse, &resp)
+                .await
+            {
+                warn!(
+                    "[range] 发送 RangeReconcileResponse 失败 to={}: {}",
+                    conn.node_id, e
+                );
+            } else {
+                self.metrics.record_message_sent();
             }
-        } else {
-            let sp = range_reconcile::split_points(
-                &rows,
-                self.config.range_reconcile_max_splits as usize,
-            );
-            RangeReconcileResponseMessage {
-                repo: req.repo,
-                lo: req.lo.clone(),
-                hi: req.hi.clone(),
-                digest: range_reconcile::range_digest(&rows),
-                split_points: sp,
-                entries: Vec::new(),
-                is_leaf: false,
-                depth: req.depth,
-            }
         };
-        if let Err(e) = conn
-            .send_message(MessageType::RangeReconcileResponse, &resp)
-            .await
-        {
-            warn!(
-                "[range] 发送 RangeReconcileResponse 失败 to={}: {}",
-                conn.node_id, e
-            );
-        } else {
-            self.metrics.record_message_sent();
+        let join_handle = tokio::spawn(__range_body);
+        // D1：执行体超时兜底收尾。H3：超时只放闸，不 abort 后台任务。
+        match tokio::time::timeout(__range_deadline, join_handle).await {
+            Ok(Ok(())) => {
+                // 正常完成，permit 在函数返回时自然 drop
+            }
+            Ok(Err(join_err)) => {
+                warn!("[range] reconcile_request 任务异常退出: {}", join_err);
+            }
+            Err(_) => {
+                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                drop(permit);
+                warn!(
+                    "[range] reconcile_request 执行超过 {}s，释放并发闸（任务后台继续）",
+                    range_handler_timeout
+                );
+                RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -2135,83 +2419,88 @@ impl SyncManager {
             return;
         }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
-        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+        let permit = match self.range_gate.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
         };
-        // v7：4 个 repo 全部走 range 通道
-        if resp.repo < repo_type::NODE || resp.repo > repo_type::TRACKER {
-            return;
-        }
-        let leaf_rows = self.leaf_rows_for_repo(resp.repo) as usize;
-        let lo = Self::range_bound(&resp.lo);
-        let hi = Self::range_bound(&resp.hi);
-        let local = match self.delta_storage().load_repo_key_hashes_in_range(
-            resp.repo,
-            lo,
-            hi,
-            range_reconcile::MAX_LEAF_ENTRIES + 1,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("[range] 请求方加载区间失败: {}", e);
+        // H3：执行体超时兜底 —— 到点只放闸、不中断对账（见 range_handler_timeout_secs）。
+        let range_handler_timeout = self.config.range_handler_timeout_secs;
+        let __range_deadline = Duration::from_secs(range_handler_timeout.max(1));
+        let __range_body = async move {
+            // v7：4 个 repo 全部走 range 通道
+            if resp.repo < repo_type::NODE || resp.repo > repo_type::TRACKER {
                 return;
             }
-        };
-        let local_digest = range_reconcile::range_digest(&local);
-        // 可观测性：累计访问的区间数（衡量下钻效率）
-        self.range_ranges_visited
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let decision = range_reconcile::decide(
-            &local_digest,
-            &resp.digest,
-            resp.is_leaf,
-            resp.depth,
-            self.config.range_reconcile_max_depth,
-        );
+            let leaf_rows = self.leaf_rows_for_repo(resp.repo) as usize;
+            let lo = Self::range_bound(&resp.lo);
+            let hi = Self::range_bound(&resp.hi);
+            let local = match self.delta_storage().load_repo_key_hashes_in_range(
+                resp.repo,
+                lo,
+                hi,
+                range_reconcile::MAX_LEAF_ENTRIES + 1,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[range] 请求方加载区间失败: {}", e);
+                    return;
+                }
+            };
+            let local_digest = range_reconcile::range_digest(&local);
+            // 可观测性：累计访问的区间数（衡量下钻效率）
+            self.range_ranges_visited
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let decision = range_reconcile::decide(
+                &local_digest,
+                &resp.digest,
+                resp.is_leaf,
+                resp.depth,
+                self.config.range_reconcile_max_depth,
+            );
 
-        match decision {
-            range_reconcile::RangeDecision::Prune => {
-                debug!(
-                    "[range] 剪枝 repo={} [{}, {}) depth={}",
-                    resp.repo,
-                    String::from_utf8_lossy(&resp.lo),
-                    String::from_utf8_lossy(&resp.hi),
-                    resp.depth
-                );
-            }
-            range_reconcile::RangeDecision::Leaf => {
-                let (local_only, remote_only) = range_reconcile::key_diff(&local, &resp.entries);
-                let n_local = local_only.len() as u64;
-                let n_remote = remote_only.len() as u64;
-                // F3：叶级明细由 info 降为 debug，并累加到计数器，由每轮 tick 收尾汇总输出。
-                // 之前每轮下钻会打上千行 INFO（每区间一行），实测把 stdout.log 刷到 150MB。
-                self.range_leaf_ranges
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.range_local_only_total
-                    .fetch_add(n_local, std::sync::atomic::Ordering::Relaxed);
-                self.range_remote_only_total
-                    .fetch_add(n_remote, std::sync::atomic::Ordering::Relaxed);
-                if n_local > 0 || n_remote > 0 {
+            match decision {
+                range_reconcile::RangeDecision::Prune => {
                     debug!(
-                        "[range] 叶级差异 repo={} [{}, {}) depth={}: 本地多={}, 对端多={}",
+                        "[range] 剪枝 repo={} [{}, {}) depth={}",
                         resp.repo,
                         String::from_utf8_lossy(&resp.lo),
                         String::from_utf8_lossy(&resp.hi),
-                        resp.depth,
-                        n_local,
-                        n_remote
+                        resp.depth
                     );
                 }
-                // P2-3：深度到顶被**强制降级**为「叶」时，对端并未返回行指纹明细
-                //（`resp.entries` 为空），此时 `key_diff(本地, 空)` 会把整个区间判成
-                //「本地多」→ 把整片数据幽灵推送给对端（对端再按 upsert 全量落地，双向放大）。
-                // 正常数据下钻到不了 max_depth；到达即说明配置过小或数据严重倾斜，
-                // 这种区间只记统计、不修复。
-                let forced_leaf =
-                    !resp.is_leaf && resp.depth >= self.config.range_reconcile_max_depth;
-                if forced_leaf && (n_local > 0 || n_remote > 0) {
-                    debug!(
+                range_reconcile::RangeDecision::Leaf => {
+                    let (local_only, remote_only) =
+                        range_reconcile::key_diff(&local, &resp.entries);
+                    let n_local = local_only.len() as u64;
+                    let n_remote = remote_only.len() as u64;
+                    // F3：叶级明细由 info 降为 debug，并累加到计数器，由每轮 tick 收尾汇总输出。
+                    // 之前每轮下钻会打上千行 INFO（每区间一行），实测把 stdout.log 刷到 150MB。
+                    self.range_leaf_ranges
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.range_local_only_total
+                        .fetch_add(n_local, std::sync::atomic::Ordering::Relaxed);
+                    self.range_remote_only_total
+                        .fetch_add(n_remote, std::sync::atomic::Ordering::Relaxed);
+                    if n_local > 0 || n_remote > 0 {
+                        debug!(
+                            "[range] 叶级差异 repo={} [{}, {}) depth={}: 本地多={}, 对端多={}",
+                            resp.repo,
+                            String::from_utf8_lossy(&resp.lo),
+                            String::from_utf8_lossy(&resp.hi),
+                            resp.depth,
+                            n_local,
+                            n_remote
+                        );
+                    }
+                    // P2-3：深度到顶被**强制降级**为「叶」时，对端并未返回行指纹明细
+                    //（`resp.entries` 为空），此时 `key_diff(本地, 空)` 会把整个区间判成
+                    //「本地多」→ 把整片数据幽灵推送给对端（对端再按 upsert 全量落地，双向放大）。
+                    // 正常数据下钻到不了 max_depth；到达即说明配置过小或数据严重倾斜，
+                    // 这种区间只记统计、不修复。
+                    let forced_leaf =
+                        !resp.is_leaf && resp.depth >= self.config.range_reconcile_max_depth;
+                    if forced_leaf && (n_local > 0 || n_remote > 0) {
+                        debug!(
                         "[range] 深度到顶强制降级为叶，跳过修复（明细不可信）: repo={} [{}, {}) depth={} 本地多={}",
                         resp.repo,
                         String::from_utf8_lossy(&resp.lo),
@@ -2219,105 +2508,126 @@ impl SyncManager {
                         resp.depth,
                         n_local
                     );
-                }
-                // F3：非诊断模式下真正执行修复
-                if !self.config.range_reconcile_diagnostic_only
-                    && (n_local > 0 || n_remote > 0)
-                    && !forced_leaf
-                {
-                    // v9：同一 (peer, repo, lo, hi) 的修复在 `range_repair_min_interval_secs`
-                    // 内只做一次。旧实现是 fire-and-forget、无去重：同一批差异会被每个 tick
-                    // 重新推拉一遍（叠加「入站条目被 version==0 早退丢弃」时就是纯无效流量）。
-                    let dedupe_key = (conn.node_id, resp.repo, resp.lo.clone(), resp.hi.clone());
-                    let skip = {
-                        let dedupe = self.range_repair_recent.read();
-                        match dedupe.get(&dedupe_key) {
-                            Some(t) => {
-                                t.elapsed().as_secs()
-                                    < self.config.range_repair_min_interval_secs.max(1)
+                    }
+                    // F3：非诊断模式下真正执行修复
+                    if !self.config.range_reconcile_diagnostic_only
+                        && (n_local > 0 || n_remote > 0)
+                        && !forced_leaf
+                    {
+                        // v9：同一 (peer, repo, lo, hi) 的修复在 `range_repair_min_interval_secs`
+                        // 内只做一次。旧实现是 fire-and-forget、无去重：同一批差异会被每个 tick
+                        // 重新推拉一遍（叠加「入站条目被 version==0 早退丢弃」时就是纯无效流量）。
+                        let dedupe_key =
+                            (conn.node_id, resp.repo, resp.lo.clone(), resp.hi.clone());
+                        let skip = {
+                            let dedupe = self.range_repair_recent.read();
+                            match dedupe.get(&dedupe_key) {
+                                Some(t) => {
+                                    t.elapsed().as_secs()
+                                        < self.config.range_repair_min_interval_secs.max(1)
+                                }
+                                None => false,
                             }
-                            None => false,
-                        }
-                    };
-                    if skip {
-                        debug!(
-                            "[range] 同一叶区间修复冷却中，跳过本轮: repo={} [{}, {})",
-                            resp.repo,
-                            String::from_utf8_lossy(&resp.lo),
-                            String::from_utf8_lossy(&resp.hi)
-                        );
-                    } else {
-                        if self.range_repair_recent.read().len() > 4096 {
-                            let cutoff = self.config.range_repair_min_interval_secs.max(1) * 2;
+                        };
+                        if skip {
+                            debug!(
+                                "[range] 同一叶区间修复冷却中，跳过本轮: repo={} [{}, {})",
+                                resp.repo,
+                                String::from_utf8_lossy(&resp.lo),
+                                String::from_utf8_lossy(&resp.hi)
+                            );
+                        } else {
+                            if self.range_repair_recent.read().len() > 4096 {
+                                let cutoff = self.config.range_repair_min_interval_secs.max(1) * 2;
+                                self.range_repair_recent
+                                    .write()
+                                    .retain(|_, t| t.elapsed().as_secs() < cutoff);
+                            }
                             self.range_repair_recent
                                 .write()
-                                .retain(|_, t| t.elapsed().as_secs() < cutoff);
-                        }
-                        self.range_repair_recent
-                            .write()
-                            .insert(dedupe_key, Instant::now());
-                        self.range_repair_triggers
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // v8：4 repo 通用的 Pull/Push2 修复通道。不再依赖「对端 oplog 必有对应 op」
-                        // 的假设——入站/bootstrap 来源的数据在 oplog 里没有 op，delta 拉不到，
-                        // 那是此前 3 个非 NODE repo 修复死路的根因。
-                        if conn.supports_range_v2() {
-                            // 对端多 → 把缺失 key 列表发给对端，对端按 key 加载完整条目回推
-                            if n_remote > 0 {
-                                self.send_range_pull(&conn, resp.repo, &remote_only).await;
+                                .insert(dedupe_key, Instant::now());
+                            self.range_repair_triggers
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // v8：4 repo 通用的 Pull/Push2 修复通道。不再依赖「对端 oplog 必有对应 op」
+                            // 的假设——入站/bootstrap 来源的数据在 oplog 里没有 op，delta 拉不到，
+                            // 那是此前 3 个非 NODE repo 修复死路的根因。
+                            if conn.supports_range_v2() {
+                                // 对端多 → 把缺失 key 列表发给对端，对端按 key 加载完整条目回推
+                                if n_remote > 0 {
+                                    self.send_range_pull(&conn, resp.repo, &remote_only).await;
+                                }
+                                // 本地多 → 按 key 加载本地完整条目直接推给对端
+                                if n_local > 0 {
+                                    self.send_range_push(&conn, resp.repo, &local_only).await;
+                                }
+                            } else if n_remote > 0 {
+                                // < v8 对端：回落 delta 委托（仅对 oplog 窗口内、对端本地 origin 的数据有效）
+                                self.trigger_delta_sync(conn.node_id, resp.repo).await;
                             }
-                            // 本地多 → 按 key 加载本地完整条目直接推给对端
-                            if n_local > 0 {
-                                self.send_range_push(&conn, resp.repo, &local_only).await;
-                            }
-                        } else if n_remote > 0 {
-                            // < v8 对端：回落 delta 委托（仅对 oplog 窗口内、对端本地 origin 的数据有效）
-                            self.trigger_delta_sync(conn.node_id, resp.repo).await;
                         }
+                    }
+                }
+                range_reconcile::RangeDecision::Descend => {
+                    if resp.depth >= self.config.range_reconcile_max_depth {
+                        return;
+                    }
+                    let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(resp.split_points.len() + 2);
+                    bounds.push(resp.lo.clone());
+                    bounds.extend(resp.split_points.iter().cloned());
+                    bounds.push(resp.hi.clone());
+                    for w in bounds.windows(2) {
+                        let sub_lo = w[0].clone();
+                        let sub_hi = w[1].clone();
+                        if sub_lo == sub_hi {
+                            continue;
+                        }
+                        let rows = match self.delta_storage().load_repo_key_hashes_in_range(
+                            resp.repo,
+                            Self::range_bound(&sub_lo),
+                            Self::range_bound(&sub_hi),
+                            leaf_rows + 1,
+                        ) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let digest = range_reconcile::range_digest(&rows);
+                        let sub_req = RangeReconcileRequestMessage {
+                            repo: resp.repo,
+                            lo: sub_lo,
+                            hi: sub_hi,
+                            digest,
+                            leaf_rows: leaf_rows as u32,
+                            depth: resp.depth + 1,
+                        };
+                        if let Err(e) = conn
+                            .send_message(MessageType::RangeReconcileRequest, &sub_req)
+                            .await
+                        {
+                            warn!("[range] 下钻请求发送失败 to={}: {}", conn.node_id, e);
+                            break;
+                        }
+                        self.metrics.record_message_sent();
                     }
                 }
             }
-            range_reconcile::RangeDecision::Descend => {
-                if resp.depth >= self.config.range_reconcile_max_depth {
-                    return;
-                }
-                let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(resp.split_points.len() + 2);
-                bounds.push(resp.lo.clone());
-                bounds.extend(resp.split_points.iter().cloned());
-                bounds.push(resp.hi.clone());
-                for w in bounds.windows(2) {
-                    let sub_lo = w[0].clone();
-                    let sub_hi = w[1].clone();
-                    if sub_lo == sub_hi {
-                        continue;
-                    }
-                    let rows = match self.delta_storage().load_repo_key_hashes_in_range(
-                        resp.repo,
-                        Self::range_bound(&sub_lo),
-                        Self::range_bound(&sub_hi),
-                        leaf_rows + 1,
-                    ) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    let digest = range_reconcile::range_digest(&rows);
-                    let sub_req = RangeReconcileRequestMessage {
-                        repo: resp.repo,
-                        lo: sub_lo,
-                        hi: sub_hi,
-                        digest,
-                        leaf_rows: leaf_rows as u32,
-                        depth: resp.depth + 1,
-                    };
-                    if let Err(e) = conn
-                        .send_message(MessageType::RangeReconcileRequest, &sub_req)
-                        .await
-                    {
-                        warn!("[range] 下钻请求发送失败 to={}: {}", conn.node_id, e);
-                        break;
-                    }
-                    self.metrics.record_message_sent();
-                }
+        };
+        let join_handle = tokio::spawn(__range_body);
+        // H3：超时只放闸，不 abort 后台任务——对账继续跑完，存量差距持续补齐。
+        match tokio::time::timeout(__range_deadline, join_handle).await {
+            Ok(Ok(())) => {
+                // 正常完成，permit 在函数返回时自然 drop
+            }
+            Ok(Err(join_err)) => {
+                warn!("[range] reconcile_response 任务异常退出: {}", join_err);
+            }
+            Err(_) => {
+                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                drop(permit);
+                warn!(
+                    "[range] reconcile_response 执行超过 {}s，释放并发闸（任务后台继续）",
+                    range_handler_timeout
+                );
+                RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -2347,15 +2657,23 @@ impl SyncManager {
             return;
         }
         let msg = crate::federation::protocol::RangeReconcilePullMessage { repo, keys: take };
-        match conn
-            .send_message(
+        // H2：range 数据型消息发送用独立超时（range_send_timeout_secs），
+        // 大块数据 5s 发不完会被当失败反复重试 → 收敛极慢。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.range_send_timeout_secs.max(1)),
+            conn.send_message(
                 crate::federation::protocol::MessageType::RangeReconcilePull,
                 &msg,
-            )
-            .await
-        {
-            Ok(()) => self.metrics.record_message_sent(),
-            Err(e) => warn!("[range] 发送按键拉取失败 to={}: {}", conn.node_id, e),
+            ),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => self.metrics.record_message_sent(),
+            Ok(Err(e)) => warn!("[range] 发送按键拉取失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[range] 发送按键拉取超时 to={}（{}s）",
+                conn.node_id, self.config.range_send_timeout_secs
+            ),
         }
     }
 
@@ -2378,21 +2696,28 @@ impl SyncManager {
         }
         let count = entries.len();
         let msg = crate::federation::protocol::RangeReconcilePush2Message { repo, entries };
-        match conn
-            .send_message(
+        // H2：range 数据型消息发送用独立超时（range_send_timeout_secs）。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.range_send_timeout_secs.max(1)),
+            conn.send_message(
                 crate::federation::protocol::MessageType::RangeReconcilePush2,
                 &msg,
-            )
-            .await
-        {
-            Ok(()) => {
+            ),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
                 self.metrics.record_message_sent();
                 debug!(
                     "[range] 推送本地多数据 to={} repo={}: {} 条",
                     conn.node_id, repo, count
                 );
             }
-            Err(e) => warn!("[range] 推送本地多数据失败 to={}: {}", conn.node_id, e),
+            Ok(Err(e)) => warn!("[range] 推送本地多数据失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[range] 推送本地多数据超时 to={}（{}s）",
+                conn.node_id, self.config.range_send_timeout_secs
+            ),
         }
     }
 
@@ -2406,53 +2731,77 @@ impl SyncManager {
             return;
         }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
-        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+        let permit = match self.range_gate.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
         };
-        if msg.repo < repo_type::NODE || msg.repo > repo_type::TRACKER || msg.keys.is_empty() {
-            return;
-        }
-        let repo = msg.repo;
-        let keys = msg.keys;
-        let sm = self.clone();
-        let peer = conn.node_id;
-        let entries = tokio::task::spawn_blocking(move || {
-            sm.delta_storage().load_repo_entries_by_keys(repo, &keys)
-        })
-        .await;
-        let entries = match entries {
-            Ok(Ok(e)) => e,
-            Ok(Err(e)) => {
-                warn!("[range] 应答按键拉取加载失败 repo={}: {}", repo, e);
+        // H3：执行体超时兜底 —— 到点只放闸、不中断对账（见 range_handler_timeout_secs）。
+        let range_handler_timeout = self.config.range_handler_timeout_secs;
+        let __range_deadline = Duration::from_secs(range_handler_timeout.max(1));
+        let __range_body = async move {
+            if msg.repo < repo_type::NODE || msg.repo > repo_type::TRACKER || msg.keys.is_empty() {
                 return;
             }
-            Err(e) => {
-                warn!("[range] 应答按键拉取任务失败: {}", e);
+            let repo = msg.repo;
+            let keys = msg.keys;
+            let sm = self.clone();
+            let peer = conn.node_id;
+            let entries = tokio::task::spawn_blocking(move || {
+                sm.delta_storage().load_repo_entries_by_keys(repo, &keys)
+            })
+            .await;
+            let entries = match entries {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
+                    warn!("[range] 应答按键拉取加载失败 repo={}: {}", repo, e);
+                    return;
+                }
+                Err(e) => {
+                    warn!("[range] 应答按键拉取任务失败: {}", e);
+                    return;
+                }
+            };
+            if entries.is_empty() {
+                debug!("[range] 按键拉取无命中: peer={}, repo={}", peer, repo);
                 return;
+            }
+            let count = entries.len();
+            let resp = crate::federation::protocol::RangeReconcilePush2Message { repo, entries };
+            match conn
+                .send_message(
+                    crate::federation::protocol::MessageType::RangeReconcilePush2,
+                    &resp,
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.metrics.record_message_sent();
+                    debug!(
+                        "[range] 应答按键拉取 to={} repo={}: {} 条",
+                        peer, repo, count
+                    );
+                }
+                Err(e) => warn!("[range] 应答按键拉取回推失败 to={}: {}", peer, e),
             }
         };
-        if entries.is_empty() {
-            debug!("[range] 按键拉取无命中: peer={}, repo={}", peer, repo);
-            return;
-        }
-        let count = entries.len();
-        let resp = crate::federation::protocol::RangeReconcilePush2Message { repo, entries };
-        match conn
-            .send_message(
-                crate::federation::protocol::MessageType::RangeReconcilePush2,
-                &resp,
-            )
-            .await
-        {
-            Ok(()) => {
-                self.metrics.record_message_sent();
-                debug!(
-                    "[range] 应答按键拉取 to={} repo={}: {} 条",
-                    peer, repo, count
-                );
+        let join_handle = tokio::spawn(__range_body);
+        // H3：超时只放闸，不 abort 后台任务——对账继续跑完。
+        match tokio::time::timeout(__range_deadline, join_handle).await {
+            Ok(Ok(())) => {
+                // 正常完成，permit 在函数返回时自然 drop
             }
-            Err(e) => warn!("[range] 应答按键拉取回推失败 to={}: {}", peer, e),
+            Ok(Err(join_err)) => {
+                warn!("[range] reconcile_pull 任务异常退出: {}", join_err);
+            }
+            Err(_) => {
+                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                drop(permit);
+                warn!(
+                    "[range] reconcile_pull 执行超过 {}s，释放并发闸（任务后台继续）",
+                    range_handler_timeout
+                );
+                RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -2467,37 +2816,62 @@ impl SyncManager {
             return;
         }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
-        let _range_permit = match self.range_gate.clone().acquire_owned().await {
+        let permit = match self.range_gate.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
         };
-        if msg.repo < repo_type::NODE || msg.repo > repo_type::TRACKER || msg.entries.is_empty() {
-            return;
-        }
-        let repo = msg.repo;
-        let entries = msg.entries;
-        let count = entries.len();
-        let sm = self.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            sm.handle_sync_batch(repo, &entries);
-        })
-        .await;
-        match result {
-            Ok(()) => {
-                debug!(
-                    "[range] 收到通用推送 from={} repo={}: {} 条，已 apply",
-                    conn.node_id, repo, count
-                );
-                self.metrics.record_sync_entries(count as u64);
-                {
-                    let s = crate::federation::sync::channels_status::global();
-                    let mut g = s.write();
-                    g.delta.sync_entries_applied =
-                        g.delta.sync_entries_applied.saturating_add(count as u64);
+        // H3：执行体超时兜底 —— 到点只放闸、不中断对账（见 range_handler_timeout_secs）。
+        let range_handler_timeout = self.config.range_handler_timeout_secs;
+        let __range_deadline = Duration::from_secs(range_handler_timeout.max(1));
+        let __range_body = async move {
+            if msg.repo < repo_type::NODE || msg.repo > repo_type::TRACKER || msg.entries.is_empty()
+            {
+                return;
+            }
+            let repo = msg.repo;
+            let entries = msg.entries;
+            let count = entries.len();
+            let sm = self.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                sm.handle_sync_batch(repo, &entries);
+            })
+            .await;
+            match result {
+                Ok(()) => {
+                    debug!(
+                        "[range] 收到通用推送 from={} repo={}: {} 条，已 apply",
+                        conn.node_id, repo, count
+                    );
+                    self.metrics.record_sync_entries(count as u64);
+                    {
+                        let s = crate::federation::sync::channels_status::global();
+                        let mut g = s.write();
+                        g.delta.sync_entries_applied =
+                            g.delta.sync_entries_applied.saturating_add(count as u64);
+                    }
+                }
+                Err(e) => {
+                    warn!("[range] 处理通用推送失败 from={}: {}", conn.node_id, e);
                 }
             }
-            Err(e) => {
-                warn!("[range] 处理通用推送失败 from={}: {}", conn.node_id, e);
+        };
+        let join_handle = tokio::spawn(__range_body);
+        // H3：超时只放闸，不 abort 后台任务——推送继续 apply 完，存量差距持续补齐。
+        match tokio::time::timeout(__range_deadline, join_handle).await {
+            Ok(Ok(())) => {
+                // 正常完成，permit 在函数返回时自然 drop
+            }
+            Ok(Err(join_err)) => {
+                warn!("[range] reconcile_push2 任务异常退出: {}", join_err);
+            }
+            Err(_) => {
+                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                drop(permit);
+                warn!(
+                    "[range] reconcile_push2 执行超过 {}s，释放并发闸（任务后台继续）",
+                    range_handler_timeout
+                );
+                RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -2796,20 +3170,35 @@ impl SyncManager {
                 leaf_rows: prog.leaf_rows,
                 depth: 0,
             };
-            if let Err(e) = conn
-                .send_message(MessageType::RangeReconcileRequest, &req)
-                .await
-            {
-                warn!(
-                    "[range] 发送 RangeReconcileRequest 失败 to={}（区间 {}/{}，进度保留待续跑）: {}",
-                    conn.node_id,
-                    i + 1,
-                    total,
-                    e
-                );
-                break;
+            // H2：range 对账请求用独立超时（range_send_timeout_secs），
+            // 避免大数据量 digest 计算+发送被 5s 超时反复打断。
+            let send_res = tokio::time::timeout(
+                Duration::from_secs(self.config.range_send_timeout_secs.max(1)),
+                conn.send_message(MessageType::RangeReconcileRequest, &req),
+            )
+            .await;
+            match send_res {
+                Ok(Ok(())) => {
+                    self.metrics.record_message_sent();
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "[range] 发送 RangeReconcileRequest 失败 to={}（区间 {}/{}，进度保留待续跑）: {}",
+                        conn.node_id,
+                        i + 1,
+                        total,
+                        e
+                    );
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "[range] 发送 RangeReconcileRequest 超时 to={}（区间 {}/{}，{}s，进度保留待续跑）",
+                        conn.node_id, i + 1, total, self.config.range_send_timeout_secs
+                    );
+                    break;
+                }
             }
-            self.metrics.record_message_sent();
             advanced = i + 1;
             sent += 1;
         }
@@ -2915,12 +3304,21 @@ impl SyncManager {
         let cached = self.bootstrap_manifests.read().get(&key).cloned();
         if let Some(m) = cached {
             let resp = BootstrapManifestResponseMessage { manifest: m };
-            if conn
-                .send_message(MessageType::BootstrapManifestResponse, &resp)
-                .await
-                .is_ok()
-            {
+            // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
+            let send_ok = tokio::time::timeout(
+                Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+                conn.send_message(MessageType::BootstrapManifestResponse, &resp),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            if send_ok {
                 self.metrics.record_message_sent();
+            } else {
+                warn!(
+                    "[bootstrap] 发送缓存清单失败/超时 to={}（{}s）",
+                    conn.node_id, self.config.transport_write_timeout_secs
+                );
             }
             return;
         }
@@ -2949,9 +3347,12 @@ impl SyncManager {
                         ..Default::default()
                     });
                 let resp = BootstrapManifestResponseMessage { manifest };
-                let _ = conn
-                    .send_message(MessageType::BootstrapManifestResponse, &resp)
-                    .await;
+                // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+                    conn.send_message(MessageType::BootstrapManifestResponse, &resp),
+                )
+                .await;
                 return;
             }
         }
@@ -3006,13 +3407,21 @@ impl SyncManager {
             .insert(key, Instant::now());
         self.bootstrap_rebuild_at.write().remove(&key);
         let resp = BootstrapManifestResponseMessage { manifest };
-        if let Err(e) = conn
-            .send_message(MessageType::BootstrapManifestResponse, &resp)
-            .await
-        {
-            warn!("[bootstrap] 发送清单失败: {}", e);
-        } else {
-            self.metrics.record_message_sent();
+        // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapManifestResponse, &resp),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
+                self.metrics.record_message_sent();
+            }
+            Ok(Err(e)) => warn!("[bootstrap] 发送清单失败: {}", e),
+            Err(_) => warn!(
+                "[bootstrap] 发送清单超时（{}s）",
+                self.config.transport_write_timeout_secs
+            ),
         }
     }
 
@@ -3034,13 +3443,81 @@ impl SyncManager {
             hash: [0u8; 32],
             is_last: false,
         };
-        if let Err(e) = conn
-            .send_message(MessageType::BootstrapChunkResponse, &resp)
-            .await
+        // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapChunkResponse, &resp),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
+                self.metrics.record_message_sent();
+            }
+            Ok(Err(e)) => warn!("[bootstrap] 发送 NAK 失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[bootstrap] 发送 NAK 超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            ),
+        }
+    }
+
+    /// A2/A3：记录一次 bootstrap 块发送失败 —— 全局失败累计 +1，per-peer 连续失败 +1。
+    /// 达阈值时该 peer 进入指数退避熔断（后续块请求在 handler 入口被 NAK("circuit open")）。
+    fn record_bootstrap_send_failure(&self, peer: &NodeId) {
+        BOOTSTRAP_SEND_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let threshold = self.config.bootstrap_send_circuit_break_threshold.max(1);
+        let prev = send_circuits()
+            .read()
+            .get(peer)
+            .copied()
+            .unwrap_or(SendCircuitState {
+                fails: 0,
+                marked_at: None,
+            });
+        let next = prev.record_failure(Instant::now());
+        if next.fails >= threshold {
+            warn!(
+                "[bootstrap] 对端 {} 连续发送失败 {} 次，进入熔断退避（新块请求 NAK circuit open）",
+                peer, next.fails
+            );
+        }
+        send_circuits().write().insert(*peer, next);
+    }
+
+    /// A5：发送方 idle 看门狗 —— 移除超过 `bootstrap_send_idle_timeout_secs` 无新块请求的
+    /// (peer,repo)「正在服务」标记；若全局通道方向仍为 send 且对端已停止拉取，复位 direction。
+    fn prune_idle_send_serving(&self) {
+        let idle = Duration::from_secs(self.config.bootstrap_send_idle_timeout_secs.max(1));
+        let now = Instant::now();
+        let mut pruned: Vec<NodeId> = Vec::new();
         {
-            warn!("[bootstrap] 发送 NAK 失败 to={}: {}", conn.node_id, e);
-        } else {
-            self.metrics.record_message_sent();
+            let mut m = self.bootstrap_serving_at.write();
+            m.retain(|(peer, _repo), last| {
+                let keep = !serving_entry_expired(*last, now, idle);
+                if !keep {
+                    pruned.push(*peer);
+                }
+                keep
+            });
+        }
+        if pruned.is_empty() {
+            return;
+        }
+        // 仅当面板方向仍为 send、且被 pruning 的对端与全局 peer_id 一致时复位 direction。
+        let s = crate::federation::sync::channels_status::global();
+        let mut g = s.write();
+        if g.bootstrap.direction == "send" {
+            for p in &pruned {
+                if p.to_hex() == g.bootstrap.peer_id {
+                    g.bootstrap.direction = String::new();
+                    debug!(
+                        "[bootstrap] 发送 idle {}s 无新块请求，复位 direction: peer={}",
+                        idle.as_secs(),
+                        p
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -3057,6 +3534,29 @@ impl SyncManager {
         self.bootstrap_serving_at
             .write()
             .insert((conn.node_id, req.repo), Instant::now());
+        // A3：per-peer 发送熔断 —— 该对端连续发送失败达阈值且指数退避未到期时，
+        // 直接 NAK("circuit open")，不加载 entries、不占内存（半开探测由成功/失败推进）。
+        {
+            let base = Duration::from_secs(self.config.bootstrap_backoff_base_secs.max(1));
+            let max = Duration::from_secs(self.config.bootstrap_backoff_max_secs.max(1));
+            let open = send_circuits()
+                .read()
+                .get(&conn.node_id)
+                .map(|s| {
+                    s.is_open(
+                        self.config.bootstrap_send_circuit_break_threshold,
+                        Instant::now(),
+                        base,
+                        max,
+                    )
+                })
+                .unwrap_or(false);
+            if open {
+                self.send_bootstrap_nak(&conn, req.repo, req.index, "circuit open")
+                    .await;
+                return;
+            }
+        }
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
@@ -3114,11 +3614,15 @@ impl SyncManager {
                             .insert(key, Instant::now());
                         self.bootstrap_rebuild_at.write().remove(&key);
                         let resp = BootstrapManifestResponseMessage { manifest: m };
-                        if conn
-                            .send_message(MessageType::BootstrapManifestResponse, &resp)
-                            .await
-                            .is_ok()
-                        {
+                        // G2：发送超时兜底（复用 transport_write_timeout_secs）。
+                        let send_ok = tokio::time::timeout(
+                            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+                            conn.send_message(MessageType::BootstrapManifestResponse, &resp),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
+                        if send_ok {
                             self.metrics.record_message_sent();
                         }
                         return;
@@ -3174,8 +3678,28 @@ impl SyncManager {
                 return;
             }
         };
-        let lo = Self::range_bound(&chunk.lo);
-        let hi = Self::range_bound(&chunk.hi);
+        // A1：发送并发上限 —— 必须早于 entries 加载（这才是内存堆积窗口）。
+        // 在途计数覆盖「加载 entries → 发送完成」整段；拿不到立即 NAK、不排队。
+        // `_send_permit` 为 RAII：发送完成或中途任何 early-return（含取数失败的 NAK）都释放槽。
+        BOOTSTRAP_SEND_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let send_limit = effective_send_limit(self.config.bootstrap_send_concurrency);
+        if !try_inc_bounded(&BOOTSTRAP_SEND_IN_FLIGHT, send_limit) {
+            self.send_bootstrap_nak(&conn, req.repo, req.index, "send concurrency limit")
+                .await;
+            return;
+        }
+        let _send_permit = BootstrapSendPermit;
+        // E3：发送方主路径 —— 通道方向标记为 send（面板据此区分收发方向）。
+        {
+            let s = crate::federation::sync::channels_status::global();
+            let mut g = s.write();
+            g.bootstrap.active = true;
+            g.bootstrap.direction = "send".to_string();
+            g.bootstrap.peer_id = conn.node_id.to_hex();
+            g.bootstrap.repo = req.repo as u64;
+        }
+        let lo = Self::range_bound(&chunk.lo).map(|b| b.to_vec());
+        let hi = Self::range_bound(&chunk.hi).map(|b| b.to_vec());
         let storage = self.delta_storage();
         // D批(D3)：删除对端「取块哈希」第二次 SELECT —— 客户端从 manifest 已知块 hash，
         // 对端不必重算 blake3。传输完整性由 verify_transport + Range 反熵兜底（见 P0-4：
@@ -3183,15 +3707,35 @@ impl SyncManager {
         // 响应线协议仍保留 hash 字段，但客户端从不读取，固定填零占位。
         let hash = [0u8; 32];
         // ② 完整条目（含 payload，供接收方批量 upsert）—— v7 全 repo 通用
-        let entries: Vec<SyncEntry> = match storage.load_repo_sync_entries_in_range(
-            req.repo,
-            lo,
-            hi,
-            chunk.rows as usize + 1,
-        ) {
-            Ok(rows) => rows.into_iter().take(chunk.rows as usize).collect(),
-            Err(e) => {
+        // v12：同步 SQLite 区间查询在 async handler 里会阻塞 tokio worker（叠加读池空回退写锁
+        // 曾致 62 侧 30s write timeout 重试循环）—— 移入 spawn_blocking，worker 不再被阻塞。
+        // lo/hi 提升为 owned Vec（原 &[u8] 借用 chunk 非 'static，无法进 'static 闭包）。
+        let max_rows = chunk.rows as usize;
+        let repo = req.repo;
+        let entries: Vec<SyncEntry> = match tokio::task::spawn_blocking(move || {
+            storage.load_repo_sync_entries_in_range(
+                repo,
+                lo.as_deref(),
+                hi.as_deref(),
+                max_rows + 1,
+            )
+        })
+        .await
+        {
+            Ok(Ok(rows)) => rows.into_iter().take(max_rows).collect(),
+            Ok(Err(e)) => {
                 warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
+                self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk entries failed")
+                    .await;
+                return;
+            }
+            Err(e) => {
+                // blocking 任务 join 失败（panic/取消）按取数失败同一路径处理，
+                // 回 NAK 让请求方走可计数、可升级的失败路径
+                warn!(
+                    "[bootstrap] 取块条目任务 join 失败 index={}: {}",
+                    req.index, e
+                );
                 self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk entries failed")
                     .await;
                 return;
@@ -3217,13 +3761,32 @@ impl SyncManager {
             hash,
             is_last,
         };
-        if let Err(e) = conn
-            .send_message(MessageType::BootstrapChunkResponse, &resp)
-            .await
-        {
-            warn!("[bootstrap] 发送块 {} 失败: {}", req.index, e);
-        } else {
-            self.metrics.record_message_sent();
+        // A2：单块发送超时兜底 —— 超时按失败处理（warn + 失败计数 + per-peer 熔断累计），
+        // 不重试、不堆积。_send_permit 在本函数返回时释放（无论成功/超时/发送 Err）。
+        let send_deadline = Duration::from_secs(self.config.bootstrap_send_timeout_secs.max(1));
+        let send_result = tokio::time::timeout(
+            send_deadline,
+            conn.send_message(MessageType::BootstrapChunkResponse, &resp),
+        )
+        .await;
+        match send_result {
+            Ok(Ok(())) => {
+                self.metrics.record_message_sent();
+                // A3：成功发送一次即清零该对端连续失败计数并解除熔断。
+                send_circuits().write().remove(&conn.node_id);
+            }
+            Ok(Err(e)) => {
+                warn!("[bootstrap] 发送块 {} 失败: {}", req.index, e);
+                self.record_bootstrap_send_failure(&conn.node_id);
+            }
+            Err(_) => {
+                warn!(
+                    "[bootstrap] 发送块 {} 超过 {}s 超时，按失败处理（不重试、不堆积）",
+                    req.index,
+                    send_deadline.as_secs()
+                );
+                self.record_bootstrap_send_failure(&conn.node_id);
+            }
         }
     }
 
@@ -3461,6 +4024,8 @@ impl SyncManager {
             g.bootstrap.done_chunks = progress.done_chunks;
             g.bootstrap.phase = "transfer".to_string();
             g.bootstrap.skipped_identical = seed.len() as u64;
+            // E3：接收方（我们在拉对端快照）标记方向为 recv。
+            g.bootstrap.direction = "recv".to_string();
         }
         // v10(C)：窗口化并发预取 —— 建立窗口状态机（resume_from = 继承的连续前缀），
         // fill 出首批在途块并批量请求。旧实现链式传输（收一块才请求下一块）把吞吐
@@ -3661,6 +4226,8 @@ impl SyncManager {
             g.bootstrap.total_chunks = mf.chunks.len() as u64;
             g.bootstrap.inflight = cw.inflight_len() as u32;
             g.bootstrap.phase = "transfer".to_string();
+            // E3：接收方块到达 → 方向 recv。
+            g.bootstrap.direction = "recv".to_string();
         }
         let batch = cw.fill(0);
         self.chunk_windows
@@ -3697,15 +4264,26 @@ impl SyncManager {
         // 仅发送失败（传输类）时记入退避表，resume tick 按指数退避表决定何时重发，
         // 永不因此重拉清单。
         let req = BootstrapChunkRequestMessage { repo, index };
-        match conn
-            .send_message(MessageType::BootstrapChunkRequest, &req)
-            .await
-        {
-            Ok(()) => self.metrics.record_message_sent(),
-            Err(e) => {
+        // H2：bootstrap 块请求发送走 bootstrap_chunk_timeout_secs（与逐块等待超时一致量级），
+        // 避免 5s 发送超时把大块数据请求反复打断导致收敛极慢。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.bootstrap_chunk_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapChunkRequest, &req),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => self.metrics.record_message_sent(),
+            Ok(Err(e)) => {
                 warn!(
                     "[bootstrap] 请求块 {} 失败（传输类，计入退避重试）: peer={} repo={} err={}",
                     index, conn.node_id, repo, e
+                );
+                self.record_chunk_transport_fail(&conn.node_id, repo, index);
+            }
+            Err(_) => {
+                warn!(
+                    "[bootstrap] 请求块 {} 超时（{}s，计入退避重试）: peer={} repo={}",
+                    index, self.config.bootstrap_chunk_timeout_secs, conn.node_id, repo
                 );
                 self.record_chunk_transport_fail(&conn.node_id, repo, index);
             }
@@ -3843,6 +4421,8 @@ impl SyncManager {
             g.bootstrap.done_chunks = g.bootstrap.total_chunks;
             g.bootstrap.inflight = 0;
             g.bootstrap.phase = "done".to_string();
+            // E3：竣工终态复位方向。
+            g.bootstrap.direction = String::new();
         }
         // v9：追尾不受协商策略门控 —— 进入 bootstrap 的判定之一恰是
         // 「策略 = BOOTSTRAP」，而 `delta_channel_allowed` 要求策略 = DELTA，
@@ -3923,6 +4503,8 @@ impl SyncManager {
             g.bootstrap.total_chunks = p.total_chunks;
             g.bootstrap.inflight = 0;
             g.bootstrap.phase = "idle".to_string();
+            // E3：停滞终态复位方向。
+            g.bootstrap.direction = String::new();
         }
         false
     }
@@ -3932,6 +4514,8 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // A5：发送方 idle 看门狗 —— 每轮续传 tick 顺带清理过期的「正在服务」标记并复位方向。
+        self.prune_idle_send_serving();
         let list = match self.delta_storage().bootstrap_list() {
             Ok(l) => l,
             Err(_) => return,
@@ -3944,6 +4528,53 @@ impl SyncManager {
             let mut arr = [0u8; 20];
             arr.copy_from_slice(&p.peer);
             let peer = NodeId(arr);
+            // I批：续传方向守卫 —— resume 恢复路径此前不查方向守卫：H 版重启后恢复
+            // 持久化进度时直接重建窗口发块请求，实测 62(436.8万行) 向 51(350.9万行) 发起的
+            // 无收益 bootstrap 空转 20+ 分钟（全部"对端无活跃会话"，进度永不 Done，调度器
+            // 超龄回收抓不到秒级返回的 resume tick）。与发起路径共用 direction_guard_blocks：
+            // 对端自报缺失(0)或行数不多于本端且本端已有存量 → **终止**该续传（置 Done、
+            // 清窗口/尝试，下一轮不再恢复），而非 continue 等冷却/退避到期再试；仅空库
+            // 冷启动（local_rows == 0）放行照常恢复。放在熔断/退避检查之前：终止与重发
+            // 方向相反，无需等待冷却/退避到期。
+            let remote_rows = self
+                .peer_negotiate_state
+                .read()
+                .get(&peer)
+                .and_then(|v| v.iter().find(|s| s.repo == p.repo).map(|s| s.row_count))
+                .unwrap_or(0);
+            let local_rows = self
+                .local_entry_counts()
+                .get((p.repo.saturating_sub(repo_type::NODE)) as usize)
+                .copied()
+                .unwrap_or(0) as u64;
+            if Self::resume_guard_terminates(remote_rows, local_rows) {
+                debug!(
+                    "[bootstrap] 续传方向守卫：终止无收益续传（本端存量 {}，对端自报缺失(0)或行数 {} 不多于本端）: peer={} repo={}",
+                    local_rows, remote_rows, peer, p.repo
+                );
+                let mut done = p.clone();
+                done.phase = bootstrap::BootstrapPhase::Done;
+                done.updated_ms = chrono::Utc::now().timestamp_millis();
+                done.error = Some(format!(
+                    "I批方向守卫终止：remote={} <= local={}",
+                    remote_rows, local_rows
+                ));
+                let _ = self.delta_storage().bootstrap_save(&done, None);
+                // 清掉该 (peer,repo) 的内存窗口与分块尝试，避免残留状态被后续逻辑拾起。
+                self.chunk_windows.write().remove(&(peer, p.repo));
+                self.bootstrap_chunk_attempt.write().remove(&(peer, p.repo));
+                // 联邦同步通道状态：终止 → 不再显示在途传输（与停滞置 Idle 的终态写法一致）。
+                {
+                    let s = crate::federation::sync::channels_status::global();
+                    let mut g = s.write();
+                    g.bootstrap.active = false;
+                    g.bootstrap.done_chunks = p.done_chunks;
+                    g.bootstrap.total_chunks = p.total_chunks;
+                    g.bootstrap.inflight = 0;
+                    g.bootstrap.phase = "idle".to_string();
+                }
+                continue;
+            }
             // 活锁治理(任务2)：重拉熔断冷却期内直接跳过 —— 不重发、不重拉、不重建窗口。
             if self.bootstrap_repull_in_cooldown(&peer, p.repo) {
                 continue;
@@ -4006,6 +4637,8 @@ impl SyncManager {
                         g.bootstrap.idle_recoveries = cw.idle_recovery_count();
                         g.bootstrap.inflight = cw.inflight_len() as u32;
                         g.bootstrap.phase = "transfer".to_string();
+                        // E3：续传（我们在拉对端快照）→ 方向 recv。
+                        g.bootstrap.direction = "recv".to_string();
                     }
                     // E2 + 活锁治理(任务1)：连续空闲恢复达上限 → 记入退避表推迟重发，
                     // **不再重拉清单**。旧实现此处 start_bootstrap，对端不可达时形成
@@ -4126,9 +4759,23 @@ impl SyncManager {
         }
     }
 
-    /// 活锁治理(任务5)：为某 repo 初选一个已连接对端。优先「对端自报行数 > 本端」
-    /// 的方向（start_bootstrap 的方向守卫会再校验一次），无自报状态时回退到第一条
-    /// 支持 bootstrap 的连接。全部候选都在熔断冷却期 → None。
+    /// H批：方向优先门槛（纯函数）。对端存量需超过本端 ×SNAPSHOT_RATIO_THRESHOLD(1.2)
+    /// 才视为「确有本端缺的存量」—— 与 check_and_trigger_bootstrap 的快照分流阈值对齐，
+    /// 微差距（≤20%）不再触发无收益快照。边界：remote == local × 1.2 不触发。
+    fn remote_exceeds_local_threshold(remote_rows: u64, local_rows: u64) -> bool {
+        remote_rows as f64 > local_rows as f64 * SNAPSHOT_RATIO_THRESHOLD
+    }
+
+    /// H批：无方向优先候选时的回退闸（纯函数）。仅空库冷启动（local_rows == 0）允许
+    /// 回退到任一已连接对端；本端已有存量时任何对端都不是值得拉的方向 → 返回 None，
+    /// 由 delta/range 与 check_and_trigger_bootstrap 接管。
+    fn allow_direction_fallback(local_rows: u64) -> bool {
+        local_rows == 0
+    }
+
+    /// 活锁治理(任务5)：为某 repo 初选一个已连接对端。优先「对端自报行数 > 本端 ×1.2」
+    /// 的方向（start_bootstrap 的方向守卫会再校验一次），无方向优先候选时仅空库冷启动
+    /// 回退到第一条支持 bootstrap 的连接。全部候选都在熔断/竣工冷却期 → None。
     fn pick_bootstrap_peer(&self, repo: u8, conns: &[Arc<PeerConn>]) -> Option<NodeId> {
         let idx = (repo - repo_type::NODE) as usize;
         let local_rows = self.local_entry_counts().get(idx).copied().unwrap_or(0) as u64;
@@ -4140,17 +4787,22 @@ impl SyncManager {
             if self.bootstrap_repull_in_cooldown(&c.node_id, repo) {
                 continue;
             }
+            // v10(F4)：竣工冷却期内不选为快照源（bootstrap 竣工后 bootstrap_cooldown_secs
+            // 内不再被拉，避免刚对齐又立刻被反向拉）。
+            if self.snapshot_in_cooldown(&c.node_id, repo) {
+                continue;
+            }
             let remote_rows = self
                 .peer_negotiate_state
                 .read()
                 .get(&c.node_id)
                 .and_then(|v| v.iter().find(|s| s.repo == repo).map(|s| s.row_count))
                 .unwrap_or(0);
-            // 方向优先：对端确有本端缺的存量
-            if remote_rows > local_rows {
+            // 方向优先：对端确有本端缺的存量（差 >20%）
+            if Self::remote_exceeds_local_threshold(remote_rows, local_rows) {
                 return Some(c.node_id);
             }
-            if fallback.is_none() {
+            if Self::allow_direction_fallback(local_rows) && fallback.is_none() {
                 fallback = Some(c.node_id);
             }
         }
@@ -4260,6 +4912,21 @@ impl SyncManager {
         }
     }
 
+    /// H批：方向守卫（纯函数）。本端已有存量（local_rows > 0）且对端自报缺失
+    /// （remote_rows == 0，协商早期/缺失，方向证据不足）或行数不多于本端 → 拦截；
+    /// 仅空库冷启动（local_rows == 0）放行。
+    fn direction_guard_blocks(remote_rows: u64, local_rows: u64) -> bool {
+        local_rows > 0 && (remote_rows == 0 || remote_rows <= local_rows)
+    }
+
+    /// I批：续传方向守卫判定（纯函数）。与发起路径共用 `direction_guard_blocks`：
+    /// 对端自报缺失(0)或行数不多于本端且本端已有存量 → 该续传无收益，返回 true 表示
+    /// 应**终止**（resume tick 置 Done、清窗口，下一轮不再恢复）；仅空库冷启动
+    /// （local_rows == 0）返回 false，照常恢复续传。
+    fn resume_guard_terminates(remote_rows: u64, local_rows: u64) -> bool {
+        Self::direction_guard_blocks(remote_rows, local_rows)
+    }
+
     /// P2-1：向指定对端发起某 repo 的 bootstrap（拉清单 → 分块 → 追尾）。默认关闭。
     pub async fn start_bootstrap(self: Arc<Self>, peer: NodeId, repo: u8) {
         if !self.config.bootstrap_enabled {
@@ -4278,7 +4945,8 @@ impl SyncManager {
         // 对端自报行数不多于本端时，快照拉来的几乎全是本端已有行（行集近似包含），
         // 数 GB 传输零收益，还会占住带宽与响应能力、阻塞对端真正需要的第一优先拉取。
         // 实测 52/58：58（305 万行）持续从 52（267 万行）拉无收益快照，而 52 真缺的
-        // 38 万行被让路卡住。仅在协商早期（对端自报缺失）放行，避免误伤冷启动。
+        // 38 万行被让路卡住。H批：协商状态缺失（对端自报缺失）不再放行 —— 本端已有
+        // 存量时方向证据不足同样拦截；仅空库冷启动（local_rows == 0）放行。
         let remote_rows = self
             .peer_negotiate_state
             .read()
@@ -4290,10 +4958,10 @@ impl SyncManager {
             .get((repo - repo_type::NODE) as usize)
             .copied()
             .unwrap_or(0) as u64;
-        if remote_rows > 0 && remote_rows <= local_rows {
+        if Self::direction_guard_blocks(remote_rows, local_rows) {
             debug!(
-                "[bootstrap] 方向守卫：对端行数({})不多于本端({})，跳过快照: peer={} repo={}",
-                remote_rows, local_rows, peer, repo
+                "[bootstrap] 方向守卫：本端已有存量({})，对端自报缺失(0)或行数({})不多于本端，跳过快照: peer={} repo={}",
+                local_rows, remote_rows, peer, repo
             );
             return;
         }
@@ -4342,12 +5010,19 @@ impl SyncManager {
         // 落地即清零。首次发起同样记账 ——「清单永远拉不回来」与「拉回来传不动」同属停滞。
         self.record_bootstrap_repull(&peer, repo);
         let req = BootstrapManifestRequestMessage { repo };
-        match conn
-            .send_message(MessageType::BootstrapManifestRequest, &req)
-            .await
-        {
-            Ok(()) => self.metrics.record_message_sent(),
-            Err(e) => warn!("[bootstrap] 发送清单请求失败: {}", e),
+        // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapManifestRequest, &req),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => self.metrics.record_message_sent(),
+            Ok(Err(e)) => warn!("[bootstrap] 发送清单请求失败: {}", e),
+            Err(_) => warn!(
+                "[bootstrap] 发送清单请求超时（{}s）",
+                self.config.transport_write_timeout_secs
+            ),
         }
     }
 
@@ -5700,5 +6375,266 @@ mod tests {
             None,
             "对端空→本地多时不得反向重触发 bootstrap"
         );
+    }
+
+    // ==================== 核心运行时切片（2026-09-30）：A1/A3/A5 纯逻辑单测 ====================
+
+    #[test]
+    fn a1_try_inc_bounded_caps_inflight_and_releases() {
+        // A1：有界在途计数 —— 打满后拒绝获取，释放一个后可再获取。
+        let c = std::sync::atomic::AtomicUsize::new(0);
+        let limit = 4;
+        for _ in 0..limit {
+            assert!(try_inc_bounded(&c, limit));
+        }
+        // 已满 → 非阻塞拒绝（handler 据此 NAK "send concurrency limit"）
+        assert!(!try_inc_bounded(&c, limit));
+        assert!(!try_inc_bounded(&c, limit));
+        // 释放一个（模拟 permit drop）→ 可再获取
+        c.fetch_sub(1, Ordering::AcqRel);
+        assert!(try_inc_bounded(&c, limit));
+        // limit<1 按 1 兜底（防配置 0 锁死发送）
+        let c2 = std::sync::atomic::AtomicUsize::new(0);
+        assert!(try_inc_bounded(&c2, 0));
+        assert!(!try_inc_bounded(&c2, 0));
+    }
+
+    #[test]
+    fn a3_send_circuit_threshold_open_then_half_open_and_reset() {
+        let now = Instant::now();
+        let base = Duration::from_secs(30);
+        let max = Duration::from_secs(600);
+        let threshold = 5;
+        let mut s = SendCircuitState::record_success();
+        // 连续 4 次失败：未达阈值，不熔断
+        for _ in 0..4 {
+            s = s.record_failure(now);
+            assert!(!s.is_open(threshold, now, base, max));
+        }
+        // 第 5 次失败 → 熔断开放（backoff_delay(30,600,5)=480s）
+        s = s.record_failure(now);
+        assert_eq!(s.fails, 5);
+        assert!(s.is_open(threshold, now, base, max));
+        // backoff 到期（481s > 480s）→ 半开，允许探测
+        let later = now + Duration::from_secs(481);
+        assert!(!s.is_open(threshold, later, base, max));
+        // 成功一次 → 整条清零
+        let fresh = SendCircuitState::record_success();
+        assert_eq!(fresh.fails, 0);
+        assert!(!fresh.is_open(threshold, now, base, max));
+    }
+
+    #[test]
+    fn a5_serving_entry_expired_boundary() {
+        let now = Instant::now();
+        let idle = Duration::from_secs(60);
+        // 59s 前的服务标记 → 仍在窗口内，保留
+        assert!(!serving_entry_expired(
+            now - Duration::from_secs(59),
+            now,
+            idle
+        ));
+        // 恰好 60s / 120s 前 → 过期，应移除并复位 direction
+        assert!(serving_entry_expired(
+            now - Duration::from_secs(60),
+            now,
+            idle
+        ));
+        assert!(serving_entry_expired(
+            now - Duration::from_secs(120),
+            now,
+            idle
+        ));
+    }
+
+    // ==================== H批：方向判定纯函数单测 ====================
+
+    /// H批：方向优先门槛 —— 对端存量需超过本端 ×SNAPSHOT_RATIO_THRESHOLD(1.2)。
+    #[test]
+    fn test_remote_exceeds_local_threshold() {
+        // 正向：对端存量超过本端 1.2 倍 → 触发
+        assert!(SyncManager::remote_exceeds_local_threshold(13, 10));
+        assert!(SyncManager::remote_exceeds_local_threshold(121, 100));
+        assert!(SyncManager::remote_exceeds_local_threshold(
+            2_500_000, 2_000_000
+        ));
+        // 边界：恰好 1.2 倍 → 不触发
+        assert!(!SyncManager::remote_exceeds_local_threshold(12, 10));
+        assert!(!SyncManager::remote_exceeds_local_threshold(120, 100));
+        assert!(!SyncManager::remote_exceeds_local_threshold(1_200, 1_000));
+        // 对端不多于本端 → 不触发
+        assert!(!SyncManager::remote_exceeds_local_threshold(10, 10));
+        assert!(!SyncManager::remote_exceeds_local_threshold(9, 10));
+        // 空库冷启动：本端 0 行、对端有任意存量 → 触发
+        assert!(SyncManager::remote_exceeds_local_threshold(1, 0));
+        // 双方皆空 → 不触发
+        assert!(!SyncManager::remote_exceeds_local_threshold(0, 0));
+    }
+
+    /// H批：方向守卫 —— 本端有存量时，协商状态缺失（remote_rows == 0）或对端行数
+    /// 不多于本端 → 拦截；仅冷启动（local_rows == 0）放行。
+    #[test]
+    fn test_direction_guard_blocks() {
+        // 协商状态缺失（remote_rows == 0）且本端有存量 → 拦截（方向证据不足）
+        assert!(SyncManager::direction_guard_blocks(0, 100));
+        assert!(SyncManager::direction_guard_blocks(0, 3_000_000));
+        // 对端行数不多于本端 → 拦截
+        assert!(SyncManager::direction_guard_blocks(100, 100));
+        assert!(SyncManager::direction_guard_blocks(50, 100));
+        // 冷启动（local_rows == 0）：对端自报缺失或任意行数 → 放行
+        assert!(!SyncManager::direction_guard_blocks(0, 0));
+        assert!(!SyncManager::direction_guard_blocks(100, 0));
+        // 对端确有多于本端的存量 → 放行
+        assert!(!SyncManager::direction_guard_blocks(101, 100));
+        assert!(!SyncManager::direction_guard_blocks(1_000, 100));
+    }
+
+    /// I批：续传方向守卫判定 —— 命中 direction_guard_blocks 的续传应被终止（置 Done、
+    /// 不再恢复重建窗口）；未命中（含空库冷启动 local_rows == 0）照常恢复。
+    #[test]
+    fn test_resume_guard_terminates() {
+        // 对端自报缺失(0)且本端有存量 → 拦截终止
+        assert!(SyncManager::resume_guard_terminates(0, 100));
+        assert!(SyncManager::resume_guard_terminates(0, 3_000_000));
+        // 对端行数不多于本端 → 拦截终止（含实测场景：62 的 436.8 万 vs 51 的 350.9 万）
+        assert!(SyncManager::resume_guard_terminates(100, 100));
+        assert!(SyncManager::resume_guard_terminates(50, 100));
+        assert!(SyncManager::resume_guard_terminates(3_509_000, 4_368_000));
+        // 冷启动（local_rows == 0）：对端自报缺失或任意行数 → 放行恢复
+        assert!(!SyncManager::resume_guard_terminates(0, 0));
+        assert!(!SyncManager::resume_guard_terminates(100, 0));
+        // 对端确有多于本端的存量 → 放行恢复
+        assert!(!SyncManager::resume_guard_terminates(101, 100));
+        assert!(!SyncManager::resume_guard_terminates(1_000, 100));
+    }
+
+    /// H批：pick_bootstrap_peer 回退闸 —— 仅空库冷启动允许回退，本端已有存量时回退被禁用。
+    #[test]
+    fn test_allow_direction_fallback() {
+        // 空库冷启动（local_rows == 0）→ 允许回退
+        assert!(SyncManager::allow_direction_fallback(0));
+        // 本端已有存量 → 不允许回退（宁可不发起，交给 delta/range/巡检）
+        assert!(!SyncManager::allow_direction_fallback(1));
+        assert!(!SyncManager::allow_direction_fallback(1_000));
+        assert!(!SyncManager::allow_direction_fallback(3_000_000));
+    }
+
+    /// 「块请求 spawn_blocking 正确性」回归：handle_bootstrap_chunk_request 的取数段已从同步
+    /// SQLite 调用移入 tokio::task::spawn_blocking（避免在 async handler 里阻塞 tokio worker，
+    /// 叠加读池空回退写锁曾致 62 侧 30s write timeout 重试循环）。
+    /// 本测试以与生产代码完全一致的闭包形态（move 捕获 Arc<Storage>/owned lo/hi/max_rows）
+    /// 验证：
+    ///   (1) 阻塞线程取数路径返回的条目与直接同步调用逐 key 一致；
+    ///   (2) 半开区间 [lo, hi) 边界正确（按 infohash 升序，hi 不包含）；
+    ///   (3) 查询 limit=max_rows+1 后再 take(max_rows) 的边界语义（多取一行用于末块判定，
+    ///       实际下发仍截断到 max_rows）。
+    #[tokio::test]
+    async fn test_bootstrap_chunk_spawn_blocking_entries_correctness() {
+        use crate::federation::protocol::repo_type;
+        // 20 字节 infohash：前 8 字节放大端下标，后 12 字节补 0 —— 唯一、按数值升序。
+        fn ih_key(i: u64) -> Vec<u8> {
+            let mut k = [0u8; 20];
+            k[..8].copy_from_slice(&i.to_be_bytes());
+            k.to_vec()
+        }
+        let storage = Arc::new(Storage::memory().unwrap());
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..100u64 {
+                conn.execute(
+                    "INSERT INTO infohashes (infohash) VALUES (?1)",
+                    rusqlite::params![ih_key(i)],
+                )
+                .unwrap();
+            }
+        }
+        let repo = repo_type::INFOHASH;
+
+        // 与生产 handler 完全一致的 spawn_blocking 取数形态：move 闭包 + 三分支 match。
+        // 此处 happy-path 仅走 Ok(Ok)；Ok(Err)/Err(join) 为防御分支，与清单重建同风格。
+        async fn load_via_blocking(
+            storage: Arc<Storage>,
+            repo: u8,
+            lo: Option<Vec<u8>>,
+            hi: Option<Vec<u8>>,
+            max_rows: usize,
+        ) -> Vec<crate::federation::protocol::SyncEntry> {
+            match tokio::task::spawn_blocking(move || {
+                storage.load_repo_sync_entries_in_range(
+                    repo,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                    max_rows + 1,
+                )
+            })
+            .await
+            {
+                Ok(Ok(rows)) => rows.into_iter().take(max_rows).collect(),
+                Ok(Err(e)) => panic!("阻塞取数返回 Err: {}", e),
+                Err(e) => panic!("阻塞取数 join 失败: {}", e),
+            }
+        }
+
+        // (1) 全区间：max_rows=100（库里恰好 100 行）。
+        let direct_all: Vec<Vec<u8>> = storage
+            .load_repo_sync_entries_in_range(repo, None, None, 101)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        let blocking_all: Vec<Vec<u8>> = load_via_blocking(storage.clone(), repo, None, None, 100)
+            .await
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(blocking_all.len(), 100, "全区间应取满 100 行");
+        assert_eq!(
+            blocking_all, direct_all,
+            "spawn_blocking 取数必须与直接同步调用逐 key 一致"
+        );
+        assert_eq!(blocking_all.first().unwrap(), &ih_key(0));
+        assert_eq!(blocking_all.last().unwrap(), &ih_key(99));
+
+        // (2) 半开区间 [30, 60)：应恰返回下标 30..=59 共 30 行。
+        let lo = ih_key(30);
+        let hi = ih_key(60);
+        let direct_range: Vec<Vec<u8>> = storage
+            .load_repo_sync_entries_in_range(repo, Some(&lo), Some(&hi), 101)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        let blocking_range: Vec<Vec<u8>> =
+            load_via_blocking(storage.clone(), repo, Some(lo), Some(hi), 30)
+                .await
+                .into_iter()
+                .map(|e| e.key)
+                .collect();
+        assert_eq!(blocking_range.len(), 30, "[30,60) 应返回 30 行");
+        assert_eq!(
+            blocking_range, direct_range,
+            "区间取数必须与直接调用逐 key 一致"
+        );
+        assert_eq!(blocking_range.first().unwrap(), &ih_key(30));
+        assert_eq!(
+            blocking_range.last().unwrap(),
+            &ih_key(59),
+            "hi=60 为开界，不得包含"
+        );
+
+        // (3) +1/take 边界：max_rows=20、库里 100 行 —— 查询多取一行(limit=21)，
+        //     但 take(20) 截断后必须恰为 20 行，末行为下标 19（多取的第 21 行被丢弃）。
+        let chunk: Vec<Vec<u8>> = load_via_blocking(storage.clone(), repo, None, None, 20)
+            .await
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(
+            chunk.len(),
+            20,
+            "take(max_rows=20) 后必须恰为 20 行（多取的第 21 行被截断）"
+        );
+        assert_eq!(chunk.last().unwrap(), &ih_key(19));
     }
 }

@@ -103,6 +103,11 @@ pub struct FederationConfig {
     /// TCP 传输写入超时（秒），超过此时间 write_all 未完成则报错（随后触发重试）
     #[serde(default = "default_transport_write_timeout")]
     pub transport_write_timeout_secs: u64,
+    /// Range 对账数据块发送超时（秒）。按键拉取、本地多推送、RangeReconcileRequest
+    /// 等 range 数据型消息发送使用此超时；bootstrap 块请求走 bootstrap_chunk_timeout_secs，
+    /// 心跳/协商/控制类消息走 transport_write_timeout_secs。
+    #[serde(default = "default_range_send_timeout_secs")]
+    pub range_send_timeout_secs: u64,
     /// TCP 写入超时后的最大重试次数（不含首次）。
     /// 超时后按退避基数指数退避重试，超过此次数才判定写入失败并断开。
     #[serde(default = "default_transport_write_max_retries")]
@@ -392,6 +397,64 @@ pub struct FederationConfig {
     /// 默认仅 `[1]`（NODE），与引入前行为一致；加入 2/3/4 可让 PEER/INFOHASH/TRACKER 走快照追赶。
     #[serde(default = "default_bootstrap_enable_repos")]
     pub bootstrap_enable_repos: Vec<u8>,
+    /// 永动治理(任务5b)：某 repo bootstrap 竣工后的再触发冷却（秒）。
+    /// 对端活表持续增长时，若无冷却，竣工→清单再膨胀→差距触发器再开火 → bootstrap
+    /// 永动（2026-09-30 三节点实证：三节点全部恒处「传输中」，range 被让路饿死）。
+    /// 冷却期内该 repo 的差距归 delta 增量 + range 反熵接管。默认 600。
+    #[serde(default = "default_bootstrap_repo_done_cooldown_secs")]
+    pub bootstrap_repo_done_cooldown_secs: u64,
+    // ========================================================================
+    // 核心运行时切片（2026-09-30）：bootstrap 发送端并发/超时/熔断 + range 执行超时。
+    // 根因：52 内存峰值 6.5GB = bootstrap 发送 handler 无并发上限 + send_message 无快速
+    // 失败，对端 HDD 慢时已加载的 2 万行 SyncEntry 在任务里无限堆积。
+    // ========================================================================
+    /// A1：bootstrap 发送 handler 的在途块发送并发上限（同时「加载 entries→发送完成」
+    /// 的最大任务数）。超限直接 NAK("send concurrency limit") 快速失败、不排队。
+    /// 这是内存堆积窗口（已加载的 2 万行 SyncEntry）的硬上限。默认 4。
+    #[serde(default = "default_bootstrap_send_concurrency")]
+    pub bootstrap_send_concurrency: usize,
+    /// A2：单块 `send_message` 发送超时（秒）。超时按失败处理（warn + 失败计数，
+    /// 不重试、不堆积），防止对端 TCP 写缓冲打满后发送 future 永久挂起占住在途槽。默认 10。
+    #[serde(default = "default_bootstrap_send_timeout_secs")]
+    pub bootstrap_send_timeout_secs: u64,
+    /// A3：发送熔断阈值 —— 同一对端连续发送失败达此次数即熔断，新块请求直接
+    /// NAK("circuit open")，按指数退避（30s×2^n 封顶 600s）后半开探测。成功一次即清零。默认 5。
+    #[serde(default = "default_bootstrap_send_circuit_break_threshold")]
+    pub bootstrap_send_circuit_break_threshold: u32,
+    /// A5：发送方 idle 看门狗阈值（秒）。某 (peer,repo) 超过此时长无新的块请求，
+    /// 即视为对端已停止拉取：移除「正在服务」标记并复位监控方向指示。默认 60。
+    #[serde(default = "default_bootstrap_send_idle_timeout_secs")]
+    pub bootstrap_send_idle_timeout_secs: u64,
+    /// D1：range 反熵 handler（请求/响应/拉/推四类）执行体超时（秒）。
+    /// 慢盘/网络 hang 时到点释放并发闸并记指标，防止 range handler 长期占住
+    /// `range_gate` 并发槽饿死同分类其它联邦任务。默认 120。
+    #[serde(default = "default_range_handler_timeout_secs")]
+    pub range_handler_timeout_secs: u64,
+}
+
+fn default_bootstrap_repo_done_cooldown_secs() -> u64 {
+    600
+}
+
+/// A1：bootstrap 发送并发上限默认 4（在途块任务数）。
+fn default_bootstrap_send_concurrency() -> usize {
+    4
+}
+/// A2：单块发送超时默认 10s（覆盖慢盘单块 ~2MB 的一次 RTT + 写缓冲等待）。
+fn default_bootstrap_send_timeout_secs() -> u64 {
+    10
+}
+/// A3：发送熔断阈值默认 5 次连续失败。
+fn default_bootstrap_send_circuit_break_threshold() -> u32 {
+    5
+}
+/// A5：发送方 idle 看门狗默认 60s 无新块请求即复位。
+fn default_bootstrap_send_idle_timeout_secs() -> u64 {
+    60
+}
+/// D1：range handler 执行体超时默认 120s（远大于正常单区间往返，兜住 hang）。
+fn default_range_handler_timeout_secs() -> u64 {
+    120
 }
 
 fn default_listen_port() -> u16 {
@@ -412,8 +475,15 @@ fn default_max_connections() -> usize {
 fn default_target_neighbors() -> usize {
     8
 }
+/// 心跳/会话空闲超时（秒）。
+///
+/// C1/C2（2026-09-30）：300 → 600。实证 51 侧 90s / 52 侧 30s 运行时 idle_timeout 会
+/// 对在途的 bootstrap 发送与 range 反熵长任务会话误杀（现场实测 108s / 318s 才断）——
+/// 318s 才断是空闲检查周期/保活报文拖住所致。默认提到 600s 给长任务让路，避免在
+/// 一次慢盘 bootstrap 传输中途把承载它的会话判死。会话侧对真正有 bootstrap 工作的
+/// 连接另有空闲豁免（`sync::has_active_bootstrap_work`），本超时只兜底彻底空闲的会话。
 fn default_heartbeat_timeout() -> u64 {
-    300
+    600
 }
 fn default_true() -> bool {
     true
@@ -589,6 +659,10 @@ fn default_bootstrap_chunk_max_attempts() -> u32 {
 fn default_bootstrap_chunk_timeout_secs() -> u64 {
     90
 }
+/// Range 数据块发送超时默认值（秒）。
+fn default_range_send_timeout_secs() -> u64 {
+    30
+}
 /// v9：清单重建租约（秒）。旧值 900 过长：租约内所有块请求被静默丢弃（实测卡死主因之一）。
 fn default_bootstrap_rebuild_lease_secs() -> u64 {
     60
@@ -701,6 +775,7 @@ impl Default for FederationConfig {
             peer_cache_enabled: default_true(),
             peer_cache_max_nodes: default_peer_cache_max(),
             transport_write_timeout_secs: default_transport_write_timeout(),
+            range_send_timeout_secs: default_range_send_timeout_secs(),
             transport_write_max_retries: default_transport_write_max_retries(),
             transport_write_retry_base_ms: default_transport_write_retry_base_ms(),
             gossip_max_consecutive_failures: default_gossip_max_consecutive_failures(),
@@ -766,6 +841,13 @@ impl Default for FederationConfig {
                 default_bootstrap_structural_drift_rows_percent(),
             bootstrap_inherit_tolerance_percent: default_bootstrap_inherit_tolerance_percent(),
             bootstrap_enable_repos: default_bootstrap_enable_repos(),
+            bootstrap_repo_done_cooldown_secs: default_bootstrap_repo_done_cooldown_secs(),
+            bootstrap_send_concurrency: default_bootstrap_send_concurrency(),
+            bootstrap_send_timeout_secs: default_bootstrap_send_timeout_secs(),
+            bootstrap_send_circuit_break_threshold: default_bootstrap_send_circuit_break_threshold(
+            ),
+            bootstrap_send_idle_timeout_secs: default_bootstrap_send_idle_timeout_secs(),
+            range_handler_timeout_secs: default_range_handler_timeout_secs(),
         }
     }
 }
@@ -781,9 +863,11 @@ mod tests {
         assert_eq!(cfg.listen_port, 6885);
         assert_eq!(cfg.max_connections, 32);
         assert_eq!(cfg.target_neighbors, 8);
-        // 300 是 2026-09-20「连接稳定性修复」的有意调参（90→300）：放宽空闲断连窗口
-        // 以降低慢链路 / NAT 抖动下的误杀。该断言当时漏同步，长期 FAIL，此处对齐实现。
-        assert_eq!(cfg.heartbeat_timeout_secs, 300);
+        // C1/C2（2026-09-30）：默认心跳/会话空闲超时 300→600。
+        // 背景：300s 会对在途的 bootstrap 发送 / range 反熵长任务会话误杀
+        // （现场实证 108s / 318s 才断，318s 才断是空闲检查周期/保活拖住）。
+        // 600s 给长任务让路；真正有 bootstrap 工作的连接由 has_active_bootstrap_work 豁免。
+        assert_eq!(cfg.heartbeat_timeout_secs, 600);
         assert!(cfg.nat_mapping_enabled);
         assert!(cfg.enable_relay);
         assert_eq!(cfg.relay_bandwidth_limit_mbps, 10);
@@ -810,6 +894,12 @@ mod tests {
             vec![1],
             "默认仅 NODE(1)，保持现行为"
         );
+        // 核心运行时切片（2026-09-30）：发送并发/超时/熔断/idle/range 超时默认值
+        assert_eq!(cfg.bootstrap_send_concurrency, 4);
+        assert_eq!(cfg.bootstrap_send_timeout_secs, 10);
+        assert_eq!(cfg.bootstrap_send_circuit_break_threshold, 5);
+        assert_eq!(cfg.bootstrap_send_idle_timeout_secs, 60);
+        assert_eq!(cfg.range_handler_timeout_secs, 120);
     }
 
     /// 活锁治理（2026-09-30）：yaml 省略新字段时全部回退默认值（向后兼容），

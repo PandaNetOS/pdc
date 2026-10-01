@@ -5,12 +5,13 @@
 //! 娴ｈ法鏁?parking_lot::RwLock閿涘牆鎮撳銉礆閿涘奔绗?NodeRepo 娑撯偓閼疯揪绱濇笟澶哥艾閺囨寧宕查崢?PeerCache閵?
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{info, warn};
 
 use crate::federation::gossip::GossipEngine;
@@ -39,7 +40,17 @@ pub struct PeerRepoImpl {
     gossip: OnceLock<Arc<GossipEngine>>,
     /// 鍐欏叆闃熷垪锛堝彲閫夛紝Some 鏃?history flush 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛?
     write_queue: Option<Arc<WriteQueue>>,
+    /// 近 1h 活跃 peer 计数（O(1) 原子读，API 线程只读，绝不遍历）。
+    /// 维护点：note_active（touch/插入）、remove_peer（删除）、sweep_active_1h（后台过期清理）、
+    /// recalibrate_active_count（启动/重载校准）。不变量：与 active_bookkeeping.len() 相等。
+    active_1h: AtomicU64,
+    /// 已计入 active_1h 的 peer：addr -> 最近活跃时间。
+    /// 只在后台 sweep 与启动校准时整体遍历；API 路径绝不读这个 map。
+    active_bookkeeping: RwLock<FxHashMap<SocketAddr, SystemTime>>,
 }
+
+/// 活跃窗口（秒）：与 federation_status_handler 原过滤口径一致（last_active 距今 < 3600s）。
+pub const ACTIVE_WINDOW_SECS: u64 = 3600;
 
 impl PeerRepoImpl {
     pub fn new(storage: Arc<Storage>) -> Self {
@@ -60,6 +71,8 @@ impl PeerRepoImpl {
             dirty: RwLock::new(FxHashSet::default()),
             gossip: OnceLock::new(),
             write_queue: None,
+            active_1h: AtomicU64::new(0),
+            active_bookkeeping: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -102,6 +115,75 @@ impl PeerRepoImpl {
     /// 紧急驱逐（内存超限时调用）。空操作。
     pub fn emergency_evict(&self, _count: usize) {
         // no-op: data is fully in memory
+    }
+
+    /// O(1) 读取近 1h 活跃 peer 数（API 线程专用：原子读，无锁遍历，不碰记账 map）。
+    pub fn active_1h_count(&self) -> u64 {
+        self.active_1h.load(Ordering::Relaxed)
+    }
+
+    /// 记账：peer 在 `at` 时刻活跃。
+    ///
+    /// - `at` 距今已超过 ACTIVE_WINDOW_SECS（如联邦同步带回来的旧 last_active）：不入账，
+    ///   等后台 sweep 兜底（与原"实时过滤"语义一致——过期 peer 本就不该被计入）。
+    /// - 已在记账集合中：仅刷新时间，不重复计数。
+    /// - 不在集合中且在窗口内：插入并 count++。
+    #[inline]
+    fn note_active(&self, addr: SocketAddr, at: SystemTime) {
+        let in_window = SystemTime::now()
+            .duration_since(at)
+            .map(|d| d.as_secs() < ACTIVE_WINDOW_SECS)
+            .unwrap_or(false);
+        if !in_window {
+            return;
+        }
+        let mut map = self.active_bookkeeping.write();
+        if map.insert(addr, at).is_none() {
+            self.active_1h.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 后台过期清理：把活跃记账中时间距今 > ACTIVE_WINDOW_SECS 的条目移除并递减计数。
+    ///
+    /// 只允许后台周期任务（stats_snapshot 的 60s 挂载）调用；
+    /// 禁止在 API handler 路径调用（记账 map 可能较大，遍历持写锁）。
+    /// 容忍度：计数最多滞后一个 sweep 周期（60s）于真实窗口边界。
+    pub fn sweep_active_1h(&self) {
+        let now = SystemTime::now();
+        let mut map = self.active_bookkeeping.write();
+        let before = map.len();
+        map.retain(|_addr, t| match now.duration_since(*t) {
+            Ok(d) => d.as_secs() < ACTIVE_WINDOW_SECS,
+            // 时钟异常（last_active 在未来）视为活跃，避免误删导致计数长期偏低
+            Err(_) => true,
+        });
+        let removed = before - map.len();
+        if removed > 0 {
+            self.active_1h.fetch_sub(removed as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// 启动/重载校准：按现有内存 peer 的 last_active 重建活跃记账集合与计数。
+    ///
+    /// 仅在 load_initial / load_all / ensure_loaded 结束后调用（此时无并发写入）；
+    /// 运行期增量维护走 note_active / sweep_active_1h，不得混用。
+    pub fn recalibrate_active_count(&self) {
+        let now = SystemTime::now();
+        let gl = self.global.read_all();
+        let mut map = FxHashMap::default();
+        for (addr, peer) in gl.iter() {
+            if now
+                .duration_since(peer.last_active)
+                .map(|d| d.as_secs() < ACTIVE_WINDOW_SECS)
+                .unwrap_or(false)
+            {
+                map.insert(*addr, peer.last_active);
+            }
+        }
+        let count = map.len() as u64;
+        drop(gl);
+        *self.active_bookkeeping.write() = map;
+        self.active_1h.store(count, Ordering::Relaxed);
     }
 
     /// 妫€鏌?(infohash, addr) 鍏宠仈鏄惁宸插瓨鍦紙鑱旈偊鍚屾鍘婚噸鐢級
@@ -220,6 +302,11 @@ impl PeerRepoImpl {
                         }
                         count += 1;
                     }
+                    drop(ir);
+                    drop(bi);
+                    drop(gl);
+                    // 重载完成：按现有 peer 的 last_active 重建活跃计数（启动校准）
+                    self.recalibrate_active_count();
                     info!(
                         "[federation] PeerRepo 閲嶆柊鍔犺浇瀹屾垚: {} 涓?peer",
                         count
@@ -260,6 +347,8 @@ impl PeerRepoImpl {
             } else {
                 gl.insert(addr, peer.clone());
             }
+            // 活跃记账：新/更新后的 last_active 驱动（旧时间由 note_active 内部判窗跳过）
+            self.note_active(addr, peer.last_active);
             // 缁存姢 (infohash, addr) 鍏宠仈
             let is_new_assoc = if let Some(set) = bi.get_mut(infohash) {
                 set.insert(addr)
@@ -345,6 +434,7 @@ impl PeerRepoImpl {
             } else {
                 gl.insert(addr, peer.clone());
             }
+            self.note_active(addr, peer.last_active);
         }
     }
 
@@ -433,11 +523,14 @@ impl PeerRepoImpl {
     }
 
     pub fn mark_connection_success_sync(&self, infohash: &Infohash, addr: &SocketAddr) {
+        let now = SystemTime::now();
         self.global.with_mut(addr, |peer| {
             peer.connection_attempts += 1;
             peer.connection_successes += 1;
-            peer.last_active = SystemTime::now();
+            peer.last_active = now;
         });
+        // 连接成功 = 活跃，记账（此刻必在窗口内）
+        self.note_active(*addr, now);
         let _ = infohash; // 閸忕厧顔愰幒銉ュ經
     }
 
@@ -481,6 +574,9 @@ impl PeerRepoImpl {
         self.by_infohash.clear();
         self.global.clear();
         self.infohash_refs.clear();
+        // 全量清空：活跃记账一并归零
+        *self.active_bookkeeping.write() = FxHashMap::default();
+        self.active_1h.store(0, Ordering::Relaxed);
     }
 
     pub fn all_peers_sync(&self) -> Vec<PeerInfo> {
@@ -617,6 +713,11 @@ impl PeerRepoImpl {
             }
             count += 1;
         }
+        drop(ir);
+        drop(bi);
+        drop(gl);
+        // 启动加载结束：按现有 peer 的 last_active 重建活跃计数（启动时安全，无并发写入）
+        self.recalibrate_active_count();
         count
     }
 }
@@ -654,6 +755,10 @@ impl PeerRepository for PeerRepoImpl {
             if refs.is_empty() {
                 gl.remove(addr);
                 ir.remove(addr);
+                // peer 已从内存删除：若在活跃记账中则移除并 count--
+                if self.active_bookkeeping.write().remove(addr).is_some() {
+                    self.active_1h.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -708,13 +813,20 @@ impl PeerRepository for PeerRepoImpl {
     }
 
     async fn update_probe_stats(&self, addr: &SocketAddr, tcp_ok: bool, _supports_dht: bool) {
-        self.global.with_mut(addr, |peer| {
-            peer.connection_attempts += 1;
-            if tcp_ok {
+        if tcp_ok {
+            let now = SystemTime::now();
+            self.global.with_mut(addr, |peer| {
+                peer.connection_attempts += 1;
                 peer.connection_successes += 1;
-                peer.last_active = SystemTime::now();
-            }
-        });
+                peer.last_active = now;
+            });
+            // 探测连通 = 活跃，记账
+            self.note_active(*addr, now);
+        } else {
+            self.global.with_mut(addr, |peer| {
+                peer.connection_attempts += 1;
+            });
+        }
     }
 
     async fn get_peer_global(&self, addr: &SocketAddr) -> Option<PeerInfo> {
@@ -791,5 +903,118 @@ impl PeerRepository for PeerRepoImpl {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+impl PeerRepoImpl {
+    /// 测试专用：直接向活跃记账注入一条（addr, at）记录并 count++。
+    pub fn testing_force_active_entry(&self, addr: SocketAddr, at: SystemTime) {
+        self.active_bookkeeping.write().insert(addr, at);
+        self.active_1h.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod active_bookkeeping_tests {
+    use super::*;
+    use crate::storage::db::Storage;
+    use crate::types::PeerSource;
+    use std::time::Duration;
+
+    fn make_repo() -> PeerRepoImpl {
+        let storage = Arc::new(Storage::memory().unwrap());
+        PeerRepoImpl::new(storage)
+    }
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    const IH: [u8; 20] = [0x11; 20];
+
+    #[test]
+    fn touch_new_peer_counts_one() {
+        let repo = make_repo();
+        repo.add_peers_sync(&IH, &[PeerInfo::new(addr(10001), PeerSource::Manual)]);
+        assert_eq!(repo.active_1h_count(), 1);
+    }
+
+    #[test]
+    fn repeated_touch_does_not_double_count() {
+        let repo = make_repo();
+        repo.add_peers_sync(&IH, &[PeerInfo::new(addr(10002), PeerSource::Manual)]);
+        repo.mark_connection_success_sync(&IH, &addr(10002));
+        repo.mark_connection_success_sync(&IH, &addr(10002));
+        assert_eq!(repo.active_1h_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_and_remove_maintains_count() {
+        let repo = make_repo();
+        let a1 = addr(10003);
+        let a2 = addr(10004);
+        repo.add_peers_sync(
+            &IH,
+            &[
+                PeerInfo::new(a1, PeerSource::Manual),
+                PeerInfo::new(a2, PeerSource::Manual),
+            ],
+        );
+        assert_eq!(repo.active_1h_count(), 2);
+        repo.remove_peer(&IH, &a1).await;
+        assert_eq!(repo.active_1h_count(), 1);
+        repo.remove_peer(&IH, &a2).await;
+        assert_eq!(repo.active_1h_count(), 0);
+    }
+
+    #[test]
+    fn old_last_active_is_not_counted() {
+        let repo = make_repo();
+        let mut p = PeerInfo::new(addr(10005), PeerSource::Manual);
+        p.last_active = SystemTime::now() - Duration::from_secs(2 * ACTIVE_WINDOW_SECS);
+        repo.add_peers_sync(&IH, &[p]);
+        assert_eq!(repo.active_1h_count(), 0);
+    }
+
+    #[test]
+    fn sweep_removes_stale_entries_keeps_fresh() {
+        let repo = make_repo();
+        let fresh = addr(10006);
+        let stale = addr(10007);
+        repo.testing_force_active_entry(fresh, SystemTime::now());
+        repo.testing_force_active_entry(
+            stale,
+            SystemTime::now() - Duration::from_secs(2 * ACTIVE_WINDOW_SECS),
+        );
+        assert_eq!(repo.active_1h_count(), 2);
+        repo.sweep_active_1h();
+        assert_eq!(repo.active_1h_count(), 1);
+        // 再次 sweep：无过期条目，计数不变
+        repo.sweep_active_1h();
+        assert_eq!(repo.active_1h_count(), 1);
+    }
+
+    #[test]
+    fn recalibrate_counts_only_recent_peers() {
+        let repo = make_repo();
+        // 旧 peer（2h 前活跃，add 时 note_active 判窗跳过）
+        let mut old = PeerInfo::new(addr(10008), PeerSource::Manual);
+        old.last_active = SystemTime::now() - Duration::from_secs(2 * ACTIVE_WINDOW_SECS);
+        repo.add_peers_sync(&IH, &[old]);
+        // 新 peer
+        repo.add_peers_sync(&IH, &[PeerInfo::new(addr(10009), PeerSource::Manual)]);
+        // 启动校准：只应计入窗口内的那个
+        repo.recalibrate_active_count();
+        assert_eq!(repo.active_1h_count(), 1);
+    }
+
+    #[test]
+    fn clear_resets_count() {
+        let repo = make_repo();
+        repo.add_peers_sync(&IH, &[PeerInfo::new(addr(10010), PeerSource::Manual)]);
+        assert_eq!(repo.active_1h_count(), 1);
+        repo.clear();
+        assert_eq!(repo.active_1h_count(), 0);
     }
 }

@@ -85,6 +85,16 @@ fn run_drop_redundant_peer_indexes(conn: &Connection) -> anyhow::Result<u32> {
     Ok(DROPPED_REDUNDANT_PEER_INDEXES.len() as u32)
 }
 
+/// 读连接池大小（WAL 下的只读连接数）。
+///
+/// 2026-09-30 由 4 扩容至 16：原 4 条只读连接被并发长任务占满——
+/// 清单重建（约 38s 全表扫描）、联邦 PEX 节点交换（约 355s 写阻塞）、
+/// range/Gossip/delta 并发读取同时占用，导致块请求取数走 `read()` 时
+/// 池空回退、被迫抢全局写锁，形成写读互锁。取 16（8~16 区间偏上限）
+/// 以覆盖 5~6 个并发长任务并预留余量；`read()` 的 PoolReturn RAII 归还
+/// 与池空回退写锁逻辑保持不变。
+const READ_POOL_SIZE: usize = 16;
+
 /// 存储层
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
@@ -117,10 +127,39 @@ struct PoolReturn<'a> {
 impl Drop for PoolReturn<'_> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // E6：连接归还读池，可用计数 +1（与 `Storage::read` pop 成功路径的 -1 配对）。
+            READ_POOL_AVAILABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.push_back(conn);
         }
     }
+}
+
+// ─── E6：读池进程级观测计数器（静态，跨 Storage 实例共享）────────────────────
+//
+// 语义：文件库 `open()` 后 `available = READ_POOL_SIZE`，内存库 = 0；
+// `Storage::read` 从读池借走一条 -1，`PoolReturn` Drop 归还 +1；
+// 池空回退写连接（`read()` 的 None 分支）累计 +1 starved。
+// 注意：静态量跨实例/并行测试共享，面板只取相对趋势，测试避免断言精确绝对值。
+
+/// 当前可用（未借出）的只读连接数。
+static READ_POOL_AVAILABLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 读池空、回退写连接取数的累计次数（池饥饿信号）。
+static READ_POOL_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// E6：读取当前可用只读连接数（观测用，随 `/api/v1/io/status` 暴露）。
+pub fn read_pool_available() -> usize {
+    READ_POOL_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// E6：读取读池空回退写连接的累计次数（池饥饿信号）。
+pub fn read_pool_starved() -> u64 {
+    READ_POOL_STARVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// E6：读池配置大小（= `READ_POOL_SIZE`，文件库口径）。
+pub fn read_pool_total() -> usize {
+    READ_POOL_SIZE
 }
 
 impl Storage {
@@ -157,11 +196,26 @@ impl Storage {
         );
         conn.execute_batch(&pragma_sql)?;
 
-        // 初始化读连接池：打开 4 个只读连接，读操作走这里不抢写锁
+        // 初始化读连接池：打开 READ_POOL_SIZE 个只读连接，读操作走这里不抢写锁
+        // （2026-09-30 由 4 扩容至 READ_POOL_SIZE=16，缘由见该常量注释）
+        //
+        // 读连接使用独立的小页缓存（8MB/条，cache_size=-8192）：SQLite 页缓存按连接
+        // 独立，16 条读连接若沿用写连接的 64MB 会使页缓存上限达 1GB，实测（2026-09-30
+        // 62/52/51 内存 2.2-3.0GB 触发驱逐、卸载 node 不降内存）确认大头即 SQLite 页缓存。
+        // 读查询多为单点/小块取数，8MB 足够；写连接仍用 config.cache_size（64MB）。
+        // mmap_size 保留（进程内文件映射共享，不随连接数放大内存）。
+        let read_pragma_sql = format!(
+            "PRAGMA journal_mode=WAL;              PRAGMA synchronous={};              PRAGMA mmap_size={};              PRAGMA cache_size=-8192;              PRAGMA temp_store={};              PRAGMA wal_autocheckpoint={};              PRAGMA busy_timeout={};",
+            config.synchronous,
+            config.mmap_size,
+            config.temp_store,
+            config.wal_autocheckpoint,
+            config.busy_timeout_ms,
+        );
         let mut read_pool = std::collections::VecDeque::new();
-        for _ in 0..4 {
+        for _ in 0..READ_POOL_SIZE {
             let rconn = Connection::open(path_ref)?;
-            rconn.execute_batch(&pragma_sql)?;
+            rconn.execute_batch(&read_pragma_sql)?;
             read_pool.push_back(rconn);
         }
         info!(
@@ -184,6 +238,9 @@ impl Storage {
         let mut wal_path: PathBuf = path_ref.to_path_buf();
         wal_path.as_mut_os_string().push("-wal");
 
+        // E6：文件库读池就绪，进程级可用计数置为池大小（观测用）。
+        READ_POOL_AVAILABLE.store(READ_POOL_SIZE, std::sync::atomic::Ordering::Relaxed);
+
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             read_pool: Arc::new(Mutex::new(read_pool)),
@@ -204,6 +261,8 @@ impl Storage {
     /// 内存数据库（用于测试）
     pub fn memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
+        // E6：内存库无读池，可用计数恒 0（读操作全部走回退写连接路径）。
+        READ_POOL_AVAILABLE.store(0, std::sync::atomic::Ordering::Relaxed);
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
             read_pool: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -371,6 +430,8 @@ impl Storage {
         };
         match pooled {
             Some(conn) => {
+                // E6：从读池借走一条，可用计数 -1（归还见 `PoolReturn::drop`）。
+                READ_POOL_AVAILABLE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let guard = PoolReturn {
                     pool: &self.read_pool,
                     conn: Some(conn),
@@ -379,6 +440,8 @@ impl Storage {
                 f(conn)
             }
             None => {
+                // E6：池空（内存库 / 极端耗尽）回退写连接，累计饥饿次数。
+                READ_POOL_STARVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                 f(&conn)
             }
@@ -469,6 +532,51 @@ impl Storage {
         }
     }
 
+    /// 当前 WAL 近似帧数（低水位信号，观测/日志用；O(1) 无锁）。
+    ///
+    /// SQLite 每帧 = `page_size` + 24B 帧头；默认 page_size=4096，单帧约 4120B。
+    /// 这里用 `wal_bytes()` 无锁估算，不打开 ckpt_conn、不取写锁——决策 tick 要求
+    /// O(1) 不阻塞。精确帧数见每次 checkpoint 回填的 [`CheckpointOutcome.wal_frames`]。
+    pub fn wal_frames(&self) -> u64 {
+        // 单帧 ≈ page_size(默认 4096) + 24B 帧头 = 4120B。
+        self.wal_bytes() / 4120u64
+    }
+}
+
+/// G4：常规（软阈值~硬阈值之间）PASSIVE checkpoint 允许执行的背压上限。
+///
+/// 背压高于此值说明 io_scheduler 前台写正在吃盘，此时不凑上去做 WAL 回写，避免
+/// 与前台批量写互踩。取 0.5——与 io_backpressure_poll 的「>0.5 即 IO 降级」档位对齐。
+pub const CHECKPOINT_IDLE_BACKPRESSURE_MAX: f32 = 0.5;
+
+/// G4：常规 PASSIVE checkpoint 的「写空闲 / 低水位」闸门。
+///
+/// # 背景与依据（53 侧日志证据）
+/// 旧逻辑：一旦 WAL 越过 `checkpoint_wal_soft_mb`(默认 32MB) 就在每个决策 tick
+/// （默认 1s）触发 `PRAGMA wal_checkpoint(PASSIVE)`，单轮把约 8000 帧（~32MB）一次性
+/// 回写主库文件，实测 checkpoint 耗时 EWMA 117ms。这是一次集中的盘写突刺，而当时
+/// io_scheduler 正在前台批量刷写——两者抢同一磁盘，写队列反复堆积、背压反复顶到 1.0。
+/// WAL 帧数长时间停留在「上万」则是长读事务（读池 16 条连接跑 delta/range/PEX）钉住
+/// 旧帧所致，属另一问题；本闸门治理的是「时机」：别在前台写忙时凑盘。
+///
+/// # 治理
+/// 常规 checkpoint 只在「写队列空（无待写请求）且背压未升高」时做——把 WAL 回写盘 I/O
+/// 排进写空闲间隙。这与 TRUNCATE 路径既有的 `queue_len()==0` 闸门同源（见 main.rs
+/// `wal_checkpoint_hourly_truncate`），此前高频 PASSIVE 路径漏了这道门。
+///
+/// # 边界
+/// 本闸门只约束常规（soft≤WAL<hard）触发；WAL≥hard 的强制 checkpoint 由调用方绕过
+/// 本闸门直接触发（WAL 无界安全网），绝不能因「写一直忙」而永不 checkpoint。
+///
+/// 为什么不调 `wal_autocheckpoint`：takeover=true 时写连接已置 0（应用单驱动，禁止两套
+/// checkpoint 并存）。若改成非 0 值，会让 SQLite 在写提交时内联触发 checkpoint——正是
+/// A1 改造前「慢盘单次 checkpoint 数百秒阻塞写路径」的病根，故维持 0、只调时机。
+#[inline]
+pub fn routine_checkpoint_advisable(queue_len: usize, backpressure: f32) -> bool {
+    queue_len == 0 && backpressure <= CHECKPOINT_IDLE_BACKPRESSURE_MAX
+}
+
+impl Storage {
     /// 写连接的 SQLite 自动 checkpoint 开关（接管/交还）。
     /// takeover=true 启动时置 0（应用接管）；false 时恢复默认页数。
     pub fn set_wal_autocheckpoint(&self, pages: u32) -> anyhow::Result<()> {
@@ -2566,83 +2674,91 @@ impl Storage {
             PEER => {
                 // F9 方案 B：块数据读取 = peers 主表活行 + peers_archive 归档行（双路
                 // 归并），与清单扫描口径一致（清单列了行，块就必须能取出对应数据）。
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                let rows = Self::query_peer_rows_both_tables(
-                    &conn,
-                    lo_s.as_deref(),
-                    hi_s.as_deref(),
-                    limit,
-                )?;
-                let mut out = Vec::new();
-                for (_key, ih, ip, port) in rows {
-                    let mut arr = [0u8; 20];
-                    if ih.len() == 20 {
-                        arr.copy_from_slice(&ih);
+                // G1：块数据读取改走读连接池，不抢全局写锁（bootstrap 应答与写事务解耦）。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let rows = Self::query_peer_rows_both_tables(
+                        conn,
+                        lo_s.as_deref(),
+                        hi_s.as_deref(),
+                        limit,
+                    )?;
+                    let mut out = Vec::new();
+                    for (_key, ih, ip, port) in rows {
+                        let mut arr = [0u8; 20];
+                        if ih.len() == 20 {
+                            arr.copy_from_slice(&ih);
+                        }
+                        if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                            if let Some(e) =
+                                to_entry(crate::federation::sync::peer_sync::build_peer_sync_entry(
+                                    arr, addr,
+                                ))
+                            {
+                                out.push(e);
+                            }
+                        }
                     }
-                    if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                    Ok(out)
+                })
+            }
+            INFOHASH => {
+                // G1：块数据读取改走读连接池，不抢全局写锁。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let mut stmt = conn.prepare(
+                        "SELECT infohash FROM infohashes \
+                         WHERE deleted_at IS NULL \
+                           AND (?1 IS NULL OR infohash >= ?1) \
+                           AND (?2 IS NULL OR infohash < ?2) \
+                         ORDER BY infohash ASC LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        let ih = r?;
+                        if ih.len() != 20 {
+                            continue;
+                        }
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(&ih);
                         if let Some(e) = to_entry(
-                            crate::federation::sync::peer_sync::build_peer_sync_entry(arr, addr),
+                            crate::federation::sync::infohash_sync::build_infohash_sync_entry(arr),
                         ) {
                             out.push(e);
                         }
                     }
-                }
-                Ok(out)
-            }
-            INFOHASH => {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut stmt = conn.prepare(
-                    "SELECT infohash FROM infohashes \
-                     WHERE deleted_at IS NULL \
-                       AND (?1 IS NULL OR infohash >= ?1) \
-                       AND (?2 IS NULL OR infohash < ?2) \
-                     ORDER BY infohash ASC LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    let ih = r?;
-                    if ih.len() != 20 {
-                        continue;
-                    }
-                    let mut arr = [0u8; 20];
-                    arr.copy_from_slice(&ih);
-                    if let Some(e) = to_entry(
-                        crate::federation::sync::infohash_sync::build_infohash_sync_entry(arr),
-                    ) {
-                        out.push(e);
-                    }
-                }
-                Ok(out)
+                    Ok(out)
+                })
             }
             TRACKER => {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                let mut stmt = conn.prepare(
-                    "SELECT url FROM trackers \
-                     WHERE deleted_at IS NULL \
-                       AND (?1 IS NULL OR url >= ?1) \
-                       AND (?2 IS NULL OR url < ?2) \
-                     ORDER BY url ASC LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                    row.get::<_, String>(0)
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    let url = r?;
-                    if let Some(e) = to_entry(
-                        crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url),
-                    ) {
-                        out.push(e);
+                // G1：块数据读取改走读连接池，不抢全局写锁。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let mut stmt = conn.prepare(
+                        "SELECT url FROM trackers \
+                         WHERE deleted_at IS NULL \
+                           AND (?1 IS NULL OR url >= ?1) \
+                           AND (?2 IS NULL OR url < ?2) \
+                         ORDER BY url ASC LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        let url = r?;
+                        if let Some(e) = to_entry(
+                            crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url),
+                        ) {
+                            out.push(e);
+                        }
                     }
-                }
-                Ok(out)
+                    Ok(out)
+                })
             }
             _ => Ok(Vec::new()),
         }
@@ -2690,47 +2806,50 @@ impl Storage {
                 }
                 pairs.sort();
                 pairs.dedup();
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut out = Vec::with_capacity(pairs.len());
-                for chunk in pairs.chunks(400) {
-                    let placeholders = chunk
-                        .iter()
-                        .map(|_| "(? , ?)")
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let sql = format!(
-                        "SELECT id, ip, port FROM dht_nodes \
-                         WHERE deleted_at IS NULL AND (ip, port) IN ({placeholders})"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
-                    for (ip, port) in chunk {
-                        bind.push(ip);
-                        bind.push(port);
-                    }
-                    let rows = stmt.query_map(bind.as_slice(), |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })?;
-                    for r in rows {
-                        let (id, ip, port) = r?;
-                        let mut arr = [0u8; 20];
-                        if id.len() == 20 {
-                            arr.copy_from_slice(&id);
+                // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let mut out = Vec::with_capacity(pairs.len());
+                    for chunk in pairs.chunks(400) {
+                        let placeholders = chunk
+                            .iter()
+                            .map(|_| "(? , ?)")
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "SELECT id, ip, port FROM dht_nodes \
+                             WHERE deleted_at IS NULL AND (ip, port) IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let mut bind: Vec<&dyn rusqlite::ToSql> =
+                            Vec::with_capacity(chunk.len() * 2);
+                        for (ip, port) in chunk {
+                            bind.push(ip);
+                            bind.push(port);
                         }
-                        if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
-                            if let Some(e) =
-                                to_entry(crate::federation::sync::build_node_sync_entry(arr, addr))
-                            {
-                                out.push(e);
+                        let rows = stmt.query_map(bind.as_slice(), |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })?;
+                        for r in rows {
+                            let (id, ip, port) = r?;
+                            let mut arr = [0u8; 20];
+                            if id.len() == 20 {
+                                arr.copy_from_slice(&id);
+                            }
+                            if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                                if let Some(e) = to_entry(
+                                    crate::federation::sync::build_node_sync_entry(arr, addr),
+                                ) {
+                                    out.push(e);
+                                }
                             }
                         }
                     }
-                }
-                Ok(out)
+                    Ok(out)
+                })
             }
             PEER => {
                 // 注意（F9 边界）：本函数是 v8 range 反熵的「按 key 精确修复」通道，
@@ -2760,83 +2879,91 @@ impl Storage {
                 }
                 triples.sort();
                 triples.dedup();
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut out = Vec::with_capacity(triples.len());
-                for chunk in triples.chunks(300) {
-                    let placeholders = chunk
-                        .iter()
-                        .map(|_| "(? , ? , ?)")
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let sql = format!(
-                        "SELECT infohash, ip, port FROM peers \
-                         WHERE deleted_at IS NULL AND (infohash, ip, port) IN ({placeholders})"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
-                    for (ih, ip, port) in chunk {
-                        bind.push(ih);
-                        bind.push(ip);
-                        bind.push(port);
-                    }
-                    let rows = stmt.query_map(bind.as_slice(), |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })?;
-                    for r in rows {
-                        let (ih, ip, port) = r?;
-                        let mut arr = [0u8; 20];
-                        if ih.len() == 20 {
-                            arr.copy_from_slice(&ih);
+                // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let mut out = Vec::with_capacity(triples.len());
+                    for chunk in triples.chunks(300) {
+                        let placeholders = chunk
+                            .iter()
+                            .map(|_| "(? , ? , ?)")
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "SELECT infohash, ip, port FROM peers \
+                             WHERE deleted_at IS NULL AND (infohash, ip, port) IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let mut bind: Vec<&dyn rusqlite::ToSql> =
+                            Vec::with_capacity(chunk.len() * 3);
+                        for (ih, ip, port) in chunk {
+                            bind.push(ih);
+                            bind.push(ip);
+                            bind.push(port);
                         }
-                        if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
-                            if let Some(e) =
-                                to_entry(crate::federation::sync::peer_sync::build_peer_sync_entry(
-                                    arr, addr,
-                                ))
-                            {
-                                out.push(e);
+                        let rows = stmt.query_map(bind.as_slice(), |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })?;
+                        for r in rows {
+                            let (ih, ip, port) = r?;
+                            let mut arr = [0u8; 20];
+                            if ih.len() == 20 {
+                                arr.copy_from_slice(&ih);
+                            }
+                            if let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                                if let Some(e) = to_entry(
+                                    crate::federation::sync::peer_sync::build_peer_sync_entry(
+                                        arr, addr,
+                                    ),
+                                ) {
+                                    out.push(e);
+                                }
                             }
                         }
                     }
-                }
-                Ok(out)
+                    Ok(out)
+                })
             }
             INFOHASH => {
                 let ih_keys: Vec<Vec<u8>> =
                     keys.iter().filter(|k| k.len() == 20).cloned().collect();
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut out = Vec::with_capacity(ih_keys.len());
-                for chunk in ih_keys.chunks(900) {
-                    let placeholders = std::iter::repeat_n("?", chunk.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let sql = format!(
-                        "SELECT infohash FROM infohashes \
-                         WHERE deleted_at IS NULL AND infohash IN ({placeholders})"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let bind: Vec<&dyn rusqlite::ToSql> =
-                        chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-                    let rows = stmt.query_map(bind.as_slice(), |row| row.get::<_, Vec<u8>>(0))?;
-                    for r in rows {
-                        let ih = r?;
-                        if ih.len() != 20 {
-                            continue;
-                        }
-                        let mut arr = [0u8; 20];
-                        arr.copy_from_slice(&ih);
-                        if let Some(e) = to_entry(
-                            crate::federation::sync::infohash_sync::build_infohash_sync_entry(arr),
-                        ) {
-                            out.push(e);
+                // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let mut out = Vec::with_capacity(ih_keys.len());
+                    for chunk in ih_keys.chunks(900) {
+                        let placeholders = std::iter::repeat_n("?", chunk.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "SELECT infohash FROM infohashes \
+                             WHERE deleted_at IS NULL AND infohash IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let bind: Vec<&dyn rusqlite::ToSql> =
+                            chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+                        let rows =
+                            stmt.query_map(bind.as_slice(), |row| row.get::<_, Vec<u8>>(0))?;
+                        for r in rows {
+                            let ih = r?;
+                            if ih.len() != 20 {
+                                continue;
+                            }
+                            let mut arr = [0u8; 20];
+                            arr.copy_from_slice(&ih);
+                            if let Some(e) = to_entry(
+                                crate::federation::sync::infohash_sync::build_infohash_sync_entry(
+                                    arr,
+                                ),
+                            ) {
+                                out.push(e);
+                            }
                         }
                     }
-                }
-                Ok(out)
+                    Ok(out)
+                })
             }
             TRACKER => {
                 let mut urls: Vec<String> = keys
@@ -2845,30 +2972,35 @@ impl Storage {
                     .collect();
                 urls.sort();
                 urls.dedup();
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut out = Vec::with_capacity(urls.len());
-                for chunk in urls.chunks(500) {
-                    let placeholders = std::iter::repeat_n("?", chunk.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let sql = format!(
-                        "SELECT url FROM trackers \
-                         WHERE deleted_at IS NULL AND url IN ({placeholders})"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let bind: Vec<&dyn rusqlite::ToSql> =
-                        chunk.iter().map(|u| u as &dyn rusqlite::ToSql).collect();
-                    let rows = stmt.query_map(bind.as_slice(), |row| row.get::<_, String>(0))?;
-                    for r in rows {
-                        let url = r?;
-                        if let Some(e) = to_entry(
-                            crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url),
-                        ) {
-                            out.push(e);
+                // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
+                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                    let mut out = Vec::with_capacity(urls.len());
+                    for chunk in urls.chunks(500) {
+                        let placeholders = std::iter::repeat_n("?", chunk.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "SELECT url FROM trackers \
+                             WHERE deleted_at IS NULL AND url IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let bind: Vec<&dyn rusqlite::ToSql> =
+                            chunk.iter().map(|u| u as &dyn rusqlite::ToSql).collect();
+                        let rows =
+                            stmt.query_map(bind.as_slice(), |row| row.get::<_, String>(0))?;
+                        for r in rows {
+                            let url = r?;
+                            if let Some(e) = to_entry(
+                                crate::federation::sync::tracker_sync::build_tracker_sync_entry(
+                                    &url,
+                                ),
+                            ) {
+                                out.push(e);
+                            }
                         }
                     }
-                }
-                Ok(out)
+                    Ok(out)
+                })
             }
             _ => Ok(Vec::new()),
         }
@@ -3437,5 +3569,76 @@ mod tests {
         drop(c);
         let _ = std::fs::remove_file(dir.join("test.db-wal"));
         cleanup_temp(&dir);
+    }
+
+    #[test]
+    fn test_read_pool_size_on_open() {
+        // 文件库：open() 应按 READ_POOL_SIZE 初始化只读连接池
+        let dir = unique_temp_dir("readpool");
+        let db_path = dir.join("test.db");
+        let cfg = crate::config::SqliteConfig::default();
+        let s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        let pool = s.read_pool.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            pool.len(),
+            READ_POOL_SIZE,
+            "open() 应初始化 READ_POOL_SIZE={} 个只读连接",
+            READ_POOL_SIZE
+        );
+        drop(pool);
+        drop(s);
+        let _ = std::fs::remove_file(dir.join("test.db-wal"));
+        cleanup_temp(&dir);
+    }
+
+    #[test]
+    fn test_read_pool_empty_on_memory() {
+        // 内存库：无文件 WAL，读池恒为空（池空回退写锁路径的存在性佐证）
+        let s = Storage::memory().unwrap();
+        let pool = s.read_pool.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pool.len(), 0, "memory() 库读池应为空");
+    }
+
+    // ── E6：读池进程级观测计数器（静态跨实例共享，只用相对断言）──────────────
+    #[test]
+    fn test_read_pool_available_net_zero_after_borrow_return() {
+        // 文件库 read() 借走(-1)/归还(+1) 应对 available 计数净变化为 0。
+        // 不断言绝对值：静态量被并行测试的 open()/memory() 反复覆写。
+        let dir = unique_temp_dir("readpoolobs");
+        let db_path = dir.join("test.db");
+        let cfg = crate::config::SqliteConfig::default();
+        let s = Storage::open_with_config(&db_path, &cfg).unwrap();
+        let a0 = read_pool_available();
+        for _ in 0..5 {
+            s.read(|conn| {
+                let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+            });
+        }
+        let a1 = read_pool_available();
+        assert_eq!(
+            a1, a0,
+            "read() 借还后 available 应回到调用前（净变化 0），a0={} a1={}",
+            a0, a1
+        );
+        drop(s);
+        let _ = std::fs::remove_file(dir.join("test.db-wal"));
+        cleanup_temp(&dir);
+    }
+
+    #[test]
+    fn test_read_pool_starved_increments_on_memory_fallback() {
+        // 内存库读池恒空，read() 必走 None 回退写连接分支，starved 相对递增（>=1）。
+        let s = Storage::memory().unwrap();
+        let s0 = read_pool_starved();
+        s.read(|conn| {
+            let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+        });
+        let s1 = read_pool_starved();
+        assert!(
+            s1 > s0,
+            "内存库 read() 回退写连接后 starved 应递增，s0={} s1={}",
+            s0,
+            s1
+        );
     }
 }

@@ -1327,6 +1327,8 @@ async fn async_main(
     if let Some(ref ckpt_worker) = checkpoint_worker {
         let worker = ckpt_worker.clone();
         let storage_ck = storage.clone();
+        // G4：写空闲闸门需要 io_scheduler 的 queue_len/backpressure 观测量。
+        let sched_ck = io_scheduler.clone();
         let soft_bytes = config.io_scheduler.checkpoint_wal_soft_mb * 1024 * 1024;
         let hard_bytes = config.io_scheduler.checkpoint_wal_hard_mb * 1024 * 1024;
         let min_interval =
@@ -1357,6 +1359,7 @@ async fn async_main(
             move || {
                 let worker = worker.clone();
                 let storage = storage_ck.clone();
+                let sched = sched_ck.clone();
                 let last_alerted = last_alerted.clone();
                 let last_stall_alert_ms = last_stall_alert_ms.clone();
                 async move {
@@ -1382,7 +1385,23 @@ async fn async_main(
                         hard_bytes,
                         min_interval,
                     ) {
-                        worker.trigger(mode);
+                        // G4：写空闲闸门——常规（soft≤WAL<hard）PASSIVE 只在写队列空、
+                        // 背压未升高时触发，把 ~117ms 的 WAL 回写盘突刺排进写空闲间隙，
+                        // 不再与前台批量写抢盘（53 实证背压反复 1.0）。WAL≥hard 仍强制
+                        // 触发（WAL 无界安全网），不被闸门拦下。
+                        let forced = wal >= hard_bytes;
+                        let idle = sched
+                            .as_ref()
+                            .map(|s| {
+                                PeerDiscoveryCenter::storage::db::routine_checkpoint_advisable(
+                                    s.queue_len(),
+                                    s.backpressure_level(),
+                                )
+                            })
+                            .unwrap_or(true);
+                        if forced || idle {
+                            worker.trigger(mode);
+                        }
                     }
                     // v10(G)：WAL 超硬阈值且 TRUNCATE 长期未成功 → ERROR 告警（10 分钟一条）。
                     // 长读事务（bootstrap 全表快照）会钉死 WAL，PASSIVE/TRUNCATE 永远
@@ -2061,12 +2080,27 @@ async fn async_main(
                 let tr = tr.clone();
                 let st = st.clone();
                 async move {
+                    // D2：单次迭代包 300s 超时兜底 —— 超时本轮中止、warn 并释放调度槽。
+                    let body = async {
                     // v10(G)：改用共享缓存快照——原 System::new_all() 每轮全量枚举
                     // 进程/磁盘，重负载下单轮可卡 451s（.51 实证），且与 API 层
                     // 每请求 new_all() 叠加导致 api_runtime 整体停摆。
                     let snap = PeerDiscoveryCenter::services::system_stats::snapshot();
                     let memory_mb = snap.mem_bytes / (1024 * 1024);
                     let threshold_mb = (memory_limit_mb as f64 * emergency_threshold) as u64;
+                    // A4：内存反压联动（回差防抖）—— 超阈值时把 bootstrap 发送并发压到 1
+                    // （串行化，阻止已加载的 2 万行 SyncEntry 在发送任务里继续堆积）；
+                    // 仅当水位回落到阈值 80% 以下才恢复配置并发，避免阈值边界抖动反复切换。
+                    let send_throttled =
+                        PeerDiscoveryCenter::federation::sync::bootstrap_send_concurrency_override() > 0;
+                    if memory_mb > threshold_mb {
+                        PeerDiscoveryCenter::federation::sync::set_bootstrap_send_concurrency_override(1);
+                    } else if send_throttled && memory_mb <= (threshold_mb as f64 * 0.8) as u64 {
+                        PeerDiscoveryCenter::federation::sync::set_bootstrap_send_concurrency_override(0);
+                        tracing::info!(
+                            "[memory_monitor] 内存回落至阈值80%以下，恢复 bootstrap 发送并发"
+                        );
+                    }
                         tracing::info!(
                             "[memory_monitor] 内存检测: {}MB / 阈值 {}MB",
                             memory_mb,
@@ -2148,7 +2182,15 @@ async fn async_main(
                                 h2_start, w2_start, h2a, w2a, total_evicted_2
                             );
                         }
-                    Ok(())
+                    };
+                    // [ALLOWED-HARDCODED: memory_monitor 单次迭代兜底超时，防槽位泄漏的保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), body).await {
+                        Ok(()) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[memory_monitor] 单次迭代超过 300s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -2308,6 +2350,9 @@ async fn async_main(
         // 周期向每个已连接对端追问新 op，否则 delta 只在建连时拉一次、之后完全停摆。
         let sm_delta = fed.sync_manager.clone();
         let delta_tick_secs = config.federation.delta_sync_interval_secs.max(1);
+        // G4：单轮自超时（默认 120s，可被 intervals 覆盖）。实证单轮曾飞行 465s，
+        // 被调度器按「timeout(300s) × stale_slot_factor(1.5)≈450s」判槽泄漏强制回收。
+        let delta_timeout_secs = get_interval_secs(intervals, "fed_delta_sync_timeout", 120);
         task_scheduler.register(
             TaskMetadata::new(
                 "fed_delta_sync",
@@ -2339,9 +2384,21 @@ async fn async_main(
             ))),
             move || {
                 let sm = sm_delta.clone();
+                // G4：单轮包 120s 自超时。超时即取消 delta_sync_tick future——tokio 丢弃
+                // future 会随协程取消清理全部在飞子请求（网络/DB 句柄），warn 并跳过本轮、
+                // 正常返回释放 Federation 调度槽；绝不允许再被调度器按槽泄漏强收。
+                let timeout = std::time::Duration::from_secs(delta_timeout_secs);
                 async move {
-                    sm.delta_sync_tick().await;
-                    Ok(())
+                    match tokio::time::timeout(timeout, sm.delta_sync_tick()).await {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "[fed_delta_sync] 单轮超过 {}s，跳轮并清理在飞状态，释放调度槽",
+                                delta_timeout_secs
+                            );
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -3156,8 +3213,18 @@ async fn async_main(
             move || {
                 let c = c1.clone();
                 async move {
-                    c.bootstrap().await;
-                    Ok(())
+                    // D2：单次执行包 300s 超时 —— 超时本轮中止、warn 并释放调度槽位，
+                    // 避免 crawler_bootstrap 卡住长期占住 Crawl 分类槽（曾 451s 被强杀）。
+                    // [ALLOWED-HARDCODED: crawler_bootstrap 单次执行兜底超时，防槽位泄漏的保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), c.bootstrap())
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[crawler] bootstrap 执行超过 300s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -3251,8 +3318,20 @@ async fn async_main(
             move || {
                 let c = c4.clone();
                 async move {
-                    c.active_get_peers().await;
-                    Ok(())
+                    // D2：单次执行包 300s 超时 —— 超时本轮中止、warn 并释放调度槽位。
+                    // [ALLOWED-HARDCODED: active_get_peers 单次执行兜底超时，防槽位泄漏的保护性上限]
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        c.active_get_peers(),
+                    )
+                    .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[crawler] get_peers 执行超过 300s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );

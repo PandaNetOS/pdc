@@ -6,6 +6,7 @@
 //! 鍗冧竾绾ф€ц兘浼樺寲锛欶xHashMap 鏇夸唬 std::HashMap锛屽閲忔寔涔呭寲鍙繚瀛?dirty 鑺傜偣銆?
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,21 @@ pub struct NodeStats {
     pub avg_score: f64,
 }
 
+/// 原子计数器与全量实测扫描的差值（= 计数器 − 实测扫描值）。
+///
+/// 供 stats_snapshot 的 60s 后台任务调用 [`NodeRepoImpl::verify_stats_consistency`]
+/// 并据此打 WARN（|差值|>5 或 |avg_score_diff|>0.01）。全 0 表示一致。
+/// 字段全部 pub，调用方不做任何额外计算。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeStatsDrift {
+    pub total: i64,
+    pub good: i64,
+    pub questionable: i64,
+    pub bad: i64,
+    pub active: i64,
+    pub avg_score_diff: f64,
+}
+
 pub struct NodeRepoImpl {
     /// 鐙珛鑺傜偣瀛樺偍锛堟棤瀹归噺闄愬埗锛屾寜 addr 鍘婚噸锛夆€?FxHashMap 楂樻€ц兘
     nodes: ShardedHashMap<SocketAddr, KBucketEntry>,
@@ -51,6 +67,16 @@ pub struct NodeRepoImpl {
     gossip: OnceLock<Arc<GossipEngine>>,
     /// 鍐欏叆闃熷垪锛堝彲閫夛紝None 鏃堕€€鍖栦负鍚屾鍐欏叆锛?
     write_queue: Option<Arc<WriteQueue>>,
+    /// 增量统计原子计数器（O(1) stats_sync，避免全量遍历 20 万节点）。
+    /// 所有变更点在 nodes 写锁/分片锁内维护；score_sum 存 f64 bit（CAS 循环更新）；Relaxed 即可。
+    total: AtomicU64,
+    good: AtomicU64,
+    questionable: AtomicU64,
+    bad: AtomicU64,
+    /// query_count>0 的节点数（只增不减，删除时扣减）
+    active: AtomicU64,
+    /// 所有节点 score 之和（f64 bit 存进 AtomicU64）
+    score_sum: AtomicU64,
 }
 
 impl NodeRepoImpl {
@@ -72,6 +98,12 @@ impl NodeRepoImpl {
             storage,
             gossip: OnceLock::new(),
             write_queue: None,
+            total: AtomicU64::new(0),
+            good: AtomicU64::new(0),
+            questionable: AtomicU64::new(0),
+            bad: AtomicU64::new(0),
+            active: AtomicU64::new(0),
+            score_sum: AtomicU64::new(0),
         }
     }
 
@@ -130,6 +162,9 @@ impl NodeRepoImpl {
             hot_addrs.insert(entry.addr);
         }
         drop(hot_addrs);
+        // 校准回填：全量扫描把 6 个计数器直接置为扫描结果（置为而非累加，兼容重复加载）。
+        // 启动阶段无并发，安全；此处仍持有 nodes 写锁，复用守卫避免重复加锁死锁。
+        self.calibrate_stats(nodes.values(), nodes.len());
         Ok(count)
     }
 
@@ -195,6 +230,7 @@ impl NodeRepoImpl {
         let mut removed = 0usize;
         for addr in addrs {
             if let Some(entry) = nodes.remove(addr) {
+                self.acc_remove_entry(&entry);
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     if let Some(bucket) = subnet_index.get_mut(&subnet) {
                         bucket.retain(|x| *x != entry.id);
@@ -329,6 +365,9 @@ impl NodeRepoImpl {
                 let mut entry = KBucketEntry::new(*id, *addr);
                 // 鏂拌妭鐐瑰垵濮嬭瘎鍒?45.0锛堜腑鎬у垎锛夛紝鍚庣画鐢?ScoreMaintainer 缁熶竴鏇存柊
                 entry.score = 45.0;
+                // 新节点：state=Good（默认）、query_count=0、score=45.0，按其字段累加计数器。
+                // 本分支已确认 addr 不存在（get_mut 为 None），纯插入，无需先扣旧值。
+                self.acc_add_entry(&entry);
                 nodes.insert(*addr, entry);
                 new_pairs.push((*id, *addr));
                 // IPv4 鑺傜偣鍏?/24 绱㈠紩
@@ -362,6 +401,7 @@ impl NodeRepoImpl {
         let mut removed = 0usize;
         for addr in addrs {
             if let Some(entry) = nodes.remove(addr) {
+                self.acc_remove_entry(&entry);
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     if let Some(bucket) = subnet_index.get_mut(&subnet) {
                         bucket.retain(|x| x != &entry.id);
@@ -483,29 +523,130 @@ impl NodeRepoImpl {
         self.subnet_index.read().len()
     }
 
-    /// 鑺傜偣缁熻淇℃伅锛堥伩鍏嶅叏閲忓厠闅嗭紝鐢ㄤ簬鍋ュ悍搴﹁绠楀拰鐩戞帶锛?
-    pub fn stats_sync(&self) -> NodeStats {
-        let nodes = self.nodes.read_all();
-        let mut good = 0;
-        let mut questionable = 0;
-        let mut bad = 0;
-        let mut active = 0;
-        let mut avg_score = 0.0;
-        for node in nodes.values() {
-            match node.state {
+    /// 全量扫描内存表，返回 (total, good, questionable, bad, active, score_sum)。
+    ///
+    /// 复用调用方已持有的读/写守卫：load_initial / load_all 已持有 write_all，
+    /// 若在其中再 read_all 会因同线程重复加 RwLock 写锁而死锁。
+    fn scan_nodes_stats<'a>(
+        iter: impl Iterator<Item = &'a KBucketEntry>,
+        total: usize,
+    ) -> (u64, u64, u64, u64, u64, f64) {
+        let mut good = 0u64;
+        let mut questionable = 0u64;
+        let mut bad = 0u64;
+        let mut active = 0u64;
+        let mut score_sum = 0.0f64;
+        for n in iter {
+            match n.state {
                 NodeState::Good => good += 1,
                 NodeState::Questionable => questionable += 1,
                 NodeState::Bad => bad += 1,
             }
-            if node.query_count > 0 {
+            if n.query_count > 0 {
                 active += 1;
             }
-            avg_score += node.score;
+            score_sum += n.score;
         }
-        let total = nodes.len();
-        if total > 0 {
-            avg_score /= total as f64;
+        (total as u64, good, questionable, bad, active, score_sum)
+    }
+
+    /// 全量扫描并把 6 个计数器**直接置为**扫描结果（置为而非累加）。
+    ///
+    /// 仅在 load_initial / load_all 结束时调用（启动阶段无并发）。重复加载也安全：
+    /// 无论加载前计数器是什么，都被权威扫描结果覆盖。
+    fn calibrate_stats<'a>(&self, iter: impl Iterator<Item = &'a KBucketEntry>, total: usize) {
+        let (t, g, q, b, a, s) = Self::scan_nodes_stats(iter, total);
+        self.total.store(t, Ordering::Relaxed);
+        self.good.store(g, Ordering::Relaxed);
+        self.questionable.store(q, Ordering::Relaxed);
+        self.bad.store(b, Ordering::Relaxed);
+        self.active.store(a, Ordering::Relaxed);
+        self.score_sum.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    /// 新增一个内存节点时累加计数器（调用方已持 nodes 写锁/分片锁）。
+    #[inline]
+    fn acc_add_entry(&self, e: &KBucketEntry) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        match e.state {
+            NodeState::Good => self.good.fetch_add(1, Ordering::Relaxed),
+            NodeState::Questionable => self.questionable.fetch_add(1, Ordering::Relaxed),
+            NodeState::Bad => self.bad.fetch_add(1, Ordering::Relaxed),
+        };
+        if e.query_count > 0 {
+            self.active.fetch_add(1, Ordering::Relaxed);
         }
+        self.acc_add_score(e.score);
+    }
+
+    /// 移除一个内存节点时按其**旧字段**扣减计数器（调用方已持 nodes 写锁/分片锁）。
+    #[inline]
+    fn acc_remove_entry(&self, e: &KBucketEntry) {
+        self.total.fetch_sub(1, Ordering::Relaxed);
+        match e.state {
+            NodeState::Good => self.good.fetch_sub(1, Ordering::Relaxed),
+            NodeState::Questionable => self.questionable.fetch_sub(1, Ordering::Relaxed),
+            NodeState::Bad => self.bad.fetch_sub(1, Ordering::Relaxed),
+        };
+        if e.query_count > 0 {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.acc_add_score(-e.score);
+    }
+
+    /// state 迁移：仅当新旧档不同时，旧档 -1、新档 +1（同档 no-op）。
+    #[inline]
+    fn acc_transition_state(&self, old: NodeState, new: NodeState) {
+        if old == new {
+            return;
+        }
+        match old {
+            NodeState::Good => self.good.fetch_sub(1, Ordering::Relaxed),
+            NodeState::Questionable => self.questionable.fetch_sub(1, Ordering::Relaxed),
+            NodeState::Bad => self.bad.fetch_sub(1, Ordering::Relaxed),
+        };
+        match new {
+            NodeState::Good => self.good.fetch_add(1, Ordering::Relaxed),
+            NodeState::Questionable => self.questionable.fetch_add(1, Ordering::Relaxed),
+            NodeState::Bad => self.bad.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// score_sum 增量。f64 求和不能对 bit 模式做整数加法，故用 CAS 循环。
+    /// 调用方多数在 write_all 内（互斥），仅 with_mut 单分片路径可能并发，CAS 保证正确。
+    #[inline]
+    fn acc_add_score(&self, delta: f64) {
+        let mut old_bits = self.score_sum.load(Ordering::Relaxed);
+        loop {
+            let new_bits = (f64::from_bits(old_bits) + delta).to_bits();
+            match self.score_sum.compare_exchange_weak(
+                old_bits,
+                new_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => old_bits = cur,
+            }
+        }
+    }
+
+    /// 鑺傜偣缁熻淇℃伅锛堥伩鍏嶅叏閲忓厠闅嗭紝鐢ㄤ簬鍋ュ悍搴﹁绠楀拰鐩戞帶锛?
+    ///
+    /// O(1) 无锁无遍历：只读 6 个原子计数器组装。语义与原全量遍历版完全一致：
+    /// active = query_count>0 的节点数；avg_score = score_sum/total，total==0 时 0.0。
+    pub fn stats_sync(&self) -> NodeStats {
+        let total = self.total.load(Ordering::Relaxed) as usize;
+        let good = self.good.load(Ordering::Relaxed) as usize;
+        let questionable = self.questionable.load(Ordering::Relaxed) as usize;
+        let bad = self.bad.load(Ordering::Relaxed) as usize;
+        let active = self.active.load(Ordering::Relaxed) as usize;
+        let score_sum = f64::from_bits(self.score_sum.load(Ordering::Relaxed));
+        let avg_score = if total > 0 {
+            score_sum / total as f64
+        } else {
+            0.0
+        };
         NodeStats {
             total,
             good,
@@ -513,6 +654,39 @@ impl NodeRepoImpl {
             bad,
             active,
             avg_score,
+        }
+    }
+
+    /// 周期抽查：全量扫描内存表，与原子计数器比对，返回差值（= 计数器 − 实测扫描值）。
+    ///
+    /// 供 stats_snapshot 的 60s 后台任务调用并据此打 WARN。本方法**不打印日志**，
+    /// 也不修改任何状态；仅一次读锁遍历 + 原子读。健康时全 0。
+    pub fn verify_stats_consistency(&self) -> NodeStatsDrift {
+        let nodes = self.nodes.read_all();
+        let (t, g, q, b, a, s) = Self::scan_nodes_stats(nodes.values(), nodes.len());
+        drop(nodes);
+
+        let c_total = self.total.load(Ordering::Relaxed);
+        let c_good = self.good.load(Ordering::Relaxed);
+        let c_questionable = self.questionable.load(Ordering::Relaxed);
+        let c_bad = self.bad.load(Ordering::Relaxed);
+        let c_active = self.active.load(Ordering::Relaxed);
+        let c_sum = f64::from_bits(self.score_sum.load(Ordering::Relaxed));
+
+        let measured_avg = if t > 0 { s / t as f64 } else { 0.0 };
+        let counted_avg = if c_total > 0 {
+            c_sum / c_total as f64
+        } else {
+            0.0
+        };
+
+        NodeStatsDrift {
+            total: c_total as i64 - t as i64,
+            good: c_good as i64 - g as i64,
+            questionable: c_questionable as i64 - q as i64,
+            bad: c_bad as i64 - b as i64,
+            active: c_active as i64 - a as i64,
+            avg_score_diff: counted_avg - measured_avg,
         }
     }
 
@@ -534,18 +708,26 @@ impl NodeRepoImpl {
     pub fn record_query_sync(&self, addr: SocketAddr, success: bool, latency_ms: u64) {
         let mut nodes = self.nodes.write_all();
         if let Some(entry) = nodes.get_mut(&addr) {
+            // active：query_count 0→1 时 +1（只增不减，删除时扣减）
+            if entry.query_count == 0 {
+                self.active.fetch_add(1, Ordering::Relaxed);
+            }
             entry.query_count += 1;
             entry.last_query_time = Some(Instant::now());
             if success {
                 entry.success_count += 1;
                 entry.total_latency_ms += latency_ms;
                 entry.last_active = Instant::now();
+                let old = entry.state;
                 entry.state = NodeState::Good;
+                self.acc_transition_state(old, NodeState::Good);
                 entry.consecutive_failures = 0;
             } else {
                 entry.consecutive_failures += 1;
                 if entry.consecutive_failures >= 3 {
+                    let old = entry.state;
                     entry.state = NodeState::Bad;
+                    self.acc_transition_state(old, NodeState::Bad);
                 }
             }
             // 鏍囪涓鸿剰锛氱粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖?
@@ -563,13 +745,18 @@ impl NodeRepoImpl {
     ) {
         let mut nodes = self.nodes.write_all();
         if let Some(entry) = nodes.get_mut(&addr) {
+            if entry.query_count == 0 {
+                self.active.fetch_add(1, Ordering::Relaxed);
+            }
             entry.query_count += 1;
             entry.success_count += 1;
             entry.total_latency_ms += latency_ms;
             entry.nodes_returned += nodes_returned;
             entry.last_active = Instant::now();
             entry.last_query_time = Some(Instant::now());
+            let old = entry.state;
             entry.state = NodeState::Good;
+            self.acc_transition_state(old, NodeState::Good);
             entry.consecutive_failures = 0;
             // 鏍囪涓鸿剰
             drop(nodes);
@@ -580,8 +767,12 @@ impl NodeRepoImpl {
     /// 鍒锋柊鎵€鏈夎妭鐐圭姸鎬侊紙鍩轰簬鏈€鍚庢椿璺冩椂闂存洿鏂?Good/Questionable锛?
     pub fn refresh_all_states_sync(&self) {
         let mut nodes = self.nodes.write_all();
+        // refresh_state() 会把 Good/Questionable 按 last_active 互切（Bad 冻结不变），
+        // 故必须捕获旧档并做状态迁移计数；旧==新时 acc_transition_state 为 no-op。
         nodes.for_values_mut(|entry| {
+            let old = entry.state;
             entry.refresh_state();
+            self.acc_transition_state(old, entry.state);
         });
     }
 
@@ -735,7 +926,9 @@ impl NodeRepoImpl {
         let mut dirty = self.dirty.write();
         for (addr, score) in scores {
             if let Some(entry) = nodes.get_mut(addr) {
+                let old = entry.score;
                 entry.score = *score;
+                self.acc_add_score(*score - old);
                 dirty.insert(*addr);
             }
         }
@@ -753,6 +946,7 @@ impl NodeRepository for NodeRepoImpl {
         let Some(entry) = removed_entry else {
             return false;
         };
+        self.acc_remove_entry(&entry);
         // 浠?/24 缃戞绱㈠紩涓Щ闄よ鑺傜偣
         self.unindex_subnet(addr, &entry.id);
         // 同步清理分层集合，避免 hot/cold 无界残留导致计数虚高与内存泄漏
@@ -843,7 +1037,11 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn update_score(&self, addr: &SocketAddr, score: f64) {
-        self.nodes.with_mut(addr, |entry| entry.score = score);
+        self.nodes.with_mut(addr, |entry| {
+            let old = entry.score;
+            entry.score = score;
+            self.acc_add_score(score - old);
+        });
     }
 
     async fn update_scores_batch(&self, scores: &[(SocketAddr, f64)]) {
@@ -855,7 +1053,11 @@ impl NodeRepository for NodeRepoImpl {
     }
 
     async fn set_node_state(&self, addr: &SocketAddr, state: NodeState) {
-        self.nodes.with_mut(addr, |entry| entry.state = state);
+        self.nodes.with_mut(addr, |entry| {
+            let old = entry.state;
+            entry.state = state;
+            self.acc_transition_state(old, state);
+        });
         // 鐘舵€佸彉鍖栦篃鏍囪涓鸿剰
         self.dirty.write().insert(*addr);
     }
@@ -996,6 +1198,9 @@ impl NodeRepository for NodeRepoImpl {
             }
             count += 1;
         }
+        // 校准回填：全量扫描把 6 个计数器直接置为扫描结果（置为而非累加）。
+        // 此处仍持有 nodes 写锁，复用守卫避免重复加锁死锁。
+        self.calibrate_stats(nodes.values(), nodes.len());
         Ok(count)
     }
 
@@ -1040,7 +1245,8 @@ impl NodeRepository for NodeRepoImpl {
         let mut dirty = self.dirty.write();
         let mut removed = 0;
         for (addr, id) in &candidates {
-            if nodes.remove(addr).is_some() {
+            if let Some(entry) = nodes.remove(addr) {
+                self.acc_remove_entry(&entry);
                 removed += 1;
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     if let Some(bucket) = subnet_index.get_mut(&subnet) {
@@ -1089,7 +1295,8 @@ impl NodeRepository for NodeRepoImpl {
         let mut dirty = self.dirty.write();
         let mut removed = 0;
         for addr in &candidates {
-            if nodes.remove(addr).is_some() {
+            if let Some(entry) = nodes.remove(addr) {
+                self.acc_remove_entry(&entry);
                 removed += 1;
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     if let Some(bucket) = subnet_index.get_mut(&subnet) {
@@ -1167,5 +1374,273 @@ mod tests {
         let removed = repo.remove_cold_nodes(7200).await.unwrap();
         assert_eq!(removed, 0);
         assert!(repo.contains_sync(a));
+    }
+
+    // ==================== 增量统计原子计数器 ====================
+
+    #[test]
+    fn test_stats_after_insert() {
+        let repo = test_repo();
+        let a = addr(1, 1001);
+        repo.add_node_sync([1u8; 20], a);
+        // 新节点：state=Good（默认）、query_count=0、score=45.0
+        let s = repo.stats_sync();
+        assert_eq!(s.total, 1);
+        assert_eq!(s.good, 1);
+        assert_eq!(s.questionable, 0);
+        assert_eq!(s.bad, 0);
+        assert_eq!(s.active, 0, "query_count=0 不计入 active");
+        assert!((s.avg_score - 45.0).abs() < 1e-9, "avg={}", s.avg_score);
+    }
+
+    #[test]
+    fn test_stats_empty_repo() {
+        let repo = test_repo();
+        let s = repo.stats_sync();
+        assert_eq!(s.total, 0);
+        assert_eq!(s.good, 0);
+        assert_eq!(s.active, 0);
+        assert_eq!(s.avg_score, 0.0, "total==0 时 avg_score 必须为 0.0");
+    }
+
+    #[test]
+    fn test_stats_same_addr_id_update_no_double_count() {
+        let repo = test_repo();
+        let a = addr(2, 1002);
+        repo.add_node_sync([1u8; 20], a);
+        // 同 addr 第二次插入不同 id → 走 existing 分支，只改 id/last_active，计数不变
+        repo.add_node_sync([9u8; 20], a);
+        let s = repo.stats_sync();
+        assert_eq!(s.total, 1, "同 addr 替换不得翻倍计数");
+        assert_eq!(s.good, 1);
+        assert!((s.avg_score - 45.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_stats_after_remove_node() {
+        let repo = test_repo();
+        let a = addr(3, 1003);
+        repo.add_node_sync([3u8; 20], a);
+        assert_eq!(repo.stats_sync().total, 1);
+        let ok = repo.remove_node(&a).await;
+        assert!(ok);
+        let s = repo.stats_sync();
+        assert_eq!(s.total, 0);
+        assert_eq!(s.good, 0);
+        assert_eq!(s.active, 0);
+        assert_eq!(s.avg_score, 0.0);
+    }
+
+    #[test]
+    fn test_stats_after_emergency_evict() {
+        let repo = test_repo();
+        let a = addr(4, 1004);
+        repo.add_node_sync([4u8; 20], a);
+        // emergency_evict 跳过 dirty 节点，先清 dirty 才会真正卸载
+        repo.clear_all_dirty_sync();
+        repo.emergency_evict(1);
+        assert!(!repo.contains_sync(a));
+        let s = repo.stats_sync();
+        assert_eq!(s.total, 0);
+        assert_eq!(s.good, 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_node_state_transition() {
+        let repo = test_repo();
+        let a = addr(5, 1005);
+        repo.add_node_sync([5u8; 20], a); // 默认 Good
+        assert_eq!(repo.stats_sync().good, 1);
+        repo.set_node_state(&a, NodeState::Bad).await;
+        let s = repo.stats_sync();
+        assert_eq!(s.good, 0, "Good→Bad 后 good 应 -1");
+        assert_eq!(s.bad, 1, "Good→Bad 后 bad 应 +1");
+        assert_eq!(s.questionable, 0);
+        // 同状态再设一次：不得重复扣减
+        repo.set_node_state(&a, NodeState::Bad).await;
+        let s2 = repo.stats_sync();
+        assert_eq!(s2.bad, 1, "同状态迁移必须 no-op");
+        assert_eq!(s2.good, 0);
+    }
+
+    #[test]
+    fn test_record_query_active_and_state_flip() {
+        let repo = test_repo();
+        let a = addr(6, 1006);
+        repo.add_node_sync([6u8; 20], a); // Good, qc=0, active=0
+                                          // 第 1 次失败：query_count 0→1 → active++；连续失败=1，仍 Good
+        repo.record_query_sync(a, false, 0);
+        let s1 = repo.stats_sync();
+        assert_eq!(s1.active, 1, "首次查询 active 0→1");
+        assert_eq!(s1.good, 1, "未满 3 次失败仍 Good");
+        // 再失败 2 次：consecutive_failures=3 → Bad
+        repo.record_query_sync(a, false, 0);
+        repo.record_query_sync(a, false, 0);
+        let s2 = repo.stats_sync();
+        assert_eq!(s2.bad, 1);
+        assert_eq!(s2.good, 0);
+        assert_eq!(s2.active, 1, "active 只增不减，不因状态翻转改变");
+        // 成功一次：转回 Good
+        repo.record_query_sync(a, true, 10);
+        let s3 = repo.stats_sync();
+        assert_eq!(s3.good, 1);
+        assert_eq!(s3.bad, 0);
+    }
+
+    #[tokio::test]
+    async fn test_score_update_changes_avg() {
+        let repo = test_repo();
+        let a = addr(7, 1007);
+        repo.add_node_sync([7u8; 20], a); // score=45
+                                          // 批量更新路径
+        repo.update_scores_batch_sync(&[(a, 95.0)]);
+        let s = repo.stats_sync();
+        assert!((s.avg_score - 95.0).abs() < 1e-9, "avg={}", s.avg_score);
+        // 单节点 trait 路径（with_mut 分片锁）
+        repo.update_score(&a, 10.0).await;
+        let s2 = repo.stats_sync();
+        assert!((s2.avg_score - 10.0).abs() < 1e-9, "avg={}", s2.avg_score);
+    }
+
+    #[test]
+    fn test_mixed_ops_match_full_scan() {
+        let repo = test_repo();
+        let a1 = addr(8, 1008);
+        let a2 = addr(9, 1009);
+        let a3 = addr(10, 1010);
+        repo.add_node_sync([1u8; 20], a1);
+        repo.add_node_sync([2u8; 20], a2);
+        repo.add_node_sync([3u8; 20], a3);
+        repo.record_query_sync(a1, true, 5); // a1: Good, active, qc=1
+        repo.record_query_sync(a2, false, 0);
+        repo.record_query_sync(a2, false, 0);
+        repo.record_query_sync(a2, false, 0); // a2 → Bad, active, qc=3
+        repo.update_scores_batch_sync(&[(a1, 80.0), (a3, 20.0)]);
+        // 清 dirty 后驱逐 1 个（最久未访问），计数器必须随驱逐扣减
+        repo.clear_all_dirty_sync();
+        repo.emergency_evict(1);
+
+        // 手动全量扫描（权威）
+        let all = repo.all_nodes_sync();
+        let mut good = 0;
+        let mut questionable = 0;
+        let mut bad = 0;
+        let mut active = 0;
+        let mut sum = 0.0;
+        for n in &all {
+            match n.state {
+                NodeState::Good => good += 1,
+                NodeState::Questionable => questionable += 1,
+                NodeState::Bad => bad += 1,
+            }
+            if n.query_count > 0 {
+                active += 1;
+            }
+            sum += n.score;
+        }
+        let manual_avg = if all.is_empty() {
+            0.0
+        } else {
+            sum / all.len() as f64
+        };
+
+        let s = repo.stats_sync();
+        assert_eq!(s.total, all.len());
+        assert_eq!(s.good, good);
+        assert_eq!(s.questionable, questionable);
+        assert_eq!(s.bad, bad);
+        assert_eq!(s.active, active);
+        assert!(
+            (s.avg_score - manual_avg).abs() < 1e-9,
+            "avg counted={} manual={}",
+            s.avg_score,
+            manual_avg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_all_recalibrates_and_idempotent() {
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo1 = NodeRepoImpl::new(storage.clone());
+        let n1 = addr(11, 1011);
+        let n2 = addr(12, 1012);
+        repo1.add_node_sync([1u8; 20], n1);
+        repo1.add_node_sync([2u8; 20], n2);
+        // n1 三次失败 → Bad，qc=3；score 改成 30
+        repo1.record_query_sync(n1, false, 0);
+        repo1.record_query_sync(n1, false, 0);
+        repo1.record_query_sync(n1, false, 0);
+        repo1.update_scores_batch_sync(&[(n1, 30.0)]);
+        repo1.save_dirty().await.unwrap(); // 落库
+
+        // 新 repo 复用同一 storage，load_all 全量加载并校准
+        let repo2 = NodeRepoImpl::new(storage);
+        let n = repo2.load_all().await.unwrap();
+        assert_eq!(n, 2);
+        let s = repo2.stats_sync();
+        assert_eq!(s.total, 2);
+        assert_eq!(s.good, 1, "n2 未查询 → Good");
+        assert_eq!(s.bad, 1, "n1 三次失败 → Bad");
+        assert_eq!(s.questionable, 0);
+        assert_eq!(s.active, 1, "仅 n1 query_count>0");
+        assert!((s.avg_score - 37.5).abs() < 1e-9, "avg={}", s.avg_score);
+
+        // 重复加载：校准是"置为扫描值"，total 不得翻倍
+        let n2b = repo2.load_all().await.unwrap();
+        assert_eq!(n2b, 2);
+        let s2 = repo2.stats_sync();
+        assert_eq!(s2.total, 2, "重复 load_all 后计数不得翻倍");
+        assert_eq!(s2.bad, 1);
+        assert_eq!(s2.active, 1);
+    }
+
+    #[test]
+    fn test_verify_consistency_clean() {
+        let repo = test_repo();
+        let a = addr(20, 1020);
+        repo.add_node_sync([1u8; 20], a);
+        repo.record_query_sync(a, true, 5);
+        repo.update_scores_batch_sync(&[(a, 88.0)]);
+        let d = repo.verify_stats_consistency();
+        assert_eq!(d.total, 0);
+        assert_eq!(d.good, 0);
+        assert_eq!(d.questionable, 0);
+        assert_eq!(d.bad, 0);
+        assert_eq!(d.active, 0);
+        assert!(
+            d.avg_score_diff.abs() < 1e-9,
+            "avg_diff={}",
+            d.avg_score_diff
+        );
+    }
+
+    #[test]
+    fn test_verify_consistency_detects_drift() {
+        let repo = test_repo();
+        let a = addr(21, 1021);
+        repo.add_node_sync([1u8; 20], a); // Good, total=1, good=1
+                                          // 人为污染计数器：total 多算 3，bad 多算 1
+        repo.total.fetch_add(3, Ordering::Relaxed);
+        repo.bad.fetch_add(1, Ordering::Relaxed);
+        let d = repo.verify_stats_consistency();
+        assert_eq!(d.total, 3, "drift = 计数器 - 实测");
+        assert_eq!(d.bad, 1);
+        assert_eq!(d.good, 0);
+        assert_eq!(d.active, 0);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_all_states_no_drift() {
+        let repo = test_repo();
+        let a = addr(22, 1022);
+        repo.add_node_sync([1u8; 20], a);
+        // refresh_state 对新节点（last_active=now）应保持 Good；
+        // 先把节点置 Bad（Bad 被 refresh_state 冻结），再 refresh，计数器不应漂移
+        repo.set_node_state(&a, NodeState::Bad).await;
+        repo.refresh_all_states_sync();
+        let d = repo.verify_stats_consistency();
+        assert_eq!(d.total, 0);
+        assert_eq!(d.bad, 0);
+        assert_eq!(d.good, 0);
     }
 }

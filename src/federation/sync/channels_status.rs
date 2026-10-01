@@ -46,6 +46,10 @@ pub struct BootstrapChannelStatus {
     /// 窗口级空闲看门狗已回收重发的次数。
     #[serde(default)]
     pub idle_recoveries: u32,
+    /// 方向：`"send"`（本地向对端推块）/ `"recv"`（本地从对端拉块）/ `""`（未确定/空闲）。
+    /// 由核心运行时在 sync 各写入点落值；观测侧只读。
+    #[serde(default)]
+    pub direction: String,
 }
 
 /// Delta（oplog 增量）通道状态。
@@ -127,7 +131,7 @@ mod tests {
             assert!(v.get(k).is_some(), "顶层缺少 key: {}, body={}", k, v);
         }
 
-        // bootstrap 子结构 9 个字段
+        // bootstrap 子结构 10 个字段（含 E3 direction）
         let b = v.get("bootstrap").unwrap();
         for k in [
             "active",
@@ -139,6 +143,7 @@ mod tests {
             "skipped_identical",
             "phase",
             "idle_recoveries",
+            "direction",
         ] {
             assert!(b.get(k).is_some(), "bootstrap 缺少字段: {}", k);
         }
@@ -168,9 +173,14 @@ mod tests {
             assert!(r.get(k).is_some(), "range_reconcile 缺少字段: {}", k);
         }
 
-        // 默认值：active=false、peer_id 空串、phase/mode 空串（业务写入后才填）
+        // 默认值：active=false、peer_id 空串、phase/direction/mode 空串（业务写入后才填）
         assert_eq!(b["active"], serde_json::json!(false));
         assert_eq!(b["peer_id"], serde_json::json!(""));
+        assert_eq!(
+            b["direction"],
+            serde_json::json!(""),
+            "E3 direction 默认应为空串"
+        );
     }
 
     #[test]

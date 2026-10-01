@@ -271,6 +271,15 @@ impl FederationDispatcher {
                     }
                     Ok(SessionEvent::Disconnected { peer, reason, .. }) => {
                         let peer_id = from_sdk_node_id(peer);
+                        // B1：连接关闭计数。SDK 对每一条曾发出 Connected 的会话，最终都经由
+                        // SessionManager::disconnect（幂等）发出恰好一次 Disconnected——
+                        // 空闲超时 / IO 错误 / 本地主动 disconnect / 被 Replaced / shutdown drain
+                        // 全部汇聚到这一臂（见 pnos-net session/acceptor.rs 接收循环与 mod.rs
+                        // disconnect/shutdown）。故在此与 Connected 臂的
+                        // `record_connection_established` 对称地 +1，established 与 closed
+                        // 必然成对，无需 registry 推断兜底。
+                        // 握手失败走的是 Rejected 臂（从未注册、未发 Connected），不计入 closed。
+                        self.metrics.record_connection_closed();
                         self.caps.remove(&peer_id);
                         self.forget(&peer_id);
                         self.node_table.mark_disconnected(&peer_id);
