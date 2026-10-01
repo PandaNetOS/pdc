@@ -14,6 +14,37 @@ use tracing::{debug, info};
 
 use blake3;
 
+/// v11(K 批/F2b)：区间查询强制索引回退的「只告警一次」标记。
+static RANGE_INDEX_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// v11(K 批/F2b)：优先用 `INDEXED BY` 强制 key 索引准备语句；索引不存在
+/// （建索引失败的库/异构旧库）时回退 `sql_plain` 并只告警一次。
+///
+/// 背景（2026-10-01 .52 本地 489 万行实测）：同一区间查询，SQLite 优化器总是
+/// 偏爱 `idx_dht_nodes_deleted`（deleted_at 布尔索引）而弃用 v9 建好的表达式
+/// 索引，区间摘要退化为 TEMP B-TREE 全量排序 4.3s/个（.53 上 ~9s/个）；强制
+/// 表达式索引后 0.035s（124×）。优化器对表达式索引的选择性估计不可靠，只能
+/// 显式强制——两份 SQL 的谓词与占位符完全一致，仅差 `INDEXED BY` 子句。
+fn prepare_range_stmt<'a>(
+    conn: &'a rusqlite::Connection,
+    sql_indexed: &str,
+    sql_plain: &str,
+) -> rusqlite::Result<rusqlite::Statement<'a>> {
+    match conn.prepare(sql_indexed) {
+        Ok(stmt) => Ok(stmt),
+        Err(indexed_err) => {
+            if !RANGE_INDEX_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "[storage] 区间查询强制索引失败，回退全表排序（性能下降，区间扫描将持读连接秒级）: {}",
+                    indexed_err
+                );
+            }
+            conn.prepare(sql_plain)
+        }
+    }
+}
+
 /// 写入统计（用于定位 IO 来源）
 #[derive(Debug, Clone, Default)]
 pub struct WriteStats {
@@ -896,6 +927,10 @@ impl Storage {
                 ON peers((lower(hex(infohash)) || ':' || ip || ':' || port));
             CREATE INDEX IF NOT EXISTS idx_peers_archive_key_expr
                 ON peers_archive((lower(hex(infohash)) || ':' || ip || ':' || port));
+            CREATE INDEX IF NOT EXISTS idx_infohashes_ih_alive
+                ON infohashes(infohash) WHERE deleted_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_trackers_url_alive
+                ON trackers(url) WHERE deleted_at IS NULL;
             "#,
         ) {
             tracing::warn!(
@@ -2153,14 +2188,24 @@ impl Storage {
             // **区间定位**。旧写法 `(?1 IS NULL OR (ip||':'||port) >= ?1)` 让 SQLite 无法做
             // 索引范围扫描，只能退化为「索引有序全扫 + 逐行过滤」—— 建一次清单要跑 93 个块查询，
             // 每个都从表头扫到 `lo`，合计上亿次探测（实测单次重建 >131s，持锁期间拖垮 API/写队列）。
-            let (sql, binds) = Self::node_range_sql(
+            // v11(K 批/F2b)：优化器从不主动选表达式索引（偏爱 deleted 布尔索引 + TEMP B-TREE
+            // 排序，实测 4.3s/区间），显式强制走表达式索引后 0.035s。
+            let (sql_ix, binds) = Self::node_range_sql(
                 "SELECT id, ip, port FROM dht_nodes",
                 &lo_s,
                 &hi_s,
                 limit.max(1) as i64,
+                Some("idx_dht_nodes_ip_port_expr"),
             );
+            let (sql_plain, _) = Self::node_range_sql(
+                "SELECT id, ip, port FROM dht_nodes",
+                &lo_s,
+                &hi_s,
+                limit.max(1) as i64,
+                None,
+            );
+            let mut stmt = prepare_range_stmt(conn, &sql_ix, &sql_plain)?;
             let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(bind_refs.as_slice(), |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -2181,13 +2226,19 @@ impl Storage {
     /// 只在**确实需要**时生成边界谓词（`?1 IS NULL OR ...` 这类写法会阻断索引范围扫描）。
     /// `hi = None` 时直接省略上界；`lo = None` 时省略下界（-∞）。占位符按实际使用情况编号，
     /// 避免 rusqlite 的「参数个数不匹配」错误。
+    /// v11(K 批/F2b)：`indexed_by` 传 Some(索引名) 时在表名后追加 `INDEXED BY`——
+    /// 调用方须同时用 None 再生成一份 `sql_plain` 供 `prepare_range_stmt` 回退。
     fn node_range_sql(
         select: &str,
         lo_s: &Option<String>,
         hi_s: &Option<String>,
         limit: i64,
+        indexed_by: Option<&str>,
     ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         let mut sql = String::from(select);
+        if let Some(idx) = indexed_by {
+            sql.push_str(&format!(" INDEXED BY {}", idx));
+        }
         sql.push_str(" WHERE deleted_at IS NULL");
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(3);
         let mut n = 0usize;
@@ -2234,14 +2285,23 @@ impl Storage {
         let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
         let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
         // v9：与 `load_node_rows_in_range` 同一套「按需谓词」拼装（使表达式索引可用于区间定位）。
-        let (sql, binds) = Self::node_range_sql(
+        // v11(K 批/F2b)：INDEXED BY 强制（见 load_node_rows_in_range 内注释）。
+        let (sql_ix, binds) = Self::node_range_sql(
             "SELECT id, ip, port FROM dht_nodes",
             &lo_s,
             &hi_s,
             limit.max(1) as i64,
+            Some("idx_dht_nodes_ip_port_expr"),
         );
+        let (sql_plain, _) = Self::node_range_sql(
+            "SELECT id, ip, port FROM dht_nodes",
+            &lo_s,
+            &hi_s,
+            limit.max(1) as i64,
+            None,
+        );
+        let mut stmt = prepare_range_stmt(conn, &sql_ix, &sql_plain)?;
         let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(bind_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -2340,6 +2400,7 @@ impl Storage {
         let main_rows = Self::query_peer_rows_one_table(
             conn,
             "peers",
+            "idx_peers_key_expr",
             "deleted_at IS NULL",
             lo,
             hi,
@@ -2348,6 +2409,7 @@ impl Storage {
         let archive_rows = Self::query_peer_rows_one_table(
             conn,
             "peers_archive",
+            "idx_peers_archive_key_expr",
             "1=1",
             lo,
             hi,
@@ -2382,34 +2444,44 @@ impl Storage {
     /// `tombstone_filter`：主表传 `deleted_at IS NULL`，archive 传 `1=1`（无墓碑列）。
     /// 谓词按需拼装（`?N IS NULL OR ...` 写法会阻断索引范围扫描），与 `node_range_sql`
     /// 同风格，key 表达式与两表的 key 表达式索引逐字一致。
+    /// v11(K 批/F2b)：`index_name` 强制对应表达式索引（优化器从不主动选它，实测
+    /// 全表排序 4.3s/区间 vs 强制后 0.010s）；索引缺失时回退无索引 SQL（只告警一次）。
     fn query_peer_rows_one_table(
         conn: &rusqlite::Connection,
         table: &str,
+        index_name: &str,
         tombstone_filter: &str,
         lo: Option<&str>,
         hi: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<(String, Vec<u8>, String, i64)>> {
         let key_expr = "(lower(hex(infohash)) || ':' || ip || ':' || port)";
-        let mut sql =
+        let from_ix = format!("{} INDEXED BY {}", table, index_name);
+        let mut sql_ix = format!(
+            "SELECT {key_expr}, infohash, ip, port FROM {from_ix} WHERE {tombstone_filter}"
+        );
+        let mut sql_pl =
             format!("SELECT {key_expr}, infohash, ip, port FROM {table} WHERE {tombstone_filter}");
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(3);
         let mut n = 0usize;
         if let Some(v) = lo {
             n += 1;
-            sql.push_str(&format!(" AND {key_expr} >= ?{n}"));
+            sql_ix.push_str(&format!(" AND {key_expr} >= ?{n}"));
+            sql_pl.push_str(&format!(" AND {key_expr} >= ?{n}"));
             binds.push(Box::new(v.to_string()));
         }
         if let Some(v) = hi {
             n += 1;
-            sql.push_str(&format!(" AND {key_expr} < ?{n}"));
+            sql_ix.push_str(&format!(" AND {key_expr} < ?{n}"));
+            sql_pl.push_str(&format!(" AND {key_expr} < ?{n}"));
             binds.push(Box::new(v.to_string()));
         }
         n += 1;
-        sql.push_str(&format!(" ORDER BY {key_expr} ASC LIMIT ?{n}"));
+        sql_ix.push_str(&format!(" ORDER BY {key_expr} ASC LIMIT ?{n}"));
+        sql_pl.push_str(&format!(" ORDER BY {key_expr} ASC LIMIT ?{n}"));
         binds.push(Box::new(limit));
+        let mut stmt = prepare_range_stmt(conn, &sql_ix, &sql_pl)?;
         let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(bind_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -2418,6 +2490,97 @@ impl Storage {
                 row.get::<_, i64>(3)?,
             ))
         })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// v11(K 批/F2b)：infohashes 区间查询（按需谓词 + INDEXED BY 强制部分索引）。
+    ///
+    /// 旧 `?1 IS NULL OR infohash >= ?1` 写法让优化器无法建立范围约束，且优化器偏爱
+    /// deleted 索引 + TEMP B-TREE 排序（实测 101ms/区间 vs 强制后 3ms）。
+    /// `sql_plain` 供部分索引缺失时回退（`prepare_range_stmt` 只告警一次）。
+    fn query_infohash_range_keys(
+        conn: &rusqlite::Connection,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut sql_ix = String::from(
+            "SELECT infohash FROM infohashes INDEXED BY idx_infohashes_ih_alive WHERE deleted_at IS NULL",
+        );
+        let mut sql_pl = String::from("SELECT infohash FROM infohashes WHERE deleted_at IS NULL");
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(3);
+        let mut n = 0usize;
+        if let Some(v) = lo {
+            n += 1;
+            let p = format!(" AND infohash >= ?{n}");
+            sql_ix.push_str(&p);
+            sql_pl.push_str(&p);
+            binds.push(Box::new(v.to_vec()));
+        }
+        if let Some(v) = hi {
+            n += 1;
+            let p = format!(" AND infohash < ?{n}");
+            sql_ix.push_str(&p);
+            sql_pl.push_str(&p);
+            binds.push(Box::new(v.to_vec()));
+        }
+        n += 1;
+        let p = format!(" ORDER BY infohash ASC LIMIT ?{n}");
+        sql_ix.push_str(&p);
+        sql_pl.push_str(&p);
+        binds.push(Box::new(limit.max(1) as i64));
+        let mut stmt = prepare_range_stmt(conn, &sql_ix, &sql_pl)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// v11(K 批/F2b)：trackers 区间查询（同 [`Self::query_infohash_range_keys`]，TEXT key）。
+    fn query_tracker_range_keys(
+        conn: &rusqlite::Connection,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        // url 为 TEXT 列，绑 TEXT（BLOB 与 TEXT 的 SQLite 类型序错配会使范围约束失效）
+        let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+        let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+        let mut sql_ix = String::from(
+            "SELECT url FROM trackers INDEXED BY idx_trackers_url_alive WHERE deleted_at IS NULL",
+        );
+        let mut sql_pl = String::from("SELECT url FROM trackers WHERE deleted_at IS NULL");
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(3);
+        let mut n = 0usize;
+        if let Some(ref v) = lo_s {
+            n += 1;
+            let p = format!(" AND url >= ?{n}");
+            sql_ix.push_str(&p);
+            sql_pl.push_str(&p);
+            binds.push(Box::new(v.clone()));
+        }
+        if let Some(ref v) = hi_s {
+            n += 1;
+            let p = format!(" AND url < ?{n}");
+            sql_ix.push_str(&p);
+            sql_pl.push_str(&p);
+            binds.push(Box::new(v.clone()));
+        }
+        n += 1;
+        let p = format!(" ORDER BY url ASC LIMIT ?{n}");
+        sql_ix.push_str(&p);
+        sql_pl.push_str(&p);
+        binds.push(Box::new(limit.max(1) as i64));
+        let mut stmt = prepare_range_stmt(conn, &sql_ix, &sql_pl)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -2519,39 +2682,19 @@ impl Storage {
                     Ok(out)
                 }
                 INFOHASH => {
-                    let mut stmt = conn.prepare(
-                        "SELECT infohash FROM infohashes \
-                     WHERE deleted_at IS NULL \
-                       AND (?1 IS NULL OR infohash >= ?1) \
-                       AND (?2 IS NULL OR infohash < ?2) \
-                     ORDER BY infohash ASC LIMIT ?3",
-                    )?;
-                    let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
-                        row.get::<_, Vec<u8>>(0)
-                    })?;
-                    let mut out = Vec::new();
-                    for r in rows {
-                        let ih = r?;
+                    // v11(K 批/F2b)：改走 query_infohash_range_keys（INDEXED BY 强制部分索引）
+                    let ihs = Self::query_infohash_range_keys(conn, lo, hi, limit)?;
+                    let mut out = Vec::with_capacity(ihs.len());
+                    for ih in ihs {
                         out.push((ih.clone(), blake3::hash(&ih).as_bytes().to_vec()));
                     }
                     Ok(out)
                 }
                 TRACKER => {
-                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let mut stmt = conn.prepare(
-                        "SELECT url FROM trackers \
-                     WHERE deleted_at IS NULL \
-                       AND (?1 IS NULL OR url >= ?1) \
-                       AND (?2 IS NULL OR url < ?2) \
-                     ORDER BY url ASC LIMIT ?3",
-                    )?;
-                    let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                        row.get::<_, String>(0)
-                    })?;
-                    let mut out = Vec::new();
-                    for r in rows {
-                        let url = r?;
+                    // v11(K 批/F2b)：改走 query_tracker_range_keys（INDEXED BY 强制部分索引）
+                    let urls = Self::query_tracker_range_keys(conn, lo, hi, limit)?;
+                    let mut out = Vec::with_capacity(urls.len());
+                    for url in urls {
                         out.push((
                             url.clone().into_bytes(),
                             blake3::hash(url.as_bytes()).as_bytes().to_vec(),
@@ -2705,20 +2848,11 @@ impl Storage {
             }
             INFOHASH => {
                 // G1：块数据读取改走读连接池，不抢全局写锁。
+                // v11(K 批/F2b)：改走 query_infohash_range_keys（INDEXED BY 强制部分索引）。
                 self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
-                    let mut stmt = conn.prepare(
-                        "SELECT infohash FROM infohashes \
-                         WHERE deleted_at IS NULL \
-                           AND (?1 IS NULL OR infohash >= ?1) \
-                           AND (?2 IS NULL OR infohash < ?2) \
-                         ORDER BY infohash ASC LIMIT ?3",
-                    )?;
-                    let rows = stmt.query_map(params![lo, hi, limit.max(1) as i64], |row| {
-                        row.get::<_, Vec<u8>>(0)
-                    })?;
+                    let ihs = Self::query_infohash_range_keys(conn, lo, hi, limit)?;
                     let mut out = Vec::new();
-                    for r in rows {
-                        let ih = r?;
+                    for ih in ihs {
                         if ih.len() != 20 {
                             continue;
                         }
@@ -2735,22 +2869,11 @@ impl Storage {
             }
             TRACKER => {
                 // G1：块数据读取改走读连接池，不抢全局写锁。
+                // v11(K 批/F2b)：改走 query_tracker_range_keys（INDEXED BY 强制部分索引）。
                 self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
-                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let mut stmt = conn.prepare(
-                        "SELECT url FROM trackers \
-                         WHERE deleted_at IS NULL \
-                           AND (?1 IS NULL OR url >= ?1) \
-                           AND (?2 IS NULL OR url < ?2) \
-                         ORDER BY url ASC LIMIT ?3",
-                    )?;
-                    let rows = stmt.query_map(params![lo_s, hi_s, limit.max(1) as i64], |row| {
-                        row.get::<_, String>(0)
-                    })?;
+                    let urls = Self::query_tracker_range_keys(conn, lo, hi, limit)?;
                     let mut out = Vec::new();
-                    for r in rows {
-                        let url = r?;
+                    for url in urls {
                         if let Some(e) = to_entry(
                             crate::federation::sync::tracker_sync::build_tracker_sync_entry(&url),
                         ) {
@@ -3112,6 +3235,119 @@ mod tests {
     fn test_init_tables() {
         let _storage = Storage::memory().unwrap();
         // 表创建成功
+    }
+
+    /// v11(K 批/F2b) 回归：四 repo 的区间查询（INDEXED BY 强制索引路径）必须
+    /// 有序、可过滤、边界正确——这是 range 摘要 / bootstrap 清单与分块服务共用的数据面。
+    #[test]
+    fn test_range_key_hashes_ordered_and_filtered() {
+        let storage = Storage::memory().unwrap();
+        // NODE：3 活 + 1 软删（软删行必须被排除）
+        for (ip, port) in [
+            ("10.0.0.2", 6881u16),
+            ("10.0.0.1", 6882u16),
+            ("10.0.0.3", 6883u16),
+            ("10.0.0.9", 6889u16),
+        ] {
+            storage
+                .save_dht_node(&[1u8; 20], ip, port, 1.0, "Good", 0, 0, 0, 0, 0, None)
+                .unwrap();
+        }
+        storage.soft_delete_node("10.0.0.9", 6889).unwrap();
+        let to_keys = |rows: &[(Vec<u8>, Vec<u8>)]| -> Vec<String> {
+            rows.iter()
+                .map(|(k, _)| String::from_utf8_lossy(k).to_string())
+                .collect()
+        };
+        let rows = storage
+            .load_repo_key_hashes_in_range(1, None, None, 100)
+            .unwrap();
+        assert_eq!(
+            to_keys(&rows),
+            vec!["10.0.0.1:6882", "10.0.0.2:6881", "10.0.0.3:6883"]
+        );
+        // 半开区间 [10.0.0.2:0, 10.0.0.3:0)
+        let rows = storage
+            .load_repo_key_hashes_in_range(1, Some(b"10.0.0.2:0"), Some(b"10.0.0.3:0"), 100)
+            .unwrap();
+        assert_eq!(to_keys(&rows), vec!["10.0.0.2:6881"]);
+
+        // INFOHASH：BLOB key 排序 + 上界过滤
+        let ih1 = [1u8; 20];
+        let ih2 = [2u8; 20];
+        storage.save_infohash(&ih1, 1, "t", 1.0).unwrap();
+        storage.save_infohash(&ih2, 1, "t", 1.0).unwrap();
+        let rows = storage
+            .load_repo_key_hashes_in_range(3, None, None, 100)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let rows = storage
+            .load_repo_key_hashes_in_range(3, None, Some(&ih2), 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, ih1.to_vec());
+
+        // TRACKER：TEXT key 排序
+        storage
+            .save_tracker("http://b.example/announce", 1.0, 0, 0, 0, 0, 0.0, 1, false)
+            .unwrap();
+        storage
+            .save_tracker("http://a.example/announce", 1.0, 0, 0, 0, 0, 0.0, 1, false)
+            .unwrap();
+        let rows = storage
+            .load_repo_key_hashes_in_range(4, None, None, 100)
+            .unwrap();
+        assert_eq!(
+            to_keys(&rows),
+            vec!["http://a.example/announce", "http://b.example/announce"]
+        );
+
+        // PEER：主表两行（key = lower(hex(ih)):ip:port，同 ih 下按 ip:port 排序）
+        storage
+            .save_peer(&ih1, "10.0.0.2", 6882, "dht", 1.0, 0, 0, 0)
+            .unwrap();
+        storage
+            .save_peer(&ih1, "10.0.0.1", 6881, "dht", 1.0, 0, 0, 0)
+            .unwrap();
+        let rows = storage
+            .load_repo_key_hashes_in_range(2, None, None, 100)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let k0 = String::from_utf8_lossy(&rows[0].0).to_string();
+        let k1 = String::from_utf8_lossy(&rows[1].0).to_string();
+        assert!(k0.starts_with("0101"));
+        assert!(k0 < k1);
+    }
+
+    /// v11(K 批/F2b) 回归：区间索引缺失（建索引失败的库）时查询必须回退可用，
+    /// 不允许 panic 或空结果——覆盖 `prepare_range_stmt` 的回退分支。
+    #[test]
+    fn test_range_query_falls_back_without_index() {
+        let storage = Storage::memory().unwrap();
+        storage
+            .save_dht_node(
+                &[1u8; 20], "10.0.0.1", 6881, 1.0, "Good", 0, 0, 0, 0, 0, None,
+            )
+            .unwrap();
+        storage.save_infohash(&[3u8; 20], 1, "t", 1.0).unwrap();
+        {
+            let conn = storage.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP INDEX idx_dht_nodes_ip_port_expr", [])
+                .unwrap();
+            conn.execute("DROP INDEX idx_infohashes_ih_alive", [])
+                .unwrap();
+        }
+        let rows = storage
+            .load_node_key_hashes_in_range(None, None, 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(String::from_utf8_lossy(&rows[0].0), "10.0.0.1:6881");
+        let rows = storage
+            .load_repo_key_hashes_in_range(3, None, None, 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, vec![3u8; 20]);
     }
 
     #[test]
