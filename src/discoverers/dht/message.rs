@@ -40,6 +40,9 @@ impl QueryMethod {
     }
 }
 
+/// parse_query 的解析结果：(transaction_id, 查询方法, infohash(如果有), announce_peer 端口(如果有))
+pub type ParsedQuery = (Vec<u8>, QueryMethod, Option<Infohash>, Option<u16>);
+
 /// DHT 节点信息（compact node info: 20字节ID + 4字节IP + 2字节端口）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DhtNode {
@@ -292,7 +295,7 @@ impl DhtMessage {
     /// 解析 DHT 查询消息
     ///
     /// 返回 (transaction_id, 查询方法, infohash(如果有))
-    pub fn parse_query(data: &[u8]) -> Option<(Vec<u8>, QueryMethod, Option<Infohash>)> {
+    pub fn parse_query(data: &[u8]) -> Option<ParsedQuery> {
         let value: BencodeValue = from_bytes(data).ok()?;
         let dict = value.as_dict()?;
 
@@ -323,6 +326,7 @@ impl DhtMessage {
 
         // 提取 infohash（get_peers 和 announce_peer 有）
         let mut infohash = None;
+        let mut announce_port = None;
         if let Some(args) = dict.get(b"a".as_slice()).and_then(|v| v.as_dict()) {
             if let Some(ih_bytes) = args.get(b"info_hash".as_slice()).and_then(|v| v.as_bytes()) {
                 if ih_bytes.len() == 20 {
@@ -331,9 +335,18 @@ impl DhtMessage {
                     infohash = Some(ih);
                 }
             }
+            // BEP 5: announce_peer 携带 BT 下载端口 port；implied_port=1 或缺省时由调用方回退来源端口
+            if method == QueryMethod::AnnouncePeer {
+                if let Some(port) = args.get(b"port".as_slice()).and_then(|v| match v {
+                    BencodeValue::Int(n) if *n > 0 && *n <= u16::MAX as i64 => Some(*n as u16),
+                    _ => None,
+                }) {
+                    announce_port = Some(port);
+                }
+            }
         }
 
-        Some((tid, method, infohash))
+        Some((tid, method, infohash, announce_port))
     }
 
     /// 从 DHT 查询消息中提取请求方的 node_id（a.id 字段）

@@ -1900,20 +1900,29 @@ mod tests {
     async fn test_flush_and_wait_timeout() {
         let conn = test_conn();
         let sched = IoScheduler::new(conn, test_config());
-        // 提交会阻塞很久的请求，flush 在很短超时内应返回 false
-        for _ in 0..5 {
-            let _ = sched.submit(
-                IoPriority::Normal,
-                None,
-                |_c| {
-                    std::thread::sleep(Duration::from_millis(500));
-                    Ok(())
-                },
-                1,
-            );
-        }
+        // 用信号量让第一个任务确定性地占用 writer_loop（阻塞等待释放），
+        // 第二个任务留在队列 —— flush 短超时必然返回 false，不依赖精确时序。
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let _ = sched.submit(
+            IoPriority::Normal,
+            None,
+            move |_c| {
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+                Ok(())
+            },
+            1,
+        );
+        // 等待第一个任务开始执行（writer_loop 已被占用）
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("任务应在 1s 内开始执行");
+        // 队列中至少保留一个待处理任务
+        let _ = sched.submit(IoPriority::Normal, None, |_c| Ok(()), 1);
         let ok = sched.flush_and_wait(Duration::from_millis(50)).await;
-        assert!(!ok, "短超时内不应排空，应返回 false");
+        release_tx.send(()).ok();
+        assert!(!ok, "writer 被长任务占用时，短超时内不应排空");
     }
 
     // ── B3：send_sized（WriteQueue 拒绝计数）──

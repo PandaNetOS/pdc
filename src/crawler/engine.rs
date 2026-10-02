@@ -6,7 +6,7 @@
 //! 3. 被动监听：其他节点发来的 get_peers / announce_peer 中提取 infohash
 //! 4. 对发现的 infohash 主动发 get_peers，收集 peer 并存入缓存
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -111,6 +111,12 @@ pub struct CrawlerState {
     pub inbound_total: u64,
     /// 入站请求唯一来源节点数（被动打洞效果指标）
     pub inbound_unique_sources: usize,
+    /// tid 命中 pending 的真实响应数（进入响应率信号）
+    pub responses_matched_total: u64,
+    /// 响应形态但 tid 未命中的迟到/伪造响应数（不进入响应率信号）
+    pub late_responses_total: u64,
+    /// 真实 RTT 的 EMA（毫秒），替代原 pending 队列年龄估算
+    pub latency_ema_ms: u64,
     /// 每 socket 发送 PPS（滑动窗口，最近10秒）
     pub socket_send_pps: Vec<u64>,
     /// 每 socket 接收 PPS（滑动窗口，最近10秒）
@@ -143,9 +149,29 @@ struct PendingRequest {
     target: [u8; 20],
     addr: SocketAddr,
     sent_at: Instant,
+    /// 所属规划轮次（0 = 非规划发送，不参与轮次反馈统计）
+    round_seq: u64,
 }
 
-/// pending 请求分片：16 个 RwLock<HashMap>，按 tid[0] % 16 路由
+/// 单个规划轮次的真实应答/超时累计（tid 命中时自增，报告后移除）
+#[derive(Debug)]
+struct RoundFeedbackAcc {
+    responded: u64,
+    timed_out: u64,
+    started_at: Instant,
+}
+
+impl Default for RoundFeedbackAcc {
+    fn default() -> Self {
+        Self {
+            responded: 0,
+            timed_out: 0,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+/// pending 请求分片：16 个 RwLock<HashMap>，按 tid 字节路由
 type PendingShards = Vec<RwLock<HashMap<Vec<u8>, PendingRequest>>>;
 
 /// `handle_query_sync` 产物：在 blocking 线程池完成解析与响应字节构建后，
@@ -219,6 +245,12 @@ pub struct CrawlerEngine {
     socket_recv_total: Arc<Vec<AtomicU64>>,
     /// 上次统计 PPS 的时间和累计值（Mutex 保护，Arc 共享）
     pps_last: Arc<Mutex<PpsSnapshot>>,
+    /// 规划轮次序号发生器（0 保留给非规划发送）
+    round_seq: Arc<AtomicU64>,
+    /// 各规划轮次的真实应答/超时累计（报告后移除，>60s 兜底清理）
+    round_feedback: Arc<Mutex<BTreeMap<u64, RoundFeedbackAcc>>>,
+    /// 真实 RTT 的 EMA（毫秒），tid 命中时更新
+    latency_ema_ms: Arc<Mutex<Option<f64>>>,
 }
 
 impl CrawlerEngine {
@@ -273,6 +305,9 @@ impl CrawlerEngine {
             socket_send_total: Arc::new((0..16).map(|_| AtomicU64::new(0)).collect()),
             socket_recv_total: Arc::new((0..16).map(|_| AtomicU64::new(0)).collect()),
             pps_last: Arc::new(Mutex::new(None)),
+            round_seq: Arc::new(AtomicU64::new(0)),
+            round_feedback: Arc::new(Mutex::new(BTreeMap::new())),
+            latency_ema_ms: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -620,6 +655,7 @@ impl CrawlerEngine {
                     target,
                     addr,
                     sent_at: Instant::now(),
+                    round_seq: 0,
                 },
             );
         }
@@ -644,31 +680,86 @@ impl CrawlerEngine {
         self.pending.iter().map(|s| s.read().len()).sum()
     }
 
-    /// 估算平均延迟（毫秒）：基于 pending 表中请求的平均等待时间
-    fn estimate_avg_latency_ms(&self) -> f64 {
-        let now = Instant::now();
-        let mut total_ms = 0f64;
-        let mut count = 0usize;
-        for shard in self.pending.iter() {
-            for req in shard.read().values() {
-                total_ms += now.duration_since(req.sent_at).as_secs_f64() * 1000.0;
-                count += 1;
-            }
-        }
-        if count > 0 {
-            total_ms / count as f64
-        } else {
-            100.0
+    /// 分配新的规划轮次序号（0 保留给非规划发送，不参与反馈统计）
+    fn next_round_seq(&self) -> u64 {
+        self.round_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 打开轮次反馈账目（报告即使零应答也能取到）
+    fn open_round_feedback(&self, seq: u64) {
+        if seq != 0 {
+            self.round_feedback
+                .lock()
+                .unwrap()
+                .insert(seq, RoundFeedbackAcc::default());
         }
     }
 
-    /// 估算本轮响应数：基于 rate_limiter 全局响应率
-    fn estimate_responded(&self, sent: u64) -> u64 {
-        if let Some(rl) = &self.rate_limiter {
-            let rate = rl.global_response_rate();
-            (sent as f64 * rate).round() as u64
-        } else {
-            (sent as f64 * 0.3).round() as u64
+    /// 取走并清除轮次反馈（responded, timed_out），顺带清理超过 60s 的陈旧账目
+    fn take_round_feedback(&self, seq: u64) -> (u64, u64) {
+        let mut map = self.round_feedback.lock().unwrap();
+        let acc = map.remove(&seq);
+        // [ALLOWED-HARDCODED: 轮次反馈账目陈旧清理的固定窗口常量，非业务可调参数]
+        map.retain(|_, acc| acc.started_at.elapsed() < Duration::from_secs(60));
+        match acc {
+            Some(a) => (a.responded, a.timed_out),
+            None => (0, 0),
+        }
+    }
+
+    /// 真实 RTT 的 EMA（毫秒），无样本时返回 100.0
+    fn current_latency_ema_ms(&self) -> f64 {
+        self.latency_ema_ms.lock().unwrap().unwrap_or(100.0)
+    }
+
+    /// 更新真实 RTT 的 EMA（α = 0.2）
+    fn update_latency_ema(&self, sample_ms: u64) {
+        let mut ema = self.latency_ema_ms.lock().unwrap();
+        let s = sample_ms as f64;
+        *ema = Some(match *ema {
+            Some(v) => v * 0.8 + s * 0.2,
+            None => s,
+        });
+    }
+
+    /// 全量同步暂停门是否置位
+    fn is_paused(&self) -> bool {
+        self.pause_gate
+            .as_ref()
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// 响应 tid 认领：仅当 tid 命中 pending 表时计入响应率与轮次反馈，
+    /// 并原子移除（防止迟到重复响应重复计数）。
+    ///
+    /// 返回 `Some((latency_ms, target))` 表示命中；未命中为迟到/伪造响应，
+    /// 只计入 `late_responses_total`，调用方仍可继续处理报文中的节点数据。
+    fn claim_pending(&self, socket_idx: usize, tid: &[u8]) -> Option<(u64, [u8; 20])> {
+        let removed = {
+            let mut pending = self.pending[pending_shard(tid)].write();
+            pending.remove(tid)
+        };
+        match removed {
+            Some(req) => {
+                if let Some(rl) = &self.rate_limiter {
+                    rl.record_response(socket_idx);
+                }
+                if req.round_seq != 0 {
+                    if let Some(acc) = self.round_feedback.lock().unwrap().get_mut(&req.round_seq) {
+                        acc.responded += 1;
+                    }
+                }
+                self.update_latency_ema(req.sent_at.elapsed().as_millis() as u64);
+                let mut state = self.state.write();
+                state.responses_matched_total += 1;
+                Some((req.sent_at.elapsed().as_millis() as u64, req.target))
+            }
+            None => {
+                let mut state = self.state.write();
+                state.late_responses_total += 1;
+                None
+            }
         }
     }
 
@@ -681,11 +772,16 @@ impl CrawlerEngine {
 
     /// find_node 多 socket 并发发送（核心并发逻辑）
     /// concurrent=1 时走单 socket 兼容路径，行为与改造前一致
-    async fn send_find_node_concurrent(&self, nodes: &[KBucketEntry], concurrent: usize) -> u64 {
+    async fn send_find_node_concurrent(
+        &self,
+        nodes: &[KBucketEntry],
+        concurrent: usize,
+        round_seq: u64,
+    ) -> u64 {
         if concurrent <= 1 || nodes.len() <= 1 {
             let (socket_idx, socket) = self.next_send_socket();
             return self
-                .send_find_node_to_socket(nodes, socket_idx, &socket)
+                .send_find_node_to_socket(nodes, socket_idx, &socket, round_seq)
                 .await;
         }
 
@@ -732,6 +828,12 @@ impl CrawlerEngine {
                 let per_target = group.len().div_ceil(num_targets);
 
                 for (i, node) in group.iter().enumerate() {
+                    // 限速跳过检查：被限速的 socket 按 skip_ratio 降频跳过
+                    if let Some(rl) = &rate_limiter {
+                        if rl.should_skip(socket_idx) {
+                            continue;
+                        }
+                    }
                     let target_idx = (i / per_target).min(num_targets - 1);
                     let target = targets[target_idx];
                     let mut tid = rand::thread_rng().gen::<[u8; 2]>();
@@ -749,6 +851,7 @@ impl CrawlerEngine {
                                 target,
                                 addr: node.addr,
                                 sent_at: Instant::now(),
+                                round_seq,
                             },
                         );
                     }
@@ -781,6 +884,7 @@ impl CrawlerEngine {
         nodes: &[KBucketEntry],
         socket_idx: usize,
         socket: &UdpSocket,
+        round_seq: u64,
     ) -> u64 {
         let num_targets = 16;
         let targets: Vec<[u8; 20]> = (0..num_targets).map(|_| self.random_target()).collect();
@@ -804,6 +908,7 @@ impl CrawlerEngine {
                         target,
                         addr: node.addr,
                         sent_at: Instant::now(),
+                        round_seq,
                     },
                 );
             }
@@ -829,11 +934,12 @@ impl CrawlerEngine {
         nodes: &[KBucketEntry],
         concurrent: usize,
         infohashes: &[Infohash],
+        round_seq: u64,
     ) -> u64 {
         if concurrent <= 1 || nodes.len() <= 1 {
             let (socket_idx, socket) = self.next_send_socket();
             return self
-                .send_get_peers_to_socket(nodes, socket_idx, &socket, infohashes)
+                .send_get_peers_to_socket(nodes, socket_idx, &socket, infohashes, round_seq)
                 .await;
         }
 
@@ -871,6 +977,12 @@ impl CrawlerEngine {
                 let mut local_sent = 0u64;
                 for node in &group {
                     for _ in 0..5 {
+                        // 限速跳过检查：被限速的 socket 按 skip_ratio 降频跳过
+                        if let Some(rl) = &rate_limiter {
+                            if rl.should_skip(socket_idx) {
+                                continue;
+                            }
+                        }
                         let idx = rand::random::<usize>() % infohashes.len();
                         let ih = infohashes[idx];
                         let mut tid = rand::random::<[u8; 2]>();
@@ -889,6 +1001,7 @@ impl CrawlerEngine {
                                     target: ih,
                                     addr: node.addr,
                                     sent_at: Instant::now(),
+                                    round_seq,
                                 },
                             );
                         }
@@ -922,6 +1035,7 @@ impl CrawlerEngine {
         socket_idx: usize,
         socket: &UdpSocket,
         infohashes: &[Infohash],
+        round_seq: u64,
     ) -> u64 {
         let mut sent = 0u64;
         for node in nodes {
@@ -943,6 +1057,7 @@ impl CrawlerEngine {
                             target: ih,
                             addr: node.addr,
                             sent_at: Instant::now(),
+                            round_seq,
                         },
                     );
                 }
@@ -967,10 +1082,13 @@ impl CrawlerEngine {
         &self,
         nodes: &[KBucketEntry],
         concurrent: usize,
+        round_seq: u64,
     ) -> u64 {
         if concurrent <= 1 || nodes.len() <= 1 {
             let (socket_idx, socket) = self.next_send_socket();
-            return self.send_sample_to_socket(nodes, socket_idx, &socket).await;
+            return self
+                .send_sample_to_socket(nodes, socket_idx, &socket, round_seq)
+                .await;
         }
 
         let base_idx = self.send_socket_idx.load(Ordering::Relaxed);
@@ -997,6 +1115,7 @@ impl CrawlerEngine {
             let socket = self.sockets[socket_idx].clone();
             let pending = self.pending.clone();
             let state = self.state.clone();
+            let rate_limiter = self.rate_limiter.clone();
             let socket_send_total = self.socket_send_total.clone();
             let sent_counter = sent_total.clone();
             let virtual_ids = self.virtual_node_ids.clone();
@@ -1004,6 +1123,12 @@ impl CrawlerEngine {
             handles.push(tokio::spawn(async move {
                 let mut local_sent = 0u64;
                 for node in &group {
+                    // 限速跳过检查：被限速的 socket 按 skip_ratio 降频跳过
+                    if let Some(rl) = &rate_limiter {
+                        if rl.should_skip(socket_idx) {
+                            continue;
+                        }
+                    }
                     let mut tid = rand::thread_rng().gen::<[u8; 2]>();
                     tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
                     let vid_idx = rand::random::<usize>() % virtual_ids.len();
@@ -1020,12 +1145,16 @@ impl CrawlerEngine {
                                 target: [0u8; 20],
                                 addr: node.addr,
                                 sent_at: Instant::now(),
+                                round_seq,
                             },
                         );
                     }
 
                     if socket.send_to(&msg, node.addr).await.is_ok() {
                         socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                        if let Some(rl) = &rate_limiter {
+                            rl.record_request(socket_idx);
+                        }
                         local_sent += 1;
                     }
                 }
@@ -1048,6 +1177,7 @@ impl CrawlerEngine {
         nodes: &[KBucketEntry],
         socket_idx: usize,
         socket: &UdpSocket,
+        round_seq: u64,
     ) -> u64 {
         let mut sent = 0u64;
         for node in nodes {
@@ -1066,12 +1196,16 @@ impl CrawlerEngine {
                         target: [0u8; 20],
                         addr: node.addr,
                         sent_at: Instant::now(),
+                        round_seq,
                     },
                 );
             }
 
             if socket.send_to(&msg, node.addr).await.is_ok() {
                 self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                if let Some(rl) = &self.rate_limiter {
+                    rl.record_request(socket_idx);
+                }
                 sent += 1;
             }
         }
@@ -1087,6 +1221,10 @@ impl CrawlerEngine {
             return;
         }
         if self.sockets.is_empty() {
+            return;
+        }
+        if self.is_paused() {
+            debug!("[crawler] 暂停门置位，跳过主动爬行");
             return;
         }
 
@@ -1121,7 +1259,9 @@ impl CrawlerEngine {
             return;
         }
 
-        // 4. 记录 pending_before
+        // 4. 记录 pending_before + 打开本轮反馈账目
+        let round_seq = self.next_round_seq();
+        self.open_round_feedback(round_seq);
         let pending_before = self.pending_total();
 
         // 5. 多 socket 并发发送
@@ -1130,15 +1270,21 @@ impl CrawlerEngine {
             let mut state = self.state.write();
             state.concurrent_sockets_in_use = concurrent;
         }
-        let sent_total = self.send_find_node_concurrent(&nodes, concurrent).await;
+        let sent_total = self
+            .send_find_node_concurrent(&nodes, concurrent, round_seq)
+            .await;
 
         // 6. 记录 pending_after
         let pending_after = self.pending_total();
 
-        // 7. 反馈本轮结果
+        // 7. 反馈本轮结果（真实 tid 命中计数）
         if let Some(ac) = &self.adaptive_controller {
-            let avg_latency = self.estimate_avg_latency_ms();
-            let responded = self.estimate_responded(sent_total);
+            let avg_latency = self.current_latency_ema_ms();
+            let (responded, timed_out) = self.take_round_feedback(round_seq);
+            debug!(
+                "[crawler] active_crawl 轮次反馈: sent={} responded={} timed_out={}",
+                sent_total, responded, timed_out
+            );
             ac.report_round_result(
                 sent_total,
                 responded,
@@ -1164,6 +1310,10 @@ impl CrawlerEngine {
             return;
         }
         if self.sockets.is_empty() {
+            return;
+        }
+        if self.is_paused() {
+            debug!("[crawler] 暂停门置位，跳过主动 get_peers");
             return;
         }
 
@@ -1223,7 +1373,9 @@ impl CrawlerEngine {
             return;
         }
 
-        // 3. 记录 pending_before
+        // 3. 记录 pending_before + 打开本轮反馈账目
+        let round_seq = self.next_round_seq();
+        self.open_round_feedback(round_seq);
         let pending_before = self.pending_total();
 
         // 4. 多 socket 并发发送（每节点发5个 infohash 查询）
@@ -1233,14 +1385,18 @@ impl CrawlerEngine {
             state.concurrent_sockets_in_use = concurrent;
         }
         let sent_total = self
-            .send_get_peers_concurrent(&nodes, concurrent, &infohashes)
+            .send_get_peers_concurrent(&nodes, concurrent, &infohashes, round_seq)
             .await;
 
-        // 5. 记录 pending_after + 反馈
+        // 5. 记录 pending_after + 反馈（真实 tid 命中计数）
         let pending_after = self.pending_total();
         if let Some(ac) = &self.adaptive_controller {
-            let avg_latency = self.estimate_avg_latency_ms();
-            let responded = self.estimate_responded(sent_total);
+            let avg_latency = self.current_latency_ema_ms();
+            let (responded, timed_out) = self.take_round_feedback(round_seq);
+            debug!(
+                "[crawler] get_peers 轮次反馈: sent={} responded={} timed_out={}",
+                sent_total, responded, timed_out
+            );
             ac.report_round_result(
                 sent_total,
                 responded,
@@ -1268,6 +1424,10 @@ impl CrawlerEngine {
             return;
         }
         if self.sockets.is_empty() {
+            return;
+        }
+        if self.is_paused() {
+            debug!("[crawler] 暂停门置位，跳过 sample_infohashes");
             return;
         }
 
@@ -1301,7 +1461,9 @@ impl CrawlerEngine {
             return;
         }
 
-        // 3. 记录 pending_before
+        // 3. 记录 pending_before + 打开本轮反馈账目
+        let round_seq = self.next_round_seq();
+        self.open_round_feedback(round_seq);
         let pending_before = self.pending_total();
 
         // 4. 多 socket 并发发送
@@ -1311,14 +1473,18 @@ impl CrawlerEngine {
             state.concurrent_sockets_in_use = concurrent;
         }
         let sent_total = self
-            .send_sample_infohashes_concurrent(&nodes, concurrent)
+            .send_sample_infohashes_concurrent(&nodes, concurrent, round_seq)
             .await;
 
-        // 5. 记录 pending_after + 反馈
+        // 5. 记录 pending_after + 反馈（真实 tid 命中计数）
         let pending_after = self.pending_total();
         if let Some(ac) = &self.adaptive_controller {
-            let avg_latency = self.estimate_avg_latency_ms();
-            let responded = self.estimate_responded(sent_total);
+            let avg_latency = self.current_latency_ema_ms();
+            let (responded, timed_out) = self.take_round_feedback(round_seq);
+            debug!(
+                "[crawler] sample 轮次反馈: sent={} responded={} timed_out={}",
+                sent_total, responded, timed_out
+            );
             ac.report_round_result(
                 sent_total,
                 responded,
@@ -1344,6 +1510,10 @@ impl CrawlerEngine {
             return;
         }
         if self.sockets.is_empty() {
+            return;
+        }
+        if self.is_paused() {
+            debug!("[crawler] 暂停门置位，跳过 active_scrape");
             return;
         }
         let (socket_idx, socket) = self.next_send_socket();
@@ -1392,12 +1562,16 @@ impl CrawlerEngine {
                         target: ih,
                         addr: node.addr,
                         sent_at: Instant::now(),
+                        round_seq: 0,
                     },
                 );
             }
 
             if socket.send_to(&msg, node.addr).await.is_ok() {
                 self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                if let Some(rl) = &self.rate_limiter {
+                    rl.record_request(socket_idx);
+                }
                 requests_sent += 1;
             }
         }
@@ -1456,6 +1630,7 @@ impl CrawlerEngine {
                         target: chain_target,
                         addr: node.addr,
                         sent_at: Instant::now(),
+                        round_seq: 0,
                     },
                 );
             }
@@ -1520,6 +1695,7 @@ impl CrawlerEngine {
                             target,
                             addr: node.addr,
                             sent_at: Instant::now(),
+                            round_seq: 0,
                         },
                     );
                 }
@@ -1581,9 +1757,9 @@ impl CrawlerEngine {
     ) -> Vec<Vec<DhtNode>> {
         let mut chain_groups: Vec<Vec<DhtNode>> = Vec::new();
 
-        if let Some(rl) = &self.rate_limiter {
-            rl.record_response(socket_idx);
-        }
+        // 注意：响应率计数收敛到 claim_pending（tid 命中 pending 才计）。
+        // 此处不再对每个入站数据报无条件计数——其他节点的未请求查询、
+        // 迟到/伪造响应都不再进入响应率信号。
         // 尝试解析 find_node 响应
         if let Some((tid, nodes)) = DhtMessage::parse_find_node_response(data) {
             debug!(
@@ -1592,14 +1768,12 @@ impl CrawlerEngine {
                 nodes.len()
             );
 
+            // tid 认领：命中则计入响应率/轮次反馈并移除 pending，未命中计迟到
+            let claimed = self.claim_pending(socket_idx, &tid);
+
             // 记录查询成功统计（响应来源节点 → NodeRepo，含返回节点数）
             {
-                let latency_ms = {
-                    let pending = self.pending[pending_shard(&tid)].read();
-                    pending
-                        .get(&tid.to_vec())
-                        .map(|r| r.sent_at.elapsed().as_millis() as u64)
-                };
+                let latency_ms = claimed.as_ref().map(|(ms, _)| *ms);
                 if let Some(repo) = &self.node_repo {
                     repo.record_query_with_nodes_sync(
                         from,
@@ -1644,12 +1818,7 @@ impl CrawlerEngine {
                 chain_groups.push(nodes.clone());
             }
 
-            // 移除 pending
-            {
-                let shard = pending_shard(&tid);
-                let mut pending = self.pending[shard].write();
-                pending.remove(&tid.to_vec());
-            }
+            // pending 已在 claim_pending 中移除
             // 注意：NodeRepo 持久化由定期任务（每5分钟）负责，不在每次响应后全量保存，避免大量磁盘 IO
             return chain_groups;
         }
@@ -1663,14 +1832,12 @@ impl CrawlerEngine {
                 resp.nodes.len()
             );
 
+            // tid 认领：命中则计入响应率/轮次反馈并移除 pending，未命中计迟到
+            let claimed = self.claim_pending(socket_idx, &tid);
+
             // 记录查询成功统计（响应来源节点 → NodeRepo，含返回节点数）
             {
-                let latency_ms = {
-                    let pending = self.pending[pending_shard(&tid)].read();
-                    pending
-                        .get(&tid.to_vec())
-                        .map(|r| r.sent_at.elapsed().as_millis() as u64)
-                };
+                let latency_ms = claimed.as_ref().map(|(ms, _)| *ms);
                 if let Some(repo) = &self.node_repo {
                     repo.record_query_with_nodes_sync(
                         from,
@@ -1683,11 +1850,8 @@ impl CrawlerEngine {
             // 存入 peer 缓存
             if !resp.values.is_empty() {
                 if let Some(peer_repo) = &self.peer_repo {
-                    // 从 pending 中找 infohash
-                    let ih = {
-                        let pending = self.pending[pending_shard(&tid)].read();
-                        pending.get(&tid.to_vec()).map(|r| r.target)
-                    };
+                    // 从认领结果中取 infohash（原 pending target）
+                    let ih = claimed.as_ref().map(|(_, target)| *target);
 
                     if let Some(infohash) = ih {
                         let peers: Vec<PeerInfo> = resp
@@ -1862,7 +2026,7 @@ impl CrawlerEngine {
         socket_idx: usize,
         from: SocketAddr,
     ) -> Option<QuerySyncResult> {
-        let (tid, method, infohash) = DhtMessage::parse_query(data)?;
+        let (tid, method, infohash, announce_port) = DhtMessage::parse_query(data)?;
 
         // 统计入站请求（被动打洞指标：其他节点主动连接我们的次数）
         {
@@ -1984,6 +2148,21 @@ impl CrawlerEngine {
                         from,
                         &ih[..4]
                     );
+                    // BEP 5: announce_peer 的来源地址本身就是该 infohash 的一个 peer。
+                    // 端口优先取 a.port（BT 下载端口），implied_port=1/缺省时回退来源 UDP 端口。
+                    let port = announce_port.unwrap_or(from.port());
+                    let peer_addr = SocketAddr::new(from.ip(), port);
+                    if let Some(peer_repo) = &self.peer_repo {
+                        let peers = vec![PeerInfo::new(peer_addr, PeerSource::Dht)];
+                        peer_repo.add_peers_sync(&ih, &peers);
+                        let mut state = self.state.write();
+                        state.peers_collected += peers.len() as u64;
+                        self.event_bus.publish(Event::PeerDiscovered {
+                            infohash: ih,
+                            peers,
+                            source: "dht-announce".to_string(),
+                        });
+                    }
                 }
                 (resp, None, infohash)
             }
@@ -2056,6 +2235,7 @@ impl CrawlerEngine {
                     target: infohash,
                     addr,
                     sent_at: Instant::now(),
+                    round_seq: 0,
                 },
             );
         }
@@ -2415,6 +2595,9 @@ impl CrawlerEngine {
             socket_send_total: self.socket_send_total.clone(),
             socket_recv_total: self.socket_recv_total.clone(),
             pps_last: self.pps_last.clone(),
+            round_seq: self.round_seq.clone(),
+            round_feedback: self.round_feedback.clone(),
+            latency_ema_ms: self.latency_ema_ms.clone(),
         }
     }
 }
