@@ -472,13 +472,12 @@ impl CrawlerEngine {
             }
         }
         *pps_last = Some((now, current_send, current_recv));
-        // UDP 丢包估算：1 - (messages_received / requests_sent)，粗略估算
-        if state.requests_sent > 0 {
-            state.udp_packet_loss_estimate =
-                1.0 - (state.messages_received as f64 / state.requests_sent as f64);
-        } else {
-            state.udp_packet_loss_estimate = 0.0;
-        }
+        // UDP 丢包估算窗口化（19号 D1.5）：1 − 限速器 60s 滑动窗口全局响应率，
+        // 与字段注释一致；原实现用生命周期累计值，启动初期恒偏低且无窗口语义
+        state.udp_packet_loss_estimate = match &self.rate_limiter {
+            Some(rl) => (1.0 - rl.global_response_rate()).clamp(0.0, 1.0),
+            None => 0.0,
+        };
         // 自适应控制器指标
         if let Some(ac) = &self.adaptive_controller {
             state.adaptive_multiplier = ac.current_multiplier();
@@ -2576,6 +2575,11 @@ impl CrawlerEngine {
             let msg = DhtMessage::build_ping(&tid, &self.node_id);
             if socket.send_to(&msg, addr).await.is_ok() {
                 self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                // keepalive 成功发送计入限速器分母（19号 D1.3：其响应经 claim 计分子，
+                // 分母缺失会让响应率虚高）
+                if let Some(rl) = &self.rate_limiter {
+                    rl.record_request(socket_idx);
+                }
                 sent += 1;
             }
         }
