@@ -126,10 +126,16 @@ impl NodeRepoImpl {
         self.storage.clone()
     }
 
+    /// 预加载热窗口：加载时仅将最近活跃（此窗口内）的节点标为热。
+    /// 与 tier.hot_threshold_secs 默认值一致；陈旧节点不再整体进场热池（2026-10 R2）。
+    const PRELOAD_HOT_WITHIN_SECS: u64 = 1800;
+
     /// 分层缓存统计（与 TrackerRepo 接口一致：(hot, warm, cold_loaded)）。
     /// NodeRepo 全量驻内存，全部计入 hot。
     pub async fn load_initial(&self, limit: usize) -> anyhow::Result<usize> {
-        let rows = self.storage.load_hot_warm_nodes(7200, 0.0, limit)?;
+        // 按最近活跃降序预加载（新近度优先）；DB 中的 last_active 为节点真实活跃时间，
+        // 不再在加载时被复位为进程启动时刻（2026-10 R0/R1）
+        let rows = self.storage.load_recent_nodes(limit)?;
         let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut count = 0;
@@ -145,21 +151,30 @@ impl NodeRepoImpl {
             entry.last_query_time = row
                 .last_query_time
                 .map(|secs| crate::utils::cutoff_before(Duration::from_secs(secs.max(0) as u64)));
+            entry.last_active = row
+                .last_active
+                .map(crate::utils::unix_secs_to_instant)
+                .unwrap_or_else(Instant::now);
             entry.state = match row.state.as_str() {
                 "Good" => NodeState::Good,
                 "Questionable" => NodeState::Questionable,
                 _ => NodeState::Bad,
             };
+            // 用真实 last_active 重算 Good/Questionable（refresh_state 对 Bad 冻结不变）
+            entry.refresh_state();
             nodes.insert(addr, entry);
             if let Some(subnet) = Self::subnet_key(addr) {
                 Self::index_subnet(&mut subnet_index, subnet, row.id);
             }
             count += 1;
         }
-        // 预热加载的节点全部标记为热节点，供爬虫直接选取
+        // 仅将最近活跃（hot 窗口内）的加载节点标为热；陈旧节点不进热池，
+        // 热池语义收归「已验证响应/新发现」（2026-10 R2）
         let mut hot_addrs = self.hot_addrs.write();
         for (_addr, entry) in nodes.iter() {
-            hot_addrs.insert(entry.addr);
+            if entry.last_active.elapsed() < Duration::from_secs(Self::PRELOAD_HOT_WITHIN_SECS) {
+                hot_addrs.insert(entry.addr);
+            }
         }
         drop(hot_addrs);
         // 校准回填：全量扫描把 6 个计数器直接置为扫描结果（置为而非累加，兼容重复加载）。
@@ -915,6 +930,9 @@ impl NodeRepoImpl {
                     consecutive_failures: node.consecutive_failures,
                     nodes_returned: node.nodes_returned,
                     last_query_time: node.last_query_time.map(|t| t.elapsed().as_secs() as i64),
+                    // 落库节点真实 last_active（Unix 秒），而非落库时刻——
+                    // 加载侧才能还原新近度（2026-10 R1 修复）
+                    last_active: Some(crate::utils::instant_to_unix_secs(node.last_active)),
                 }
             })
             .collect()
@@ -1642,5 +1660,88 @@ mod tests {
         assert_eq!(d.total, 0);
         assert_eq!(d.bad, 0);
         assert_eq!(d.good, 0);
+    }
+
+    fn dht_row_for_load(port: u16, score: f64, last_active: Option<i64>) -> DhtNodeRow {
+        DhtNodeRow {
+            id: [port as u8; 20],
+            ip: "127.0.0.1".into(),
+            port,
+            score,
+            state: "Good".into(),
+            query_count: 2,
+            success_count: 2,
+            total_latency_ms: 5,
+            consecutive_failures: 0,
+            nodes_returned: 8,
+            last_query_time: None,
+            last_active,
+        }
+    }
+
+    /// 预加载新近度回归（2026-10 R1/R2）：加载必须还原 DB 真实 last_active，
+    /// 按其重算 Good/Questionable，且只有 hot 窗口内的节点进热池——
+    /// 陈旧高分节点不得以「刚刚活跃」+ Good + 热 的身份进场。
+    #[tokio::test]
+    async fn test_load_initial_restores_recency_and_state() {
+        let repo = test_repo();
+        let now = crate::utils::instant_to_unix_secs(Instant::now());
+        let month_ago = now - 30 * 24 * 3600;
+        let rows = vec![
+            dht_row_for_load(3001, 10.0, Some(now)),       // 新近低分
+            dht_row_for_load(3002, 95.0, Some(month_ago)), // 陈旧高分（僵尸）
+        ];
+        repo.storage().save_dht_nodes_batch(&rows).unwrap();
+
+        let loaded = repo.load_initial(100).await.unwrap();
+        assert_eq!(loaded, 2);
+
+        let fresh_addr = addr(1, 3001);
+        let stale_addr = addr(1, 3002);
+        let fresh = repo.get_node(&fresh_addr).await.unwrap();
+        let stale = repo.get_node(&stale_addr).await.unwrap();
+
+        // 新近节点：Good 且在热池
+        assert_eq!(fresh.state, NodeState::Good);
+        assert!(
+            fresh.last_active.elapsed().as_secs() < 5,
+            "last_active 应从 DB 还原，而非复位为加载时刻"
+        );
+        assert!(
+            repo.hot_nodes_sync().iter().any(|n| n.addr == fresh_addr),
+            "hot 窗口内的加载节点应进热池"
+        );
+        // 陈旧高分节点：被 refresh_state 按 真实 last_active 翻为 Questionable，且不进热池
+        assert_eq!(
+            stale.state,
+            NodeState::Questionable,
+            "陈旧节点不得保持 Good（last_active 未复位）"
+        );
+        assert!(
+            !repo.hot_nodes_sync().iter().any(|n| n.addr == stale_addr),
+            "陈旧节点不得进热池"
+        );
+    }
+
+    /// 落库回归（2026-10 R1）：save_dirty 落库的是节点真实 last_active，
+    /// 加载侧才能还原新近度。
+    #[tokio::test]
+    async fn test_save_dirty_persists_real_last_active() {
+        let repo = test_repo();
+        let a = addr(9, 3009);
+        repo.add_node_sync([9u8; 20], a);
+        let old = crate::utils::cutoff_before(Duration::from_secs(3600));
+        repo.nodes.with_mut(&a, |e| e.last_active = old);
+        repo.mark_dirty(&a).await;
+        repo.save_dirty().await.unwrap();
+
+        let rows = repo.storage().load_recent_nodes(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let la = rows[0].last_active.expect("last_active 必须落库");
+        let expected = crate::utils::instant_to_unix_secs(old);
+        assert!(
+            la <= expected + 2 && la >= expected - 5,
+            "落库 last_active({la}) 应为节点真实活跃时间({expected})，而非落库时刻"
+        );
     }
 }

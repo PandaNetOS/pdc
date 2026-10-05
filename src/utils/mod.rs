@@ -6,4 +6,4 @@ pub mod object_pool;
 pub mod time;
 
 pub use object_pool::{create_buffer_pool, ObjectPool, PooledObject};
-pub use time::{cutoff_before, within};
+pub use time::{cutoff_before, instant_to_unix_secs, unix_secs_to_instant, within};

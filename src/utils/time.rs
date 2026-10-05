@@ -27,6 +27,33 @@ pub fn within(ts: Instant, window: Duration) -> bool {
     ts.elapsed() <= window
 }
 
+fn system_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `Instant` → Unix 秒（供持久化 last_active 等字段）。
+///
+/// 基于"当前墙钟 − 已运行时长"换算；进程内单调一致，
+/// 重启后由 [`unix_secs_to_instant`] 还原（精度受墙钟调整影响，可接受）。
+pub fn instant_to_unix_secs(t: Instant) -> i64 {
+    system_unix_secs() - t.elapsed().as_secs() as i64
+}
+
+/// Unix 秒 → `Instant`（持久化时间戳还原）。
+///
+/// 未来时间截断为 now；早于进程启动的时间回退为进程启动时刻
+/// （与 [`cutoff_before`] 的下溢语义一致，避免 panic）。
+pub fn unix_secs_to_instant(secs: i64) -> Instant {
+    let now_unix = system_unix_secs();
+    if secs >= now_unix {
+        return Instant::now();
+    }
+    cutoff_before(Duration::from_secs((now_unix - secs) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +74,30 @@ mod tests {
     #[test]
     fn test_within() {
         assert!(within(Instant::now(), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_unix_instant_round_trip() {
+        let t = Instant::now();
+        let secs = instant_to_unix_secs(t);
+        let back = unix_secs_to_instant(secs);
+        // 还原误差 ≤ 1 秒
+        assert!(back.elapsed() <= t.elapsed() + Duration::from_secs(1));
+        assert!(t.elapsed() <= back.elapsed() + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_unix_secs_to_instant_future_clamps_to_now() {
+        let future = system_unix_secs() + 3600;
+        let t = unix_secs_to_instant(future);
+        assert!(t.elapsed().as_secs() < 2);
+    }
+
+    #[test]
+    fn test_unix_secs_to_instant_stale_falls_back_to_process_start() {
+        // 早于进程启动的时间戳：回退为进程启动时刻，不 panic
+        let stale = system_unix_secs() - 100 * 365 * 24 * 3600;
+        let t = unix_secs_to_instant(stale);
+        assert!(t.elapsed() >= process_start().elapsed());
     }
 }

@@ -1027,7 +1027,7 @@ impl Storage {
     /// 加载所有 DHT 节点
     pub fn load_dht_nodes(&self) -> anyhow::Result<Vec<DhtNodeRow>> {
         self.read(|conn| {
-        let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time FROM dht_nodes WHERE deleted_at IS NULL")?;
+        let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time, last_active FROM dht_nodes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
             let mut id_arr = [0u8; 20];
@@ -1046,6 +1046,7 @@ impl Storage {
                 consecutive_failures: row.get::<_, i64>(8)? as u32,
                 nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
                 last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
+                last_active: row.get::<_, Option<i64>>(11).unwrap_or(None),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1141,7 +1142,7 @@ impl Storage {
                     node.consecutive_failures as i64,
                     node.nodes_returned as i64,
                     node.last_query_time,
-                    now,
+                    node.last_active.unwrap_or(now),
                     l2,
                     now
                 ])?;
@@ -1187,7 +1188,7 @@ impl Storage {
                 node.consecutive_failures as i64,
                 node.nodes_returned as i64,
                 node.last_query_time,
-                now,
+                node.last_active.unwrap_or(now),
                 l2,
                 now
             ])?;
@@ -1935,25 +1936,23 @@ impl Storage {
         })
     }
 
-    /// 加载热/温 DHT 节点（最近活跃或高分），按评分降序 + LIMIT，供分层缓存启动加载。
-    pub fn load_hot_warm_nodes(
-        &self,
-        warm_threshold_secs: u64,
-        min_score: f64,
-        limit: usize,
-    ) -> anyhow::Result<Vec<DhtNodeRow>> {
+    /// 按最近活跃降序加载 DHT 节点 + LIMIT，供启动预加载。
+    ///
+    /// 旧实现 `load_hot_warm_nodes(7200, 0.0, n)` 的谓词
+    /// `last_active > cutoff OR score >= min_score` 在 min_score=0 时恒真，
+    /// 退化为「按历史评分取前 N」——陈旧高分僵尸整体进场且 last_active 被加载侧复位
+    /// （2026-10 根因 R0/R1）。现改为新近度优先，与 `load_limited_peers` 同一模式。
+    pub fn load_recent_nodes(&self, limit: usize) -> anyhow::Result<Vec<DhtNodeRow>> {
         self.read(|conn| {
-            let now = chrono::Utc::now().timestamp();
-            let warm_cutoff = now - warm_threshold_secs as i64;
             let mut stmt = conn.prepare(
                 r#"SELECT id, ip, port, score, state, query_count, success_count,
-                  total_latency_ms, consecutive_failures, nodes_returned, last_query_time
+                  total_latency_ms, consecutive_failures, nodes_returned, last_query_time, last_active
                FROM dht_nodes
-               WHERE deleted_at IS NULL AND (last_active > ?1 OR score >= ?2)
-               ORDER BY score DESC
-               LIMIT ?3"#,
+               WHERE deleted_at IS NULL
+               ORDER BY last_active DESC
+               LIMIT ?1"#,
             )?;
-            let rows = stmt.query_map(params![warm_cutoff, min_score, limit as i64], |row| {
+            let rows = stmt.query_map(params![limit as i64], |row| {
                 let id: Vec<u8> = row.get(0)?;
                 let mut id_arr = [0u8; 20];
                 if id.len() == 20 {
@@ -1971,6 +1970,7 @@ impl Storage {
                     consecutive_failures: row.get::<_, i64>(8)? as u32,
                     nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
                     last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
+                    last_active: row.get::<_, Option<i64>>(11).unwrap_or(None),
                 })
             })?;
             Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2036,7 +2036,7 @@ impl Storage {
         self.read(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, \
-             consecutive_failures, nodes_returned, last_query_time FROM dht_nodes \
+             consecutive_failures, nodes_returned, last_query_time, last_active FROM dht_nodes \
              WHERE ip = ?1 AND port = ?2 AND deleted_at IS NULL",
             )?;
             let result = stmt.query_row(params![ip, port as i64], |row| {
@@ -2057,6 +2057,7 @@ impl Storage {
                     consecutive_failures: row.get::<_, i64>(8)? as u32,
                     nodes_returned: row.get::<_, i64>(9).unwrap_or(0) as u64,
                     last_query_time: row.get::<_, Option<i64>>(10).unwrap_or(None),
+                    last_active: row.get::<_, Option<i64>>(11).unwrap_or(None),
                 })
             });
             match result {
@@ -2362,6 +2363,7 @@ impl Storage {
                 consecutive_failures: row.get::<_, i64>(8)? as u32,
                 nodes_returned: row.get::<_, i64>(9)? as u64,
                 last_query_time: None,
+                last_active: None,
             })
         })?;
         let mut out = Vec::new();
@@ -3168,6 +3170,9 @@ pub struct DhtNodeRow {
     pub consecutive_failures: u32,
     pub nodes_returned: u64,
     pub last_query_time: Option<i64>,
+    /// 节点最近活跃（Unix 秒；None = 该查询未取此列）。
+    /// 语义为节点真实 last_active，而非落库时刻（2026-10 预加载新近度修复）。
+    pub last_active: Option<i64>,
 }
 
 /// Tracker 行
@@ -3235,6 +3240,48 @@ mod tests {
     fn test_init_tables() {
         let _storage = Storage::memory().unwrap();
         // 表创建成功
+    }
+
+    fn dht_row(port: u16, score: f64, last_active: Option<i64>) -> DhtNodeRow {
+        DhtNodeRow {
+            id: [port as u8; 20],
+            ip: "127.0.0.1".into(),
+            port,
+            score,
+            state: "Good".into(),
+            query_count: 1,
+            success_count: 1,
+            total_latency_ms: 5,
+            consecutive_failures: 0,
+            nodes_returned: 8,
+            last_query_time: None,
+            last_active,
+        }
+    }
+
+    /// 预加载新近度回归（2026-10 R0）：load_recent_nodes 必须按 last_active 降序，
+    /// 且落库的 last_active 是传入值而非落库时刻——陈旧高分节点不得排到新近节点之前。
+    #[test]
+    fn test_load_recent_nodes_orders_by_last_active() {
+        let storage = Storage::memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let month_ago = now - 30 * 24 * 3600;
+        // 陈旧节点历史评分更高
+        storage
+            .save_dht_nodes_batch(&[
+                dht_row(2002, 99.0, Some(month_ago)),
+                dht_row(2001, 1.0, Some(now)),
+            ])
+            .unwrap();
+        let rows = storage.load_recent_nodes(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].port, 2001, "新近节点必须排在陈旧高分节点之前");
+        assert_eq!(
+            rows[0].last_active,
+            Some(now),
+            "落库 last_active 应为传入值"
+        );
+        assert_eq!(rows[1].last_active, Some(month_ago));
     }
 
     /// v11(K 批/F2b) 回归：四 repo 的区间查询（INDEXED BY 强制索引路径）必须
