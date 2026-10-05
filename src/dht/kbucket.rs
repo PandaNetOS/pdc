@@ -41,6 +41,11 @@ pub struct KBucketEntry {
     /// 最后一次被访问/选中时间（内存字段，不持久化，用于冷热分层）
     #[serde(skip)]
     pub last_accessed: Option<Instant>,
+    /// 最后一次**已验证**活跃时间（本会话内收到该节点的响应；内存字段，不持久化）。
+    /// 与 last_active（任何接触，含"在别人响应中被提及"）分离——
+    /// mention 刷新 last_active 不再伪造活性（2026-10 R5）。
+    #[serde(skip)]
+    pub last_verified: Option<Instant>,
     /// 连续失败次数
     pub consecutive_failures: u32,
     /// 总查询次数
@@ -90,6 +95,7 @@ impl KBucketEntry {
             last_active: Instant::now(),
             last_query_time: None,
             last_accessed: None,
+            last_verified: None,
             consecutive_failures: 0,
             query_count: 0,
             success_count: 0,

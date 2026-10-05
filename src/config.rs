@@ -1416,6 +1416,17 @@ pub struct CrawlerConfig {
     /// 过短超时会在响应到达前清空 pending → claim 未命中 → 轮次反馈 responded 失真。
     #[serde(default = "default_pending_timeout_secs")]
     pub pending_timeout_secs: u64,
+    /// 节点选择模式（2026-10 20号方案 D2）：`layered` = 新近度分层（L0 已验证 → L1 新鲜 → 探索预算受限）；
+    /// `legacy` = 旧行为（热池优先 + top500 评分）逃生通道。每次选择时读取。
+    #[serde(default = "default_select_mode")]
+    pub select_mode: String,
+    /// 分层选择的探索预算占比（0.0-1.0）：每轮发送中分配给「未验证池」的比例，
+    /// 无论陈旧池多大，每轮损耗上限即该比例。
+    #[serde(default = "default_select_explore_ratio")]
+    pub select_explore_ratio: f64,
+    /// L0 已验证窗口（秒）：本会话响应成功且在此窗口内的节点为「已验证活」层。
+    #[serde(default = "default_select_verified_recent_secs")]
+    pub select_verified_recent_secs: u64,
     /// 入站来源节点集合上限（超过时清空，防止无界增长）
     #[serde(default = "default_inbound_sources_max")]
     pub inbound_sources_max: usize,
@@ -1550,6 +1561,18 @@ fn default_pending_timeout_secs() -> u64 {
     120
 }
 
+fn default_select_mode() -> String {
+    "layered".to_string()
+}
+
+fn default_select_explore_ratio() -> f64 {
+    0.2
+}
+
+fn default_select_verified_recent_secs() -> u64 {
+    600
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -1572,6 +1595,9 @@ impl Default for CrawlerConfig {
             concurrent_sockets: default_concurrent_sockets(),
             round_feedback_wait_ms: default_round_feedback_wait_ms(),
             pending_timeout_secs: default_pending_timeout_secs(),
+            select_mode: default_select_mode(),
+            select_explore_ratio: default_select_explore_ratio(),
+            select_verified_recent_secs: default_select_verified_recent_secs(),
             inbound_sources_max: default_inbound_sources_max(),
             active_pex_enabled: false,
         }

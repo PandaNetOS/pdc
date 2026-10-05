@@ -383,7 +383,11 @@ impl NodeRepoImpl {
                 // 新节点：state=Good（默认）、query_count=0、score=45.0，按其字段累加计数器。
                 // 本分支已确认 addr 不存在（get_mut 为 None），纯插入，无需先扣旧值。
                 self.acc_add_entry(&entry);
+                // 新发现即最强活性先验（刚在别人的响应里出现）→ 进热池；
+                // last_accessed 必须同步设置，否则 tier_evict 的迁移会因 None 立即迁冷（2026-10 D2）
+                entry.last_accessed = Some(Instant::now());
                 nodes.insert(*addr, entry);
+                self.hot_addrs.write().insert(*addr);
                 new_pairs.push((*id, *addr));
                 // IPv4 鑺傜偣鍏?/24 绱㈠紩
                 if let Some(subnet) = Self::subnet_key(*addr) {
@@ -722,6 +726,7 @@ impl NodeRepoImpl {
 
     pub fn record_query_sync(&self, addr: SocketAddr, success: bool, latency_ms: u64) {
         let mut nodes = self.nodes.write_all();
+        let mut verified = false;
         if let Some(entry) = nodes.get_mut(&addr) {
             // active：query_count 0→1 时 +1（只增不减，删除时扣减）
             if entry.query_count == 0 {
@@ -733,6 +738,8 @@ impl NodeRepoImpl {
                 entry.success_count += 1;
                 entry.total_latency_ms += latency_ms;
                 entry.last_active = Instant::now();
+                entry.last_verified = Some(Instant::now());
+                verified = true;
                 let old = entry.state;
                 entry.state = NodeState::Good;
                 self.acc_transition_state(old, NodeState::Good);
@@ -745,9 +752,12 @@ impl NodeRepoImpl {
                     self.acc_transition_state(old, NodeState::Bad);
                 }
             }
-            // 鏍囪涓鸿剰锛氱粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖?
             drop(nodes);
             self.dirty.write().insert(addr);
+            // 已验证响应成功 → 进热池（热池语义 = 已验证/新发现，2026-10 R2）
+            if verified {
+                self.hot_addrs.write().insert(addr);
+            }
         }
     }
 
@@ -769,13 +779,15 @@ impl NodeRepoImpl {
             entry.nodes_returned += nodes_returned;
             entry.last_active = Instant::now();
             entry.last_query_time = Some(Instant::now());
+            entry.last_verified = Some(Instant::now());
             let old = entry.state;
             entry.state = NodeState::Good;
             self.acc_transition_state(old, NodeState::Good);
             entry.consecutive_failures = 0;
-            // 鏍囪涓鸿剰
             drop(nodes);
             self.dirty.write().insert(addr);
+            // 已验证响应成功 → 进热池（热池语义 = 已验证/新发现，2026-10 R2）
+            self.hot_addrs.write().insert(addr);
         }
     }
 

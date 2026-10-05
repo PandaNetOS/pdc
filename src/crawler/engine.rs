@@ -148,6 +148,8 @@ struct PendingRequest {
     sent_at: Instant,
     /// 所属规划轮次（0 = 非规划发送，不参与轮次反馈统计）
     round_seq: u64,
+    /// 选择层标签（0=已验证 L0 / 1=新鲜 L1 / 2=探索；非规划发送无分层语义，记 0）
+    layer: u8,
 }
 
 /// 单个规划轮次的真实应答/超时累计（tid 命中时自增，增量报告后留存至 300s 兜底清理）
@@ -155,9 +157,15 @@ struct PendingRequest {
 struct RoundFeedbackAcc {
     responded: u64,
     timed_out: u64,
-    /// 已报告过的累计值（增量报告用：本轮只上报自上次报告以来的新增）
-    reported: u64,
+    /// 已报告水位（增量报告用）：responded 与 timed_out 各自独立计数，
+    /// 单一水位在二者不等时会重复上报或下溢（2026-10 修复）
+    reported_responded: u64,
+    reported_timed_out: u64,
     started_at: Instant,
+    /// 分层账目：按下标 [L0 已验证, L1 新鲜, 探索] 记发送数/响应数/已报告数
+    layer_sent: [u64; 3],
+    layer_responded: [u64; 3],
+    layer_reported: [u64; 3],
 }
 
 impl Default for RoundFeedbackAcc {
@@ -165,8 +173,12 @@ impl Default for RoundFeedbackAcc {
         Self {
             responded: 0,
             timed_out: 0,
-            reported: 0,
+            reported_responded: 0,
+            reported_timed_out: 0,
             started_at: Instant::now(),
+            layer_sent: [0; 3],
+            layer_responded: [0; 3],
+            layer_reported: [0; 3],
         }
     }
 }
@@ -529,15 +541,48 @@ impl CrawlerEngine {
     /// 3. IP /24 网段去重（同一网段最多选 max_per_subnet 个），保证网络多样性
     /// 4. 每轮从各桶取评分最高的节点，轮询直到选满 count 个
     fn select_diverse_nodes(&self, count: usize, max_per_subnet: usize) -> Vec<KBucketEntry> {
+        self.select_diverse_nodes_tagged(count, max_per_subnet)
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect()
+    }
+
+    /// 收集在飞请求地址（pending 表），供本轮选择排除——避免同一节点
+    /// 在上一轮请求未超时时再次入选、重复消耗预算（2026-10 D2/R7）
+    fn pending_addrs(&self) -> std::collections::HashSet<SocketAddr> {
+        let mut set = std::collections::HashSet::new();
+        for shard in self.pending.iter() {
+            for req in shard.read().values() {
+                set.insert(req.addr);
+            }
+        }
+        set
+    }
+
+    /// 【统一收口】分层选择（2026-10 20号方案 D2）：返回 (节点, 层标签)。
+    /// 层标签随 pending 注册进入分层反馈账目（L0 已验证 / L1 新鲜 / 探索），
+    /// 每轮日志输出分层响应率——选节点质量的核心观测指标。
+    fn select_diverse_nodes_tagged(
+        &self,
+        count: usize,
+        max_per_subnet: usize,
+    ) -> Vec<(KBucketEntry, u8)> {
         let repo = match &self.node_repo {
             Some(r) => r,
             None => return Vec::new(),
         };
-        // 统一调用 SelectSystem（内部优化：不全量克隆，只在最后返回时克隆）
-        crate::intelligence::SelectSystem::select_diverse_nodes(
+        let exclude = self.pending_addrs();
+        let params = crate::intelligence::select_system::SelectionParams {
+            layered: self.config.select_mode != "legacy",
+            explore_ratio: self.config.select_explore_ratio,
+            verified_recent_secs: self.config.select_verified_recent_secs,
+            exclude: &exclude,
+        };
+        crate::intelligence::SelectSystem::select_diverse_nodes_tagged(
             repo.as_ref(),
             count,
             max_per_subnet,
+            &params,
         )
     }
 
@@ -661,6 +706,7 @@ impl CrawlerEngine {
                     addr,
                     sent_at: Instant::now(),
                     round_seq: 0,
+                    layer: 0,
                 },
             );
         }
@@ -690,13 +736,15 @@ impl CrawlerEngine {
         self.round_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// 打开轮次反馈账目（报告即使零应答也能取到）
-    fn open_round_feedback(&self, seq: u64) {
+    /// 打开轮次反馈账目（报告即使零应答也能取到）；
+    /// layer_sent 为本轮各层 [L0, L1, 探索] 的选中发送数（分层响应率观测用）。
+    fn open_round_feedback(&self, seq: u64, layer_sent: [u64; 3]) {
         if seq != 0 {
-            self.round_feedback
-                .lock()
-                .unwrap()
-                .insert(seq, RoundFeedbackAcc::default());
+            let acc = RoundFeedbackAcc {
+                layer_sent,
+                ..Default::default()
+            };
+            self.round_feedback.lock().unwrap().insert(seq, acc);
         }
     }
 
@@ -714,21 +762,32 @@ impl CrawlerEngine {
     }
 
     /// 增量报告轮次反馈：账目持续累计（响应延迟到达仍 +1），
-    /// 本轮只上报自上次报告以来的新增 responded/timed_out，账目不移除，
+    /// 本轮只上报自上次报告以来的新增 responded/timed_out 与分层 responded，账目不移除，
     /// 由 300s 兜底清理回收。根治（2026-10-05）：响应到达/处理延迟实测超过
     /// 一轮（约 40s），此前"下轮 take"会让延迟到达的响应丢失（账目已移除）。
-    fn drain_round_feedback_delta(&self, seq: u64) -> (u64, u64) {
+    fn drain_round_feedback_delta(&self, seq: u64) -> (u64, u64, [u64; 3], [u64; 3]) {
         let mut map = self.round_feedback.lock().unwrap();
         // [ALLOWED-HARDCODED: 轮次反馈账目陈旧清理的固定窗口常量，非业务可调参数]
         map.retain(|_, acc| acc.started_at.elapsed() < Duration::from_secs(300));
         match map.get_mut(&seq) {
             Some(acc) => {
-                let d_responded = acc.responded - acc.reported;
-                let d_timed_out = acc.timed_out - acc.reported;
-                acc.reported = acc.responded;
-                (d_responded, d_timed_out)
+                // 双水位增量：responded 与 timed_out 独立追踪，saturating 兜底任何记账竞态
+                let d_responded = acc.responded.saturating_sub(acc.reported_responded);
+                acc.reported_responded = acc.responded;
+                let d_timed_out = acc.timed_out.saturating_sub(acc.reported_timed_out);
+                acc.reported_timed_out = acc.timed_out;
+                let mut layer_responded = [0u64; 3];
+                for ((lr, cur), rep) in layer_responded
+                    .iter_mut()
+                    .zip(acc.layer_responded.iter())
+                    .zip(acc.layer_reported.iter_mut())
+                {
+                    *lr = cur.saturating_sub(*rep);
+                    *rep = *cur;
+                }
+                (d_responded, d_timed_out, acc.layer_sent, layer_responded)
             }
-            None => (0, 0),
+            None => (0, 0, [0; 3], [0; 3]),
         }
     }
 
@@ -773,6 +832,7 @@ impl CrawlerEngine {
                 if req.round_seq != 0 {
                     if let Some(acc) = self.round_feedback.lock().unwrap().get_mut(&req.round_seq) {
                         acc.responded += 1;
+                        acc.layer_responded[(req.layer as usize).min(2)] += 1;
                     }
                 }
                 self.update_latency_ema(req.sent_at.elapsed().as_millis() as u64);
@@ -797,9 +857,10 @@ impl CrawlerEngine {
 
     /// find_node 多 socket 并发发送（核心并发逻辑）
     /// concurrent=1 时走单 socket 兼容路径，行为与改造前一致
+    /// nodes 为 (节点, 选择层标签) 切片：层标签随 pending 注册进入分层反馈账目
     async fn send_find_node_concurrent(
         &self,
-        nodes: &[KBucketEntry],
+        nodes: &[(KBucketEntry, u8)],
         concurrent: usize,
         round_seq: u64,
     ) -> u64 {
@@ -831,7 +892,7 @@ impl CrawlerEngine {
                 continue;
             }
 
-            let group: Vec<KBucketEntry> = nodes[start..end].to_vec();
+            let group: Vec<(KBucketEntry, u8)> = nodes[start..end].to_vec();
             let socket = self.sockets[socket_idx].clone();
             let pending = self.pending.clone();
             let state = self.state.clone();
@@ -852,7 +913,7 @@ impl CrawlerEngine {
                     .collect();
                 let per_target = group.len().div_ceil(num_targets);
 
-                for (i, node) in group.iter().enumerate() {
+                for (i, (node, layer)) in group.iter().enumerate() {
                     // 限速跳过检查：被限速的 socket 按 skip_ratio 降频跳过
                     if let Some(rl) = &rate_limiter {
                         if rl.should_skip(socket_idx) {
@@ -877,6 +938,7 @@ impl CrawlerEngine {
                                 addr: node.addr,
                                 sent_at: Instant::now(),
                                 round_seq,
+                                layer: *layer,
                             },
                         );
                     }
@@ -906,7 +968,7 @@ impl CrawlerEngine {
     /// 单 socket find_node 发送（concurrent=1 兼容路径，行为与改造前一致）
     async fn send_find_node_to_socket(
         &self,
-        nodes: &[KBucketEntry],
+        nodes: &[(KBucketEntry, u8)],
         socket_idx: usize,
         socket: &UdpSocket,
         round_seq: u64,
@@ -916,7 +978,7 @@ impl CrawlerEngine {
         let per_target = nodes.len().div_ceil(num_targets);
         let mut sent = 0u64;
 
-        for (i, node) in nodes.iter().enumerate() {
+        for (i, (node, layer)) in nodes.iter().enumerate() {
             let target_idx = (i / per_target).min(num_targets - 1);
             let target = targets[target_idx];
             let mut tid = rand::thread_rng().gen::<[u8; 2]>();
@@ -934,6 +996,7 @@ impl CrawlerEngine {
                         addr: node.addr,
                         sent_at: Instant::now(),
                         round_seq,
+                        layer: *layer,
                     },
                 );
             }
@@ -1027,6 +1090,7 @@ impl CrawlerEngine {
                                     addr: node.addr,
                                     sent_at: Instant::now(),
                                     round_seq,
+                                    layer: 0,
                                 },
                             );
                         }
@@ -1083,6 +1147,7 @@ impl CrawlerEngine {
                             addr: node.addr,
                             sent_at: Instant::now(),
                             round_seq,
+                            layer: 0,
                         },
                     );
                 }
@@ -1171,6 +1236,7 @@ impl CrawlerEngine {
                                 addr: node.addr,
                                 sent_at: Instant::now(),
                                 round_seq,
+                                layer: 0,
                             },
                         );
                     }
@@ -1222,6 +1288,7 @@ impl CrawlerEngine {
                         addr: node.addr,
                         sent_at: Instant::now(),
                         round_seq,
+                        layer: 0,
                     },
                 );
             }
@@ -1263,9 +1330,9 @@ impl CrawlerEngine {
         // 2. 计算发送节点数（基础64 × 倍率，clamp 到 [8, 256]）
         let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
 
-        // 3. 选取节点
-        let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(target_count, 3)
+        // 3. 选取节点（分层：L0 已验证 / L1 新鲜 / 探索预算受限）
+        let tagged_nodes = if self.node_repo.is_some() {
+            self.select_diverse_nodes_tagged(target_count, 3)
         } else {
             let known = self.known_nodes.write();
             if known.is_empty() {
@@ -1278,25 +1345,29 @@ impl CrawlerEngine {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             all.truncate(target_count.min(32));
-            all
+            all.into_iter().map(|e| (e, 2u8)).collect()
         };
-        if nodes.is_empty() {
+        if tagged_nodes.is_empty() {
             return;
+        }
+        let mut layer_sent = [0u64; 3];
+        for (_, layer) in &tagged_nodes {
+            layer_sent[(*layer as usize).min(2)] += 1;
         }
 
         // 4. 记录 pending_before + 打开本轮反馈账目
         let round_seq = self.next_round_seq();
-        self.open_round_feedback(round_seq);
+        self.open_round_feedback(round_seq, layer_sent);
         let pending_before = self.pending_total();
 
         // 5. 多 socket 并发发送
-        let concurrent = self.resolve_concurrent_sockets(nodes.len());
+        let concurrent = self.resolve_concurrent_sockets(tagged_nodes.len());
         {
             let mut state = self.state.write();
             state.concurrent_sockets_in_use = concurrent;
         }
         let sent_total = self
-            .send_find_node_concurrent(&nodes, concurrent, round_seq)
+            .send_find_node_concurrent(&tagged_nodes, concurrent, round_seq)
             .await;
 
         // 6. 记录 pending_after
@@ -1309,10 +1380,20 @@ impl CrawlerEngine {
         if let Some(ac) = &self.adaptive_controller {
             if let Some((prev_seq, prev_sent)) = self.active_prev_round.lock().unwrap().take() {
                 let avg_latency = self.current_latency_ema_ms();
-                let (responded, timed_out) = self.drain_round_feedback_delta(prev_seq);
+                let (responded, timed_out, prev_layer_sent, prev_layer_resp) =
+                    self.drain_round_feedback_delta(prev_seq);
                 debug!(
                     "[crawler] active_crawl 轮次反馈: sent={} responded={} timed_out={}",
                     prev_sent, responded, timed_out
+                );
+                info!(
+                    "[crawler] 分层响应率: L0已验证 {}/{} L1新鲜 {}/{} 探索 {}/{}（响应/上轮选中）",
+                    prev_layer_resp[0],
+                    prev_layer_sent[0],
+                    prev_layer_resp[1],
+                    prev_layer_sent[1],
+                    prev_layer_resp[2],
+                    prev_layer_sent[2]
                 );
                 ac.report_round_result(
                     prev_sent,
@@ -1407,7 +1488,7 @@ impl CrawlerEngine {
 
         // 3. 打开本轮反馈账目
         let round_seq = self.next_round_seq();
-        self.open_round_feedback(round_seq);
+        self.open_round_feedback(round_seq, [0, 0, 0]);
 
         // 4. 多 socket 并发发送（每节点发5个 infohash 查询）
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
@@ -1477,7 +1558,7 @@ impl CrawlerEngine {
 
         // 3. 打开本轮反馈账目
         let round_seq = self.next_round_seq();
-        self.open_round_feedback(round_seq);
+        self.open_round_feedback(round_seq, [0, 0, 0]);
 
         // 4. 多 socket 并发发送
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
@@ -1559,6 +1640,7 @@ impl CrawlerEngine {
                         addr: node.addr,
                         sent_at: Instant::now(),
                         round_seq: 0,
+                        layer: 0,
                     },
                 );
             }
@@ -1627,6 +1709,7 @@ impl CrawlerEngine {
                         addr: node.addr,
                         sent_at: Instant::now(),
                         round_seq: 0,
+                        layer: 0,
                     },
                 );
             }
@@ -1692,6 +1775,7 @@ impl CrawlerEngine {
                             addr: node.addr,
                             sent_at: Instant::now(),
                             round_seq: 0,
+                            layer: 0,
                         },
                     );
                 }
@@ -2234,6 +2318,7 @@ impl CrawlerEngine {
                     addr,
                     sent_at: Instant::now(),
                     round_seq: 0,
+                    layer: 0,
                 },
             );
         }
@@ -2633,5 +2718,42 @@ mod tests {
         let result = engine.start().await;
         assert!(result.is_ok());
         assert!(!engine.is_running());
+    }
+
+    /// 分层反馈账目：layer_sent 记发送数、claim 按 pending.layer 计响应、
+    /// drain 只报增量且账目保留（延迟响应不丢）
+    #[tokio::test]
+    async fn test_round_feedback_layer_accounting() {
+        let config = CrawlerConfig::default();
+        let bus = EventBus::default();
+        let engine = CrawlerEngine::new(config, bus);
+
+        let seq = engine.next_round_seq();
+        engine.open_round_feedback(seq, [5, 3, 2]);
+        // 无响应时 drain 报零增量，但 layer_sent 可读
+        let (r0, t0, sent, resp0) = engine.drain_round_feedback_delta(seq);
+        assert_eq!((r0, t0), (0, 0));
+        assert_eq!(sent, [5, 3, 2]);
+        assert_eq!(resp0, [0, 0, 0]);
+
+        // 模拟两个不同层的 pending 响应认领
+        {
+            let mut map = engine.round_feedback.lock().unwrap();
+            let acc = map.get_mut(&seq).unwrap();
+            acc.responded += 1;
+            acc.layer_responded[0] += 1; // L0 响应 1
+        }
+        {
+            let mut map = engine.round_feedback.lock().unwrap();
+            let acc = map.get_mut(&seq).unwrap();
+            acc.responded += 1;
+            acc.layer_responded[2] += 1; // 探索层响应 1
+        }
+        let (r1, _t1, _s, resp1) = engine.drain_round_feedback_delta(seq);
+        assert_eq!(r1, 2, "增量报告：新增响应 2");
+        assert_eq!(resp1, [1, 0, 1], "分层增量 L0=1 探索=1");
+        // 账目不移除：再次 drain 增量为 0（G2 语义）
+        let (r2, _, _, resp2) = engine.drain_round_feedback_delta(seq);
+        assert_eq!((r2, resp2), (0, [0, 0, 0]));
     }
 }
