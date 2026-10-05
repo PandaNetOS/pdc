@@ -34,9 +34,6 @@ use crate::intelligence::AdaptiveController;
 
 use super::Crawler;
 
-/// pending 请求超时（P2 优化：缩短以加速节点轮换）
-const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// PPS 统计快照类型（上次统计时间 + 各 socket 发送累计 + 接收累计）
 type PpsSnapshot = Option<(Instant, Vec<u64>, Vec<u64>)>;
 
@@ -153,11 +150,13 @@ struct PendingRequest {
     round_seq: u64,
 }
 
-/// 单个规划轮次的真实应答/超时累计（tid 命中时自增，报告后移除）
+/// 单个规划轮次的真实应答/超时累计（tid 命中时自增，增量报告后留存至 300s 兜底清理）
 #[derive(Debug)]
 struct RoundFeedbackAcc {
     responded: u64,
     timed_out: u64,
+    /// 已报告过的累计值（增量报告用：本轮只上报自上次报告以来的新增）
+    reported: u64,
     started_at: Instant,
 }
 
@@ -166,6 +165,7 @@ impl Default for RoundFeedbackAcc {
         Self {
             responded: 0,
             timed_out: 0,
+            reported: 0,
             started_at: Instant::now(),
         }
     }
@@ -249,6 +249,10 @@ pub struct CrawlerEngine {
     round_seq: Arc<AtomicU64>,
     /// 各规划轮次的真实应答/超时累计（报告后移除，>60s 兜底清理）
     round_feedback: Arc<Mutex<BTreeMap<u64, RoundFeedbackAcc>>>,
+    /// active_crawl 上一轮 (seq, sent)：反馈延迟一轮取账目，覆盖完整响应窗口
+    /// （根因修复 2026-10-05：UDP 响应到达远超 800ms，立即取账目 responded 恒≈0，
+    ///  自适应倍率被锁死下限；改为本轮发送、下轮取上轮账目）
+    active_prev_round: Arc<Mutex<Option<(u64, u64)>>>,
     /// 真实 RTT 的 EMA（毫秒），tid 命中时更新
     latency_ema_ms: Arc<Mutex<Option<f64>>>,
 }
@@ -307,6 +311,7 @@ impl CrawlerEngine {
             pps_last: Arc::new(Mutex::new(None)),
             round_seq: Arc::new(AtomicU64::new(0)),
             round_feedback: Arc::new(Mutex::new(BTreeMap::new())),
+            active_prev_round: Arc::new(Mutex::new(None)),
             latency_ema_ms: Arc::new(Mutex::new(None)),
         }
     }
@@ -695,14 +700,34 @@ impl CrawlerEngine {
         }
     }
 
-    /// 取走并清除轮次反馈（responded, timed_out），顺带清理超过 60s 的陈旧账目
+    /// 取走并清除轮次反馈（responded, timed_out），顺带清理超过 300s 的陈旧账目。
+    /// 仅用于不参与自适应决策的轮次（get_peers/sample）清理防泄漏。
     fn take_round_feedback(&self, seq: u64) -> (u64, u64) {
         let mut map = self.round_feedback.lock().unwrap();
         let acc = map.remove(&seq);
         // [ALLOWED-HARDCODED: 轮次反馈账目陈旧清理的固定窗口常量，非业务可调参数]
-        map.retain(|_, acc| acc.started_at.elapsed() < Duration::from_secs(60));
+        map.retain(|_, acc| acc.started_at.elapsed() < Duration::from_secs(300));
         match acc {
             Some(a) => (a.responded, a.timed_out),
+            None => (0, 0),
+        }
+    }
+
+    /// 增量报告轮次反馈：账目持续累计（响应延迟到达仍 +1），
+    /// 本轮只上报自上次报告以来的新增 responded/timed_out，账目不移除，
+    /// 由 300s 兜底清理回收。根治（2026-10-05）：响应到达/处理延迟实测超过
+    /// 一轮（约 40s），此前"下轮 take"会让延迟到达的响应丢失（账目已移除）。
+    fn drain_round_feedback_delta(&self, seq: u64) -> (u64, u64) {
+        let mut map = self.round_feedback.lock().unwrap();
+        // [ALLOWED-HARDCODED: 轮次反馈账目陈旧清理的固定窗口常量，非业务可调参数]
+        map.retain(|_, acc| acc.started_at.elapsed() < Duration::from_secs(300));
+        match map.get_mut(&seq) {
+            Some(acc) => {
+                let d_responded = acc.responded - acc.reported;
+                let d_timed_out = acc.timed_out - acc.reported;
+                acc.reported = acc.responded;
+                (d_responded, d_timed_out)
+            }
             None => (0, 0),
         }
     }
@@ -1277,23 +1302,30 @@ impl CrawlerEngine {
         // 6. 记录 pending_after
         let pending_after = self.pending_total();
 
-        // 7. 反馈本轮结果（真实 tid 命中计数）
+        // 7. 反馈上一轮的增量账目（本轮发送的账目留到下轮取，覆盖完整响应窗口）。
+        // 根因修复（2026-10-05）：UDP 响应到达/处理远超固定等待窗口，
+        // 此前立即取账目 responded 恒≈0 → 自适应控制器倍率锁死下限；
+        // 账目持续累计、每轮只上报新增（delta），响应延迟多久都计入。
         if let Some(ac) = &self.adaptive_controller {
-            let avg_latency = self.current_latency_ema_ms();
-            let (responded, timed_out) = self.take_round_feedback(round_seq);
-            debug!(
-                "[crawler] active_crawl 轮次反馈: sent={} responded={} timed_out={}",
-                sent_total, responded, timed_out
-            );
-            ac.report_round_result(
-                sent_total,
-                responded,
-                avg_latency,
-                pending_before,
-                pending_after,
-                0,
-                1.0,
-            );
+            if let Some((prev_seq, prev_sent)) = self.active_prev_round.lock().unwrap().take() {
+                let avg_latency = self.current_latency_ema_ms();
+                let (responded, timed_out) = self.drain_round_feedback_delta(prev_seq);
+                debug!(
+                    "[crawler] active_crawl 轮次反馈: sent={} responded={} timed_out={}",
+                    prev_sent, responded, timed_out
+                );
+                ac.report_round_result(
+                    prev_sent,
+                    responded,
+                    avg_latency,
+                    pending_before,
+                    pending_after,
+                    0,
+                    1.0,
+                );
+            }
+            // 记录本轮（seq, sent），供下一轮报告
+            *self.active_prev_round.lock().unwrap() = Some((round_seq, sent_total));
         }
 
         {
@@ -1373,10 +1405,9 @@ impl CrawlerEngine {
             return;
         }
 
-        // 3. 记录 pending_before + 打开本轮反馈账目
+        // 3. 打开本轮反馈账目
         let round_seq = self.next_round_seq();
         self.open_round_feedback(round_seq);
-        let pending_before = self.pending_total();
 
         // 4. 多 socket 并发发送（每节点发5个 infohash 查询）
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
@@ -1384,29 +1415,12 @@ impl CrawlerEngine {
             let mut state = self.state.write();
             state.concurrent_sockets_in_use = concurrent;
         }
-        let sent_total = self
+        let _ = self
             .send_get_peers_concurrent(&nodes, concurrent, &infohashes, round_seq)
             .await;
 
-        // 5. 记录 pending_after + 反馈（真实 tid 命中计数）
-        let pending_after = self.pending_total();
-        if let Some(ac) = &self.adaptive_controller {
-            let avg_latency = self.current_latency_ema_ms();
-            let (responded, timed_out) = self.take_round_feedback(round_seq);
-            debug!(
-                "[crawler] get_peers 轮次反馈: sent={} responded={} timed_out={}",
-                sent_total, responded, timed_out
-            );
-            ac.report_round_result(
-                sent_total,
-                responded,
-                avg_latency,
-                pending_before,
-                pending_after,
-                0,
-                1.0,
-            );
-        }
+        // 5. get_peers 不参与自适应决策（发送量小、反馈无代表性），仅清理本轮账目防泄漏
+        let _ = self.take_round_feedback(round_seq);
 
         info!(
             "[crawler] 主动 get_peers: 向 {} 节点发送了 {} infohash 查询",
@@ -1461,10 +1475,9 @@ impl CrawlerEngine {
             return;
         }
 
-        // 3. 记录 pending_before + 打开本轮反馈账目
+        // 3. 打开本轮反馈账目
         let round_seq = self.next_round_seq();
         self.open_round_feedback(round_seq);
-        let pending_before = self.pending_total();
 
         // 4. 多 socket 并发发送
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
@@ -1472,33 +1485,16 @@ impl CrawlerEngine {
             let mut state = self.state.write();
             state.concurrent_sockets_in_use = concurrent;
         }
-        let sent_total = self
+        let _ = self
             .send_sample_infohashes_concurrent(&nodes, concurrent, round_seq)
             .await;
 
-        // 5. 记录 pending_after + 反馈（真实 tid 命中计数）
-        let pending_after = self.pending_total();
-        if let Some(ac) = &self.adaptive_controller {
-            let avg_latency = self.current_latency_ema_ms();
-            let (responded, timed_out) = self.take_round_feedback(round_seq);
-            debug!(
-                "[crawler] sample 轮次反馈: sent={} responded={} timed_out={}",
-                sent_total, responded, timed_out
-            );
-            ac.report_round_result(
-                sent_total,
-                responded,
-                avg_latency,
-                pending_before,
-                pending_after,
-                0,
-                1.0,
-            );
-        }
+        // 5. sample_infohashes 不参与自适应决策（发送量小、反馈无代表性），仅清理本轮账目防泄漏
+        let _ = self.take_round_feedback(round_seq);
 
         info!(
             "[crawler] 主动 sample_infohashes: 向 {} 节点发送了请求",
-            sent_total
+            nodes.len()
         );
     }
 
@@ -1716,7 +1712,9 @@ impl CrawlerEngine {
 
     /// 清理超时的 pending 请求，并记录失败统计到 NodeRepo
     pub fn cleanup_pending(&self) {
-        let timeout = PENDING_REQUEST_TIMEOUT;
+        // pending 超时由配置控制（默认 120s）：响应到达/处理延迟实测远超 15s，
+        // 过短超时会在响应到达前清空 pending → claim 未命中 → responded 失真
+        let timeout = Duration::from_secs(self.config.pending_timeout_secs);
 
         // 跨 16 个分片收集超时请求的地址，用于记录失败统计
         let mut expired_addrs: Vec<SocketAddr> = Vec::new();
@@ -2597,6 +2595,7 @@ impl CrawlerEngine {
             pps_last: self.pps_last.clone(),
             round_seq: self.round_seq.clone(),
             round_feedback: self.round_feedback.clone(),
+            active_prev_round: self.active_prev_round.clone(),
             latency_ema_ms: self.latency_ema_ms.clone(),
         }
     }

@@ -63,6 +63,8 @@ pdc/
 | `discoverers.dht_listen_port` | 6881 | DHT 发现器 |
 | `crawler.socket_count` | 1（上限10） | 爬虫 socket 数量 |
 | `crawler.concurrent_sockets` | 4 | 每轮并发 socket 数 |
+| `crawler.pending_timeout_secs` | 120 | pending 请求超时（秒）。响应到达/处理延迟实测远超 15s，过短超时会清空 pending 导致 claim 未命中、轮次反馈 responded 失真 |
+| `crawler.round_feedback_wait_ms` | 800 | 【遗留，不再使用】固定等待窗口方案的残留配置，反馈已改增量报告机制，字段保留仅为向后兼容 |
 | `crawler.listen_port` | 6882 | DHT 爬虫监听；多 socket 额外端口由 PortAllocator 在同百位段内整组平移分配 |
 | `crawler.utp_port` | 6883 | uTP |
 | `crawler.tcp_pex_port` | 6884 | TCP-PEX |
@@ -83,6 +85,7 @@ pdc/
 4. **测试目录**：测试必须在 `D:\test\pdc` 运行，禁止在仓库目录执行
 5. **编译环境**：飞牛服务器 192.168.30.35:2222 Docker 容器
 6. **远程节点**：192.168.30.51 的数据不允许删除
+7. **轮次反馈增量报告（2026-10-05 根治）**：active_crawl 账目**持续累计、每轮只报告自上次以来的新增（delta）**，不移除账目（300s 兜底清理）。根因是 UDP 响应到达/处理延迟远超固定等待窗口（实测 1-2 分钟甚至超过一整轮 40s），任何"等待后取账目"方案都会丢失延迟响应导致 responded 失真、控制器倍率锁死下限。get_peers/sample **不参与自适应决策**（发送量小、0 响应数据污染控制器）。详见 [爬虫效率调优记录](docs/crawler-efficiency-tuning-2026-10-05.md)
 
 ## 联邦同步诊断摘要（2026-09-21）
 
@@ -101,6 +104,34 @@ pdc/
 | 2026-09-22 | v1.2 | **联邦同步去 Merkle 化（协议 v8）**：Merkle 反熵全退场，Range 反熵成为唯一兜底通道（详见下节与 ADR-007）。v1.1 诊断报告中的 Federation 槽饥饿分析里，Merkle 相关任务（联邦Merkle反熵/联邦Merkle批量flush/Merkle增量×4/Merkle冷重算×4）已随本次重构整体消失 |
 | 2026-09-22 | v1.3 | **联邦同步收敛修复（v9，按通道）**：解除 delta↔bootstrap 互锁、oplog 空洞可检测+裁剪感知对端进度、NODE 反熵确定性收敛、gossip 取消安全+攒批、bootstrap 生命周期护栏、表达式索引消除全表排序。**未改线网格式**，两端可分别升级。详见下节 |
 | 2026-09-29 | v1.4 | 精简 09-21 联邦诊断报告为摘要（原始数据见 git 历史）；修正关键配置表端口默认值（`server.port` 6880 / `server.api_port` 6886）；README 重写对齐现状 |
+| 2026-10-05 | v1.5 | **爬虫效率调优与轮次反馈链路根治**：并发 socket 8 配置化；反馈链路三层根因（账目取早 → pending 15s 清理 → 下轮 take 早于延迟响应）修复为**增量报告机制**；新增 `crawler.pending_timeout_secs`；get_peers/sample 退出自适应决策。实测 240→4,620/h。详见下节与 [调优记录](docs/crawler-efficiency-tuning-2026-10-05.md) |
+
+## 爬虫轮次反馈链路（2026-10-05 根治）
+
+**本节为爬虫自适应反馈的最新基准。** 完整排查与方案演进（C/D/E/G/G2）见 [爬虫效率调优记录](docs/crawler-efficiency-tuning-2026-10-05.md)。
+
+### 机制
+
+- **账目生命周期**：`active_crawl` 每轮 `open_round_feedback(seq)` 注册账目，`claim_pending`（tid 命中 pending 表）时 `responded += 1`；账目**持续累计、不移除**，`drain_round_feedback_delta(seq)` 每轮只上报自上次报告以来的**新增**（`RoundFeedbackAcc.reported` 标记），300s 兜底清理。
+- **为什么不能"等待后取账目"**：UDP 响应到达/处理延迟实测 1-2 分钟、甚至超过一整轮（约 40s）。固定等待窗口（800ms）与"下轮 take"都会在延迟响应到达前移除账目 → responded 恒≈0 → 控制器每轮判 0 响应率 → 倍率锁死 `min_multiplier=0.2`。
+- **pending 超时必须大于响应延迟**：`crawler.pending_timeout_secs`（默认 120s）。15s 硬编码时代，响应到达时 pending 已被 `cleanup_pending` 清空 → `claim_pending` 未命中 → 账目根本加不进去（实测 94% 响应未命中）。
+- **只有 active_crawl 参与自适应决策**：get_peers/sample 发送量小、反馈无代表性，已移除 `report_round_result` 调用（仅 take 清理各自账目防泄漏）。
+- **决策滞后语义**：倍率基于上一轮（40s 前）的发送与累计响应，controller 按真实响应率平滑调整。
+
+### 调优路径（结论速览）
+
+| 阶段 | 现象 | 结论 |
+|---|---|---|
+| 并发 | `concurrent_sockets_in_use=1` | 设计如此（未配置），配置 `concurrent_sockets: 8` 后预热期 11,700/h |
+| 二次瓶颈 | 预热后回 1,380/h，倍率锁死 0.2 | 反馈链路缺陷的表象，非控制器问题 |
+| 根治 | 三层缺陷（取早 → pending 清理 → take 早于延迟响应） | 增量报告机制（见上），实测 240→4,620/h |
+| 剩余 | 真实响应率 5-15%（正常 30-70%） | 选节点质量/死节点淘汰，`select_diverse_nodes` 待分析 |
+
+### 待清理（需用户确认）
+
+临时验证配置 `adaptive.warmup_rounds: 10`、`log_level: debug` 需恢复正式值（warmup=50 / info）。
+
+---
 
 ## 联邦同步架构 v9（2026-09-22，收敛修复）
 

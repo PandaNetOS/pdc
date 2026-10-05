@@ -1406,6 +1406,16 @@ pub struct CrawlerConfig {
     /// 每轮并发发送的 socket 数量（默认1，上限8）
     #[serde(default = "default_concurrent_sockets")]
     pub concurrent_sockets: usize,
+    /// 轮次反馈等待窗口（毫秒）：发送后等待该时长再收集账目。
+    /// 根因修复（2026-10-05）：此前发送一结束立即取账目，UDP 响应未到达时
+    /// responded 恒≈0，导致自适应控制器每轮判定 0 响应率、倍率锁死下限。
+    /// 0 = 不等待（兼容旧行为）。
+    #[serde(default = "default_round_feedback_wait_ms")]
+    pub round_feedback_wait_ms: u64,
+    /// pending 请求超时（秒）：响应到达/处理延迟远超 15s（实测 1-2 分钟），
+    /// 过短超时会在响应到达前清空 pending → claim 未命中 → 轮次反馈 responded 失真。
+    #[serde(default = "default_pending_timeout_secs")]
+    pub pending_timeout_secs: u64,
     /// 入站来源节点集合上限（超过时清空，防止无界增长）
     #[serde(default = "default_inbound_sources_max")]
     pub inbound_sources_max: usize,
@@ -1532,6 +1542,14 @@ fn default_inbound_sources_max() -> usize {
     100_000
 }
 
+fn default_round_feedback_wait_ms() -> u64 {
+    800
+}
+
+fn default_pending_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -1552,6 +1570,8 @@ impl Default for CrawlerConfig {
             warmup_bootstrap_concurrent: default_warmup_bootstrap_concurrent(),
             max_concurrent_msg_handlers: default_max_concurrent_msg_handlers(),
             concurrent_sockets: default_concurrent_sockets(),
+            round_feedback_wait_ms: default_round_feedback_wait_ms(),
+            pending_timeout_secs: default_pending_timeout_secs(),
             inbound_sources_max: default_inbound_sources_max(),
             active_pex_enabled: false,
         }
@@ -1921,7 +1941,10 @@ mod tests {
     /// （2026-09 生产事故回归测试：BOM 导致整份配置被静默弃用）。
     #[test]
     fn test_from_file_strips_utf8_bom() {
-        let path = std::env::temp_dir().join(format!("pdc-bom-test-{}.yaml", std::process::id()));
+        // 不用 %TEMP% 根目录：安全策略会拒绝 target 构建目录镜像进程对 Temp 根的直写
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        let _ = std::fs::create_dir_all(&tmp);
+        let path = tmp.join(format!("pdc-bom-test-{}.yaml", std::process::id()));
         let mut content = String::from("\u{feff}");
         content.push_str("server:\n  port: 7001\nlog_level: debug\n");
         std::fs::write(&path, content).expect("写入测试文件失败");
@@ -1934,7 +1957,9 @@ mod tests {
     /// 无 BOM 的普通配置文件不受 BOM 剥离影响。
     #[test]
     fn test_from_file_without_bom_ok() {
-        let path = std::env::temp_dir().join(format!("pdc-nobom-test-{}.yaml", std::process::id()));
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        let _ = std::fs::create_dir_all(&tmp);
+        let path = tmp.join(format!("pdc-nobom-test-{}.yaml", std::process::id()));
         std::fs::write(&path, "server:\n  port: 7002\n").expect("写入测试文件失败");
         let config = PdcConfig::from_file(&path).expect("无 BOM 的配置应解析成功");
         assert_eq!(config.server.port, 7002);
