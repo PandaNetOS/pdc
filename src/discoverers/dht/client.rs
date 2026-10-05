@@ -205,7 +205,7 @@ impl DhtDiscoverer {
         info_hash: &Infohash,
         timeout: Duration,
     ) -> Result<QueryResult> {
-        let tid = rand::thread_rng().gen::<[u8; 2]>();
+        let tid = rand::thread_rng().gen::<[u8; 4]>();
         let request = DhtMessage::build_get_peers(&tid, our_id, info_hash);
 
         socket.send_to(&request, node_addr).await?;
@@ -333,7 +333,7 @@ impl DhtDiscoverer {
                             }
                             // 关键：收到 token 后立即 announce，保证与 discover 节点 100% 重叠
                             if let Some(token) = &qr.token {
-                                let tid = rand::thread_rng().gen::<[u8; 2]>();
+                                let tid = rand::thread_rng().gen::<[u8; 4]>();
                                 let announce_msg = DhtMessage::build_announce_peer(
                                     &tid,
                                     &our_id,
@@ -584,7 +584,7 @@ impl PeerDiscoverer for DhtDiscoverer {
 
             tasks.push(tokio::spawn(async move {
                 let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-                let tid = rand::thread_rng().gen::<[u8; 2]>();
+                let tid = rand::thread_rng().gen::<[u8; 4]>();
                 let request = DhtMessage::build_get_peers(&tid, &our_id, &infohash);
                 if sock.send_to(&request, node_addr).await.is_err() {
                     return None;
@@ -618,7 +618,7 @@ impl PeerDiscoverer for DhtDiscoverer {
         for task in tasks {
             if let Ok(Some((node_addr, token))) = task.await {
                 // 发送 announce_peer（fire and forget）
-                let tid = rand::thread_rng().gen::<[u8; 2]>();
+                let tid = rand::thread_rng().gen::<[u8; 4]>();
                 let announce_msg = DhtMessage::build_announce_peer(
                     &tid,
                     &self.config.node_id,

@@ -200,7 +200,7 @@ struct QuerySyncResult {
 /// 根据 transaction_id 选择分片（取第一个字节 mod 16），减少锁竞争
 #[inline]
 fn pending_shard(tid: &[u8]) -> usize {
-    (tid[0] as usize) % 16
+    (tid[3] as usize) % 16
 }
 
 /// 爬虫引擎
@@ -690,8 +690,8 @@ impl CrawlerEngine {
         addr: SocketAddr,
         target: [u8; 20],
     ) -> bool {
-        let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-        tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+        let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+        tid[0] = socket_idx as u8;
         let msg = DhtMessage::build_find_node(&tid, &self.node_id, &target);
 
         {
@@ -921,13 +921,13 @@ impl CrawlerEngine {
                     }
                     let target_idx = (i / per_target).min(num_targets - 1);
                     let target = targets[target_idx];
-                    let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-                    tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                    let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                    tid[0] = socket_idx as u8;
 
                     let msg = DhtMessage::build_find_node(&tid, &node_id, &target);
 
                     {
-                        let shard = (tid[0] as usize) % 16;
+                        let shard = (tid[3] as usize) % 16;
                         let mut pending_map = pending[shard].write();
                         pending_map.insert(
                             tid.to_vec(),
@@ -980,8 +980,8 @@ impl CrawlerEngine {
         for (i, (node, layer)) in nodes.iter().enumerate() {
             let target_idx = (i / per_target).min(num_targets - 1);
             let target = targets[target_idx];
-            let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-            tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+            let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+            tid[0] = socket_idx as u8;
             let msg = DhtMessage::build_find_node(&tid, &self.node_id, &target);
 
             {
@@ -1072,14 +1072,14 @@ impl CrawlerEngine {
                         }
                         let idx = rand::random::<usize>() % infohashes.len();
                         let ih = infohashes[idx];
-                        let mut tid = rand::random::<[u8; 2]>();
-                        tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                        let mut tid = rand::random::<[u8; 4]>();
+                        tid[0] = socket_idx as u8;
                         let vid_idx = rand::random::<usize>() % virtual_ids.len();
                         let vid = virtual_ids[vid_idx];
                         let msg = DhtMessage::build_get_peers(&tid, &vid, &ih);
 
                         {
-                            let shard = (tid[0] as usize) % 16;
+                            let shard = (tid[3] as usize) % 16;
                             let mut pending_map = pending[shard].write();
                             pending_map.insert(
                                 tid.to_vec(),
@@ -1130,8 +1130,8 @@ impl CrawlerEngine {
             for _ in 0..5 {
                 let idx = rand::random::<usize>() % infohashes.len();
                 let ih = infohashes[idx];
-                let mut tid = rand::random::<[u8; 2]>();
-                tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                let mut tid = rand::random::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
                 let vid = self.random_virtual_node_id();
                 let msg = DhtMessage::build_get_peers(&tid, &vid, &ih);
 
@@ -1218,14 +1218,14 @@ impl CrawlerEngine {
                             continue;
                         }
                     }
-                    let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-                    tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                    let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                    tid[0] = socket_idx as u8;
                     let vid_idx = rand::random::<usize>() % virtual_ids.len();
                     let vid = virtual_ids[vid_idx];
                     let msg = DhtMessage::build_sample_infohashes(&tid, &vid);
 
                     {
-                        let shard = (tid[0] as usize) % 16;
+                        let shard = (tid[3] as usize) % 16;
                         let mut pending_map = pending[shard].write();
                         pending_map.insert(
                             tid.to_vec(),
@@ -1271,8 +1271,8 @@ impl CrawlerEngine {
     ) -> u64 {
         let mut sent = 0u64;
         for node in nodes {
-            let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-            tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+            let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+            tid[0] = socket_idx as u8;
             let vid = self.random_virtual_node_id();
             let msg = DhtMessage::build_sample_infohashes(&tid, &vid);
 
@@ -1623,8 +1623,8 @@ impl CrawlerEngine {
         for node in &nodes {
             // 每个节点查询随机 1 个 infohash
             let ih = infohashes[rand::random::<usize>() % infohashes.len()];
-            let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-            tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+            let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+            tid[0] = socket_idx as u8;
             let vid = self.random_virtual_node_id();
             let msg = DhtMessage::build_scrape(&tid, &vid, &ih);
 
@@ -1692,8 +1692,8 @@ impl CrawlerEngine {
             // 每个链式请求用不同随机 target，扩大覆盖面
             let chain_target = self.random_target();
 
-            let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-            tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+            let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+            tid[0] = socket_idx as u8;
             let vid = self.random_virtual_node_id();
             let msg = DhtMessage::build_find_node(&tid, &vid, &chain_target);
 
@@ -1759,8 +1759,8 @@ impl CrawlerEngine {
             };
 
             for node in nodes {
-                let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-                tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+                let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
                 let msg = DhtMessage::build_find_node(&tid, &self.node_id, &target);
 
                 {
@@ -2302,8 +2302,8 @@ impl CrawlerEngine {
         addr: SocketAddr,
         infohash: Infohash,
     ) {
-        let mut tid = rand::thread_rng().gen::<[u8; 2]>();
-        tid[0] = (tid[0] & 0x0F) | ((socket_idx as u8 & 0x0F) << 4);
+        let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+        tid[0] = socket_idx as u8;
         let msg = DhtMessage::build_get_peers(&tid, &self.node_id, &infohash);
 
         {
@@ -2571,7 +2571,7 @@ impl CrawlerEngine {
         }
         let mut sent = 0;
         for addr in &top_nodes {
-            let tid = rand::random::<[u8; 2]>();
+            let tid = rand::random::<[u8; 4]>();
             let msg = DhtMessage::build_ping(&tid, &self.node_id);
             if socket.send_to(&msg, addr).await.is_ok() {
                 self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
@@ -2693,6 +2693,31 @@ impl CrawlerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 分片均匀性（19号 D2）：pending_shard 按 tid[3]%16 路由，随机 tid 均匀落 16 片；
+    /// socket_idx 编码在字节 0，不参与分片
+    #[test]
+    fn test_pending_shard_uniform() {
+        let mut counts = [0usize; 16];
+        for i in 0..1600u32 {
+            let mut tid = [0u8; 4];
+            tid[3] = ((i.wrapping_mul(2654435761) >> 8) % 256) as u8;
+            counts[pending_shard(&tid)] += 1;
+        }
+        for c in counts {
+            assert!((60..=140).contains(&c), "分片应大致均匀，实测 {:?}", counts);
+        }
+        let mut shards = std::collections::HashSet::new();
+        for b in 0..=255u8 {
+            let tid = [3u8, 0, 0, b];
+            shards.insert(pending_shard(&tid));
+        }
+        assert!(
+            shards.len() >= 14,
+            "byte3 变化应覆盖多数分片，实测 {}",
+            shards.len()
+        );
+    }
 
     #[test]
     fn test_crawler_state_default() {

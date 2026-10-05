@@ -296,7 +296,7 @@ impl DhtProbe {
     /// 向单个节点发送 DHT ping，返回 responder node_id
     async fn ping_node(addr: SocketAddr, our_id: [u8; 20]) -> anyhow::Result<[u8; 20]> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let tid = rand::thread_rng().gen::<[u8; 2]>();
+        let tid = rand::thread_rng().gen::<[u8; 4]>();
         let request = DhtMessage::build_ping(&tid, &our_id);
 
         socket.send_to(&request, addr).await?;

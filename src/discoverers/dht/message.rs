@@ -184,18 +184,18 @@ impl DhtMessage {
     /// - `node_id`: 自己的节点 ID（20 字节）
     /// - `info_hash`: 要查询的 infohash（20 字节）
     pub fn build_get_peers(
-        transaction_id: &[u8; 2],
+        transaction_id: &[u8; 4],
         node_id: &[u8; 20],
         info_hash: &Infohash,
     ) -> Vec<u8> {
         // 手动构造 bencode，避免复杂的 serde 结构
-        // d1:ad2:id20:<node_id>9:info_hash20:<info_hash>e1:q9:get_peers1:t2:<tid>1:y1:qe
+        // d1:ad2:id20:<node_id>9:info_hash20:<info_hash>e1:q9:get_peers1:t4:<tid>1:y1:qe
         let mut buf = Vec::new();
         buf.extend_from_slice(b"d1:ad2:id20:");
         buf.extend_from_slice(node_id);
         buf.extend_from_slice(b"9:info_hash20:");
         buf.extend_from_slice(info_hash);
-        buf.extend_from_slice(b"e1:q9:get_peers1:t2:");
+        buf.extend_from_slice(b"e1:q9:get_peers1:t4:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
         buf
@@ -204,13 +204,13 @@ impl DhtMessage {
     /// 构建 sample_infohashes 查询（BEP 51: DHT Infohash Indexing）
     ///
     /// 向远程节点请求它已知的 infohash 列表（随机采样子集）
-    /// 请求格式: d1:ad2:id20:<node_id>e1:q19:sample_infohashes1:t2:<tid>1:y1:qe
-    pub fn build_sample_infohashes(transaction_id: &[u8; 2], node_id: &[u8; 20]) -> Vec<u8> {
+    /// 请求格式: d1:ad2:id20:<node_id>e1:q19:sample_infohashes1:t4:<tid>1:y1:qe
+    pub fn build_sample_infohashes(transaction_id: &[u8; 4], node_id: &[u8; 20]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"d1:ad2:id20:");
         buf.extend_from_slice(node_id);
         // "sample_infohashes" 长度为 17（此前误写为 19，导致请求 bencode 非法、对端解析失败）
-        buf.extend_from_slice(b"e1:q17:sample_infohashes1:t2:");
+        buf.extend_from_slice(b"e1:q17:sample_infohashes1:t4:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
         buf
@@ -219,9 +219,9 @@ impl DhtMessage {
     /// 构建 scrape 查询（BEP 33: DHT Scrapes）
     ///
     /// 向远程节点查询特定 infohash 的 seeder/leecher 统计
-    /// 请求格式: d1:ad2:id20:<node_id>9:info_hash20:<infohash>e1:q6:scrape1:t2:<tid>1:y1:qe
+    /// 请求格式: d1:ad2:id20:<node_id>9:info_hash20:<infohash>e1:q6:scrape1:t4:<tid>1:y1:qe
     pub fn build_scrape(
-        transaction_id: &[u8; 2],
+        transaction_id: &[u8; 4],
         node_id: &[u8; 20],
         info_hash: &Infohash,
     ) -> Vec<u8> {
@@ -230,7 +230,7 @@ impl DhtMessage {
         buf.extend_from_slice(node_id);
         buf.extend_from_slice(b"9:info_hash20:");
         buf.extend_from_slice(info_hash);
-        buf.extend_from_slice(b"e1:q6:scrape1:t2:");
+        buf.extend_from_slice(b"e1:q6:scrape1:t4:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
         buf
@@ -238,7 +238,7 @@ impl DhtMessage {
 
     /// 构建 sample_infohashes 响应（BEP 51）
     ///
-    /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t2:<tid>1:y1:re
+    /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t4:<tid>1:y1:re
     pub fn build_sample_infohashes_response(
         transaction_id: &[u8],
         node_id: &[u8; 20],
@@ -258,7 +258,7 @@ impl DhtMessage {
         for ih in samples {
             buf.extend_from_slice(ih);
         }
-        buf.extend_from_slice(b"e1:t2:");
+        buf.extend_from_slice(b"e1:t4:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:re");
         buf
@@ -266,7 +266,7 @@ impl DhtMessage {
 
     /// 构建 find_node 查询
     pub fn build_find_node(
-        transaction_id: &[u8; 2],
+        transaction_id: &[u8; 4],
         node_id: &[u8; 20],
         target_id: &[u8; 20],
     ) -> Vec<u8> {
@@ -275,18 +275,18 @@ impl DhtMessage {
         buf.extend_from_slice(node_id);
         buf.extend_from_slice(b"9:target20:");
         buf.extend_from_slice(target_id);
-        buf.extend_from_slice(b"e1:q9:find_node1:t2:");
+        buf.extend_from_slice(b"e1:q9:find_node1:t4:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
         buf
     }
 
     /// 构建 ping 查询
-    pub fn build_ping(transaction_id: &[u8; 2], node_id: &[u8; 20]) -> Vec<u8> {
+    pub fn build_ping(transaction_id: &[u8; 4], node_id: &[u8; 20]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"d1:ad2:id20:");
         buf.extend_from_slice(node_id);
-        buf.extend_from_slice(b"e1:q4:ping1:t2:");
+        buf.extend_from_slice(b"e1:q4:ping1:t4:");
         buf.extend_from_slice(transaction_id);
         buf.extend_from_slice(b"1:y1:qe");
         buf
@@ -520,7 +520,7 @@ impl DhtMessage {
     /// 解析 get_peers 响应
     ///
     /// 返回 (transaction_id, GetPeersResponse)
-    pub fn parse_get_peers_response(data: &[u8]) -> Option<([u8; 2], GetPeersResponse)> {
+    pub fn parse_get_peers_response(data: &[u8]) -> Option<([u8; 4], GetPeersResponse)> {
         let value: BencodeValue = from_bytes(data).ok()?;
         let dict = value.as_dict()?;
 
@@ -533,9 +533,9 @@ impl DhtMessage {
 
         // transaction_id
         let t = dict.get(b"t".as_slice())?.as_bytes()?;
-        let mut tid = [0u8; 2];
-        if t.len() >= 2 {
-            tid.copy_from_slice(&t[0..2]);
+        let mut tid = [0u8; 4];
+        if t.len() >= 4 {
+            tid.copy_from_slice(&t[0..4]);
         }
 
         // 响应字典
@@ -580,7 +580,7 @@ impl DhtMessage {
     }
 
     /// 解析 find_node 响应，返回节点列表
-    pub fn parse_find_node_response(data: &[u8]) -> Option<([u8; 2], Vec<DhtNode>)> {
+    pub fn parse_find_node_response(data: &[u8]) -> Option<([u8; 4], Vec<DhtNode>)> {
         let value: BencodeValue = from_bytes(data).ok()?;
         let dict = value.as_dict()?;
 
@@ -590,9 +590,9 @@ impl DhtMessage {
         }
 
         let t = dict.get(b"t".as_slice())?.as_bytes()?;
-        let mut tid = [0u8; 2];
-        if t.len() >= 2 {
-            tid.copy_from_slice(&t[0..2]);
+        let mut tid = [0u8; 4];
+        if t.len() >= 4 {
+            tid.copy_from_slice(&t[0..4]);
         }
 
         let r = dict.get(b"r".as_slice())?.as_dict()?;
@@ -607,10 +607,10 @@ impl DhtMessage {
 
     /// 解析 sample_infohashes 响应（BEP 51: DHT Infohash Indexing）
     ///
-    /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t2:<tid>1:y1:re
+    /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t4:<tid>1:y1:re
     pub fn parse_sample_infohashes_response(
         data: &[u8],
-    ) -> Option<([u8; 2], SampleInfohashesResponse)> {
+    ) -> Option<([u8; 4], SampleInfohashesResponse)> {
         let value: BencodeValue = from_bytes(data).ok()?;
         let dict = value.as_dict()?;
 
@@ -620,9 +620,9 @@ impl DhtMessage {
         }
 
         let t = dict.get(b"t".as_slice())?.as_bytes()?;
-        let mut tid = [0u8; 2];
-        if t.len() >= 2 {
-            tid.copy_from_slice(&t[0..2]);
+        let mut tid = [0u8; 4];
+        if t.len() >= 4 {
+            tid.copy_from_slice(&t[0..4]);
         }
 
         let r = dict.get(b"r".as_slice())?.as_dict()?;
@@ -668,8 +668,8 @@ impl DhtMessage {
 
     /// 解析 scrape 响应（BEP 33: DHT Scrapes）
     ///
-    /// 响应格式: d1:rd2:id20:<node_id>5:filesd20:<ih>d8:completei<N>e10:incompletei<N>e10:downloadedi<N>eeee1:t2:<tid>1:y1:re
-    pub fn parse_scrape_response(data: &[u8]) -> Option<([u8; 2], ScrapeResponse)> {
+    /// 响应格式: d1:rd2:id20:<node_id>5:filesd20:<ih>d8:completei<N>e10:incompletei<N>e10:downloadedi<N>eeee1:t4:<tid>1:y1:re
+    pub fn parse_scrape_response(data: &[u8]) -> Option<([u8; 4], ScrapeResponse)> {
         let value: BencodeValue = from_bytes(data).ok()?;
         let dict = value.as_dict()?;
 
@@ -679,9 +679,9 @@ impl DhtMessage {
         }
 
         let t = dict.get(b"t".as_slice())?.as_bytes()?;
-        let mut tid = [0u8; 2];
-        if t.len() >= 2 {
-            tid.copy_from_slice(&t[0..2]);
+        let mut tid = [0u8; 4];
+        if t.len() >= 4 {
+            tid.copy_from_slice(&t[0..4]);
         }
 
         let r = dict.get(b"r".as_slice())?.as_dict()?;
@@ -802,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_build_ping() {
-        let tid = [0x01, 0x02];
+        let tid = [0x01, 0x02, 0x03, 0x04];
         let node_id = [0u8; 20];
         let msg = DhtMessage::build_ping(&tid, &node_id);
         let s = String::from_utf8_lossy(&msg);
@@ -812,13 +812,25 @@ mod tests {
 
     #[test]
     fn test_build_get_peers() {
-        let tid = [0x01, 0x02];
+        let tid = [0x01, 0x02, 0x03, 0x04];
         let node_id = [0u8; 20];
         let infohash = [1u8; 20];
         let msg = DhtMessage::build_get_peers(&tid, &node_id, &infohash);
         let s = String::from_utf8_lossy(&msg);
         assert!(s.contains("9:get_peers"));
         assert!(s.contains("9:info_hash"));
+    }
+
+    /// tid 4 字节往返（19号 D2）：build → parse → tid 一致，长度前缀为 4
+    #[test]
+    fn test_tid_4byte_roundtrip() {
+        let tid = [0xA5u8, 0x12, 0x34, 0x56];
+        let node_id = [7u8; 20];
+        let msg = DhtMessage::build_ping(&tid, &node_id);
+        let s = String::from_utf8_lossy(&msg);
+        assert!(s.contains("1:t4:"), "长度前缀应为 4");
+        let parsed = DhtMessage::parse_query(&msg).expect("应解析成功");
+        assert_eq!(parsed.0, tid.to_vec(), "tid 往返一致");
     }
 
     #[test]
