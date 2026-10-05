@@ -65,6 +65,10 @@ pdc/
 | `crawler.concurrent_sockets` | 4 | 每轮并发 socket 数 |
 | `crawler.pending_timeout_secs` | 120 | pending 请求超时（秒）。响应到达/处理延迟实测远超 15s，过短超时会清空 pending 导致 claim 未命中、轮次反馈 responded 失真 |
 | `crawler.round_feedback_wait_ms` | 800 | 【遗留，不再使用】固定等待窗口方案的残留配置，反馈已改增量报告机制，字段保留仅为向后兼容 |
+| `crawler.select_mode` | layered | 节点选择模式：`layered`=新近度分层（L0已验证→L1新鲜→探索预算受限）/ `legacy`=旧行为逃生通道 |
+| `crawler.select_explore_ratio` | 0.2 | 每轮发送中分配给未验证池（探索）的预算占比——无论陈旧池多大，每轮损耗上限即该比例 |
+| `crawler.select_verified_recent_secs` | 600 | L0「已验证活」窗口（秒）：本会话响应成功且在此窗口内的节点优先 |
+| `crawler.bad_after_failures` | 3 | 判 Bad 的连续失败阈值（可调 2 加快死节点淘汰）；Bad 被 mention 且距最近提及/失败超 600s 冷却后复活 |
 | `crawler.listen_port` | 6882 | DHT 爬虫监听；多 socket 额外端口由 PortAllocator 在同百位段内整组平移分配 |
 | `crawler.utp_port` | 6883 | uTP |
 | `crawler.tcp_pex_port` | 6884 | TCP-PEX |
@@ -105,6 +109,24 @@ pdc/
 | 2026-09-22 | v1.3 | **联邦同步收敛修复（v9，按通道）**：解除 delta↔bootstrap 互锁、oplog 空洞可检测+裁剪感知对端进度、NODE 反熵确定性收敛、gossip 取消安全+攒批、bootstrap 生命周期护栏、表达式索引消除全表排序。**未改线网格式**，两端可分别升级。详见下节 |
 | 2026-09-29 | v1.4 | 精简 09-21 联邦诊断报告为摘要（原始数据见 git 历史）；修正关键配置表端口默认值（`server.port` 6880 / `server.api_port` 6886）；README 重写对齐现状 |
 | 2026-10-05 | v1.5 | **爬虫效率调优与轮次反馈链路根治**：并发 socket 8 配置化；反馈链路三层根因（账目取早 → pending 15s 清理 → 下轮 take 早于延迟响应）修复为**增量报告机制**；新增 `crawler.pending_timeout_secs`；get_peers/sample 退出自适应决策。实测 240→4,620/h。详见下节与 [调优记录](docs/crawler-efficiency-tuning-2026-10-05.md) |
+| 2026-10-05 | v1.6 | **选节点质量根治（20号方案批次1-4）**：预加载恒真过滤修复+真实 last_active 恢复；新近度分层选择+在飞去重+分层响应率观测；评分窗口化+mention 解耦+未验证先验分；判死阈值配置化+Bad 冷却复活。详见下节与 [20号文档](docs/architecture/20-crawler-node-selection-quality.md) |
+
+## 节点选择与评分（2026-10-05，20号方案批次1-4 落地）
+
+**本节为爬虫选节点/评分的最新基准。** 完整根因（R0-R7）与设计（D1-D5）见 [20号文档](docs/architecture/20-crawler-node-selection-quality.md)。四批次均已过合规门禁：批次1 `fix(storage)` 恒真过滤修复、批次2 `feat(crawler)` 分层选择、批次3 `feat(intelligence)` 评分窗口化、批次4 `feat(crawler)` 池卫生。
+
+### 核心机制
+
+- **预加载按 last_active DESC**（R0 修复）：旧谓词 `last_active>cutoff OR score>=0` 恒真，实际按历史评分加载 10 万行僵尸高分馆；现改为新近度优先，且 DB 落库节点真实 last_active（原为落库时刻）、加载时还原并按其重算 Good/Questionable（原被复位为进程启动时刻）。
+- **分层选择**（D2）：每轮 target_count = exploit(80%) + explore(20%)。L0=已验证（本会话响应成功，`last_verified` 窗口内）→ L1=热池其余（本会话新发现/近期验证）→ top500 按评分补足。选择时排除在飞（pending 中）地址。`select_mode=legacy` 一键回退。
+- **热池语义**：由「已验证响应成功 + 本会话新发现」喂给；「选中即热」的自我强化回路已移除（legacy 模式保留）。mention（在别人响应里被提及）只记 `last_mentioned`，不再刷新 last_active——死节点无法靠邻居提及永葆新鲜（R5）。
+- **评分窗口化**（D3）：响应率维度优先近期窗口（指数衰减 EMA，α=0.3/h），近期连续失败立即跌分，不再被终身累计稀释；未验证先验阶梯：刚验证≈0.8、仅被提及≈0.3、陈旧中性=0.2（修复「新节点被压到池底」倒挂）。
+- **快速失败与复活**（D4）：判 Bad 阈值 `bad_after_failures`（默认3，可调2）；超时失败计入近期窗口 → 下轮重算自动跌出 exploit 层；Bad 冷却复活（被再次提及且距最近提及/失败 >600s → Questionable、失败数减半）。
+- **分层响应率观测**（D5）：每轮 info 日志 `[crawler] 分层响应率: L0已验证 r/s L1新鲜 r/s 探索 r/s`——选节点质量的核心验证指标，目标 L0>60%、L1>40%。
+
+### 池卫生联动（部署后预期现象）
+
+mention 解耦后，陈旧节点的 last_active 不再被刷新 → tier_check（300s）按 `tier.warm_threshold_secs`（默认 7200）把陈旧池从内存逐出（DB 保留、不写墓碑，被提及可重新入池）。内存池收敛为「会话内活跃节点集」，规模由新节点流入率 × 温窗口自然平衡；这是预期行为，不是数据丢失。
 
 ## 爬虫轮次反馈链路（2026-10-05 根治）
 
