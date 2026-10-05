@@ -77,6 +77,8 @@ pub struct NodeRepoImpl {
     active: AtomicU64,
     /// 所有节点 score 之和（f64 bit 存进 AtomicU64）
     score_sum: AtomicU64,
+    /// 近期窗口衰减系数（每小时）：与 NodeScoreConfig.recent_decay_alpha 同源，默认 0.3
+    recent_decay_alpha: f64,
 }
 
 impl NodeRepoImpl {
@@ -102,6 +104,8 @@ impl NodeRepoImpl {
             good: AtomicU64::new(0),
             questionable: AtomicU64::new(0),
             bad: AtomicU64::new(0),
+            recent_decay_alpha: crate::intelligence::scorer_config::NodeScoreConfig::default()
+                .recent_decay_alpha,
             active: AtomicU64::new(0),
             score_sum: AtomicU64::new(0),
         }
@@ -119,6 +123,28 @@ impl NodeRepoImpl {
     pub fn with_write_queue(mut self, wq: Arc<WriteQueue>) -> Self {
         self.write_queue = Some(wq);
         self
+    }
+
+    /// 设置近期窗口衰减系数（builder 模式；与评分器配置同源时二者一致）
+    pub fn with_recent_decay_alpha(mut self, alpha: f64) -> Self {
+        self.recent_decay_alpha = alpha;
+        self
+    }
+
+    /// 近期窗口统计更新（指数衰减近似 EMA）：先衰减存量再累加本次。
+    /// 终身累计 success/query 会被历史稀释，近期窗口让连续失败立即反映到评分（2026-10 R4）。
+    fn record_recent(&self, entry: &mut KBucketEntry, success: bool) {
+        let now = Instant::now();
+        if let Some(last) = entry.recent_updated {
+            let d = KBucketEntry::decay_factor(self.recent_decay_alpha, last.elapsed());
+            entry.recent_query *= d;
+            entry.recent_success *= d;
+        }
+        entry.recent_query += 1.0;
+        if success {
+            entry.recent_success += 1.0;
+        }
+        entry.recent_updated = Some(now);
     }
 
     /// 获取底层 Storage 引用（用于联邦同步按分片加载数据）。
@@ -375,7 +401,10 @@ impl NodeRepoImpl {
                     }
                 }
                 existing.id = *id;
-                existing.last_active = Instant::now();
+                // mention（在别人响应里被提及，未经验证）只记 last_mentioned，
+                // 不再刷新 last_active/last_verified——否则死节点会被邻居高频提及
+                // 而永葆「新鲜」（2026-10 R5）；弱新鲜先验由评分器读 last_mentioned 给出
+                existing.last_mentioned = Some(Instant::now());
             } else {
                 let mut entry = KBucketEntry::new(*id, *addr);
                 // 鏂拌妭鐐瑰垵濮嬭瘎鍒?45.0锛堜腑鎬у垎锛夛紝鍚庣画鐢?ScoreMaintainer 缁熶竴鏇存柊
@@ -734,6 +763,7 @@ impl NodeRepoImpl {
             }
             entry.query_count += 1;
             entry.last_query_time = Some(Instant::now());
+            self.record_recent(entry, success);
             if success {
                 entry.success_count += 1;
                 entry.total_latency_ms += latency_ms;
@@ -780,6 +810,7 @@ impl NodeRepoImpl {
             entry.last_active = Instant::now();
             entry.last_query_time = Some(Instant::now());
             entry.last_verified = Some(Instant::now());
+            self.record_recent(entry, true);
             let old = entry.state;
             entry.state = NodeState::Good;
             self.acc_transition_state(old, NodeState::Good);
@@ -1362,6 +1393,25 @@ mod tests {
     fn test_repo() -> NodeRepoImpl {
         let storage = Arc::new(Storage::memory().unwrap());
         NodeRepoImpl::new(storage)
+    }
+
+    /// 近期窗口统计（2026-10 R4/D3）：record_query 路径同步更新窗口，
+    /// α=0 时为精确计数，窗口响应率可覆盖终身统计
+    #[tokio::test]
+    async fn test_recent_window_accumulates() {
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo = NodeRepoImpl::new(storage).with_recent_decay_alpha(0.0);
+        let a = addr(7, 3007);
+        repo.add_node_sync([7u8; 20], a);
+        repo.record_query_sync(a, true, 5);
+        repo.record_query_sync(a, true, 5);
+        repo.record_query_sync(a, false, 0);
+
+        let e = repo.get_node(&a).await.unwrap();
+        assert!((e.recent_query - 3.0).abs() < 1e-9);
+        assert!((e.recent_success - 2.0).abs() < 1e-9);
+        let r = e.windowed_response_rate(0.0, 1.0).unwrap();
+        assert!((r - 2.0 / 3.0).abs() < 1e-9);
     }
 
     fn addr(oct: u8, port: u16) -> SocketAddr {

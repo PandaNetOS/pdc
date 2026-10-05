@@ -46,6 +46,18 @@ pub struct KBucketEntry {
     /// mention 刷新 last_active 不再伪造活性（2026-10 R5）。
     #[serde(skip)]
     pub last_verified: Option<Instant>,
+    /// 最后一次被提及时间（仅出现在别人响应里，未验证；内存字段，不持久化）。
+    /// 用于未验证先验分的弱新鲜加成，不参与状态翻转（2026-10 D3）。
+    #[serde(skip)]
+    pub last_mentioned: Option<Instant>,
+    /// 近期窗口统计（指数衰减近似 EMA；内存字段，不持久化）。
+    /// 终身累计 success/query 会被历史稀释，近期窗口让连续失败立即反映到评分（2026-10 R4）。
+    #[serde(skip)]
+    pub recent_query: f64,
+    #[serde(skip)]
+    pub recent_success: f64,
+    #[serde(skip)]
+    pub recent_updated: Option<Instant>,
     /// 连续失败次数
     pub consecutive_failures: u32,
     /// 总查询次数
@@ -96,6 +108,10 @@ impl KBucketEntry {
             last_query_time: None,
             last_accessed: None,
             last_verified: None,
+            last_mentioned: None,
+            recent_query: 0.0,
+            recent_success: 0.0,
+            recent_updated: None,
             consecutive_failures: 0,
             query_count: 0,
             success_count: 0,
@@ -104,6 +120,28 @@ impl KBucketEntry {
             state: NodeState::Good,
             score: 0.0,
         }
+    }
+
+    /// 近期窗口指数衰减因子（alpha 为每小时衰减速率）
+    pub fn decay_factor(alpha_per_hour: f64, elapsed: Duration) -> f64 {
+        (-alpha_per_hour * elapsed.as_secs_f64() / 3600.0).exp()
+    }
+
+    /// 近期窗口响应率（优先于终身统计）：
+    /// 返回 `Some(rate)` 当衰减后有效样本数 ≥ min_samples，否则 None（回落终身值）。
+    pub fn windowed_response_rate(&self, alpha: f64, min_samples: f64) -> Option<f64> {
+        if self.recent_query <= 0.0 {
+            return None;
+        }
+        let decay = self
+            .recent_updated
+            .map(|t| Self::decay_factor(alpha, t.elapsed()))
+            .unwrap_or(1.0);
+        let effective = self.recent_query * decay;
+        if effective < min_samples {
+            return None;
+        }
+        Some(self.recent_success * decay / effective)
     }
 
     /// 记录一次成功查询
@@ -382,5 +420,34 @@ mod tests {
         entry.record_failure();
         entry.record_failure();
         assert_eq!(entry.state, NodeState::Bad);
+    }
+
+    #[test]
+    fn test_decay_factor_math() {
+        // alpha=0 → 不衰减；alpha=0.3、1 小时 → exp(-0.3) ≈ 0.7408
+        assert!((KBucketEntry::decay_factor(0.0, Duration::from_secs(3600)) - 1.0).abs() < 1e-9);
+        let d = KBucketEntry::decay_factor(0.3, Duration::from_secs(3600));
+        assert!((d - (-0.3f64).exp()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_windowed_response_rate_decay_invariant() {
+        // 衰减因子同时作用于分子分母 → 比值不变；有效样本数受衰减限制
+        let mut e = make_entry(2, 1002);
+        assert_eq!(e.windowed_response_rate(0.3, 1.0), None, "无样本返回 None");
+
+        e.recent_query = 4.0;
+        e.recent_success = 3.0;
+        e.recent_updated = Some(Instant::now());
+        let r = e.windowed_response_rate(0.3, 1.0).unwrap();
+        assert!((r - 0.75).abs() < 1e-9);
+
+        // 距上次更新很久 → 有效样本衰减到阈值以下 → 回落 None
+        e.recent_updated = Some(crate::utils::cutoff_before(Duration::from_secs(48 * 3600)));
+        assert_eq!(
+            e.windowed_response_rate(0.3, 1.0),
+            None,
+            "有效样本 = 4×exp(-14.4) ≈ 0.003 < 1"
+        );
     }
 }

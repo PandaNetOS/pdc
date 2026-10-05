@@ -24,6 +24,38 @@ pub struct NodeScoreConfig {
     pub decay_end_hours: f64,
     /// 时间衰减最低系数（默认 0.2）
     pub decay_min_factor: f64,
+    /// 近期窗口衰减系数（每小时，默认 0.3）：近期响应率的指数衰减速率，
+    /// 终身累计统计会被历史稀释（2026-10 R4），近期窗口让连续失败立即反映到评分
+    #[serde(default = "default_recent_decay_alpha")]
+    pub recent_decay_alpha: f64,
+    /// 近期窗口最少有效样本数（衰减后，默认 1.0；不足时回落终身统计）
+    #[serde(default = "default_recent_min_samples")]
+    pub recent_min_samples: f64,
+    /// 未验证先验：已验证新鲜加成（默认 0.6，刚验证 ≈ 0.2+0.6=0.8 响应率先验）
+    #[serde(default = "default_fresh_prior_verified_boost")]
+    pub fresh_prior_verified_boost: f64,
+    /// 未验证先验：仅被提及加成（默认 0.1 → ≈0.3，弱于已验证）
+    #[serde(default = "default_fresh_prior_mention_boost")]
+    pub fresh_prior_mention_boost: f64,
+    /// 未验证先验半衰期（小时，默认 1.0）
+    #[serde(default = "default_fresh_prior_half_life_hours")]
+    pub fresh_prior_half_life_hours: f64,
+}
+
+fn default_recent_decay_alpha() -> f64 {
+    0.3
+}
+fn default_recent_min_samples() -> f64 {
+    1.0
+}
+fn default_fresh_prior_verified_boost() -> f64 {
+    0.6
+}
+fn default_fresh_prior_mention_boost() -> f64 {
+    0.1
+}
+fn default_fresh_prior_half_life_hours() -> f64 {
+    1.0
 }
 
 impl Default for NodeScoreConfig {
@@ -37,6 +69,11 @@ impl Default for NodeScoreConfig {
             decay_start_hours: 2.0,
             decay_end_hours: 24.0,
             decay_min_factor: 0.2,
+            recent_decay_alpha: default_recent_decay_alpha(),
+            recent_min_samples: default_recent_min_samples(),
+            fresh_prior_verified_boost: default_fresh_prior_verified_boost(),
+            fresh_prior_mention_boost: default_fresh_prior_mention_boost(),
+            fresh_prior_half_life_hours: default_fresh_prior_half_life_hours(),
         }
     }
 }

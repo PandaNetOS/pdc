@@ -87,12 +87,35 @@ pub fn calculate_node_score_with_config(entry: &KBucketEntry, config: &NodeScore
         return 0.0;
     }
 
-    // 响应率得分
-    let response_rate = if entry.query_count > 0 {
-        entry.success_count as f64 / entry.query_count as f64
-    } else {
-        0.2 // 无查询记录给保守中性分（DHT节点在线率约30%，保守取20%）
-    };
+    // 响应率得分：近期窗口优先（样本足够时），回落终身累计，再回落未验证先验
+    let response_rate =
+        match entry.windowed_response_rate(config.recent_decay_alpha, config.recent_min_samples) {
+            Some(r) => r,
+            None => {
+                if entry.query_count > 0 {
+                    entry.success_count as f64 / entry.query_count as f64
+                } else {
+                    // 未验证先验（2026-10 D3/R4）：刚被验证响应 ≈ 0.8、仅被提及 ≈ 0.3、
+                    // 陈旧未验证 = 0.2 中性——替代旧「新节点 45 分随后被压到池底」的倒挂
+                    let half_life = config.fresh_prior_half_life_hours.max(0.01);
+                    let verified_boost = entry
+                        .last_verified
+                        .map(|t| {
+                            config.fresh_prior_verified_boost
+                                * 0.5f64.powf(t.elapsed().as_secs_f64() / 3600.0 / half_life)
+                        })
+                        .unwrap_or(0.0);
+                    let mention_boost = entry
+                        .last_mentioned
+                        .map(|t| {
+                            config.fresh_prior_mention_boost
+                                * 0.5f64.powf(t.elapsed().as_secs_f64() / 3600.0 / half_life)
+                        })
+                        .unwrap_or(0.0);
+                    (0.2 + verified_boost + mention_boost).min(1.0)
+                }
+            }
+        };
     let response_rate_score = response_rate * config.response_rate_weight;
 
     // 延迟得分：越快越高，基准 5000ms 为 0，100ms 为满分
@@ -150,6 +173,7 @@ pub fn calculate_node_score_with_config(entry: &KBucketEntry, config: &NodeScore
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+    use std::time::Instant;
 
     #[test]
     fn test_perfect_node_score() {
@@ -169,5 +193,51 @@ mod tests {
         entry.state = crate::dht::kbucket::NodeState::Bad;
         let score = calculate_node_score(&entry);
         assert_eq!(score, 0.0);
+    }
+
+    /// 未验证先验阶梯（2026-10 D3）：刚验证 > 仅被提及 > 陈旧中性；
+    /// 「刚被证实活着」的节点不得再被压到池底（旧 45→26.6 倒挂）
+    #[test]
+    fn test_fresh_prior_ladder() {
+        let now = Instant::now();
+        let mut verified = KBucketEntry::new([1u8; 20], SocketAddr::from(([10, 0, 0, 1], 1000)));
+        verified.last_verified = Some(now);
+        let mut mentioned = KBucketEntry::new([2u8; 20], SocketAddr::from(([10, 0, 0, 2], 1000)));
+        mentioned.last_mentioned = Some(now);
+        let stale = KBucketEntry::new([3u8; 20], SocketAddr::from(([10, 0, 0, 3], 1000)));
+        let mut stale = stale;
+        stale.last_active = crate::utils::cutoff_before(std::time::Duration::from_secs(3600));
+
+        let sv = calculate_node_score(&verified);
+        let sm = calculate_node_score(&mentioned);
+        let ss = calculate_node_score(&stale);
+        assert!(sv > 70.0, "刚验证先验分应约 77，实测 {sv}");
+        assert!(sm > ss && sm < 55.0, "仅被提及应介于两者之间，实测 {sm}");
+        assert!(ss < 45.0, "陈旧未验证 = 中性先验，实测 {ss}");
+    }
+
+    /// 近期窗口优先于终身累计：终身 0% 成功但近期 100% → 高分；反之近期全败 → 快速跌分
+    #[test]
+    fn test_windowed_rate_overrides_lifetime() {
+        // 终身 100 查 0 成功（历史很差），本会话近期 5 查 5 成功
+        let mut recovered = KBucketEntry::new([4u8; 20], SocketAddr::from(([10, 0, 0, 4], 1000)));
+        recovered.query_count = 100;
+        recovered.success_count = 0;
+        recovered.recent_query = 5.0;
+        recovered.recent_success = 5.0;
+        recovered.recent_updated = Some(Instant::now());
+        recovered.total_latency_ms = 500;
+        let good = calculate_node_score(&recovered);
+        assert!(good > 60.0, "近期窗口应覆盖终身糟糕记录，实测 {good}");
+
+        // 终身 100 查 100 成功（历史很好），本会话近期 5 查 0 成功
+        let mut degraded = KBucketEntry::new([5u8; 20], SocketAddr::from(([10, 0, 0, 5], 1000)));
+        degraded.query_count = 100;
+        degraded.success_count = 100;
+        degraded.total_latency_ms = 500;
+        degraded.recent_query = 5.0;
+        degraded.recent_updated = Some(Instant::now());
+        let bad = calculate_node_score(&degraded);
+        assert!(bad < 45.0, "近期全败应压过终身好记录，实测 {bad}");
     }
 }
