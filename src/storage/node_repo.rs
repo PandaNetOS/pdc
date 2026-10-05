@@ -79,6 +79,8 @@ pub struct NodeRepoImpl {
     score_sum: AtomicU64,
     /// 近期窗口衰减系数（每小时）：与 NodeScoreConfig.recent_decay_alpha 同源，默认 0.3
     recent_decay_alpha: f64,
+    /// 判 Bad 的连续失败阈值（默认 3；可配置加快死节点淘汰，2026-10 D4）
+    bad_after_failures: AtomicU64,
 }
 
 impl NodeRepoImpl {
@@ -106,6 +108,7 @@ impl NodeRepoImpl {
             bad: AtomicU64::new(0),
             recent_decay_alpha: crate::intelligence::scorer_config::NodeScoreConfig::default()
                 .recent_decay_alpha,
+            bad_after_failures: AtomicU64::new(3),
             active: AtomicU64::new(0),
             score_sum: AtomicU64::new(0),
         }
@@ -128,6 +131,12 @@ impl NodeRepoImpl {
     /// 设置近期窗口衰减系数（builder 模式；与评分器配置同源时二者一致）
     pub fn with_recent_decay_alpha(mut self, alpha: f64) -> Self {
         self.recent_decay_alpha = alpha;
+        self
+    }
+
+    /// 设置判 Bad 的连续失败阈值（builder 模式，2026-10 D4）
+    pub fn with_bad_after_failures(self, n: u32) -> Self {
+        self.bad_after_failures.store(n as u64, Ordering::Relaxed);
         self
     }
 
@@ -155,6 +164,9 @@ impl NodeRepoImpl {
     /// 预加载热窗口：加载时仅将最近活跃（此窗口内）的节点标为热。
     /// 与 tier.hot_threshold_secs 默认值一致；陈旧节点不再整体进场热池（2026-10 R2）。
     const PRELOAD_HOT_WITHIN_SECS: u64 = 1800;
+
+    /// Bad 复活冷却期（秒）：判死后需间隔此时长才可因被再次提及而复活（2026-10 D4）
+    const BAD_REVIVE_COOLDOWN_SECS: u64 = 600;
 
     /// 分层缓存统计（与 TrackerRepo 接口一致：(hot, warm, cold_loaded)）。
     /// NodeRepo 全量驻内存，全部计入 hot。
@@ -389,6 +401,7 @@ impl NodeRepoImpl {
         let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut new_pairs: Vec<(NodeId, SocketAddr)> = Vec::new();
+        let mut revived: Vec<SocketAddr> = Vec::new();
         for (id, addr) in items {
             if let Some(existing) = nodes.get_mut(addr) {
                 // 鍚屽湴鍧€鑺傜偣 ID 鏇存柊锛氳嫢 ID 鍙樺寲锛屽悓姝ユ洿鏂扮綉娈电储寮曚腑鐨勬棫 ID
@@ -401,6 +414,26 @@ impl NodeRepoImpl {
                     }
                 }
                 existing.id = *id;
+                // Bad 冷却复活（2026-10 D4/R7）：Bad 被 refresh_state 冻结且此前无复活通道，
+                // 误判（暂时丢包/换线）成为永久损失。被再次提及且「最近一次提及或失败」
+                // 距今超过冷却期 → 降回 Questionable、失败数减半，评分恢复交给统一重算
+                if existing.state == NodeState::Bad {
+                    let last_anchor = match (existing.last_mentioned, existing.last_query_time) {
+                        (Some(m), Some(q)) => Some(m.max(q)),
+                        (Some(m), None) => Some(m),
+                        (None, Some(q)) => Some(q),
+                        (None, None) => None,
+                    };
+                    let cooled = last_anchor
+                        .map(|t| t.elapsed() >= Duration::from_secs(Self::BAD_REVIVE_COOLDOWN_SECS))
+                        .unwrap_or(true);
+                    if cooled {
+                        existing.state = NodeState::Questionable;
+                        existing.consecutive_failures /= 2;
+                        self.acc_transition_state(NodeState::Bad, NodeState::Questionable);
+                        revived.push(*addr);
+                    }
+                }
                 // mention（在别人响应里被提及，未经验证）只记 last_mentioned，
                 // 不再刷新 last_active/last_verified——否则死节点会被邻居高频提及
                 // 而永葆「新鲜」（2026-10 R5）；弱新鲜先验由评分器读 last_mentioned 给出
@@ -428,9 +461,13 @@ impl NodeRepoImpl {
         drop(subnet_index);
 
         // 鏂拌妭鐐圭粺涓€鏍囪 dirty锛堥渶瑕佸閲忔寔涔呭寲锛夛紝涓€娆″啓閿?
-        if !new_pairs.is_empty() {
+        if !new_pairs.is_empty() || !revived.is_empty() {
             let mut dirty = self.dirty.write();
             for (_, addr) in &new_pairs {
+                dirty.insert(*addr);
+            }
+            // 复活的节点也标 dirty（state/failures 变更需要持久化与重算）
+            for addr in &revived {
                 dirty.insert(*addr);
             }
         }
@@ -776,7 +813,8 @@ impl NodeRepoImpl {
                 entry.consecutive_failures = 0;
             } else {
                 entry.consecutive_failures += 1;
-                if entry.consecutive_failures >= 3 {
+                let threshold = self.bad_after_failures.load(Ordering::Relaxed) as u32;
+                if entry.consecutive_failures >= threshold.max(1) {
                     let old = entry.state;
                     entry.state = NodeState::Bad;
                     self.acc_transition_state(old, NodeState::Bad);
@@ -1412,6 +1450,51 @@ mod tests {
         assert!((e.recent_success - 2.0).abs() < 1e-9);
         let r = e.windowed_response_rate(0.0, 1.0).unwrap();
         assert!((r - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// 判 Bad 阈值可配置（2026-10 D4）：threshold=2 时两次失败即 Bad
+    #[tokio::test]
+    async fn test_bad_after_failures_configurable() {
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo = NodeRepoImpl::new(storage).with_bad_after_failures(2);
+        let a = addr(8, 3008);
+        repo.add_node_sync([8u8; 20], a);
+        repo.record_query_sync(a, false, 0);
+        assert_ne!(repo.get_node(&a).await.unwrap().state, NodeState::Bad);
+        repo.record_query_sync(a, false, 0);
+        assert_eq!(repo.get_node(&a).await.unwrap().state, NodeState::Bad);
+    }
+
+    /// Bad 冷却复活（2026-10 D4/R7）：冷却期后被再次提及 → Questionable、失败数减半；
+    /// 冷却期内重复提及不复活
+    #[tokio::test]
+    async fn test_bad_revival_via_mention() {
+        let repo = test_repo();
+        let a = addr(11, 3011);
+        repo.add_node_sync([11u8; 20], a);
+        repo.record_query_sync(a, false, 0);
+        repo.record_query_sync(a, false, 0);
+        repo.record_query_sync(a, false, 0);
+        assert_eq!(repo.get_node(&a).await.unwrap().state, NodeState::Bad);
+
+        // 刚被判死（last_mentioned=now，未过冷却期 600s）→ 提及不复活
+        repo.add_nodes_batch_internal(&[([11u8; 20], a)]);
+        assert_eq!(
+            repo.get_node(&a).await.unwrap().state,
+            NodeState::Bad,
+            "冷却期内提及不得复活"
+        );
+
+        // 把 last_mentioned/last_query_time 都推到冷却期之外 → 再次提及复活
+        repo.nodes.with_mut(&a, |e| {
+            let old = crate::utils::cutoff_before(Duration::from_secs(700));
+            e.last_mentioned = Some(old);
+            e.last_query_time = Some(old);
+        });
+        repo.add_nodes_batch_internal(&[([11u8; 20], a)]);
+        let e = repo.get_node(&a).await.unwrap();
+        assert_eq!(e.state, NodeState::Questionable, "冷却期后提及应复活");
+        assert_eq!(e.consecutive_failures, 1, "失败数应减半（3→1）");
     }
 
     fn addr(oct: u8, port: u16) -> SocketAddr {

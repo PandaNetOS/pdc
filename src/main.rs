@@ -554,7 +554,8 @@ async fn async_main(
             tier_cache_config.clone(),
             tier_enabled,
         )
-        .with_write_queue(write_queue.clone()),
+        .with_write_queue(write_queue.clone())
+        .with_bad_after_failures(config.crawler.bad_after_failures),
     );
     info!("[main] 数据层 Repo 已初始化（冷热分层已启用）");
 

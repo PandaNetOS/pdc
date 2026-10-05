@@ -1427,6 +1427,9 @@ pub struct CrawlerConfig {
     /// L0 已验证窗口（秒）：本会话响应成功且在此窗口内的节点为「已验证活」层。
     #[serde(default = "default_select_verified_recent_secs")]
     pub select_verified_recent_secs: u64,
+    /// 判 Bad 的连续失败阈值（2026-10 D4）：默认 3；降低可加快死节点淘汰
+    #[serde(default = "default_bad_after_failures")]
+    pub bad_after_failures: u32,
     /// 入站来源节点集合上限（超过时清空，防止无界增长）
     #[serde(default = "default_inbound_sources_max")]
     pub inbound_sources_max: usize,
@@ -1573,6 +1576,10 @@ fn default_select_verified_recent_secs() -> u64 {
     600
 }
 
+fn default_bad_after_failures() -> u32 {
+    3
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -1598,6 +1605,7 @@ impl Default for CrawlerConfig {
             select_mode: default_select_mode(),
             select_explore_ratio: default_select_explore_ratio(),
             select_verified_recent_secs: default_select_verified_recent_secs(),
+            bad_after_failures: default_bad_after_failures(),
             inbound_sources_max: default_inbound_sources_max(),
             active_pex_enabled: false,
         }
