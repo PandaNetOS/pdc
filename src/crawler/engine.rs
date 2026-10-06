@@ -626,6 +626,7 @@ impl CrawlerEngine {
             layered: self.config.select_mode != "legacy",
             explore_ratio: self.config.select_explore_ratio,
             verified_recent_secs: self.config.select_verified_recent_secs,
+            reprobe_min_interval_secs: self.config.reprobe_min_interval_secs,
             exclude: &exclude,
         };
         crate::intelligence::SelectSystem::select_diverse_nodes_tagged(

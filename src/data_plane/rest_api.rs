@@ -275,6 +275,15 @@ pub struct CrawlerStatsResponse {
     pub requests_sent: u64,
     pub errors: u64,
     pub uptime_seconds: u64,
+    /// 真实 RTT 的 EMA（毫秒）——区分「响应延迟」与「节点沉默」的关键诊断量（批次K #15）
+    #[serde(default)]
+    pub latency_ema_ms: u64,
+    /// tid 命中 pending 的响应数
+    #[serde(default)]
+    pub responses_matched_total: u64,
+    /// 迟到/伪造响应数（不进入响应率信号）
+    #[serde(default)]
+    pub late_responses_total: u64,
     #[serde(default)]
     pub top_nodes: Vec<NodeInfo>,
 }
@@ -728,6 +737,9 @@ async fn crawler_handler(State(state): State<AppState>) -> Response {
                 requests_sent: s.requests_sent,
                 errors: s.errors,
                 uptime_seconds: uptime,
+                latency_ema_ms: s.latency_ema_ms,
+                responses_matched_total: s.responses_matched_total,
+                late_responses_total: s.late_responses_total,
                 top_nodes,
             }
         }
@@ -742,6 +754,9 @@ async fn crawler_handler(State(state): State<AppState>) -> Response {
             requests_sent: 0,
             errors: 0,
             uptime_seconds: 0,
+            latency_ema_ms: 0,
+            responses_matched_total: 0,
+            late_responses_total: 0,
             top_nodes: vec![],
         },
     };

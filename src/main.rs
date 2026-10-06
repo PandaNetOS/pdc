@@ -3636,6 +3636,13 @@ async fn async_main(
     tokio::signal::ctrl_c().await.ok();
     info!("[main] 收到关闭信号，开始优雅关闭...");
 
+    // 批次J(#7)：向联邦对端广播 Goodbye（对端立即清承载态，避免陈旧会话冲突）
+    if let Some(fed) = federation_service.as_ref() {
+        if let Some(sessions) = fed.sessions.current() {
+            fed.dispatcher.broadcast_goodbye(sessions.clone()).await;
+        }
+    }
+
     // 通知统计快照后台任务退出
     stats_shutdown.notify_waiters();
 

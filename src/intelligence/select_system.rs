@@ -34,8 +34,20 @@ pub struct SelectionParams<'a> {
     pub explore_ratio: f64,
     /// L0 已验证窗口（秒）
     pub verified_recent_secs: u64,
+    /// 同节点复探最小间隔（秒）：距上次查询不足此间隔的节点跳过（批次K #12）
+    pub reprobe_min_interval_secs: u64,
     /// 在飞节点（pending 中）——本轮排除，避免重复消耗预算
     pub exclude: &'a HashSet<SocketAddr>,
+}
+
+/// 批次K(#12)：是否处于复探冷却——距上次查询不足间隔的节点本轮跳过
+fn in_reprobe_cooldown(n: &KBucketEntry, interval_secs: u64) -> bool {
+    if interval_secs == 0 {
+        return false;
+    }
+    n.last_query_time
+        .map(|t| t.elapsed() < Duration::from_secs(interval_secs))
+        .unwrap_or(false)
 }
 
 /// 统一节点选择系统
@@ -141,6 +153,7 @@ impl SelectSystem {
             .filter(|n| {
                 n.state != NodeState::Bad
                     && !params.exclude.contains(&n.addr)
+                    && !in_reprobe_cooldown(n, params.reprobe_min_interval_secs)
                     && n.last_verified
                         .map(|t| t.elapsed() <= verified_window)
                         .unwrap_or(false)
@@ -171,6 +184,7 @@ impl SelectSystem {
                 .filter(|n| {
                     n.state != NodeState::Bad
                         && !params.exclude.contains(&n.addr)
+                        && !in_reprobe_cooldown(n, params.reprobe_min_interval_secs)
                         && !chosen.contains(&n.addr)
                 })
                 .cloned()
@@ -208,6 +222,7 @@ impl SelectSystem {
                 .filter(|n| {
                     n.state != NodeState::Bad
                         && !params.exclude.contains(&n.addr)
+                        && !in_reprobe_cooldown(n, params.reprobe_min_interval_secs)
                         && !chosen.contains(&n.addr)
                 })
                 .collect();
@@ -472,6 +487,7 @@ mod tests {
             layered: true,
             explore_ratio: ratio,
             verified_recent_secs: 600,
+            reprobe_min_interval_secs: 0,
             exclude,
         }
     }
@@ -571,6 +587,32 @@ mod tests {
         );
     }
 
+    /// 复探冷却（批次K #12）：距上次查询不足间隔的节点跳过，超过则可复选
+    #[test]
+    fn test_reprobe_cooldown_filter() {
+        let mut hot: Vec<KBucketEntry> = (1..=2)
+            .map(|i| entry(i as u8, 6000 + i as u16, 10.0, true))
+            .collect();
+        // 节点1 刚被查询过（100s 前 < 300s 间隔）；节点2 从未查询
+        hot[0].last_query_time = Some(Instant::now() - Duration::from_secs(100));
+        let repo = MockRepo::new(hot.clone(), hot);
+        let exclude = HashSet::new();
+        let p = SelectionParams {
+            layered: true,
+            explore_ratio: 0.0,
+            verified_recent_secs: 600,
+            reprobe_min_interval_secs: 300,
+            exclude: &exclude,
+        };
+        let tagged = SelectSystem::select_diverse_nodes_tagged(&repo, 5, 30, &p);
+        let addrs: Vec<SocketAddr> = tagged.iter().map(|(e, _)| e.addr).collect();
+        let recently_probed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)), 6001);
+        assert!(
+            !addrs.contains(&recently_probed),
+            "复探冷却期内的节点不得入选"
+        );
+    }
+
     /// legacy 模式：旧行为（含 mark_accessed 自我强化语义），全部记探索层
     #[test]
     fn test_legacy_mode_keeps_old_behavior() {
@@ -583,6 +625,7 @@ mod tests {
             layered: false,
             explore_ratio: 0.2,
             verified_recent_secs: 600,
+            reprobe_min_interval_secs: 0,
             exclude: &exclude,
         };
         let tagged = SelectSystem::select_diverse_nodes_tagged(&repo, 5, 30, &p);

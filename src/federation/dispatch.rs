@@ -210,6 +210,26 @@ impl FederationDispatcher {
         self.peers.len()
     }
 
+    /// 批次J(#7)：优雅关闭时向所有在线对端广播 Goodbye——
+    /// 对端立即感知并清承载态，避免陈旧会话与新握手冲突（v9 遗留 #3）。
+    /// 各发送带独立短超时，失败不阻断关闭流程。
+    pub async fn broadcast_goodbye(&self, sessions: Arc<FederationSessions>) {
+        let runtimes = self.runtimes();
+        if runtimes.is_empty() {
+            return;
+        }
+        info!("[federation] 广播 Goodbye 至 {} 个对端", runtimes.len());
+        // [ALLOWED-HARDCODED: Goodbye 广播的 2s 独立发送超时，关闭路径容错上限，非业务可调参数]
+        for rt in &runtimes {
+            let pc = Arc::new(PeerConn::sdk(rt.node_id, sessions.clone()));
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                pc.send_message(MessageType::Goodbye, &()),
+            )
+            .await;
+        }
+    }
+
     /// 遍历所有承载态（供 gossip flush 调度）
     pub fn runtimes(&self) -> Vec<Arc<PeerRuntime>> {
         self.peers.iter().map(|e| Arc::clone(e.value())).collect()

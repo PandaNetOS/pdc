@@ -1425,8 +1425,14 @@ pub struct CrawlerConfig {
     #[serde(default = "default_select_explore_ratio")]
     pub select_explore_ratio: f64,
     /// L0 已验证窗口（秒）：本会话响应成功且在此窗口内的节点为「已验证活」层。
+    /// 批次K(#12)：600→120——实测对 2-10 分钟前节点的复探命中率仅 1-6%，
+    /// 收窄窗口把 exploit 预算留给「刚验证过」的节点。
     #[serde(default = "default_select_verified_recent_secs")]
     pub select_verified_recent_secs: u64,
+    /// 同节点复探最小间隔（秒，批次K #12）：距上次查询不足此间隔的节点不重复选中
+    /// （与在飞去重叠加，避免对同一节点的探测风暴触发对端限速）。
+    #[serde(default = "default_reprobe_min_interval_secs")]
+    pub reprobe_min_interval_secs: u64,
     /// 判 Bad 的连续失败阈值（2026-10 D4）：默认 3；降低可加快死节点淘汰
     #[serde(default = "default_bad_after_failures")]
     pub bad_after_failures: u32,
@@ -1583,7 +1589,11 @@ fn default_select_explore_ratio() -> f64 {
 }
 
 fn default_select_verified_recent_secs() -> u64 {
-    600
+    120
+}
+
+fn default_reprobe_min_interval_secs() -> u64 {
+    300
 }
 
 fn default_bad_after_failures() -> u32 {
@@ -1627,6 +1637,7 @@ impl Default for CrawlerConfig {
             select_mode: default_select_mode(),
             select_explore_ratio: default_select_explore_ratio(),
             select_verified_recent_secs: default_select_verified_recent_secs(),
+            reprobe_min_interval_secs: default_reprobe_min_interval_secs(),
             bad_after_failures: default_bad_after_failures(),
             send_mode: default_send_mode(),
             paced_tick_ms: default_paced_tick_ms(),
