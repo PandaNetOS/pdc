@@ -269,6 +269,10 @@ struct RangeSampleProgress {
 /// 同时 load 区间 / 回帧，高负载节点 IO 饱和引发帧风暴与 os error 10053；闸削平突发。
 const RANGE_MAX_CONCURRENT_HANDLERS: usize = 8;
 
+/// 批次I(#4)：range Push2 单帧字节上限（约 1.5MB）——超限分帧，
+/// 防止单帧数千条造成收发两侧大分配（v9 遗留 #4）
+const RANGE_PUSH_FRAME_MAX_BYTES: usize = 1_500_000;
+
 /// 节点同步负载
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeSyncPayload {
@@ -2833,30 +2837,53 @@ impl SyncManager {
             );
             return;
         }
-        let count = entries.len();
-        let msg = crate::federation::protocol::RangeReconcilePush2Message { repo, entries };
-        // H2：range 数据型消息发送用独立超时（range_send_timeout_secs）。
-        let send_res = tokio::time::timeout(
-            Duration::from_secs(self.config.range_send_timeout_secs.max(1)),
-            conn.send_message(
-                crate::federation::protocol::MessageType::RangeReconcilePush2,
-                &msg,
-            ),
-        )
-        .await;
-        match send_res {
-            Ok(Ok(())) => {
-                self.metrics.record_message_sent();
-                debug!(
-                    "[range] 推送本地多数据 to={} repo={}: {} 条",
-                    conn.node_id, repo, count
-                );
+        // 批次I(#4)：单帧字节上限 —— v9 遗留「send_range_push 无字节上限（单帧可含数千条）」；
+        // 超限分帧发送，避免巨型帧造成发送/接收两侧大分配（内存尖峰来源之一）。
+        let mut frames: Vec<Vec<_>> = vec![Vec::new()];
+        let mut frame_bytes = 0usize;
+        for entry in entries {
+            let entry_bytes = entry.key.len() + entry.payload.len() + 24;
+            if frame_bytes > 0 && frame_bytes + entry_bytes > RANGE_PUSH_FRAME_MAX_BYTES {
+                frames.push(Vec::new());
+                frame_bytes = 0;
             }
-            Ok(Err(e)) => warn!("[range] 推送本地多数据失败 to={}: {}", conn.node_id, e),
-            Err(_) => warn!(
-                "[range] 推送本地多数据超时 to={}（{}s）",
-                conn.node_id, self.config.range_send_timeout_secs
-            ),
+            frame_bytes += entry_bytes;
+            frames.last_mut().unwrap().push(entry);
+        }
+        let total_frames = frames.len();
+        for (frame_idx, frame_entries) in frames.into_iter().enumerate() {
+            let frame_count = frame_entries.len();
+            let msg = crate::federation::protocol::RangeReconcilePush2Message {
+                repo,
+                entries: frame_entries,
+            };
+            // H2：range 数据型消息发送用独立超时（range_send_timeout_secs）。
+            let send_res = tokio::time::timeout(
+                Duration::from_secs(self.config.range_send_timeout_secs.max(1)),
+                conn.send_message(
+                    crate::federation::protocol::MessageType::RangeReconcilePush2,
+                    &msg,
+                ),
+            )
+            .await;
+            match send_res {
+                Ok(Ok(())) => {
+                    self.metrics.record_message_sent();
+                    debug!(
+                        "[range] 推送本地多数据 to={} repo={}：帧 {}/{} 共 {} 条",
+                        conn.node_id,
+                        repo,
+                        frame_idx + 1,
+                        total_frames,
+                        frame_count
+                    );
+                }
+                Ok(Err(e)) => warn!("[range] 推送本地多数据失败 to={}: {}", conn.node_id, e),
+                Err(_) => warn!(
+                    "[range] 推送本地多数据超时 to={}（{}s）",
+                    conn.node_id, self.config.range_send_timeout_secs
+                ),
+            }
         }
     }
 

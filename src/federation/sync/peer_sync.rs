@@ -129,6 +129,22 @@ impl PeerSync {
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
+                // 批次I(#5)：入站 DELETE 落软删墓碑（key = "hex(ih):ip:port"）——
+                // 物理删除后重新采集会被当新建回推，删除在联邦内无法收敛
+                if let Ok(s) = std::str::from_utf8(&entry.key) {
+                    let parts: Vec<&str> = s.splitn(3, ':').collect();
+                    if parts.len() == 3 {
+                        if let Ok(port) = parts[2].parse::<u16>() {
+                            if let Err(e) = self
+                                .peer_repo
+                                .storage()
+                                .soft_delete_peer(parts[0], parts[1], port)
+                            {
+                                tracing::warn!("[peer_sync] 入站删除落墓碑失败: {}", e);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             let payload: PeerSyncPayload = match bincode::deserialize(&entry.payload) {
@@ -142,6 +158,22 @@ impl PeerSync {
                 .has_peer_assoc(&payload.infohash, &payload.addr)
             {
                 continue;
+            }
+
+            // 批次I(#5)：本地墓碑优先——已软删的 peer 不得被入站 upsert 复活
+            let hex: String = payload
+                .infohash
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            match self.peer_repo.storage().is_peer_tombstoned(
+                &hex,
+                &payload.addr.ip().to_string(),
+                payload.addr.port(),
+            ) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => tracing::debug!("[peer_sync] 墓碑查询失败: {}", e),
             }
 
             // 新关联：用默认状态构建 PeerInfo（source=Manual，时间取当前）

@@ -1255,6 +1255,65 @@ impl Storage {
         Ok(n)
     }
 
+    /// 批次I(#5)：peer 软删墓碑——入站 DELETE 落墓碑，防止
+    /// 「A 删 → B 物理删 → B 重新采集 → 当新建回推 → A 复活」的收敛闭环。
+    pub fn soft_delete_peer(
+        &self,
+        infohash_hex: &str,
+        ip: &str,
+        port: u16,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE peers SET deleted_at = ?1 \
+             WHERE lower(hex(infohash)) = ?2 AND ip = ?3 AND port = ?4 AND deleted_at IS NULL",
+            params![now, infohash_hex, ip, port as i64],
+        )?;
+        Ok(n)
+    }
+
+    /// 批次I(#5)：判断 peer 是否存在软删墓碑（入站 upsert 仲裁用）。
+    pub fn is_peer_tombstoned(
+        &self,
+        infohash_hex: &str,
+        ip: &str,
+        port: u16,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM peers \
+             WHERE lower(hex(infohash)) = ?1 AND ip = ?2 AND port = ?3 AND deleted_at IS NOT NULL",
+            params![infohash_hex, ip, port as i64],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 批次I(#5)：infohash 软删墓碑（语义同 peer）。
+    pub fn soft_delete_infohash(&self, infohash_hex: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE infohashes SET deleted_at = ?1 \
+             WHERE lower(hex(infohash)) = ?2 AND deleted_at IS NULL",
+            params![now, infohash_hex],
+        )?;
+        Ok(n)
+    }
+
+    /// 批次I(#5)：判断 infohash 是否存在软删墓碑。
+    pub fn is_infohash_tombstoned(&self, infohash_hex: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM infohashes \
+             WHERE lower(hex(infohash)) = ?1 AND deleted_at IS NOT NULL",
+            params![infohash_hex],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// P0-3：判断指定 tracker 是否存在软删墓碑（`deleted_at` 非 NULL）。
     ///
     /// 用于入站 upsert 的仲裁：本地已删除的 tracker 不得被对端回推的 upsert 复活，

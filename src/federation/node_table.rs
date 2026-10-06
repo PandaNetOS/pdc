@@ -196,11 +196,50 @@ impl NodeTable {
 
     /// 标记节点为已连接
     pub fn mark_connected(&self, node_id: &NodeId, rtt_ms: Option<u32>) {
-        if let Some(entry) = self.nodes.write().get_mut(node_id) {
+        let mut nodes = self.nodes.write();
+        let target_addrs: Vec<std::net::SocketAddr> = nodes
+            .get(node_id)
+            .map(|e| {
+                let mut v = Vec::new();
+                if let Some(a) = e.info.ipv4_addr {
+                    v.push(a);
+                }
+                if let Some(a) = e.info.ipv6_addr {
+                    v.push(a);
+                }
+                v
+            })
+            .unwrap_or_default();
+        if let Some(entry) = nodes.get_mut(node_id) {
             entry.status = NodeStatus::Connected;
             entry.connection_count += 1;
             entry.consecutive_failures = 0;
             entry.rtt_ms = rtt_ms;
+        }
+        // 批次I(#8)：同地址旧身份清退（v9 遗留 #3「同一地址多身份」）——
+        // 拨号占位/历史身份条目滞留 Disconnected，会让 /federation/nodes
+        // 在会话已建立后仍显示离线。只清退从未真正连接过的条目。
+        if !target_addrs.is_empty() {
+            let stale: Vec<NodeId> = nodes
+                .iter()
+                .filter(|(id, e)| {
+                    id != &node_id
+                        && e.connection_count == 0
+                        && (e
+                            .info
+                            .ipv4_addr
+                            .map(|a| target_addrs.contains(&a))
+                            .unwrap_or(false)
+                            || e.info
+                                .ipv6_addr
+                                .map(|a| target_addrs.contains(&a))
+                                .unwrap_or(false))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in stale {
+                nodes.remove(&id);
+            }
         }
     }
 

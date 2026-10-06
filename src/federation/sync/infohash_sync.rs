@@ -114,12 +114,34 @@ impl InfohashSync {
         let mut applied = 0;
         for entry in entries {
             if entry.operation == operation::DELETE {
+                // 批次I(#5)：入站 DELETE 落软删墓碑（key = infohash 原文）——
+                // 物理删除后重新采集会被当新建回推，删除在联邦内无法收敛
+                if entry.key.len() == 20 {
+                    let hex: String = entry.key.iter().map(|b| format!("{:02x}", b)).collect();
+                    if let Err(e) = self.infohash_repo.storage().soft_delete_infohash(&hex) {
+                        tracing::warn!("[infohash_sync] 入站删除落墓碑失败: {}", e);
+                    }
+                }
                 continue;
             }
             let payload: InfohashSyncPayload = match bincode::deserialize(&entry.payload) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+
+            // 批次I(#5)：本地墓碑优先——已软删的 infohash 不得被入站 upsert 复活
+            {
+                let hex: String = payload
+                    .infohash
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                match self.infohash_repo.storage().is_infohash_tombstoned(&hex) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => tracing::debug!("[infohash_sync] 墓碑查询失败: {}", e),
+                }
+            }
 
             items.push((payload.infohash, "federation".to_string(), now));
             applied += 1;
