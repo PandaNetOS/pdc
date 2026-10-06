@@ -298,10 +298,6 @@ pub struct CrawlerEngine {
     round_seq: Arc<AtomicU64>,
     /// 各规划轮次的真实应答/超时累计（报告后移除，>60s 兜底清理）
     round_feedback: Arc<Mutex<BTreeMap<u64, RoundFeedbackAcc>>>,
-    /// active_crawl 上一轮 (seq, sent)：反馈延迟一轮取账目，覆盖完整响应窗口
-    /// （根因修复 2026-10-05：UDP 响应到达远超 800ms，立即取账目 responded 恒≈0，
-    ///  自适应倍率被锁死下限；改为本轮发送、下轮取上轮账目）
-    active_prev_round: Arc<Mutex<Option<(u64, u64)>>>,
     /// 真实 RTT 的 EMA（毫秒），tid 命中时更新
     latency_ema_ms: Arc<Mutex<Option<f64>>>,
     /// paced 流式发送队列（19号 D3）：start() 时建立；round 模式保持 None
@@ -370,7 +366,6 @@ impl CrawlerEngine {
             pps_last: Arc::new(Mutex::new(None)),
             round_seq: Arc::new(AtomicU64::new(0)),
             round_feedback: Arc::new(Mutex::new(BTreeMap::new())),
-            active_prev_round: Arc::new(Mutex::new(None)),
             latency_ema_ms: Arc::new(Mutex::new(None)),
             send_tx: OnceLock::new(),
             send_rx: OnceLock::new(),
@@ -816,34 +811,38 @@ impl CrawlerEngine {
         }
     }
 
-    /// 增量报告轮次反馈：账目持续累计（响应延迟到达仍 +1），
-    /// 本轮只上报自上次报告以来的新增 responded/timed_out 与分层 responded，账目不移除，
-    /// 由 300s 兜底清理回收。根治（2026-10-05）：响应到达/处理延迟实测超过
-    /// 一轮（约 40s），此前"下轮 take"会让延迟到达的响应丢失（账目已移除）。
-    fn drain_round_feedback_delta(&self, seq: u64) -> (u64, u64, [u64; 3], [u64; 3]) {
+    /// 聚合上报所有未过期账目（≤300s）的增量（19号批次F 修复）：
+    /// 响应到达延迟实测可达 ~2 分钟（数倍于 40s 轮周期），此前 active_crawl 只
+    /// drain「上一轮」账目一次，>40s 才到达的认领虽已计入账目（限速器窗口可见 ~70%），
+    /// 却永远不会再被上报给控制器（仅 ~11%）→ 倍率被锁死下限。
+    /// 现改为每轮聚合全部账目「自上次上报以来」的增量（reported 水位终于生效）：
+    /// 响应无论多晚到达，都会在后续某轮的聚合中被计入恰好一次。
+    fn drain_all_round_feedback_delta(&self) -> (u64, u64, [u64; 3], [u64; 3]) {
         let mut map = self.round_feedback.lock().unwrap();
         // [ALLOWED-HARDCODED: 轮次反馈账目陈旧清理的固定窗口常量，非业务可调参数]
         map.retain(|_, acc| acc.started_at.elapsed() < Duration::from_secs(300));
-        match map.get_mut(&seq) {
-            Some(acc) => {
-                // 双水位增量：responded 与 timed_out 独立追踪，saturating 兜底任何记账竞态
-                let d_responded = acc.responded.saturating_sub(acc.reported_responded);
-                acc.reported_responded = acc.responded;
-                let d_timed_out = acc.timed_out.saturating_sub(acc.reported_timed_out);
-                acc.reported_timed_out = acc.timed_out;
-                let mut layer_responded = [0u64; 3];
-                for ((lr, cur), rep) in layer_responded
-                    .iter_mut()
-                    .zip(acc.layer_responded.iter())
-                    .zip(acc.layer_reported.iter_mut())
-                {
-                    *lr = cur.saturating_sub(*rep);
-                    *rep = *cur;
-                }
-                (d_responded, d_timed_out, acc.layer_sent, layer_responded)
+        let mut responded = 0u64;
+        let mut timed_out = 0u64;
+        let mut layer_sent = [0u64; 3];
+        let mut layer_resp = [0u64; 3];
+        for acc in map.values_mut() {
+            responded += acc.responded.saturating_sub(acc.reported_responded);
+            acc.reported_responded = acc.responded;
+            timed_out += acc.timed_out.saturating_sub(acc.reported_timed_out);
+            acc.reported_timed_out = acc.timed_out;
+            for ((lr, cur), rep) in layer_resp
+                .iter_mut()
+                .zip(acc.layer_responded.iter())
+                .zip(acc.layer_reported.iter_mut())
+            {
+                *lr += cur.saturating_sub(*rep);
+                *rep = *cur;
             }
-            None => (0, 0, [0; 3], [0; 3]),
+            for (ls, s) in layer_sent.iter_mut().zip(acc.layer_sent.iter()) {
+                *ls += *s;
+            }
         }
+        (responded, timed_out, layer_sent, layer_resp)
     }
 
     /// 真实 RTT 的 EMA（毫秒），无样本时返回 100.0
@@ -1681,7 +1680,7 @@ impl CrawlerEngine {
                 concurrent
             };
         }
-        let sent_total = if self.is_paced() {
+        let _sent_total = if self.is_paced() {
             self.enqueue_find_nodes(&tagged_nodes, round_seq)
         } else {
             self.send_find_node_concurrent(&tagged_nodes, concurrent, round_seq)
@@ -1691,40 +1690,37 @@ impl CrawlerEngine {
         // 6. 记录 pending_after
         let pending_after = self.pending_total();
 
-        // 7. 反馈上一轮的增量账目（本轮发送的账目留到下轮取，覆盖完整响应窗口）。
-        // 根因修复（2026-10-05）：UDP 响应到达/处理远超固定等待窗口，
-        // 此前立即取账目 responded 恒≈0 → 自适应控制器倍率锁死下限；
-        // 账目持续累计、每轮只上报新增（delta），响应延迟多久都计入。
+        // 7. 聚合上报所有未过期账目的增量（19号批次F）：
+        // 响应到达延迟可达 ~2 分钟（数倍于 40s 轮周期），此前「只 drain 上一轮账目一次」
+        // 使 >40s 才到达的认领永远不会进入控制器输入（限速器 70% vs 控制器 11% 的背离根因）。
+        // 现在每轮聚合全部账目的自上次上报以来增量：响应无论多晚到达都会恰好计入一次。
         if let Some(ac) = &self.adaptive_controller {
-            if let Some((prev_seq, prev_sent)) = self.active_prev_round.lock().unwrap().take() {
-                let avg_latency = self.current_latency_ema_ms();
-                let (responded, timed_out, prev_layer_sent, prev_layer_resp) =
-                    self.drain_round_feedback_delta(prev_seq);
-                debug!(
-                    "[crawler] active_crawl 轮次反馈: sent={} responded={} timed_out={}",
-                    prev_sent, responded, timed_out
-                );
-                info!(
-                    "[crawler] 分层响应率: L0已验证 {}/{} L1新鲜 {}/{} 探索 {}/{}（响应/上轮选中）",
-                    prev_layer_resp[0],
-                    prev_layer_sent[0],
-                    prev_layer_resp[1],
-                    prev_layer_sent[1],
-                    prev_layer_resp[2],
-                    prev_layer_sent[2]
-                );
-                ac.report_round_result(
-                    prev_sent,
-                    responded,
-                    avg_latency,
-                    pending_before,
-                    pending_after,
-                    0,
-                    1.0,
-                );
-            }
-            // 记录本轮（seq, sent），供下一轮报告
-            *self.active_prev_round.lock().unwrap() = Some((round_seq, sent_total));
+            let avg_latency = self.current_latency_ema_ms();
+            let (responded, timed_out, layer_sent, layer_resp) =
+                self.drain_all_round_feedback_delta();
+            let sent: u64 = layer_sent.iter().sum();
+            debug!(
+                "[crawler] active_crawl 轮次反馈: sent={} responded={} timed_out={}",
+                sent, responded, timed_out
+            );
+            info!(
+                "[crawler] 分层响应率: L0已验证 {}/{} L1新鲜 {}/{} 探索 {}/{}（300s窗口 响应增量/选中）",
+                layer_resp[0],
+                layer_sent[0],
+                layer_resp[1],
+                layer_sent[1],
+                layer_resp[2],
+                layer_sent[2]
+            );
+            ac.report_round_result(
+                sent,
+                responded,
+                avg_latency,
+                pending_before,
+                pending_after,
+                0,
+                1.0,
+            );
         }
 
         {
@@ -3069,7 +3065,6 @@ impl CrawlerEngine {
             pps_last: self.pps_last.clone(),
             round_seq: self.round_seq.clone(),
             round_feedback: self.round_feedback.clone(),
-            active_prev_round: self.active_prev_round.clone(),
             latency_ema_ms: self.latency_ema_ms.clone(),
             send_tx: self.send_tx.clone(),
             send_rx: self.send_rx.clone(),
@@ -3179,40 +3174,65 @@ mod tests {
         assert!(!engine.is_running());
     }
 
-    /// 分层反馈账目：layer_sent 记发送数、claim 按 pending.layer 计响应、
-    /// drain 只报增量且账目保留（延迟响应不丢）
+    /// 分层账目聚合上报（19号批次F 修复）：迟到响应跨轮计入恰好一次
     #[tokio::test]
     async fn test_round_feedback_layer_accounting() {
         let config = CrawlerConfig::default();
         let bus = EventBus::default();
         let engine = CrawlerEngine::new(config, bus);
 
-        let seq = engine.next_round_seq();
-        engine.open_round_feedback(seq, [5, 3, 2]);
-        // 无响应时 drain 报零增量，但 layer_sent 可读
-        let (r0, t0, sent, resp0) = engine.drain_round_feedback_delta(seq);
+        // 轮 N：打开账目 L0=5/L1=3/探索=2
+        let seq_n = engine.next_round_seq();
+        engine.open_round_feedback(seq_n, [5, 3, 2]);
+        // 轮 N+1 聚合（响应尚未到达）：零增量，账目保留
+        let (r0, t0, sent, resp0) = engine.drain_all_round_feedback_delta();
         assert_eq!((r0, t0), (0, 0));
-        assert_eq!(sent, [5, 3, 2]);
+        assert!(sent.iter().sum::<u64>() >= 5);
         assert_eq!(resp0, [0, 0, 0]);
 
-        // 模拟两个不同层的 pending 响应认领
+        // 轮 N+2 前夕：轮 N 的两个迟到响应到达（L0=1、探索=1）
         {
             let mut map = engine.round_feedback.lock().unwrap();
-            let acc = map.get_mut(&seq).unwrap();
-            acc.responded += 1;
-            acc.layer_responded[0] += 1; // L0 响应 1
+            let acc = map.get_mut(&seq_n).unwrap();
+            acc.responded += 2;
+            acc.layer_responded[0] += 1;
+            acc.layer_responded[2] += 1;
         }
-        {
-            let mut map = engine.round_feedback.lock().unwrap();
-            let acc = map.get_mut(&seq).unwrap();
-            acc.responded += 1;
-            acc.layer_responded[2] += 1; // 探索层响应 1
-        }
-        let (r1, _t1, _s, resp1) = engine.drain_round_feedback_delta(seq);
-        assert_eq!(r1, 2, "增量报告：新增响应 2");
-        assert_eq!(resp1, [1, 0, 1], "分层增量 L0=1 探索=1");
-        // 账目不移除：再次 drain 增量为 0（G2 语义）
-        let (r2, _, _, resp2) = engine.drain_round_feedback_delta(seq);
+        // 聚合必须包含迟到的 2 个响应（旧实现 drain 一次后即丢失）
+        let (r1, _t1, _s, resp1) = engine.drain_all_round_feedback_delta();
+        assert_eq!(r1, 2, "迟到响应必须被聚合上报");
+        assert_eq!(resp1, [1, 0, 1]);
+        // 再次聚合：零增量（水位推进，恰好计入一次）
+        let (r2, _, _s, resp2) = engine.drain_all_round_feedback_delta();
         assert_eq!((r2, resp2), (0, [0, 0, 0]));
+    }
+
+    /// 多账目并存（连续两轮 open）：聚合覆盖全部账目且互不重复
+    #[tokio::test]
+    async fn test_round_feedback_multi_account_aggregate() {
+        let config = CrawlerConfig::default();
+        let bus = EventBus::default();
+        let engine = CrawlerEngine::new(config, bus);
+
+        let seq_a = engine.next_round_seq();
+        engine.open_round_feedback(seq_a, [10, 0, 0]);
+        let seq_b = engine.next_round_seq();
+        engine.open_round_feedback(seq_b, [0, 8, 0]);
+
+        {
+            let mut map = engine.round_feedback.lock().unwrap();
+            map.get_mut(&seq_a).unwrap().responded += 3;
+            map.get_mut(&seq_a).unwrap().layer_responded[0] += 3;
+            map.get_mut(&seq_b).unwrap().responded += 4;
+            map.get_mut(&seq_b).unwrap().layer_responded[1] += 4;
+        }
+        let (r, _t, s, resp) = engine.drain_all_round_feedback_delta();
+        assert_eq!(r, 7, "两账目增量求和");
+        assert_eq!(resp, [3, 4, 0]);
+        assert_eq!(
+            (s[0], s[1], s[2]),
+            (10, 8, 0),
+            "layer_sent 为窗口内全部账目之和"
+        );
     }
 }
