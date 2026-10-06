@@ -1430,6 +1430,16 @@ pub struct CrawlerConfig {
     /// 判 Bad 的连续失败阈值（2026-10 D4）：默认 3；降低可加快死节点淘汰
     #[serde(default = "default_bad_after_failures")]
     pub bad_after_failures: u32,
+    /// 发送模式（19号 D3）：`paced`=流式平滑发送（默认，每 tick 按预算出队）/
+    /// `round`=轮次突发旧行为逃生通道。启动时生效。
+    #[serde(default = "default_send_mode")]
+    pub send_mode: String,
+    /// paced 消费 tick 间隔（毫秒，19号 D3）
+    #[serde(default = "default_paced_tick_ms")]
+    pub paced_tick_ms: u64,
+    /// paced 每 socket 每 tick 发送配额：全局天花板 ≈ 配额 × socket 数 × 倍率 / tick
+    #[serde(default = "default_paced_max_per_socket_per_tick")]
+    pub paced_max_per_socket_per_tick: u32,
     /// 入站来源节点集合上限（超过时清空，防止无界增长）
     #[serde(default = "default_inbound_sources_max")]
     pub inbound_sources_max: usize,
@@ -1580,6 +1590,18 @@ fn default_bad_after_failures() -> u32 {
     3
 }
 
+fn default_send_mode() -> String {
+    "paced".to_string()
+}
+
+fn default_paced_tick_ms() -> u64 {
+    250
+}
+
+fn default_paced_max_per_socket_per_tick() -> u32 {
+    8
+}
+
 impl Default for CrawlerConfig {
     fn default() -> Self {
         Self {
@@ -1606,6 +1628,9 @@ impl Default for CrawlerConfig {
             select_explore_ratio: default_select_explore_ratio(),
             select_verified_recent_secs: default_select_verified_recent_secs(),
             bad_after_failures: default_bad_after_failures(),
+            send_mode: default_send_mode(),
+            paced_tick_ms: default_paced_tick_ms(),
+            paced_max_per_socket_per_tick: default_paced_max_per_socket_per_tick(),
             inbound_sources_max: default_inbound_sources_max(),
             active_pex_enabled: false,
         }

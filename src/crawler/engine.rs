@@ -9,14 +9,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rand::Rng;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::CrawlerConfig;
@@ -124,6 +124,12 @@ pub struct CrawlerState {
     pub global_response_rate: f64,
     /// pending 表各分片长度
     pub pending_shard_lens: Vec<usize>,
+    /// paced 发送队列当前长度（round 模式恒 0；19号 D3）
+    pub send_queue_len: u64,
+    /// paced 队列满/限速收敛丢弃累计（19号 D3）
+    pub enqueue_dropped_total: u64,
+    /// 流式平滑发送模式是否启用（19号 D3）
+    pub paced_mode: bool,
     /// UDP 丢包估算（发送-响应-超时，最近60s）
     pub udp_packet_loss_estimate: f64,
     /// 节点选择耗时（最近10次均值，微秒）
@@ -183,6 +189,34 @@ impl Default for RoundFeedbackAcc {
     }
 }
 
+/// 流式发送队列条目（19号 D3）：生产者只入队，paced 消费者按预算平滑发送
+#[derive(Debug)]
+enum SendWorkItem {
+    FindNode {
+        addr: SocketAddr,
+        target: [u8; 20],
+        layer: u8,
+        round_seq: u64,
+    },
+    GetPeers {
+        addr: SocketAddr,
+        infohash: [u8; 20],
+        layer: u8,
+        round_seq: u64,
+    },
+    Sample {
+        addr: SocketAddr,
+        layer: u8,
+        round_seq: u64,
+    },
+    Scrape {
+        addr: SocketAddr,
+        infohash: [u8; 20],
+        layer: u8,
+        round_seq: u64,
+    },
+}
+
 /// pending 请求分片：16 个 RwLock<HashMap>，按 tid 字节路由
 type PendingShards = Vec<RwLock<HashMap<Vec<u8>, PendingRequest>>>;
 
@@ -202,6 +236,9 @@ struct QuerySyncResult {
 fn pending_shard(tid: &[u8]) -> usize {
     (tid[3] as usize) % 16
 }
+
+/// paced 发送队列容量（19号 D3）：兜底轮次突发的缓冲深度
+const PACED_QUEUE_CAPACITY: usize = 8192;
 
 /// 爬虫引擎
 ///
@@ -267,6 +304,16 @@ pub struct CrawlerEngine {
     active_prev_round: Arc<Mutex<Option<(u64, u64)>>>,
     /// 真实 RTT 的 EMA（毫秒），tid 命中时更新
     latency_ema_ms: Arc<Mutex<Option<f64>>>,
+    /// paced 流式发送队列（19号 D3）：start() 时建立；round 模式保持 None
+    send_tx: OnceLock<mpsc::Sender<SendWorkItem>>,
+    /// paced 消费端（Arc 共享给 clone_for_async）
+    send_rx: OnceLock<Arc<tokio::sync::Mutex<mpsc::Receiver<SendWorkItem>>>>,
+    /// 队列当前长度（入队 +1 / 出队 -1）
+    send_queue_len: Arc<AtomicU64>,
+    /// 队列满/限速收敛时被丢弃的条目累计
+    enqueue_dropped_total: Arc<AtomicU64>,
+    /// paced 模式标记（启动时确定，1=启用）
+    paced_mode: Arc<AtomicU64>,
 }
 
 impl CrawlerEngine {
@@ -325,6 +372,11 @@ impl CrawlerEngine {
             round_feedback: Arc::new(Mutex::new(BTreeMap::new())),
             active_prev_round: Arc::new(Mutex::new(None)),
             latency_ema_ms: Arc::new(Mutex::new(None)),
+            send_tx: OnceLock::new(),
+            send_rx: OnceLock::new(),
+            send_queue_len: Arc::new(AtomicU64::new(0)),
+            enqueue_dropped_total: Arc::new(AtomicU64::new(0)),
+            paced_mode: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -478,6 +530,10 @@ impl CrawlerEngine {
             Some(rl) => (1.0 - rl.global_response_rate()).clamp(0.0, 1.0),
             None => 0.0,
         };
+        // paced 发送队列观测（19号 D3）
+        state.send_queue_len = self.send_queue_len.load(Ordering::Relaxed);
+        state.enqueue_dropped_total = self.enqueue_dropped_total.load(Ordering::Relaxed);
+        state.paced_mode = self.is_paced();
         // 自适应控制器指标
         if let Some(ac) = &self.adaptive_controller {
             state.adaptive_multiplier = ac.current_multiplier();
@@ -811,6 +867,262 @@ impl CrawlerEngine {
             .as_ref()
             .map(|g| g.load(Ordering::Relaxed))
             .unwrap_or(false)
+    }
+
+    /// 是否处于 paced 流式发送模式（19号 D3）
+    fn is_paced(&self) -> bool {
+        self.paced_mode.load(Ordering::Relaxed) == 1
+    }
+
+    /// 建立 paced 发送通道（幂等；供 start() 与测试使用）
+    fn init_paced_channel(&self, capacity: usize) {
+        if self.send_tx.get().is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel(capacity);
+        let _ = self.send_tx.set(tx);
+        let _ = self.send_rx.set(Arc::new(tokio::sync::Mutex::new(rx)));
+    }
+
+    /// paced 预算数学（19号 D3）：每 socket 每 tick 配额 × 活跃 socket 数 × 自适应倍率，min 1
+    fn paced_budget(max_per_socket: u32, sockets: usize, multiplier: f64) -> usize {
+        ((max_per_socket as f64 * sockets.max(1) as f64 * multiplier.clamp(0.2, 4.0)).round()
+            as usize)
+            .max(1)
+    }
+
+    /// 入队一条流式发送；队列满即丢弃并计数（容量兜底轮次突发）
+    fn enqueue_send(&self, item: SendWorkItem) -> bool {
+        let tx = match self.send_tx.get() {
+            Some(tx) => tx,
+            None => return false,
+        };
+        match tx.try_send(item) {
+            Ok(()) => {
+                self.send_queue_len.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => {
+                self.enqueue_dropped_total.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// 批量入队 find_node（active_crawl 用），返回成功入队数
+    fn enqueue_find_nodes(&self, nodes: &[(KBucketEntry, u8)], round_seq: u64) -> u64 {
+        let mut n = 0u64;
+        for (entry, layer) in nodes {
+            if self.enqueue_send(SendWorkItem::FindNode {
+                addr: entry.addr,
+                target: self.random_target(),
+                layer: *layer,
+                round_seq,
+            }) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// paced 消费循环（19号 D3）：每 tick 按预算出队发送；
+    /// 全 socket 限速时整 tick 让路（条目保留，等限速解除）。
+    /// pause_gate 置位时跳过出队（堆积由队列容量兜底）。
+    async fn paced_send_loop(&self) {
+        let tick = Duration::from_millis(self.config.paced_tick_ms.max(50));
+        // [ALLOWED-INTERVAL] paced 消费 tick：engine 自有常驻任务，不经 TaskScheduler
+        // （调度器 300s 硬超时会周期性杀死常驻任务；与 crawl_loop/recv_loop 先例一致，19号 D3）
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if self.is_paused() {
+                continue;
+            }
+            let rx = match self.send_rx.get() {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            // 全 socket 限速 → 本 tick 不消费
+            if let Some(rl) = &self.rate_limiter {
+                let n = self.sockets.len();
+                if n > 0 && (0..n).all(|i| rl.should_skip(i)) {
+                    continue;
+                }
+            }
+            let multiplier = self
+                .adaptive_controller
+                .as_ref()
+                .map(|c| c.next_rate_multiplier())
+                .unwrap_or(1.0);
+            let budget = Self::paced_budget(
+                self.config.paced_max_per_socket_per_tick,
+                self.sockets.len(),
+                multiplier,
+            );
+            for _ in 0..budget {
+                let item = {
+                    let mut guard = rx.lock().await;
+                    guard.try_recv().ok()
+                };
+                let item = match item {
+                    Some(i) => i,
+                    None => break,
+                };
+                self.send_queue_len.fetch_sub(1, Ordering::Relaxed);
+                let (socket_idx, socket) = self.next_send_socket();
+                if let Some(rl) = &self.rate_limiter {
+                    if rl.should_skip(socket_idx) {
+                        // next_send_socket 已尽量避免选中限速 socket；
+                        // 全限速竞态下收敛本 tick，该条计入丢弃
+                        self.enqueue_dropped_total.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                self.dispatch_send_item(&item, socket_idx, &socket).await;
+            }
+        }
+    }
+
+    /// 按条目类型构造 tid/pending/发送（paced 消费者分发）
+    async fn dispatch_send_item(&self, item: &SendWorkItem, socket_idx: usize, socket: &UdpSocket) {
+        match item {
+            SendWorkItem::FindNode {
+                addr,
+                target,
+                layer,
+                round_seq,
+            } => {
+                let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
+                let msg = DhtMessage::build_find_node(&tid, &self.node_id, target);
+                {
+                    let shard = pending_shard(&tid);
+                    let mut pending = self.pending[shard].write();
+                    pending.insert(
+                        tid.to_vec(),
+                        PendingRequest {
+                            _method: QueryMethod::FindNode,
+                            target: *target,
+                            addr: *addr,
+                            sent_at: Instant::now(),
+                            round_seq: *round_seq,
+                            layer: *layer,
+                        },
+                    );
+                }
+                if socket.send_to(&msg, *addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                    let mut s = self.state.write();
+                    s.requests_sent += 1;
+                    s.nodes_crawled += 1;
+                    if let Some(rl) = &self.rate_limiter {
+                        rl.record_request(socket_idx);
+                    }
+                }
+            }
+            SendWorkItem::GetPeers {
+                addr,
+                infohash,
+                layer,
+                round_seq,
+            } => {
+                let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
+                let vid = self.random_virtual_node_id();
+                let msg = DhtMessage::build_get_peers(&tid, &vid, infohash);
+                {
+                    let shard = pending_shard(&tid);
+                    let mut pending = self.pending[shard].write();
+                    pending.insert(
+                        tid.to_vec(),
+                        PendingRequest {
+                            _method: QueryMethod::GetPeers,
+                            target: *infohash,
+                            addr: *addr,
+                            sent_at: Instant::now(),
+                            round_seq: *round_seq,
+                            layer: *layer,
+                        },
+                    );
+                }
+                if socket.send_to(&msg, *addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                    let mut s = self.state.write();
+                    s.requests_sent += 1;
+                    if let Some(rl) = &self.rate_limiter {
+                        rl.record_request(socket_idx);
+                    }
+                }
+            }
+            SendWorkItem::Sample {
+                addr,
+                layer,
+                round_seq,
+            } => {
+                let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
+                let vid = self.random_virtual_node_id();
+                let msg = DhtMessage::build_sample_infohashes(&tid, &vid);
+                {
+                    let shard = pending_shard(&tid);
+                    let mut pending = self.pending[shard].write();
+                    pending.insert(
+                        tid.to_vec(),
+                        PendingRequest {
+                            _method: QueryMethod::SampleInfohashes,
+                            target: [0u8; 20],
+                            addr: *addr,
+                            sent_at: Instant::now(),
+                            round_seq: *round_seq,
+                            layer: *layer,
+                        },
+                    );
+                }
+                if socket.send_to(&msg, *addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                    let mut s = self.state.write();
+                    s.requests_sent += 1;
+                    if let Some(rl) = &self.rate_limiter {
+                        rl.record_request(socket_idx);
+                    }
+                }
+            }
+            SendWorkItem::Scrape {
+                addr,
+                infohash,
+                layer,
+                round_seq,
+            } => {
+                let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
+                let vid = self.random_virtual_node_id();
+                let msg = DhtMessage::build_scrape(&tid, &vid, infohash);
+                {
+                    let shard = pending_shard(&tid);
+                    let mut pending = self.pending[shard].write();
+                    pending.insert(
+                        tid.to_vec(),
+                        PendingRequest {
+                            _method: QueryMethod::Scrape,
+                            target: *infohash,
+                            addr: *addr,
+                            sent_at: Instant::now(),
+                            round_seq: *round_seq,
+                            layer: *layer,
+                        },
+                    );
+                }
+                if socket.send_to(&msg, *addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                    let mut s = self.state.write();
+                    s.requests_sent += 1;
+                    if let Some(rl) = &self.rate_limiter {
+                        rl.record_request(socket_idx);
+                    }
+                }
+            }
+        }
     }
 
     /// 响应 tid 认领：仅当 tid 命中 pending 表时计入响应率与轮次反馈，
@@ -1359,15 +1671,22 @@ impl CrawlerEngine {
         self.open_round_feedback(round_seq, layer_sent);
         let pending_before = self.pending_total();
 
-        // 5. 多 socket 并发发送
+        // 5. 发送：paced 模式入队流式平滑发送（消费者按预算出队）；round 模式轮次突发直发
         let concurrent = self.resolve_concurrent_sockets(tagged_nodes.len());
         {
             let mut state = self.state.write();
-            state.concurrent_sockets_in_use = concurrent;
+            state.concurrent_sockets_in_use = if self.is_paced() {
+                self.sockets.len()
+            } else {
+                concurrent
+            };
         }
-        let sent_total = self
-            .send_find_node_concurrent(&tagged_nodes, concurrent, round_seq)
-            .await;
+        let sent_total = if self.is_paced() {
+            self.enqueue_find_nodes(&tagged_nodes, round_seq)
+        } else {
+            self.send_find_node_concurrent(&tagged_nodes, concurrent, round_seq)
+                .await
+        };
 
         // 6. 记录 pending_after
         let pending_after = self.pending_total();
@@ -1489,15 +1808,33 @@ impl CrawlerEngine {
         let round_seq = self.next_round_seq();
         self.open_round_feedback(round_seq, [0, 0, 0]);
 
-        // 4. 多 socket 并发发送（每节点发5个 infohash 查询）
+        // 4. 发送（每节点发5个 infohash 查询）：paced 入队 / round 直发
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
         {
             let mut state = self.state.write();
-            state.concurrent_sockets_in_use = concurrent;
+            state.concurrent_sockets_in_use = if self.is_paced() {
+                self.sockets.len()
+            } else {
+                concurrent
+            };
         }
-        let _ = self
-            .send_get_peers_concurrent(&nodes, concurrent, &infohashes, round_seq)
-            .await;
+        if self.is_paced() {
+            for node in &nodes {
+                for _ in 0..5 {
+                    let ih = infohashes[rand::random::<usize>() % infohashes.len()];
+                    self.enqueue_send(SendWorkItem::GetPeers {
+                        addr: node.addr,
+                        infohash: ih,
+                        layer: 0,
+                        round_seq,
+                    });
+                }
+            }
+        } else {
+            let _ = self
+                .send_get_peers_concurrent(&nodes, concurrent, &infohashes, round_seq)
+                .await;
+        }
 
         // 5. get_peers 不参与自适应决策（发送量小、反馈无代表性），仅清理本轮账目防泄漏
         let _ = self.take_round_feedback(round_seq);
@@ -1559,15 +1896,29 @@ impl CrawlerEngine {
         let round_seq = self.next_round_seq();
         self.open_round_feedback(round_seq, [0, 0, 0]);
 
-        // 4. 多 socket 并发发送
+        // 4. 发送：paced 入队 / round 直发
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
         {
             let mut state = self.state.write();
-            state.concurrent_sockets_in_use = concurrent;
+            state.concurrent_sockets_in_use = if self.is_paced() {
+                self.sockets.len()
+            } else {
+                concurrent
+            };
         }
-        let _ = self
-            .send_sample_infohashes_concurrent(&nodes, concurrent, round_seq)
-            .await;
+        if self.is_paced() {
+            for node in &nodes {
+                self.enqueue_send(SendWorkItem::Sample {
+                    addr: node.addr,
+                    layer: 0,
+                    round_seq,
+                });
+            }
+        } else {
+            let _ = self
+                .send_sample_infohashes_concurrent(&nodes, concurrent, round_seq)
+                .await;
+        }
 
         // 5. sample_infohashes 不参与自适应决策（发送量小、反馈无代表性），仅清理本轮账目防泄漏
         let _ = self.take_round_feedback(round_seq);
@@ -1616,6 +1967,20 @@ impl CrawlerEngine {
         };
 
         if nodes.is_empty() {
+            return;
+        }
+
+        if self.is_paced() {
+            // paced：入队流式平滑发送（scrape 量小，语义等价直发，统一走消费者限速）
+            for node in &nodes {
+                let ih = infohashes[rand::random::<usize>() % infohashes.len()];
+                self.enqueue_send(SendWorkItem::Scrape {
+                    addr: node.addr,
+                    infohash: ih,
+                    layer: 0,
+                    round_seq: 0,
+                });
+            }
             return;
         }
 
@@ -2625,6 +2990,26 @@ impl Crawler for CrawlerEngine {
             engine.crawl_loop().await;
         });
 
+        // 流式平滑发送（19号 D3）：engine 自有常驻任务，不经 TaskScheduler
+        // （调度器对每次执行有 300s 硬超时，会周期性杀死常驻任务；
+        //   与 crawl_loop/recv_loop 的既有先例同级）
+        if self.config.send_mode == "paced" {
+            self.init_paced_channel(PACED_QUEUE_CAPACITY);
+            self.paced_mode.store(1, Ordering::Relaxed);
+            let engine = self.clone_for_async();
+            tokio::spawn(async move {
+                engine.paced_send_loop().await;
+            });
+            info!(
+                "[crawler] paced 流式发送已启用：tick={}ms 配额={}/socket/tick 容量={}",
+                self.config.paced_tick_ms,
+                self.config.paced_max_per_socket_per_tick,
+                PACED_QUEUE_CAPACITY
+            );
+        } else {
+            info!("[crawler] 发送模式 = round（轮次突发，旧行为逃生通道）");
+        }
+
         info!("[crawler] 爬虫引擎已启动（主动模式）");
         Ok(())
     }
@@ -2686,6 +3071,11 @@ impl CrawlerEngine {
             round_feedback: self.round_feedback.clone(),
             active_prev_round: self.active_prev_round.clone(),
             latency_ema_ms: self.latency_ema_ms.clone(),
+            send_tx: self.send_tx.clone(),
+            send_rx: self.send_rx.clone(),
+            send_queue_len: self.send_queue_len.clone(),
+            enqueue_dropped_total: self.enqueue_dropped_total.clone(),
+            paced_mode: self.paced_mode.clone(),
         }
     }
 }
@@ -2725,6 +3115,46 @@ mod tests {
         assert!(!state.running);
         assert_eq!(state.nodes_crawled, 0);
         assert_eq!(state.infohashes_collected, 0);
+    }
+
+    /// paced 预算数学（19号 D3）：配额 x socket 数 x 倍率，min 1
+    #[test]
+    fn test_paced_budget_math() {
+        assert_eq!(CrawlerEngine::paced_budget(8, 8, 1.0), 64);
+        assert_eq!(CrawlerEngine::paced_budget(8, 8, 0.2), 13);
+        assert_eq!(CrawlerEngine::paced_budget(8, 4, 2.0), 64);
+        assert_eq!(
+            CrawlerEngine::paced_budget(8, 0, 1.0),
+            8,
+            "sockets=0 按 1 参与（实际发送由 socket 缺失保护）"
+        );
+        assert_eq!(
+            CrawlerEngine::paced_budget(1, 1, 0.05),
+            1,
+            "极小倍率兜底 min 1"
+        );
+    }
+
+    /// paced 入队（19号 D3）：通道容量上限 + 溢出丢弃计数 + 队列长度守恒
+    #[tokio::test]
+    async fn test_paced_enqueue_overflow() {
+        let engine = CrawlerEngine::new(CrawlerConfig::default(), EventBus::default());
+        assert!(!engine.is_paced(), "start() 前不处于 paced 模式");
+        engine.init_paced_channel(2);
+        let addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mk = || SendWorkItem::Sample {
+            addr,
+            layer: 0,
+            round_seq: 1,
+        };
+        assert!(engine.enqueue_send(mk()));
+        assert!(engine.enqueue_send(mk()));
+        assert!(!engine.enqueue_send(mk()), "队列满应返回 false");
+        assert_eq!(engine.enqueue_dropped_total.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.send_queue_len.load(Ordering::Relaxed), 2);
+        // round 模式（未 init 通道）enqueue 直接拒绝
+        let engine2 = CrawlerEngine::new(CrawlerConfig::default(), EventBus::default());
+        assert!(!engine2.enqueue_send(mk()));
     }
 
     #[test]
