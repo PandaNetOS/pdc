@@ -310,6 +310,16 @@ pub struct FederationConfig {
     /// 而裁定输入（行数）不会立刻变化，无冷却必然重裁 BOOTSTRAP（死循环通道）。
     #[serde(default = "default_bootstrap_cooldown_secs")]
     pub bootstrap_cooldown_secs: u64,
+    /// 批次G(F1)：bootstrap 熔断阈值 —— 窗口内连续竣工次数达该值即熔断该 (peer,repo)
+    /// 的全量重拉（实测 60s/轮 × 292 块全量循环把双端内存拉爆的根因路径）。
+    #[serde(default = "default_bootstrap_breaker_threshold")]
+    pub bootstrap_breaker_threshold: u32,
+    /// 批次G(F1)：熔断计数窗口（秒）。
+    #[serde(default = "default_bootstrap_breaker_window_secs")]
+    pub bootstrap_breaker_window_secs: u64,
+    /// 批次G(F1)：熔断持续时长（秒），冷却期内协商裁定对该 (peer,repo) 强制 DELTA。
+    #[serde(default = "default_bootstrap_breaker_cooldown_secs")]
+    pub bootstrap_breaker_cooldown_secs: u64,
     /// v9：同一 (peer,repo) 叶区间修复的最小间隔（秒），避免同一批差异每轮重复推拉。
     #[serde(default = "default_range_repair_min_interval_secs")]
     pub range_repair_min_interval_secs: u64,
@@ -682,6 +692,21 @@ fn default_range_ranges_per_tick() -> u32 {
 fn default_bootstrap_cooldown_secs() -> u64 {
     600
 }
+
+/// 批次G(F1)：熔断阈值（窗口内竣工次数）。
+fn default_bootstrap_breaker_threshold() -> u32 {
+    3
+}
+
+/// 批次G(F1)：熔断计数窗口（秒）。
+fn default_bootstrap_breaker_window_secs() -> u64 {
+    900
+}
+
+/// 批次G(F1)：熔断持续（秒）。
+fn default_bootstrap_breaker_cooldown_secs() -> u64 {
+    1800
+}
 fn default_range_repair_min_interval_secs() -> u64 {
     60
 }
@@ -782,6 +807,9 @@ impl Default for FederationConfig {
             reconnect_cooldown_secs: default_reconnect_cooldown_secs(),
             never_connected_prune_secs: default_never_connected_prune_secs(),
             bootstrap_cooldown_secs: default_bootstrap_cooldown_secs(),
+            bootstrap_breaker_threshold: default_bootstrap_breaker_threshold(),
+            bootstrap_breaker_window_secs: default_bootstrap_breaker_window_secs(),
+            bootstrap_breaker_cooldown_secs: default_bootstrap_breaker_cooldown_secs(),
             heavy_task_max_concurrency: default_heavy_task_max_concurrency(),
             gossip_max_bytes_per_second: default_gossip_max_bytes_per_second(),
             gossip_max_messages_per_second: default_gossip_max_messages_per_second(),

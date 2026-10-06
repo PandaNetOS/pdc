@@ -1475,6 +1475,74 @@ impl Storage {
         Ok(())
     }
 
+    /// 批次G(F4)：批量判断 infohash 是否已存在于 DB（重添加防误报新建——
+    /// 内存驱逐后的条目再遇时只回内存，不进 oplog/gossip，掐掉联邦风暴的燃料源）
+    pub fn existing_infohashes(
+        &self,
+        ihs: &[[u8; 20]],
+    ) -> anyhow::Result<std::collections::HashSet<[u8; 20]>> {
+        let mut out = std::collections::HashSet::new();
+        if ihs.is_empty() {
+            return Ok(out);
+        }
+        self.read(|conn| {
+            for chunk in ihs.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT infohash FROM infohashes WHERE infohash IN ({})",
+                    placeholders
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let params: Vec<&dyn rusqlite::ToSql> =
+                        chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        let b: Vec<u8> = row.get(0)?;
+                        let mut a = [0u8; 20];
+                        if b.len() == 20 {
+                            a.copy_from_slice(&b);
+                        }
+                        Ok(a)
+                    }) {
+                        for r in rows.flatten() {
+                            out.insert(r);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(out)
+    }
+
+    /// 批次G(F4)：批量判断节点 ("ip:port") 是否已存在于 DB（语义同 existing_infohashes）
+    pub fn existing_node_keys(
+        &self,
+        keys: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        self.read(|conn| {
+            for chunk in keys.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT (ip || ':' || port) FROM dht_nodes WHERE (ip || ':' || port) IN ({}) AND deleted_at IS NULL",
+                    placeholders
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let params: Vec<&dyn rusqlite::ToSql> =
+                        chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0)) {
+                        for r in rows.flatten() {
+                            out.insert(r);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(out)
+    }
+
     /// 批量保存 infohash（在已有连接上执行，供 IOScheduler 回调）
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {

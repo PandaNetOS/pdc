@@ -296,6 +296,14 @@ pub(crate) fn build_node_sync_entry(
     Some((key, payload_bytes, data_hash))
 }
 
+/// 批次G(F1)：bootstrap 熔断器状态 —— 窗口内连续竣工计数 + 熔断截止时刻。
+#[derive(Debug)]
+struct BootstrapBreakerState {
+    completions: u32,
+    window_start: Instant,
+    suppressed_until: Option<Instant>,
+}
+
 /// 同步管理器
 pub struct SyncManager {
     sessions: Arc<SessionsHandle>,
@@ -388,6 +396,11 @@ pub struct SyncManager {
     /// v10(F4)：快照冷却期 —— (peer, repo) → 竣工时刻。冷却期内协商裁定与巡检
     /// 对该 repo 强制 DELTA，防「竣工 → 清协商重裁 → 行数未变 → 又裁 BOOTSTRAP」环。
     bootstrap_cooldown: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// 批次G(F1)：bootstrap 熔断器 —— (peer, repo) → 连续竣工计数/窗口起点/熔断截止。
+    /// 「竣工 → delta 零进展 → 重协商 → 又竣工」循环达阈值即熔断：
+    /// 冷却期内对该 (peer, repo) 强制 DELTA，不再全量重拉（实测 60s/轮 × 292 块 × 2 万行
+    /// 把双端内存拉爆的根因路径）。
+    bootstrap_breaker: RwLock<FxHashMap<(NodeId, u8), BootstrapBreakerState>>,
     /// v10：bootstrap 发起互斥 —— (peer, repo) → 发起时刻（TTL 内重复触发直接拒绝）。
     bootstrap_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
     /// E1：运行时差异复检重触发冷却 —— (peer, repo) → 最近一次因运行时行数差超 D2 阈值
@@ -551,6 +564,7 @@ impl SyncManager {
             range_peer_tick_last: RwLock::new(FxHashMap::default()),
             range_progress: RwLock::new(FxHashMap::default()),
             bootstrap_cooldown: RwLock::new(FxHashMap::default()),
+            bootstrap_breaker: RwLock::new(FxHashMap::default()),
             bootstrap_inflight: RwLock::new(FxHashMap::default()),
             bootstrap_rediff_cooldown: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
@@ -1871,6 +1885,10 @@ impl SyncManager {
                 } else if self.snapshot_in_cooldown(peer, repo) {
                     // v10(F4)：冷却期内强制 DELTA（快照刚竣工，追尾是正确路径）
                     protocol::STRATEGY_DELTA
+                } else if self.bootstrap_breaker_suppressed(peer, repo) {
+                    // 批次G(F1)：熔断期内强制 DELTA——「竣工→delta 零进展」循环达阈值，
+                    // 全量重拉只会重复爆内存，增量通道始终可以慢慢推进
+                    protocol::STRATEGY_DELTA
                 } else if Self::should_bootstrap_by_volume(local, peer_count) {
                     // D批(D2)：双向大差集（不区分方向）或冷启动 → 走 bootstrap 快照通道
                     protocol::STRATEGY_BOOTSTRAP
@@ -2005,6 +2023,65 @@ impl SyncManager {
             .iter()
             .find(|s| s.repo == repo)
             .map(|s| s.strategy)
+    }
+
+    /// 批次G(F1)：记录一次 bootstrap 竣工；窗口内竣工次数达阈值即熔断该 (peer, repo)。
+    ///
+    /// 实测风暴形态：竣工 → delta 零进展（源端持续写入导致对齐永远失败）→ 看门狗重协商
+    /// → 又裁 BOOTSTRAP → 全量重拉（292 块 × 2 万行）→ 60s 一轮无限循环，双端内存被
+    /// 块处理的大分配反复拉爆。熔断后冷却期内强制 DELTA（增量永远可以推进，只是慢）。
+    fn bootstrap_breaker_record(&self, peer: NodeId, repo: u8) {
+        let threshold = self.config.bootstrap_breaker_threshold.max(1);
+        let window = Duration::from_secs(self.config.bootstrap_breaker_window_secs.max(60));
+        let cooldown = Duration::from_secs(self.config.bootstrap_breaker_cooldown_secs.max(60));
+        let mut w = self.bootstrap_breaker.write();
+        let now = Instant::now();
+        let st = w.entry((peer, repo)).or_insert(BootstrapBreakerState {
+            completions: 0,
+            window_start: now,
+            suppressed_until: None,
+        });
+        // 熔断期内只保留截止状态，不累计
+        if let Some(until) = st.suppressed_until {
+            if now < until {
+                return;
+            }
+            st.suppressed_until = None;
+            st.completions = 0;
+            st.window_start = now;
+        }
+        if now.duration_since(st.window_start) > window {
+            st.completions = 0;
+            st.window_start = now;
+        }
+        st.completions += 1;
+        if st.completions >= threshold {
+            st.suppressed_until = Some(now + cooldown);
+            st.completions = 0;
+            error!(
+                "[bootstrap][熔断] peer={} repo={} 在 {:?} 内竣工 {} 次（delta 始终零进展），\
+                 熔断 {:?}：冷却期内强制 DELTA，不再全量重拉。请检查两端该 repo 的对齐口径与写入churn",
+                peer, repo, window, threshold, cooldown
+            );
+        }
+    }
+
+    /// 批次G(F1)：该 (peer, repo) 是否处于 bootstrap 熔断期
+    fn bootstrap_breaker_suppressed(&self, peer: &NodeId, repo: u8) -> bool {
+        let mut w = self.bootstrap_breaker.write();
+        match w.get_mut(&(*peer, repo)) {
+            Some(st) => match st.suppressed_until {
+                Some(until) if Instant::now() < until => true,
+                Some(_) => {
+                    st.suppressed_until = None;
+                    st.completions = 0;
+                    st.window_start = Instant::now();
+                    false
+                }
+                None => false,
+            },
+            None => false,
+        }
     }
 
     /// v7：delta 大通道是否放行（协商 + 门控 + 策略）。
@@ -4514,6 +4591,8 @@ impl SyncManager {
         self.bootstrap_cooldown
             .write()
             .insert((conn.node_id, repo), Instant::now());
+        // 批次G(F1)：竣工计数 → 「竣工→delta 零进展」循环达阈值即熔断全量重拉
+        self.bootstrap_breaker_record(conn.node_id, repo);
         self.delta_request_at.write().remove(&(conn.node_id, repo));
         self.delta_has_more.write().insert((conn.node_id, repo));
         info!(

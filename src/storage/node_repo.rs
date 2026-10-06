@@ -406,6 +406,22 @@ impl NodeRepoImpl {
         let mut subnet_index = self.subnet_index.write();
         let mut new_pairs: Vec<(NodeId, SocketAddr)> = Vec::new();
         let mut revived: Vec<SocketAddr> = Vec::new();
+        // 批次G(F4)：内存未命中 ≠ 真新增——先查 DB，已有节点只回内存不进 new_pairs
+        // （否则驱逐→再遇→当新建→oplog+gossip 的 churn 灌爆联邦，实测 10 分钟 4.8 万条）
+        let db_known: std::collections::HashSet<String> = {
+            let candidates: Vec<String> = items
+                .iter()
+                .filter(|(_, a)| !nodes.contains_key(a))
+                .map(|(_, a)| format!("{}:{}", a.ip(), a.port()))
+                .collect();
+            if candidates.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                self.storage
+                    .existing_node_keys(&candidates)
+                    .unwrap_or_default()
+            }
+        };
         for (id, addr) in items {
             if let Some(existing) = nodes.get_mut(addr) {
                 // 鍚屽湴鍧€鑺傜偣 ID 鏇存柊锛氳嫢 ID 鍙樺寲锛屽悓姝ユ洿鏂扮綉娈电储寮曚腑鐨勬棫 ID
@@ -444,6 +460,8 @@ impl NodeRepoImpl {
                 existing.last_mentioned = Some(Instant::now());
             } else {
                 let mut entry = KBucketEntry::new(*id, *addr);
+                let key = format!("{}:{}", addr.ip(), addr.port());
+                let db_known = db_known.contains(&key);
                 // 鏂拌妭鐐瑰垵濮嬭瘎鍒?45.0锛堜腑鎬у垎锛夛紝鍚庣画鐢?ScoreMaintainer 缁熶竴鏇存柊
                 entry.score = 45.0;
                 // 新节点：state=Good（默认）、query_count=0、score=45.0，按其字段累加计数器。
@@ -454,7 +472,12 @@ impl NodeRepoImpl {
                 entry.last_accessed = Some(Instant::now());
                 nodes.insert(*addr, entry);
                 self.hot_addrs.write().insert(*addr);
-                new_pairs.push((*id, *addr));
+                // 批次G(F4)：DB 已知节点只回内存（不标 dirty 防止 stub 统计覆盖 DB 原行），
+                // 不进 new_pairs —— 不记 oplog、不 gossip、不计 new_nodes_total
+                if !db_known {
+                    self.new_nodes_total.fetch_add(1, Ordering::Relaxed);
+                    new_pairs.push((*id, *addr));
+                }
                 self.new_nodes_total.fetch_add(1, Ordering::Relaxed);
                 // IPv4 鑺傜偣鍏?/24 绱㈠紩
                 if let Some(subnet) = Self::subnet_key(*addr) {

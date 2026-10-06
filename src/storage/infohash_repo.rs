@@ -172,6 +172,21 @@ impl InfohashRepoImpl {
             return Vec::new();
         }
         let mut view = self.entries.write_all();
+        // 批次G(F4)：内存未命中 ≠ 真新增。先查 DB——已存在的条目（曾被驱逐/裁剪后再遇）
+        // 只回内存，不进 new_items，否则「驱逐→再遇→当新建→oplog+gossip」的churn
+        // 会把 INFOHASH oplog 灌到百万级，联邦 delta 永远追不完 → 对齐失败 → 全量重拉风暴。
+        let candidates: Vec<Infohash> = items
+            .iter()
+            .map(|(ih, _, _)| *ih)
+            .filter(|ih| !view.contains_key(ih))
+            .collect();
+        let db_known = if candidates.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            self.storage
+                .existing_infohashes(&candidates)
+                .unwrap_or_default()
+        };
         let mut new_items: Vec<(Infohash, String)> = Vec::new();
         for (infohash, source, last_seen) in items {
             // LWW: if local exists and remote last_seen is older, skip
@@ -184,6 +199,10 @@ impl InfohashRepoImpl {
                 if *last_seen > entry.3 {
                     entry.3 = *last_seen;
                 }
+            } else if db_known.contains(infohash) {
+                // 批次G(F4)：DB 已知 → 只回内存（引用计数置 1），不作为「真新增」传播。
+                // 保留 DB 行，不做 pending 重写（原行数据更完整）。
+                view.insert(*infohash, (1, source.clone(), 0.0, *last_seen));
             } else {
                 view.insert(*infohash, (1, source.clone(), 0.0, *last_seen));
                 new_items.push((*infohash, source.clone()));
