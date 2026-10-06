@@ -69,6 +69,9 @@ pdc/
 | `crawler.select_explore_ratio` | 0.2 | 每轮发送中分配给未验证池（探索）的预算占比——无论陈旧池多大，每轮损耗上限即该比例 |
 | `crawler.select_verified_recent_secs` | 600 | L0「已验证活」窗口（秒）：本会话响应成功且在此窗口内的节点优先 |
 | `crawler.bad_after_failures` | 3 | 判 Bad 的连续失败阈值（可调 2 加快死节点淘汰）；Bad 被 mention 且距最近提及/失败超 600s 冷却后复活 |
+| `crawler.send_mode` | paced | 发送模式（19号 D3）：`paced`=流式平滑（每 250ms 按预算出队）/ `round`=轮次突发旧行为逃生通道。启动时生效 |
+| `crawler.paced_tick_ms` | 250 | paced 消费 tick 间隔 |
+| `crawler.paced_max_per_socket_per_tick` | 8 | paced 每 socket 每 tick 配额（全局天花板 ≈ 配额 × socket 数 × 倍率 / tick） |
 | `crawler.listen_port` | 6882 | DHT 爬虫监听；多 socket 额外端口由 PortAllocator 在同百位段内整组平移分配 |
 | `crawler.utp_port` | 6883 | uTP |
 | `crawler.tcp_pex_port` | 6884 | TCP-PEX |
@@ -110,6 +113,16 @@ pdc/
 | 2026-09-29 | v1.4 | 精简 09-21 联邦诊断报告为摘要（原始数据见 git 历史）；修正关键配置表端口默认值（`server.port` 6880 / `server.api_port` 6886）；README 重写对齐现状 |
 | 2026-10-05 | v1.5 | **爬虫效率调优与轮次反馈链路根治**：并发 socket 8 配置化；反馈链路三层根因（账目取早 → pending 15s 清理 → 下轮 take 早于延迟响应）修复为**增量报告机制**；新增 `crawler.pending_timeout_secs`；get_peers/sample 退出自适应决策。实测 240→4,620/h。详见下节与 [调优记录](docs/crawler-efficiency-tuning-2026-10-05.md) |
 | 2026-10-05 | v1.6 | **选节点质量根治（20号方案批次1-4）**：预加载恒真过滤修复+真实 last_active 恢复；新近度分层选择+在飞去重+分层响应率观测；评分窗口化+mention 解耦+未验证先验分；判死阈值配置化+Bad 冷却复活。详见下节与 [20号文档](docs/architecture/20-crawler-node-selection-quality.md) |
+| 2026-10-05 | v1.7 | **发送链路重构落地（19号文档批次A-D）**：tid 扩宽 4 字节（分片路由改末字节）；paced 流式平滑发送默认启用（4 规划任务入队、消费者按预算出队，round 逃生）；响应率信号收尾（丢包窗口化+keepalive 分母）；/metrics 全量接线（17 个新指标族）+new_nodes_total+调度器真实指标。详见 [19号文档](docs/architecture/19-crawler-send-refactor.md) |
+
+## 爬虫发送链路（2026-10-05，19号文档实施基准）
+
+- **paced 流式发送（默认）**：4 个规划任务（active_crawl/get_peers/sample/scrape）只入队 `mpsc(8192)`，消费者 `paced_send_loop`（engine 自有常驻任务，**不经 TaskScheduler**——300s 硬超时会杀死常驻任务）每 250ms 按「配额8 × socket数 × 自适应倍率」出队发送。消除轮内紧循环突发（get_peers 满载 640 数据报瞬间发出的锯齿震荡根因 R2）。`send_mode=round` 一键回退旧行为。
+- **全 socket 限速 → 整 tick 让路不消费**（条目保留）；pause_gate 置位跳过出队；队列满丢弃计数（`enqueue_dropped_total` 进 /api/v1/stats）。
+- **bootstrap/chain_crawl 保持直发**（响应驱动、延迟敏感、量小）。
+- **tid 4 字节**：`[socket_idx, rand×3]`——单 socket 在飞上限 4,096→~1,670 万；pending 分片按 `tid[3]%16`（末字节随机，均匀分布）。BEP-5 兼容（t 任意长度，对端原样回显）。
+- **/metrics 已接线**（修复 R4 全零）：`pdc_crawler_socket_{send,recv}_pps/response_rate{socket_idx}`、`pdc_crawler_adaptive_multiplier`、`pdc_node_discovered_total`（真新增单一咽喉点计数）、`repo_total_count{repo}`、`pdc_scheduler_*` 等 17 个新指标族，由 1s 快照任务每 tick 更新。
+- **验证信号**：socket_send_pps 方差显著下降、socket_response_rates 平稳、倍率随真实响应率平滑调整、`/metrics` 非零、uptime 正确。
 
 ## 节点选择与评分（2026-10-05，20号方案批次1-4 落地）
 
