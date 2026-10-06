@@ -1543,6 +1543,45 @@ impl Storage {
         Ok(out)
     }
 
+    /// 批次G(F4)：批量判断 peer (infohash, addr) 是否已存在于 DB（重添加防误报传播）。
+    /// key = `lower(hex(infohash)):ip:port`，与 idx_peers_key_expr 表达式索引一致。
+    pub fn existing_peer_keys(
+        &self,
+        entries: &[(crate::types::Infohash, std::net::SocketAddr)],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        if entries.is_empty() {
+            return Ok(out);
+        }
+        self.read(|conn| {
+            for chunk in entries.chunks(500) {
+                let mut keys = Vec::with_capacity(chunk.len());
+                for (ih, addr) in chunk {
+                    let hex: String = ih.iter().map(|b| format!("{:02x}", b)).collect();
+                    keys.push(format!("{}:{}:{}", hex, addr.ip(), addr.port()));
+                }
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT (lower(hex(infohash)) || ':' || ip || ':' || port) FROM peers \
+                     WHERE (lower(hex(infohash)) || ':' || ip || ':' || port) IN ({})",
+                    placeholders
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let params: Vec<&dyn rusqlite::ToSql> =
+                        keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) =
+                        stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))
+                    {
+                        for r in rows.flatten() {
+                            out.insert(r);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(out)
+    }
+
     /// 批量保存 infohash（在已有连接上执行，供 IOScheduler 回调）
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {

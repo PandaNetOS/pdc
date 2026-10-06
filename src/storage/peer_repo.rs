@@ -443,8 +443,24 @@ impl PeerRepoImpl {
         if new_entries.is_empty() {
             return;
         }
-        let mut built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(new_entries.len());
-        for (infohash, addr, _first_seen_secs, _source) in &new_entries {
+        // 批次G(F4)：DB 已知 peer 不再传播——驱逐/裁剪后再遇的 peer 会被内存判定为
+        // 「新建」，逐条进 oplog+gossip 把联邦灌爆（实测 msgs 2600/s）。对端已有该 peer
+        // （或由 range 反熵兜底），此处只放行 DB 里真不存在的。
+        let probes: Vec<(Infohash, SocketAddr)> =
+            new_entries.iter().map(|(ih, a, _, _)| (*ih, *a)).collect();
+        let known = self.storage.existing_peer_keys(&probes).unwrap_or_default();
+        let fresh: Vec<(Infohash, SocketAddr, u64, String)> = new_entries
+            .into_iter()
+            .filter(|(ih, a, _, _)| {
+                let hex: String = ih.iter().map(|b| format!("{:02x}", b)).collect();
+                !known.contains(&format!("{}:{}:{}", hex, a.ip(), a.port()))
+            })
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let mut built: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(fresh.len());
+        for (infohash, addr, _first_seen_secs, _source) in &fresh {
             if let Some((k, p, h)) =
                 crate::federation::sync::peer_sync::build_peer_sync_entry(*infohash, *addr)
             {
