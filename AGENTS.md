@@ -67,7 +67,8 @@ pdc/
 | `crawler.round_feedback_wait_ms` | 800 | 【遗留，不再使用】固定等待窗口方案的残留配置，反馈已改增量报告机制，字段保留仅为向后兼容 |
 | `crawler.select_mode` | layered | 节点选择模式：`layered`=新近度分层（L0已验证→L1新鲜→探索预算受限）/ `legacy`=旧行为逃生通道 |
 | `crawler.select_explore_ratio` | 0.2 | 每轮发送中分配给未验证池（探索）的预算占比——无论陈旧池多大，每轮损耗上限即该比例 |
-| `crawler.select_verified_recent_secs` | 600 | L0「已验证活」窗口（秒）：本会话响应成功且在此窗口内的节点优先 |
+| `crawler.select_verified_recent_secs` | 120 | L0「已验证活」窗口（秒）：本会话响应成功且在此窗口内的节点优先（批次K：600→120，复探 2-10 分钟前节点命中率仅 1-6%） |
+| `crawler.reprobe_min_interval_secs` | 300 | 同节点复探最小间隔（秒）：距上次查询不足此间隔不重复选中，抑制对同一节点的探测风暴（批次K #12） |
 | `crawler.bad_after_failures` | 3 | 判 Bad 的连续失败阈值（可调 2 加快死节点淘汰）；Bad 被 mention 且距最近提及/失败超 600s 冷却后复活 |
 | `crawler.send_mode` | paced | 发送模式（19号 D3）：`paced`=流式平滑（每 250ms 按预算出队）/ `round`=轮次突发旧行为逃生通道。启动时生效 |
 | `crawler.paced_tick_ms` | 250 | paced 消费 tick 间隔 |
@@ -114,6 +115,24 @@ pdc/
 | 2026-10-05 | v1.5 | **爬虫效率调优与轮次反馈链路根治**：并发 socket 8 配置化；反馈链路三层根因（账目取早 → pending 15s 清理 → 下轮 take 早于延迟响应）修复为**增量报告机制**；新增 `crawler.pending_timeout_secs`；get_peers/sample 退出自适应决策。实测 240→4,620/h。详见下节与 [调优记录](docs/crawler-efficiency-tuning-2026-10-05.md) |
 | 2026-10-05 | v1.6 | **选节点质量根治（20号方案批次1-4）**：预加载恒真过滤修复+真实 last_active 恢复；新近度分层选择+在飞去重+分层响应率观测；评分窗口化+mention 解耦+未验证先验分；判死阈值配置化+Bad 冷却复活。详见下节与 [20号文档](docs/architecture/20-crawler-node-selection-quality.md) |
 | 2026-10-05 | v1.7 | **发送链路重构落地（19号文档批次A-D）**：tid 扩宽 4 字节（分片路由改末字节）；paced 流式平滑发送默认启用（4 规划任务入队、消费者按预算出队，round 逃生）；响应率信号收尾（丢包窗口化+keepalive 分母）；/metrics 全量接线（17 个新指标族）+new_nodes_total+调度器真实指标。详见 [19号文档](docs/architecture/19-crawler-send-refactor.md) |
+| 2026-10-06 | v1.8 | **联邦风暴根治 + 遗留清单消化（批次G/I/J/K/M）**：bootstrap 熔断器；三 repo 重添加查 DB 守卫；同地址身份清退；PEER/INFOHASH DELETE 软删墓碑；RangePush2 分帧；优雅关闭 Goodbye；复探冷却+L0 窗口收窄；诊断计数器暴露；pnos-net 冷却粒度 (node_id,addr)+事件通道 1024。详见下节 |
+
+## 联邦风暴根治与遗留消化（2026-10-06，批次G-M 基准）
+
+**风暴形态（实测）**：双端 Private 内存 1.3-1.7GB、每分钟数百 MB 增长；bootstrap 每 60s 全量重拉（292 块×2 万行）与 delta 零进展看门狗互相触发；INFOHASH oplog seq 灌到 371 万；互发消息 540 万条/25 分钟。
+
+**根治三斧**：
+1. **熔断器**（G）：同 (peer,repo) 窗口内 bootstrap 竣工 3 次（900s）→ 熔断 1800s 强制 DELTA + ERROR。配置 `federation.bootstrap_breaker_{threshold,window_secs,cooldown_secs}`（默认 3/900/1800）。
+2. **重添加守卫**（G/H）：node/infohash/peer 三 repo 的 add 路径内存未命中时**先查 DB**——已存在条目只回内存，不进 oplog/gossip/new_nodes_total（实测重添加垃圾 4.8 万条/10 分钟 → 0）。peer 守卫对齐 `idx_peers_key_expr` 表达式索引。
+3. **oplog 清零**（运维）：双端 feed_oplog + oplog_peer_ack 清理（工具 `examples/oplog_reset.rs`，未入库），差异由 range 反熵兜底。
+
+**遗留清单消化状态（对照 v9 遗留六项）**：
+- #1 全局单连接长 PRAGMA：✅ 已解（checkpoint 独立线程/连接/单飞/退避 + 读池）；
+- #2 统计直查库：✅ 基本已解（F9 增量计数 + 读池 + 系统指标缓存）；
+- #3 会话层：✅ 三项全解——同地址身份清退（node_table）、Goodbye 广播（优雅关闭）、pnos-net 冷却粒度 (node_id,addr) + 事件通道 1024；「同 node_id 接管」由 SDK Replaced 语义覆盖；
+- #4 send_range_push 无字节上限：✅ 单帧 1.5MB 分帧；**控制帧优先级**仍缺（设计级）；
+- #5 DELETE 墓碑：✅ PEER/INFOHASH 已补（tracker 原有）；**PEER_ARCHIVE 收敛口径**仍待设计评审；
+- #6 接收端背压：❌ **仍缺**——receive_pending_threshold 仍无消费方（源端风暴已断，优先级降为 P2）。
 
 ## 爬虫发送链路（2026-10-05，19号文档实施基准）
 
