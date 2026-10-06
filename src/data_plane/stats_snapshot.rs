@@ -12,7 +12,8 @@ use tokio::sync::Notify;
 
 use crate::data_plane::rest_api::{
     CacheStats, CrawlerMetrics, DiscovererStat, FetcherStats, InfohashRepoMetrics, NodeRepoMetrics,
-    PeerRepoMetrics, RepoTierStats, SuperTrackerStats, TrackerRepoMetrics, TrackerScoreInfo,
+    PeerRepoMetrics, RepoTierStats, SuperTrackerStats, TaskSchedulerMetrics, TrackerRepoMetrics,
+    TrackerScoreInfo,
 };
 use crate::data_plane::AppState;
 use crate::intelligence::scorer_traits::HealthReport;
@@ -38,8 +39,8 @@ pub struct StatsSnapshotData {
     pub fetcher_stats: Option<FetcherStats>,
     /// 爬虫深度指标
     pub crawler_metrics: Option<CrawlerMetrics>,
-    /// 任务调度器指标（暂未注入）
-    pub task_scheduler_metrics: Option<()>,
+    /// 任务调度器指标（19号 D4：由 metrics::scheduler_metrics() 注入）
+    pub task_scheduler_metrics: Option<TaskSchedulerMetrics>,
     /// NodeRepo 深度指标
     pub node_repo_metrics: Option<NodeRepoMetrics>,
     /// PeerRepo 冷热分层指标
@@ -113,7 +114,9 @@ pub fn spawn_snapshot_updater(state: AppState, interval_secs: u64) -> Arc<Notify
     tokio::spawn(async move {
         // 立即执行一次首次收集，避免启动后第一秒快照为空
         let data = collect_stats(&state_main);
-        snapshot.update(data);
+        snapshot.update(data.clone());
+        // Prometheus /metrics 每 tick 接线（19号 D4：修复注册与更新断线）
+        crate::data_plane::metrics::update_from_snapshot(&state_main, &data);
 
         // [ALLOWED-INTERVAL] 统计快照后台更新，间隔由 spawn_snapshot_updater 的 interval_secs 参数控制
         let mut ticker = tokio::time::interval(interval);
@@ -121,7 +124,8 @@ pub fn spawn_snapshot_updater(state: AppState, interval_secs: u64) -> Arc<Notify
             tokio::select! {
                 _ = ticker.tick() => {
                     let data = collect_stats(&state_main);
-                    snapshot.update(data);
+                    snapshot.update(data.clone());
+                    crate::data_plane::metrics::update_from_snapshot(&state_main, &data);
                 }
                 _ = shutdown_clone.notified() => {
                     tracing::debug!("[stats_snapshot] 后台更新任务收到关闭信号，退出");
@@ -483,7 +487,7 @@ fn collect_stats(state: &AppState) -> StatsSnapshotData {
         tracker_scores,
         fetcher_stats,
         crawler_metrics,
-        task_scheduler_metrics: None,
+        task_scheduler_metrics: crate::data_plane::metrics::scheduler_metrics(),
         node_repo_metrics,
         peer_repo_metrics,
         infohash_repo_metrics,

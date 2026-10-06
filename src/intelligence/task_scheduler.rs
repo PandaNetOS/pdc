@@ -2353,6 +2353,11 @@ impl TaskScheduler {
         self.queue.read().len()
     }
 
+    /// 累计准入执行数（19号 D4：调度器指标导出用）
+    pub fn admitted_total(&self) -> u64 {
+        self.admitted_total.load(Ordering::Relaxed)
+    }
+
     /// 各任务最近10次平均耗时（毫秒）
     pub fn task_recent_avg_durations(&self) -> HashMap<String, u64> {
         self.stats

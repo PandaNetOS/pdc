@@ -81,6 +81,9 @@ pub struct NodeRepoImpl {
     recent_decay_alpha: f64,
     /// 判 Bad 的连续失败阈值（默认 3；可配置加快死节点淘汰，2026-10 D4）
     bad_after_failures: AtomicU64,
+    /// 本会话真新增节点累计（add_nodes_batch_internal 的 new_pairs 单一咽喉点，
+    /// 覆盖爬虫/探测/联邦三条路径；启动 load_initial 不经过此路径不灌水；19号 D4）
+    new_nodes_total: AtomicU64,
 }
 
 impl NodeRepoImpl {
@@ -109,6 +112,7 @@ impl NodeRepoImpl {
             recent_decay_alpha: crate::intelligence::scorer_config::NodeScoreConfig::default()
                 .recent_decay_alpha,
             bad_after_failures: AtomicU64::new(3),
+            new_nodes_total: AtomicU64::new(0),
             active: AtomicU64::new(0),
             score_sum: AtomicU64::new(0),
         }
@@ -451,6 +455,7 @@ impl NodeRepoImpl {
                 nodes.insert(*addr, entry);
                 self.hot_addrs.write().insert(*addr);
                 new_pairs.push((*id, *addr));
+                self.new_nodes_total.fetch_add(1, Ordering::Relaxed);
                 // IPv4 鑺傜偣鍏?/24 绱㈠紩
                 if let Some(subnet) = Self::subnet_key(*addr) {
                     Self::index_subnet(&mut subnet_index, subnet, *id);
@@ -930,6 +935,11 @@ impl NodeRepoImpl {
     /// 鐑妭鐐规暟閲?
     pub fn hot_count_sync(&self) -> usize {
         self.hot_addrs.read().len()
+    }
+
+    /// 本会话真新增节点累计（19号 D4：新节点发现速率的核心指标源）
+    pub fn new_nodes_total(&self) -> u64 {
+        self.new_nodes_total.load(Ordering::Relaxed)
     }
 
     /// 鍐疯妭鐐规暟閲?

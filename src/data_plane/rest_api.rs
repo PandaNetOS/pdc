@@ -456,7 +456,7 @@ async fn stats_handler(State(state): State<AppState>) -> Response {
         tracker_scores: s.tracker_scores,
         fetcher_stats: s.fetcher_stats,
         crawler_metrics: s.crawler_metrics,
-        task_scheduler_metrics: None,
+        task_scheduler_metrics: s.task_scheduler_metrics,
         node_repo_metrics: s.node_repo_metrics,
         peer_repo_metrics: s.peer_repo_metrics,
         infohash_repo_metrics: s.infohash_repo_metrics,

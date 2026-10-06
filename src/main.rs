@@ -1098,6 +1098,8 @@ async fn async_main(
             // 把 config.task_scheduler 的准入/抖动/预测/自适应旋钮真正注入调度器（乙类接线）
             .with_knobs(SchedulerKnobs::from_config(&config.task_scheduler)),
     );
+    // 调度器引用注入 metrics（19号 D4：/metrics 调度器指标导出）
+    PeerDiscoveryCenter::data_plane::metrics::set_scheduler(task_scheduler.clone());
 
     // 任务间隔覆盖表：未配置的任务使用代码内默认值（与改造前行为一致）。
     // key=任务名（或 <任务名>_initial_delay / <任务名>_jitter）。
