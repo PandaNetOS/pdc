@@ -2913,12 +2913,23 @@ async fn async_main(
                     async move {
                         // v9：裁剪必须感知对端进度，否则会裁出对端永远拉不到的空洞
                         // （请求方游标跨过空洞后 lag 归零 = 假收敛）。
-                        match st.trim_oplog_guarded(retention, respect_floor, hard_mult) {
-                            Ok(n) if n > 0 => {
+                        // P批(P1)：裁剪（即使分批后仍可能连续数十批）是同步 DB 操作，
+                        // spawn_blocking 化避免占死 Persistence runtime worker
+                        // （对齐 J 批对 delta 通道的处理）。
+                        let trim = {
+                            let st = st.clone();
+                            tokio::task::spawn_blocking(move || {
+                                st.trim_oplog_guarded(retention, respect_floor, hard_mult)
+                            })
+                            .await
+                        };
+                        match trim {
+                            Ok(Ok(n)) if n > 0 => {
                                 debug!("[oplog] 裁剪 {} 条（保留窗口 {}s）", n, retention)
                             }
-                            Ok(_) => {}
-                            Err(e) => warn!("[oplog] 裁剪失败: {}", e),
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => warn!("[oplog] 裁剪失败: {}", e),
+                            Err(e) => warn!("[oplog] 裁剪任务 join 失败: {}", e),
                         }
                         // v10(G)：每轮打一条可观测摘要（此前全 debug，线上无法确认
                         // 裁剪是否在跑——.62 曾积压 302 万条无人知晓）

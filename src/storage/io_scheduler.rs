@@ -1134,12 +1134,33 @@ impl AimdController {
     }
 
     /// 喂入一次观测，返回本次决策记录。纯函数式推进状态。
-    pub fn observe(&mut self, checkpoint_ms_ewma: u64, queue_rows: usize) -> AimdDecisionRecord {
+    ///
+    /// P批(P2)：新增 `write_latency_ms`（前台批写延迟 EWMA）。AIMD 原本只看
+    /// checkpoint 自身耗时——checkpoint 排涝永远「快」，而 WriteQueue 大批 flush
+    /// 把前台写延迟顶到 11s 时预算仍只增不减（.52 2026-10-07 实证 rows_per_tick
+    /// 33,500 + latency 11,245ms 正反馈失控）。前台延迟超阈 → 强制收缩。
+    pub fn observe(
+        &mut self,
+        checkpoint_ms_ewma: u64,
+        queue_rows: usize,
+        write_latency_ms: u64,
+    ) -> AimdDecisionRecord {
         let rows_before = self.rows;
         let interval_before = self.interval_secs;
         let (action, reason);
 
-        if checkpoint_ms_ewma > self.slow_ms {
+        if write_latency_ms > AIMD_WRITE_LATENCY_SLOW_MS {
+            // P批(P2)：前台写延迟超阈 → 乘法减（不看 checkpoint 是否快）
+            self.rows = (self.rows / 2).max(self.profile.rows_min);
+            self.interval_secs =
+                (self.interval_secs.saturating_mul(2)).min(self.profile.interval_max);
+            self.fast_streak = 0;
+            action = "shrink";
+            reason = format!(
+                "前台写延迟 {}ms > {}ms，rows/2、interval×2（延迟收缩臂）",
+                write_latency_ms, AIMD_WRITE_LATENCY_SLOW_MS
+            );
+        } else if checkpoint_ms_ewma > self.slow_ms {
             // 慢 → 乘法减
             self.rows = (self.rows / 2).max(self.profile.rows_min);
             self.interval_secs =
@@ -1255,6 +1276,11 @@ static DISK_FSYNC_P50_X100: AtomicU32 = AtomicU32::new(0);
 /// C2：AIMD 控制器（启动时按磁盘画像初始化一次，运行期由 metrics tick 喂观测）。
 static AIMD: OnceLock<ParkingMutex<AimdController>> = OnceLock::new();
 
+/// P批(P2)：前台批写延迟的「慢」阈值（毫秒，EWMA）。超过即触发 rows/2 + interval×2。
+/// 依据：健康稳态实测 40~300ms，写风暴期 853~11,245ms；取 500 挡住失控早期。
+// [ALLOWED-HARDCODED: 控制器内建阈值常量，调优经 io_scheduler 配置化另行处理]
+const AIMD_WRITE_LATENCY_SLOW_MS: u64 = 500;
+
 /// C1：启动时写入磁盘画像结果。
 pub fn set_disk_profile(class: &str, fsync_ms_p50: f32) {
     let _ = DISK_CLASS.set(class.to_string());
@@ -1285,9 +1311,13 @@ pub fn init_aimd_controller(profile: AimdProfile, target_ms: u64, slow_ms: u64) 
 }
 
 /// C2：metrics tick 喂入一次观测，返回是否触发了 rows_per_tick 变化。
+/// P批(P2)：同时携带前台批写延迟 EWMA（延迟收缩臂的被控量之一）。
 pub fn aimd_observe(checkpoint_ms_ewma: u64, queue_rows: usize) -> Option<AimdDecisionRecord> {
-    AIMD.get()
-        .map(|m| m.lock().observe(checkpoint_ms_ewma, queue_rows))
+    let write_latency_ms = io_batch_latency_ewma_us() / 1000;
+    AIMD.get().map(|m| {
+        m.lock()
+            .observe(checkpoint_ms_ewma, queue_rows, write_latency_ms)
+    })
 }
 
 /// C2：当前 AIMD 给出的 rows_per_tick 建议（未初始化时回退 0=不限）。
@@ -1967,7 +1997,7 @@ mod tests {
     fn test_aimd_shrinks_on_slow() {
         let mut ctl = AimdController::new(c2_profile(), 50, 200);
         let rows0 = ctl.rows_per_tick();
-        let rec = ctl.observe(500, 1000); // > slow
+        let rec = ctl.observe(500, 1000, 0); // > slow（前台延迟健康）
         assert_eq!(rec.action, "slow");
         assert!(ctl.rows_per_tick() < rows0, "慢时应收缩");
     }
@@ -1978,7 +2008,7 @@ mod tests {
         let rows0 = ctl.rows_per_tick();
         // 快带连续 grow_after 次 → 增窗
         for _ in 0..ctl.grow_after {
-            ctl.observe(10, 0);
+            ctl.observe(10, 0, 0);
         }
         assert!(ctl.rows_per_tick() > rows0, "持续快应增窗");
     }
@@ -1988,7 +2018,7 @@ mod tests {
         let mut ctl = AimdController::new(c2_profile(), 50, 200);
         // 持续慢 → 收敛到 rows_min
         for _ in 0..20 {
-            ctl.observe(10_000, 0);
+            ctl.observe(10_000, 0, 0);
         }
         assert_eq!(ctl.rows_per_tick(), c2_profile().rows_min, "慢应收敛到地板");
         assert_eq!(
@@ -1998,12 +2028,33 @@ mod tests {
         );
     }
 
+    /// P批(P2)：延迟收缩臂 —— 前台写延迟超阈时，即使 checkpoint「快」也必须收缩；
+    /// 延迟恢复后快带逻辑照常增窗。
+    #[test]
+    fn test_aimd_shrinks_on_foreground_latency() {
+        let mut ctl = AimdController::new(c2_profile(), 50, 200);
+        // 先喂出高预算
+        for _ in 0..12 {
+            ctl.observe(10, 0, 0);
+        }
+        let rows0 = ctl.rows_per_tick();
+        assert!(rows0 > c2_profile().rows_base, "前置：预算已增长");
+        // 前台写延迟超阈（checkpoint 依旧「快」= 旧逻辑盲区）
+        let rec = ctl.observe(10, 0, 5_000);
+        assert_eq!(rec.action, "shrink", "前台延迟超阈必须触发 shrink");
+        assert!(ctl.rows_per_tick() < rows0, "延迟收缩臂必须减预算");
+        // 边界：恰好等于阈值不收缩
+        let mut ctl2 = AimdController::new(c2_profile(), 50, 200);
+        let rec2 = ctl2.observe(10, 0, 500);
+        assert_eq!(rec2.action, "hold", "延迟==阈值不触发收缩（需严格大于）");
+    }
+
     #[test]
     fn test_latency_hysteresis_hold() {
         let mut ctl = AimdController::new(c2_profile(), 50, 200);
         let rows0 = ctl.rows_per_tick();
         // 在迟滞带 [50,200] 内 → hold
-        let rec = ctl.observe(120, 0);
+        let rec = ctl.observe(120, 0, 0);
         assert_eq!(rec.action, "hold");
         assert_eq!(ctl.rows_per_tick(), rows0, "迟滞带内不动");
     }
@@ -2012,7 +2063,7 @@ mod tests {
     fn test_aimd_ring_buffer_keeps_recent() {
         let mut ctl = AimdController::new(c2_profile(), 50, 200);
         for _ in 0..300 {
-            ctl.observe(10, 0);
+            ctl.observe(10, 0, 0);
         }
         let recent = ctl.recent_decisions(20);
         assert_eq!(recent.len(), 20, "应暴露最近 20 条");

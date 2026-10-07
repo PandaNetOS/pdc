@@ -4324,7 +4324,7 @@ impl SyncManager {
     pub async fn handle_bootstrap_chunk_response(
         self: Arc<Self>,
         conn: Arc<PeerConn>,
-        resp: BootstrapChunkResponseMessage,
+        mut resp: BootstrapChunkResponseMessage,
     ) {
         if !self.config.bootstrap_enabled {
             return;
@@ -4372,17 +4372,39 @@ impl SyncManager {
             });
         // ④ 批量 upsert（A4：走全 repo 通用 dispatch handle_sync_batch，按 resp.repo 分派到
         // apply_node/peer/infohash/tracker_sync，严禁逐条 INSERT，也严禁硬编码走 NODE 落地）
+        // P批(P3)：spawn_blocking 化 —— handle_sync_batch 内部是同步 DB 写（写连接锁 +
+        // 批量 upsert），2 万行的块在内联执行时会占死 federation runtime worker 数秒，
+        // 读循环随之饿死（对端块发送/NAK 全部超时，.52 2026-10-07 实证）；对齐 J 批
+        // 对 delta apply 的处理。join 失败视为收到 0 条 → 传输校验自然判失败。
+        let mut received = resp.entries.len();
         if !resp.entries.is_empty() {
-            self.handle_sync_batch(resp.repo, &resp.entries);
-            // v10(C)：刷新快照导入窗口 —— 落库预算在窗口内解除时间片限速
-            // （writes_per_tick ×200），窗口静默 30s 自动回落稳态平滑语义。
-            crate::storage::io_scheduler::refresh_bootstrap_import_window(Duration::from_secs(
-                crate::storage::io_scheduler::BOOTSTRAP_IMPORT_WINDOW_TTL_SECS,
-            ));
+            let sm = self.clone();
+            let repo = resp.repo;
+            let entries = std::mem::take(&mut resp.entries);
+            let applied =
+                tokio::task::spawn_blocking(move || sm.handle_sync_batch(repo, &entries)).await;
+            match applied {
+                Ok(()) => {
+                    // v10(C)：刷新快照导入窗口 —— 落库预算在窗口内解除时间片限速
+                    // （writes_per_tick ×200），窗口静默 30s 自动回落稳态平滑语义。
+                    crate::storage::io_scheduler::refresh_bootstrap_import_window(
+                        Duration::from_secs(
+                            crate::storage::io_scheduler::BOOTSTRAP_IMPORT_WINDOW_TTL_SECS,
+                        ),
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[bootstrap] 块 {} apply 任务 join 失败（按空块处理）: {}",
+                        resp.index, e
+                    );
+                    received = 0;
+                }
+            }
         }
         // ⑥ 校验（P0-4 语义修正）：只做「传输完整性」校验 —— 校验**对端发来的这一批条目**
         // 是否完整到达，不再重算本地 [lo,hi) 区间摘要与清单 hash 比对。
-        let ok = bootstrap::verify_transport(chunk.rows, resp.entries.len());
+        let ok = bootstrap::verify_transport(chunk.rows, received);
         if ok {
             // D批(D3)：对端负载保护 —— 每收到一个完成块，按配置节流 sleep，避免 16 路窗口
             // 满速回包把对端正常业务挤爆（工程约束「同步不能影响对端正常运行」）。

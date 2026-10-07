@@ -19,7 +19,7 @@
 //! 若进程在「落库后、写 oplog 前」崩溃，最坏情况是该条变更不进 delta 通道，由周期反熵兜底收敛。
 //! 任何 oplog 写入失败都只告警，**绝不阻断业务写入**。
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
@@ -338,13 +338,7 @@ impl super::db::Storage {
 
     /// 裁剪 `ts_ms < older_than_ms` 的 op，返回删除条数。
     pub fn trim_oplog(&self, older_than_ms: i64) -> anyhow::Result<usize> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let n = conn.execute(
-            "DELETE FROM feed_oplog WHERE ts_ms < ?1",
-            params![older_than_ms],
-        )?;
-        drop(conn);
+        let n = self.delete_oplog_batched("ts_ms < ?1", &[older_than_ms])?;
         if n > 0 {
             self.bump_oplog_len(-(n as i64));
             // 裁剪成功日志原来是 debug 级，线上（info）完全不可见，无法确认大表是否在被
@@ -352,6 +346,35 @@ impl super::db::Storage {
             self.log_trim_throttled(n);
         }
         Ok(n)
+    }
+
+    /// P批(P1)：分批 DELETE oplog —— 每批 `LIMIT OPLOG_TRIM_BATCH_ROWS`，批间**释放写锁**
+    /// 并短暂让渡。百万行级单条 DELETE 会长时间占住写连接锁（其他写者全部停摆）
+    /// 且一次性把整表 B-tree 页推进 WAL（.52 2026-10-07 实证：370 万行积压 → 单条
+    /// DELETE → 2.6GB WAL + 分钟级写锁独占，delta/爬虫/联邦 apply 全部冻结）。
+    /// 分批后 WAL 增长被摊开、checkpoint 可在批间排涝、前台写者可插队。
+    fn delete_oplog_batched(&self, where_sql: &str, bind: &[i64]) -> anyhow::Result<usize> {
+        use std::time::Duration;
+        const OPLOG_TRIM_BATCH_ROWS: i64 = 5_000;
+        const OPLOG_TRIM_BATCH_PAUSE_MS: u64 = 50;
+        let conn = self.connection();
+        let sql = format!(
+            "DELETE FROM feed_oplog WHERE rowid IN \
+             (SELECT rowid FROM feed_oplog WHERE {where_sql} LIMIT {OPLOG_TRIM_BATCH_ROWS})"
+        );
+        let mut total = 0usize;
+        loop {
+            let deleted = {
+                let c = conn.lock().unwrap_or_else(|e| e.into_inner());
+                c.execute(&sql, params_from_iter(bind.iter()))?
+            };
+            total += deleted;
+            if (deleted as i64) < OPLOG_TRIM_BATCH_ROWS {
+                return Ok(total);
+            }
+            // 写锁已随 guard drop 释放；让渡 IO 给 checkpoint 与前台写者
+            std::thread::sleep(Duration::from_millis(OPLOG_TRIM_BATCH_PAUSE_MS));
+        }
     }
 
     /// 裁剪可观测：累计裁剪条数，按 [`TRIM_LOG_INTERVAL_MS`] 节流输出 INFO。
@@ -491,29 +514,26 @@ impl super::db::Storage {
         for repo in 1u8..=4 {
             floors[repo as usize] = self.peer_ack_floor(repo).unwrap_or(None);
         }
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        // P批(P1)：分批删除（见 delete_oplog_batched 文档）——原来每 repo 一条
+        // 无界 DELETE，370 万行积压时单条语句制造 2.6GB WAL 并占死写锁分钟级。
         let mut n = 0usize;
         for repo in 1u8..=4 {
             let deleted = match floors[repo as usize] {
-                Some(f) => conn.execute(
-                    "DELETE FROM feed_oplog \
-                     WHERE repo = ?1 AND ts_ms < ?2 AND (ts_ms < ?3 OR seq < ?4)",
-                    params![
+                Some(f) => self.delete_oplog_batched(
+                    "repo = ?1 AND ts_ms < ?2 AND (ts_ms < ?3 OR seq < ?4)",
+                    &[
                         repo as i64,
                         cutoff,
                         hard_cutoff,
-                        f.saturating_sub(FLOOR_SAFETY_MARGIN)
+                        f.saturating_sub(FLOOR_SAFETY_MARGIN),
                     ],
                 )?,
-                None => conn.execute(
-                    "DELETE FROM feed_oplog WHERE repo = ?1 AND ts_ms < ?2",
-                    params![repo as i64, cutoff],
-                )?,
+                None => {
+                    self.delete_oplog_batched("repo = ?1 AND ts_ms < ?2", &[repo as i64, cutoff])?
+                }
             };
             n += deleted;
         }
-        drop(conn);
         if n > 0 {
             self.bump_oplog_len(-(n as i64));
             // 明细（cutoff/floor 等）保留 debug 级；INFO 走节流汇总，避免高频调用刷屏
