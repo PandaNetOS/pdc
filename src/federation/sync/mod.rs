@@ -58,7 +58,11 @@ const SNAPSHOT_RATIO_THRESHOLD: f64 = 1.2;
 /// D批(D2)：双向快照触发的「大小端比例」阈值（不区分方向，max/min 超过即候选）。
 /// D批(D3)：1.3→1.1 调敏 —— 三端联邦实测 52/62 ratio≈1.11 在 1.3 下永远裁定 DELTA，
 /// 不触发 bootstrap，NODE 表长期不对齐；1.1 配合 diff>50_000 即可覆盖该量级差。
-const SNAPSHOT_BIDIR_RATIO: f64 = 1.1;
+/// 2026-10-07(N批)：1.1→1.02 调敏 —— .52/.53 六天故障期积压 20.5 万行 NODE
+/// （ratio≈1.034），1.1 门槛下永远裁定 DELTA，只能靠 range 修复以 ~4k/h 磨
+/// （ETA ~2 天）。1.02（≥2% 差距）让该量级积压走快照通道；防回环由既有
+/// 熔断器（15min 内 3 次竣工 → 30min 强制 DELTA）+ F4 竣工冷却 + 方向守卫兜底。
+const SNAPSHOT_BIDIR_RATIO: f64 = 1.02;
 /// D批(D2)：双向快照触发的最小行数绝对差（行）。
 const BOOTSTRAP_BIDIR_MIN_DIFF_ROWS: u64 = 50_000;
 /// v10(F2)：Range 抽样进度的停滞阈值（秒）—— 超过未推进视为对端持续不可达/连接失效，
@@ -5795,16 +5799,28 @@ mod tests {
         );
     }
 
-    /// D批(D2/D3)：双向快照阈值 —— 不区分方向。max/min > 1.1 且绝对差 > 50_000 才触发；
-    /// 冷启动（一端为 0、另一端有量）触发；小比例差走 DELTA。
+    /// D批(D2/D3)+N批(2026-10-07)：双向快照阈值 —— 不区分方向。max/min > 1.02 且绝对差
+    /// > 50_000 才触发；冷启动（一端为 0、另一端有量）触发；小比例差走 DELTA。
     #[test]
     fn test_bidir_bootstrap_by_volume_threshold() {
         // local 10 万 vs peer 150001：ratio≈1.5、diff=50001 → 触发（对端更多）
         assert!(SyncManager::should_bootstrap_by_volume(100_000, 150_001));
         // 对称方向（我更多）同结果
         assert!(SyncManager::should_bootstrap_by_volume(150_001, 100_000));
-        // ratio=1.2、diff=2 万 → 不触发（绝对差门槛仍拦住，即使 ratio 已 > 1.1）
+        // ratio=1.2、diff=2 万 → 不触发（绝对差门槛仍拦住，即使 ratio 已超比例阈值）
         assert!(!SyncManager::should_bootstrap_by_volume(100_000, 120_000));
+        // N批：.52/.53 实测场景 ratio≈1.034、diff≈20.4 万 → 触发（1.02 调敏的动机）
+        assert!(SyncManager::should_bootstrap_by_volume(
+            5_981_192, 6_184_778
+        ));
+        // N批边界：ratio 恰为 1.02（2% 差）→ 不触发（需严格大于）
+        assert!(!SyncManager::should_bootstrap_by_volume(
+            1_000_000, 1_020_000
+        ));
+        // N批边界：ratio 1.051（>1.02）、diff>5 万 → 触发
+        assert!(SyncManager::should_bootstrap_by_volume(
+            1_000_000, 1_051_000
+        ));
         // 冷启动：本地 0、对端 5000 (>1000) → 触发
         assert!(SyncManager::should_bootstrap_by_volume(0, 5_000));
         // 冷启动：本地 5000、对端 0 → 触发
