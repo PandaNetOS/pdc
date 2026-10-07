@@ -541,6 +541,16 @@ impl DhtMessage {
         // 响应字典
         let r = dict.get(b"r".as_slice())?.as_dict()?;
 
+        // 2026-10 fix4：严格类型判定——get_peers 响应必须携带 values 或 token 字段。
+        // 此前本函数对任何 y=r + t 的响应（含 find_node 响应仅 nodes）都返回 Some，
+        // 配合 handle_response_sync 的「find_node 分支优先 + return」导致 get_peers
+        // 响应被 find_node 分支吞掉、peers（values）被丢弃 → 采集恒为 0。
+        let has_values = r.contains_key(b"values".as_slice());
+        let has_token = r.contains_key(b"token".as_slice());
+        if !has_values && !has_token {
+            return None;
+        }
+
         // node_id
         let mut node_id = [0u8; 20];
         if let Some(id_bytes) = r.get(b"id".as_slice()).and_then(|v| v.as_bytes()) {
@@ -605,6 +615,22 @@ impl DhtMessage {
         Some((tid, nodes))
     }
 
+    /// 2026-10 fix4：检查响应 r 字典是否含指定字段（响应类型特化判定用）。
+    /// 用于在 handle_response_sync 中区分 get_peers（values/token）、
+    /// sample（num/samples）与 find_node（仅 nodes），避免类型误判吞掉采集数据。
+    pub fn response_has_field(data: &[u8], key: &[u8]) -> bool {
+        let Ok(value) = from_bytes::<BencodeValue>(data) else {
+            return false;
+        };
+        let Some(dict) = value.as_dict() else {
+            return false;
+        };
+        let Some(r) = dict.get(b"r".as_slice()).and_then(|v| v.as_dict()) else {
+            return false;
+        };
+        r.contains_key(key)
+    }
+
     /// 解析 sample_infohashes 响应（BEP 51: DHT Infohash Indexing）
     ///
     /// 响应格式: d1:rd2:id20:<node_id>5:num<i>N7:samples<N*20>:<ih1><ih2>...e1:t4:<tid>1:y1:re
@@ -626,6 +652,14 @@ impl DhtMessage {
         }
 
         let r = dict.get(b"r".as_slice())?.as_dict()?;
+
+        // 2026-10 fix4：严格类型判定——sample 响应必须携带 num 或 samples 字段
+        // （避免 find_node 响应被本函数误识别为 sample，见 parse_get_peers_response 注释）
+        let has_num = r.contains_key(b"num".as_slice());
+        let has_samples = r.contains_key(b"samples".as_slice());
+        if !has_num && !has_samples {
+            return None;
+        }
 
         // node_id
         let mut node_id = [0u8; 20];

@@ -1127,8 +1127,21 @@ async fn async_main(
             move || {
                 let rm = rm.clone();
                 async move {
-                    rm.refresh();
-                    Ok(())
+                    // fix14：30s 超时 —— 系统资源监控曾卡 439s 占死 Monitor 槽
+                    // [ALLOWED-HARDCODED: 系统资源监控执行兜底超时 30s（fix14 治理 Monitor 槽卡 439s），保护性上限，配置化无实际收益]
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+                        rm.refresh();
+                    })
+                    .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "[observability] 系统资源监控执行超过 30s，本轮中止释放槽位"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -1189,34 +1202,48 @@ async fn async_main(
                             return Ok(());
                         }
                     }
-                    let mut saved = 0u64;
-                    match nr.save_dirty().await {
-                        Ok(_) => saved += 1,
-                        Err(e) => warn!("[persistence] NodeRepo 保存失败: {}", e),
-                    }
-                    match tr.save_all().await {
-                        Ok(_) => saved += 1,
-                        Err(e) => warn!("[persistence] TrackerRepo 保存失败: {}", e),
-                    }
-                    match ir.save_all().await {
-                        Ok(_) => saved += 1,
-                        Err(e) => warn!("[persistence] InfohashRepo 保存失败: {}", e),
-                    }
-                    match pr.save_all().await {
-                        Ok(_) => saved += 1,
-                        Err(e) => warn!("[persistence] PeerRepo 保存失败: {}", e),
-                    }
-                    match pr.flush_history().await {
-                        Ok(n) if n > 0 => {
-                            debug!("[persistence] PeerRepo history flushed: {} records", n)
+                    // fix16：45s 超时 —— dirty 积压时 save_dirty 曾卡 270s 占死
+                    // Persistence 槽，SQLite 写锁长持连累 select 读锁（RwLock 写优先）。
+                    let body = async {
+                        let mut saved = 0u64;
+                        match nr.save_dirty().await {
+                            Ok(_) => saved += 1,
+                            Err(e) => warn!("[persistence] NodeRepo 保存失败: {}", e),
                         }
-                        Err(e) => warn!("[persistence] PeerRepo history flush 失败: {}", e),
-                        _ => {}
+                        match tr.save_all().await {
+                            Ok(_) => saved += 1,
+                            Err(e) => warn!("[persistence] TrackerRepo 保存失败: {}", e),
+                        }
+                        match ir.save_all().await {
+                            Ok(_) => saved += 1,
+                            Err(e) => warn!("[persistence] InfohashRepo 保存失败: {}", e),
+                        }
+                        match pr.save_all().await {
+                            Ok(_) => saved += 1,
+                            Err(e) => warn!("[persistence] PeerRepo 保存失败: {}", e),
+                        }
+                        match pr.flush_history().await {
+                            Ok(n) if n > 0 => {
+                                debug!("[persistence] PeerRepo history flushed: {} records", n)
+                            }
+                            Err(e) => warn!("[persistence] PeerRepo history flush 失败: {}", e),
+                            _ => {}
+                        }
+                        saved
+                    };
+                    // [ALLOWED-HARDCODED: 增量持久化执行兜底超时 45s（fix16 治理 dirty 积压占死 Persistence 槽 270s），保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), body).await {
+                        Ok(saved) => {
+                            debug!("[persistence] 增量持久化完成（{} 项）", saved);
+                            Ok(())
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "[persistence] 增量持久化执行超过 45s，本轮中止释放槽位"
+                            );
+                            Ok(())
+                        }
                     }
-                    // WAL checkpoint 已移至独立高频任务（wal_checkpoint_steady，每100ms），
-                    // 此处不再执行，避免与持久化操作叠加形成 IO 尖峰
-                    debug!("[persistence] 增量持久化完成（{} 项）", saved);
-                    Ok(())
                 }
             },
         );
@@ -1581,7 +1608,9 @@ async fn async_main(
                 let max_file_bytes = max_file_bytes;
                 let max_file_mb_val = max_file_mb_val;
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    // fix14：spawn_blocking + 45s 超时 —— IO 指标采样曾卡 420s+（storage
+                    // 锁竞争），占死 Monitor 槽、连带拖垮准入器饿死 Crawl 任务。
+                    let handle = tokio::task::spawn_blocking(move || {
                         let wal = storage.wal_bytes();
                         let _ = storage.update_aggregate("io_wal_bytes", wal as f64);
                         let mut ckpt_ewma_ms: u64 = 0;
@@ -1631,10 +1660,15 @@ async fn async_main(
                                 }
                             }
                         }
-                    })
-                    .await
-                    .ok();
-                    Ok(())
+                    });
+                    // [ALLOWED-HARDCODED: IO 指标采样执行兜底超时 45s（fix14 治理 Monitor 槽卡 420s），保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), handle).await {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[observability] IO 指标采样执行超过 45s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -1831,8 +1865,20 @@ async fn async_main(
             move || {
                 let m = m.clone();
                 async move {
-                    m.rescore_incremental().await;
-                    Ok(())
+                    // fix14：45s 超时 —— 增量评分重算曾卡 53-59s 占 Monitor 槽
+                    // [ALLOWED-HARDCODED: 增量评分重算执行兜底超时 45s（fix14 治理 Monitor 槽卡 53-59s），保护性上限]
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(45),
+                        m.rescore_incremental(),
+                    )
+                    .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[score] 增量评分重算执行超过 45s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -1971,7 +2017,7 @@ async fn async_main(
             TaskMetadata::new(
                 "tier_check",
                 "冷热分层检查",
-                std::time::Duration::from_secs(get_interval_secs(intervals, "tier_check", 60)),
+                std::time::Duration::from_secs(get_interval_secs(intervals, "tier_check", 600)),
             )
             .with_category(TaskCategory::Monitor)
             .with_priority(TaskPriority::Background)
@@ -1995,10 +2041,19 @@ async fn async_main(
             move || {
                 let tm = tm.clone();
                 async move {
+                    // fix14：45s 超时 —— 冷热分层检查曾卡 215s+ 占 Monitor 槽
+                    // [ALLOWED-HARDCODED: 冷热分层检查执行兜底超时 45s（fix14 治理 Monitor 槽卡 215s+），保护性上限]
                     // Capacity eviction is in-memory only (DB rows kept, no tombstones);
                     // must run even when IO busy. Dirty flush is rate-limited by IOScheduler.
-                    tm.check_all().await;
-                    Ok(())
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), tm.check_all())
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[tier] 冷热分层检查执行超过 45s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -2036,11 +2091,22 @@ async fn async_main(
                 let ir = ir.clone();
                 let tr = tr.clone();
                 async move {
-                    nr.tier_evict();
-                    pr.tier_evict();
-                    ir.tier_evict();
-                    tr.tier_evict();
-                    Ok(())
+                    // fix14：45s 超时 —— 冷热分层驱逐曾卡 418s+ 占死 Monitor 槽并堵死
+                    // select 的 hot 读取。同步调用放 spawn_blocking 便于 timeout 释放槽位。
+                    let handle = tokio::task::spawn_blocking(move || {
+                        nr.tier_evict();
+                        pr.tier_evict();
+                        ir.tier_evict();
+                        tr.tier_evict();
+                    });
+                    // [ALLOWED-HARDCODED: 冷热分层驱逐执行兜底超时 45s（fix14 治理 Monitor 槽卡死），保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), handle).await {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!("[tier] 冷热分层驱逐执行超过 45s，本轮中止释放槽位");
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -2945,8 +3011,20 @@ async fn async_main(
             move || {
                 let t = t.clone();
                 async move {
-                    t.run_once().await;
-                    Ok(())
+                    // 2026-10 fix8：120s 兜底超时。观测：tracker_fetcher 单轮卡 265s+
+                    // 长期占住 Network 分类槽（Network 4 槽被其独占），拖慢全局调度节奏。
+                    // [ALLOWED-HARDCODED: tracker_fetcher 单次执行兜底超时，防槽位泄漏的保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(120), t.run_once())
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "[tracker] tracker_fetcher 执行超过 120s，本轮中止释放槽位"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -3187,7 +3265,7 @@ async fn async_main(
 
     // 8.18 crawler 定时任务（8个）
     if let Some(ref crawler) = crawler_ref {
-        // crawler_bootstrap: 重新bootstrap（120s）
+        // crawler_bootstrap: 重新bootstrap（300s；fix7：120s → 300s，减少低频补充任务对 Crawl 槽位的占用）
         let c1 = crawler.clone();
         task_scheduler.register(
             TaskMetadata::new(
@@ -3196,7 +3274,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "crawler_bootstrap",
-                    120,
+                    300,
                 )),
             )
             .with_category(TaskCategory::Crawl)
@@ -3216,15 +3294,17 @@ async fn async_main(
             move || {
                 let c = c1.clone();
                 async move {
-                    // D2：单次执行包 300s 超时 —— 超时本轮中止、warn 并释放调度槽位，
-                    // 避免 crawler_bootstrap 卡住长期占住 Crawl 分类槽（曾 451s 被强杀）。
+                    // D2：单次执行包 45s 超时 —— 超时本轮中止、warn 并释放调度槽位，
+                    // 避免 crawler_bootstrap 卡住长期占住 Crawl 分类槽（曾 451s 被强杀；
+                    // 2026-10 fix7：300s → 45s，bootstrap 为补充性任务，发不完下轮再补，
+                    // 防止占满 Crawl 槽位拖死 active_crawl 的 30s 轮周期）。
                     // [ALLOWED-HARDCODED: crawler_bootstrap 单次执行兜底超时，防槽位泄漏的保护性上限]
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), c.bootstrap())
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), c.bootstrap())
                         .await
                     {
                         Ok(_) => Ok(()),
                         Err(_) => {
-                            tracing::warn!("[crawler] bootstrap 执行超过 300s，本轮中止释放槽位");
+                            tracing::warn!("[crawler] bootstrap 执行超过 45s，本轮中止释放槽位");
                             Ok(())
                         }
                     }
@@ -3306,7 +3386,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "crawler_get_peers",
-                    10,
+                    20,
                 )),
             )
             .with_category(TaskCategory::Crawl)
@@ -3339,7 +3419,8 @@ async fn async_main(
             },
         );
 
-        // crawler_sample_infohashes: 主动sample_infohashes（15s）
+        // crawler_sample_infohashes: 主动sample_infohashes（30s，fix21 由 15s 降频，
+        // values 采集国内恒 0（已闭环验证），给 find_node 腾 Crawl 槽）
         let c5 = crawler.clone();
         task_scheduler.register(
             TaskMetadata::new(
@@ -3348,11 +3429,11 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "crawler_sample_infohashes",
-                    15,
+                    30,
                 )),
             )
             .with_category(TaskCategory::Crawl)
-            .with_priority(TaskPriority::Normal)
+            .with_priority(TaskPriority::Important)
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
                 memory: ResourceLevel::Low,
@@ -3405,7 +3486,9 @@ async fn async_main(
             },
         );
 
-        // crawler_cleanup_pending: 清理超时pending请求（30s）
+        // crawler_cleanup_pending: 清理超时pending请求（120s；fix7：30s → 60s 并包超时；
+        // fix9：60s → 120s 降低触发频率；超时包装改 spawn_blocking，block_in_place 下
+        // timeout 无法中断同步闭包，cleanup 实测仍卡 128s+ 占 Crawl 槽）
         let c7 = crawler.clone();
         task_scheduler.register(
             TaskMetadata::new(
@@ -3414,7 +3497,7 @@ async fn async_main(
                 std::time::Duration::from_secs(get_interval_secs(
                     intervals,
                     "crawler_cleanup_pending",
-                    30,
+                    120,
                 )),
             )
             .with_category(TaskCategory::Crawl)
@@ -3429,8 +3512,20 @@ async fn async_main(
             move || {
                 let c = c7.clone();
                 async move {
-                    c.cleanup_pending();
-                    Ok(())
+                    // fix9：45s 兜底超时。spawn_blocking 的 JoinHandle 可被 timeout drop，
+                    // 任务从调度器角度立即结束（槽位释放），blocking 线程跑完即止。
+                    // [ALLOWED-HARDCODED: crawler_cleanup_pending 单次执行兜底超时，防槽位泄漏的保护性上限]
+                    let c2 = c.clone();
+                    let handle = tokio::task::spawn_blocking(move || c2.cleanup_pending());
+                    match tokio::time::timeout(std::time::Duration::from_secs(45), handle).await {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "[crawler] cleanup_pending 执行超过 45s，本轮中止释放槽位"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
             },
         );
@@ -3494,8 +3589,21 @@ async fn async_main(
             move || {
                 let c = c9.clone();
                 async move {
-                    c.update_metrics();
-                    Ok(())
+                    // fix14：30s 超时 —— 爬虫监控指标刷新曾卡 436s 占 Monitor 槽
+                    // [ALLOWED-HARDCODED: 爬虫监控指标刷新执行兜底超时 30s（fix14 治理 Monitor 槽卡 436s），保护性上限]
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+                        c.update_metrics();
+                    })
+                    .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "[crawler] 爬虫监控指标刷新执行超过 30s，本轮中止释放槽位"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
             },
         );

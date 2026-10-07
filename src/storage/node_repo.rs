@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -84,6 +84,17 @@ pub struct NodeRepoImpl {
     /// 本会话真新增节点累计（add_nodes_batch_internal 的 new_pairs 单一咽喉点，
     /// 覆盖爬虫/探测/联邦三条路径；启动 load_initial 不经过此路径不灌水；19号 D4）
     new_nodes_total: AtomicU64,
+    /// top 节点列表缓存（2026-10 fix8，30s 有效）。
+    /// 探索池 select 每轮调用 top_nodes_sync 触发 592 万节点全表克隆+排序，
+    /// 在写锁竞争下单次 40-90s，拖垮 active_crawl/get_peers/sample 轮周期
+    /// （实测 active_crawl 30s 周期被拉到 120s、get_peers 10s 拉到 87s）。
+    /// 缓存固定 2000 条（探索池最大需求），30s 内 select 秒回。
+    top_cache: Mutex<Option<(Instant, Vec<KBucketEntry>)>>,
+    /// 热池节点列表缓存（2026-10 fix10，30s 有效）。
+    /// hot_nodes_sync 每次 select 全表 read_all（592 万克隆），L0/L1 读取同样
+    /// 拖慢每轮 select（get_peers/sample 单轮实测 30s+）。与 top_cache 同模式，
+    /// 缓存固定 10000 条上限（热池通常远小于此），30s 内秒回。
+    hot_cache: Mutex<Option<(Instant, Vec<KBucketEntry>)>>,
 }
 
 impl NodeRepoImpl {
@@ -115,6 +126,8 @@ impl NodeRepoImpl {
             new_nodes_total: AtomicU64::new(0),
             active: AtomicU64::new(0),
             score_sum: AtomicU64::new(0),
+            top_cache: Mutex::new(None),
+            hot_cache: Mutex::new(None),
         }
     }
 
@@ -167,7 +180,7 @@ impl NodeRepoImpl {
 
     /// 预加载热窗口：加载时仅将最近活跃（此窗口内）的节点标为热。
     /// 与 tier.hot_threshold_secs 默认值一致；陈旧节点不再整体进场热池（2026-10 R2）。
-    const PRELOAD_HOT_WITHIN_SECS: u64 = 1800;
+    const PRELOAD_HOT_WITHIN_SECS: u64 = 120;
 
     /// Bad 复活冷却期（秒）：判死后需间隔此时长才可因被再次提及而复活（2026-10 D4）
     const BAD_REVIVE_COOLDOWN_SECS: u64 = 600;
@@ -402,26 +415,31 @@ impl NodeRepoImpl {
         if items.is_empty() {
             return Vec::new();
         }
+        // fix19：DB 已知性查询移出写锁 —— 原实现持 nodes 写锁做 SQLite
+        // existing_node_keys 查询（对端推送数万条时锁持数百 ms~120s+，RwLock
+        // 写优先直接饿死 select 读锁，拖死 Crawl、sample 卡 292s）。改为：
+        // 读锁筛内存未命中 → 释放 → DB 查询（无内存锁）→ 再写锁纯内存写入，
+        // 写锁持有时间降到毫秒级。写锁内 get_mut 命中即走更新分支，读锁到写锁
+        // 之间被并发插入的 addr 不会重复进 new_pairs，语义与原实现一致。
+        let candidates: Vec<String> = {
+            let nodes = self.nodes.read_all();
+            items
+                .iter()
+                .filter(|(_, a)| !nodes.contains_key(a))
+                .map(|(_, a)| format!("{}:{}", a.ip(), a.port()))
+                .collect()
+        };
+        let db_known: std::collections::HashSet<String> = if candidates.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            self.storage
+                .existing_node_keys(&candidates)
+                .unwrap_or_default()
+        };
         let mut nodes = self.nodes.write_all();
         let mut subnet_index = self.subnet_index.write();
         let mut new_pairs: Vec<(NodeId, SocketAddr)> = Vec::new();
         let mut revived: Vec<SocketAddr> = Vec::new();
-        // 批次G(F4)：内存未命中 ≠ 真新增——先查 DB，已有节点只回内存不进 new_pairs
-        // （否则驱逐→再遇→当新建→oplog+gossip 的 churn 灌爆联邦，实测 10 分钟 4.8 万条）
-        let db_known: std::collections::HashSet<String> = {
-            let candidates: Vec<String> = items
-                .iter()
-                .filter(|(_, a)| !nodes.contains_key(a))
-                .map(|(_, a)| format!("{}:{}", a.ip(), a.port()))
-                .collect();
-            if candidates.is_empty() {
-                std::collections::HashSet::new()
-            } else {
-                self.storage
-                    .existing_node_keys(&candidates)
-                    .unwrap_or_default()
-            }
-        };
         for (id, addr) in items {
             if let Some(existing) = nodes.get_mut(addr) {
                 // 鍚屽湴鍧€鑺傜偣 ID 鏇存柊锛氳嫢 ID 鍙樺寲锛屽悓姝ユ洿鏂扮綉娈电储寮曚腑鐨勬棫 ID
@@ -804,14 +822,54 @@ impl NodeRepoImpl {
     }
 
     pub fn top_nodes_sync(&self, n: usize) -> Vec<KBucketEntry> {
+        // 2026-10 fix8：30s 缓存，避免每次 select 全表克隆+排序 592 万节点。
+        // 缓存固定 2000 条（探索池最大需求 top_nodes_sync(2000)），按 n 截断返回。
+        // fix12：TTL 30s → 60s，缓存重建频率减半（重建需全表排序，实测 3-5s）。
+        let now = Instant::now();
+        const CACHE_TTL: Duration = Duration::from_secs(60);
+        const CACHE_SIZE: usize = 2000;
+        {
+            let cache = self.top_cache.lock().unwrap();
+            if let Some((updated, entries)) = cache.as_ref() {
+                if updated.elapsed() < CACHE_TTL {
+                    return entries.iter().take(n).cloned().collect();
+                }
+            }
+        }
+
         let mut all: Vec<KBucketEntry> = self.nodes.read_all().values().cloned().collect();
+        // 排序用「即时衰减有效分」：DB 恢复的 score 是历史值，加载节点未经 rescore 时
+        // 8 个月前 100% 响应率的历史高分死节点会恒占 top 位（2026-10 修复#4）。
+        // 按最后一次查询距今的时间衰减（复用 NodeScoreConfig 衰减参数），死节点快速掉出前 500。
+        let cfg = crate::intelligence::scorer_config::NodeScoreConfig::default();
         all.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let sa = Self::effective_score(a, &cfg);
+            let sb = Self::effective_score(b, &cfg);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
-        all.truncate(n);
-        all
+        let cached: Vec<KBucketEntry> = all.into_iter().take(CACHE_SIZE).collect();
+        let truncated: Vec<KBucketEntry> = cached.iter().take(n).cloned().collect();
+        *self.top_cache.lock().unwrap() = Some((now, cached));
+        truncated
+    }
+
+    /// 即时衰减有效分：score × 时间衰减系数（依据 last_query_time 距今时长）。
+    /// 无查询记录（新发现/从未查询）不衰减，保持中性分参与探索。
+    fn effective_score(
+        entry: &KBucketEntry,
+        cfg: &crate::intelligence::scorer_config::NodeScoreConfig,
+    ) -> f64 {
+        let mut s = entry.score;
+        if let Some(last_query) = entry.last_query_time {
+            let hours_elapsed = last_query.elapsed().as_secs_f64() / 3600.0;
+            if hours_elapsed > cfg.decay_start_hours {
+                let decay_range = cfg.decay_end_hours - cfg.decay_start_hours;
+                let decay = (1.0 - (hours_elapsed - cfg.decay_start_hours) / decay_range)
+                    .max(cfg.decay_min_factor);
+                s *= decay;
+            }
+        }
+        s
     }
 
     pub fn all_nodes_sync(&self) -> Vec<KBucketEntry> {
@@ -921,32 +979,65 @@ impl NodeRepoImpl {
 
     /// 杩斿洖鐑妭鐐瑰垪琛紙hot 闆嗗悎涓殑鑺傜偣锛屾寜璇勫垎闄嶅簭鐢辫皟鐢ㄦ柟鎺掑簭锛?
     pub fn hot_nodes_sync(&self) -> Vec<KBucketEntry> {
-        let nodes = self.nodes.read_all();
-        self.hot_addrs
+        // 2026-10 fix10：30s 缓存，避免每次 select 全表 read_all 克隆 592 万节点。
+        // fix12：重建不再 read_all，直接分片 O(1) get——缓存到期时 select 从 7-9s 降到 ~1s。
+        // fix13：按有效分排序截断 5000（select L0/L1 只处理 5000，不再被几百万 hot 拖垮；
+        // 启动热池曾达数百万——load_initial 窗口问题，见 PRELOAD_HOT_WITHIN_SECS=120）。
+        let now = Instant::now();
+        const CACHE_TTL: Duration = Duration::from_secs(30);
+        const CACHE_LIMIT: usize = 5000;
+        {
+            let cache = self.hot_cache.lock().unwrap();
+            if let Some((updated, entries)) = cache.as_ref() {
+                if updated.elapsed() < CACHE_TTL {
+                    return entries.clone();
+                }
+            }
+        }
+        let mut hot: Vec<KBucketEntry> = self
+            .hot_addrs
             .read()
             .iter()
-            .filter_map(|addr| nodes.get(addr).cloned())
-            .collect()
+            .filter_map(|addr| self.nodes.get(addr))
+            .collect();
+        // 排序用有效分（与 top_nodes_sync 一致），截断 5000 供 L0/L1 层选择
+        let cfg = crate::intelligence::scorer_config::NodeScoreConfig::default();
+        hot.sort_by(|a, b| {
+            let sa = Self::effective_score(a, &cfg);
+            let sb = Self::effective_score(b, &cfg);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hot.truncate(CACHE_LIMIT);
+        *self.hot_cache.lock().unwrap() = Some((now, hot.clone()));
+        hot
     }
 
     /// 灏嗚秴杩囬槇鍊肩殑鑺傜偣浠?hot 绉诲埌 cold锛堢敱澶栭儴 TaskScheduler 瀹氭椂璋冪敤锛屾ā鍧楀唴涓嶈嚜璺戝畾鏃讹級
     /// 杩斿洖鏈杩佺Щ鐨勮妭鐐规暟
     pub fn migrate_hot_to_cold_sync(&self, threshold_secs: u64) -> usize {
         let cutoff = crate::utils::cutoff_before(Duration::from_secs(threshold_secs));
-        let nodes = self.nodes.read_all();
+        // fix13：单轮最多处理 20 万，避免一次遍历数百万 hot 持锁数分钟
+        // （冷热分层驱逐曾卡 418s+ 占死 Monitor 槽、堵死 select 的 hot 读取）。
+        // 处理不完的下轮继续；hot 集合由真实活性驱动后规模有限。
+        const PER_ROUND_LIMIT: usize = 200_000;
         let mut hot = self.hot_addrs.write();
         let mut cold = self.cold_addrs.write();
-        let to_move: Vec<SocketAddr> = hot
-            .iter()
-            .filter(|addr| {
-                nodes
-                    .get(addr)
-                    .and_then(|e| e.last_accessed)
-                    .map(|t| t < cutoff)
-                    .unwrap_or(true)
-            })
-            .copied()
-            .collect();
+        let mut to_move: Vec<SocketAddr> = Vec::with_capacity(PER_ROUND_LIMIT.min(65_536));
+        for addr in hot.iter().take(PER_ROUND_LIMIT) {
+            // 判定依据用 last_active（真实活性：验证成功/查询响应会刷新，mention 不刷新——R5），
+            // 不再用 last_accessed：分层选择(默认 layered)不调用 mark_accessed 后 last_accessed
+            // 只在节点首次加入时更新，若仍按它迁移，验证成功的节点会在 30 分钟后全部被迁冷，
+            // 热池只剩下「新发现但从未验证」的节点——L1 层响应率归零的根因（2026-10 修复#2）。
+            // fix12：去掉全表 read_all（592 万克隆），改分片 O(1) get。
+            if self
+                .nodes
+                .get(addr)
+                .map(|e| e.last_active < cutoff)
+                .unwrap_or(true)
+            {
+                to_move.push(*addr);
+            }
+        }
         let moved = to_move.len();
         for addr in to_move {
             hot.remove(&addr);

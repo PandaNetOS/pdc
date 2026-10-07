@@ -110,11 +110,8 @@ impl SelectSystem {
             );
         }
 
-        // 3. 标记选中节点为热节点（legacy 语义保留：选中即热，自我强化回路）
-        for node in &result {
-            repo.mark_accessed_sync(node.addr);
-        }
-
+        // 3. 不再 mark_accessed：旧「选中即热」回路会让死节点被选一次后永远留在热池
+        //    （2026-10 修复#2）。热池语义收归「已验证响应/新发现」，由 NodeRepo 反馈路径维护。
         result
     }
 
@@ -147,13 +144,15 @@ impl SelectSystem {
 
         let hot = repo.hot_nodes_sync();
 
-        // L0：已验证活（本会话响应成功且在窗口内），按评分降序
+        // L0：已验证活（本会话响应成功且在窗口内），按评分降序。
+        // 已验证节点免除复探冷却（2026-10 修复#1）：验证窗口(默认120s)短于冷却期(旧默认300s)时
+        // 已验证节点全部处于冷却 → L0 恒空 → 选择退化为热池/探索（死节点池）。
+        // 已验证=最强活性证据，应立即复用；冷却仅约束 L1/探索等弱信号层。
         let mut verified: Vec<KBucketEntry> = hot
             .iter()
             .filter(|n| {
                 n.state != NodeState::Bad
                     && !params.exclude.contains(&n.addr)
-                    && !in_reprobe_cooldown(n, params.reprobe_min_interval_secs)
                     && n.last_verified
                         .map(|t| t.elapsed() <= verified_window)
                         .unwrap_or(false)
@@ -204,7 +203,8 @@ impl SelectSystem {
             );
         }
 
-        // top500 补足：exploit 缺口 + 探索预算（无论陈旧池多大，探索损耗受 explore_target 约束）
+        // top2000 补足：exploit 缺口 + 探索预算（2026-10 吞吐方案：500 → 2000，
+        // 扩大探索覆盖面，避免每轮重复同一批 top 节点）
         let mut tagged: Vec<(KBucketEntry, u8)> = Vec::with_capacity(count);
         for (idx, entry) in result.iter().enumerate() {
             let layer = if idx < verified_count {
@@ -217,7 +217,7 @@ impl SelectSystem {
         if tagged.len() < count {
             let chosen: HashSet<SocketAddr> = tagged.iter().map(|(e, _)| e.addr).collect();
             let pool: Vec<KBucketEntry> = repo
-                .top_nodes_sync(500)
+                .top_nodes_sync(2000)
                 .into_iter()
                 .filter(|n| {
                     n.state != NodeState::Bad
@@ -587,14 +587,18 @@ mod tests {
         );
     }
 
-    /// 复探冷却（批次K #12）：距上次查询不足间隔的节点跳过，超过则可复选
+    /// 复探冷却（2026-10 修复#1）：L0 已验证节点免冷却（立即复用，避免 L0 恒空）；
+    /// 冷却仍约束未验证（L1 新鲜）层——刚查询过的未验证节点不得入选
     #[test]
     fn test_reprobe_cooldown_filter() {
         let mut hot: Vec<KBucketEntry> = (1..=2)
             .map(|i| entry(i as u8, 6000 + i as u16, 10.0, true))
             .collect();
-        // 节点1 刚被查询过（100s 前 < 300s 间隔）；节点2 从未查询
+        // 节点1 已验证 + 刚被查询过（100s 前 < 300s 间隔）——L0 免冷却，应入选
         hot[0].last_query_time = Some(Instant::now() - Duration::from_secs(100));
+        // 节点2 未验证（清空 last_verified），但刚被查询过——L1 冷却应跳过
+        hot[1].last_verified = None;
+        hot[1].last_query_time = Some(Instant::now() - Duration::from_secs(100));
         let repo = MockRepo::new(hot.clone(), hot);
         let exclude = HashSet::new();
         let p = SelectionParams {
@@ -606,14 +610,18 @@ mod tests {
         };
         let tagged = SelectSystem::select_diverse_nodes_tagged(&repo, 5, 30, &p);
         let addrs: Vec<SocketAddr> = tagged.iter().map(|(e, _)| e.addr).collect();
-        let recently_probed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)), 6001);
+        let verified = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)), 6001);
+        let unverified = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 2, 2, 2)), 6002);
+        assert!(addrs.contains(&verified), "L0 已验证节点免复探冷却，应入选");
         assert!(
-            !addrs.contains(&recently_probed),
-            "复探冷却期内的节点不得入选"
+            !addrs.contains(&unverified),
+            "未验证节点仍受复探冷却约束，不得入选"
         );
     }
 
-    /// legacy 模式：旧行为（含 mark_accessed 自我强化语义），全部记探索层
+    /// legacy 模式（2026-10 修复#2）：全部记探索层；不再调用 mark_accessed——
+    /// 「选中即热」回路已全局移除（热池只由 NodeRepo 验证反馈维护），
+    /// legacy 逃生通道同样遵守，避免历史死节点被选一次后永驻热池
     #[test]
     fn test_legacy_mode_keeps_old_behavior() {
         let hot: Vec<KBucketEntry> = (1..=5)
@@ -633,8 +641,8 @@ mod tests {
         assert!(tagged.iter().all(|(_, l)| *l == LAYER_EXPLORE));
         assert_eq!(
             repo.accessed.load(std::sync::atomic::Ordering::Relaxed),
-            5,
-            "legacy 模式保留选中即热语义"
+            0,
+            "legacy 模式同样不再自我标记热"
         );
     }
 

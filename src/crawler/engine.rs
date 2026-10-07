@@ -25,6 +25,7 @@ use crate::dht::routing_table::RoutingTable;
 use crate::discoverers::dht::message::{DhtMessage, DhtNode, QueryMethod};
 use crate::event_bus::EventBus;
 use crate::net::socket_opts::create_udp_socket;
+use crate::storage::repo_traits::InfohashRepository;
 use crate::storage::PeerRepoImpl;
 use crate::types::{Event, Infohash, PeerInfo, PeerSource};
 
@@ -56,6 +57,9 @@ static INFOHASH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 爬行进度日志上次打印时间（Unix 毫秒），用于按时间间隔采样
 static LAST_PROGRESS_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 未识别/error 消息日志采样计数器（每 200 条打一次日志；2026-10 fix2 观测用）
+static UNPARSED_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 解析消息处理并发上限：配置为 0 时按 CPU 核数 / 4 自动计算，下限 1。
 ///
@@ -190,7 +194,10 @@ impl Default for RoundFeedbackAcc {
 }
 
 /// 流式发送队列条目（19号 D3）：生产者只入队，paced 消费者按预算平滑发送
+/// 2026-10 fix2 后 active_* 改为直发（不再入队），部分变体暂未构造——
+/// 保留枚举完整性（链式采集/未来回退入队路径仍引用类型），clippy 放行。
 #[derive(Debug)]
+#[allow(dead_code)]
 enum SendWorkItem {
     FindNode {
         addr: SocketAddr,
@@ -910,6 +917,9 @@ impl CrawlerEngine {
     }
 
     /// 批量入队 find_node（active_crawl 用），返回成功入队数
+    /// 2026-10 fix2 后 active_crawl 直发（不经过入队/消费者），本方法保留供
+    /// paced 模式回退与兼容测试引用，clippy 放行 dead_code。
+    #[allow(dead_code)]
     fn enqueue_find_nodes(&self, nodes: &[(KBucketEntry, u8)], round_seq: u64) -> u64 {
         let mut n = 0u64;
         for (entry, layer) in nodes {
@@ -934,6 +944,9 @@ impl CrawlerEngine {
         // （调度器 300s 硬超时会周期性杀死常驻任务；与 crawl_loop/recv_loop 先例一致，19号 D3）
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 2026-10 fix2：消费者健康观测（每 60s 一条，确认队列消费是否正常）
+        let mut last_obs = std::time::Instant::now();
+        let mut consumed_total = 0u64;
         loop {
             interval.tick().await;
             if self.is_paused() {
@@ -980,6 +993,18 @@ impl CrawlerEngine {
                     }
                 }
                 self.dispatch_send_item(&item, socket_idx, &socket).await;
+                consumed_total += 1;
+            }
+            // [ALLOWED-HARDCODED: paced 消费者健康观测日志周期 60s，纯观测无逻辑影响，保持固定节奏便于日志对齐]
+            if last_obs.elapsed() >= Duration::from_secs(60) {
+                let dropped_now = self.enqueue_dropped_total.load(Ordering::Relaxed);
+                let queue_now = self.send_queue_len.load(Ordering::Relaxed);
+                info!(
+                    "[crawler] paced 消费者: 60s内消费 {} 条, 队列={}, 累计丢弃={}, 预算={}/tick",
+                    consumed_total, queue_now, dropped_now, budget
+                );
+                last_obs = std::time::Instant::now();
+                consumed_total = 0;
             }
         }
     }
@@ -1159,9 +1184,9 @@ impl CrawlerEngine {
         }
     }
 
-    /// 解析实际并发 socket 数（clamp 到 [1, min(config.concurrent_sockets, sockets.len(), 8)]）
+    /// 解析实际并发 socket 数（clamp 到 [1, min(config.concurrent_sockets, sockets.len(), 32)]）
     fn resolve_concurrent_sockets(&self, node_count: usize) -> usize {
-        let configured = self.config.concurrent_sockets.clamp(1, 8);
+        let configured = self.config.concurrent_sockets.clamp(1, 32);
         let available = self.sockets.len().max(1);
         configured.min(available).min(node_count.max(1))
     }
@@ -1225,12 +1250,11 @@ impl CrawlerEngine {
                 let per_target = group.len().div_ceil(num_targets);
 
                 for (i, (node, layer)) in group.iter().enumerate() {
-                    // 限速跳过检查：被限速的 socket 按 skip_ratio 降频跳过
-                    if let Some(rl) = &rate_limiter {
-                        if rl.should_skip(socket_idx) {
-                            continue;
-                        }
-                    }
+                    // fix20：find_node 不再走 should_skip 降频 —— 响应率低触发
+                    // throttled 时 get_peers/sample/find_node 共享 skip 周期，实测
+                    // 总发送被砍半、find_node 净 5,700/h（目标 10,000/h）。find_node
+                    // 峰值仅 128/30s≈15,360/h（8 socket ≈ 32/s/口），UDP 压力可控；
+                    // rate_limiter 的 record_request 仍记录，防爆兜底保留。
                     let target_idx = (i / per_target).min(num_targets - 1);
                     let target = targets[target_idx];
                     let mut tid = rand::thread_rng().gen::<[u8; 4]>();
@@ -1375,7 +1399,10 @@ impl CrawlerEngine {
             handles.push(tokio::spawn(async move {
                 let mut local_sent = 0u64;
                 for node in &group {
-                    for _ in 0..5 {
+                    // 2026-10 fix8：5 → 2。观测：128 节点 × 5 = 640 条/轮，10s 周期
+                    // 发不完（实际 87s/轮），拖慢全部 Crawl 任务。降为 2 次/节点后
+                    // 单轮 256 条，周期恢复 10s；values 采集当前恒 0，无实质损失。
+                    for _ in 0..2 {
                         // 限速跳过检查：被限速的 socket 按 skip_ratio 降频跳过
                         if let Some(rl) = &rate_limiter {
                             if rl.should_skip(socket_idx) {
@@ -1439,7 +1466,8 @@ impl CrawlerEngine {
     ) -> u64 {
         let mut sent = 0u64;
         for node in nodes {
-            for _ in 0..5 {
+            // 2026-10 fix8：5 → 2（同 send_get_peers_concurrent，控制单轮发送量）
+            for _ in 0..2 {
                 let idx = rand::random::<usize>() % infohashes.len();
                 let ih = infohashes[idx];
                 let mut tid = rand::random::<[u8; 4]>();
@@ -1638,8 +1666,14 @@ impl CrawlerEngine {
             .map(|c| c.next_rate_multiplier())
             .unwrap_or(1.0);
 
-        // 2. 计算发送节点数（基础64 × 倍率，clamp 到 [8, 256]）
-        let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
+        // 2. 计算发送节点数（基础128 × 倍率，clamp 到 [64, 512]）
+        // fix21：128 → 192 —— 实测 crawl 周期被 get_peers/sample 排队拖到 35-40s、
+        // 发送命中 ~85%，128/轮净 8.6-10.8k/h 波动不达 1 万目标。192/轮按 37s×85%
+        // ≈ 15.8k/h，留 50% 余量稳定超线。select 毫秒级、发送 2-3ms，负担可忽略。
+        let target_count = ((192.0_f64 * multiplier.max(0.5)).round() as usize).clamp(64, 512);
+
+        // fix11 探针：分段耗时定位（select / 发送）
+        let t0 = std::time::Instant::now();
 
         // 3. 选取节点（分层：L0 已验证 / L1 新鲜 / 探索预算受限）
         let tagged_nodes = if self.node_repo.is_some() {
@@ -1661,6 +1695,11 @@ impl CrawlerEngine {
         if tagged_nodes.is_empty() {
             return;
         }
+        info!(
+            "[crawler][probe] crawl select 耗时 {}ms，选中 {}",
+            t0.elapsed().as_millis(),
+            tagged_nodes.len()
+        );
         let mut layer_sent = [0u64; 3];
         for (_, layer) in &tagged_nodes {
             layer_sent[(*layer as usize).min(2)] += 1;
@@ -1681,12 +1720,19 @@ impl CrawlerEngine {
                 concurrent
             };
         }
-        let _sent_total = if self.is_paced() {
-            self.enqueue_find_nodes(&tagged_nodes, round_seq)
-        } else {
-            self.send_find_node_concurrent(&tagged_nodes, concurrent, round_seq)
-                .await
-        };
+        let t_send = std::time::Instant::now();
+        // 2026-10 fix2：paced 模式也直发（不再入队）。
+        // 观测证据：paced 消费者在运行中偶发饿死/不消费（requests_sent 仅 ~2/s，
+        // 远低于理论 38/s；分层账目"选中 255 响应 0"实为入队后未发送），
+        // 入队≈不发送。直发受 concurrent 并发限制 + RateLimiter 节流保护。
+        let _sent_total = self
+            .send_find_node_concurrent(&tagged_nodes, concurrent, round_seq)
+            .await;
+        info!(
+            "[crawler][probe] crawl 发送耗时 {}ms（select 后总计 {}ms）",
+            t_send.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
 
         // 6. 记录 pending_after
         let pending_after = self.pending_total();
@@ -1751,11 +1797,14 @@ impl CrawlerEngine {
             .as_ref()
             .map(|c| c.next_rate_multiplier())
             .unwrap_or(1.0);
-        let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
+        let target_count = ((128.0_f64 * multiplier.max(0.5)).round() as usize).clamp(64, 512);
 
-        // 2. 选取节点
-        let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(target_count, 4)
+        // fix11 探针：分段耗时定位（select / 发送）
+        let t0 = std::time::Instant::now();
+
+        // 2. 选取节点（2026-10 fix2：改分层选择，与 active_crawl 统一；L0 已验证优先）
+        let tagged_nodes = if self.node_repo.is_some() {
+            self.select_diverse_nodes_tagged(target_count, 4)
         } else {
             let known = self.known_nodes.read();
             if known.is_empty() {
@@ -1768,12 +1817,18 @@ impl CrawlerEngine {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             all.truncate(16);
-            all
+            all.into_iter().map(|e| (e, 2u8)).collect()
         };
+        let nodes: Vec<KBucketEntry> = tagged_nodes.into_iter().map(|(e, _)| e).collect();
 
         if nodes.is_empty() {
             return;
         }
+        info!(
+            "[crawler][probe] get_peers select 耗时 {}ms，选中 {}",
+            t0.elapsed().as_millis(),
+            nodes.len()
+        );
 
         // 解析内置热门 infohash
         let mut infohashes: Vec<Infohash> = Vec::new();
@@ -1805,33 +1860,22 @@ impl CrawlerEngine {
         let round_seq = self.next_round_seq();
         self.open_round_feedback(round_seq, [0, 0, 0]);
 
-        // 4. 发送（每节点发5个 infohash 查询）：paced 入队 / round 直发
+        // 4. 发送（每节点发5个 infohash 查询）：2026-10 fix2 统一直发
+        //    （paced 入队已被观测证实在运行中可能不消费，见 active_crawl 注释）
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
         {
             let mut state = self.state.write();
-            state.concurrent_sockets_in_use = if self.is_paced() {
-                self.sockets.len()
-            } else {
-                concurrent
-            };
+            state.concurrent_sockets_in_use = concurrent;
         }
-        if self.is_paced() {
-            for node in &nodes {
-                for _ in 0..5 {
-                    let ih = infohashes[rand::random::<usize>() % infohashes.len()];
-                    self.enqueue_send(SendWorkItem::GetPeers {
-                        addr: node.addr,
-                        infohash: ih,
-                        layer: 0,
-                        round_seq,
-                    });
-                }
-            }
-        } else {
-            let _ = self
-                .send_get_peers_concurrent(&nodes, concurrent, &infohashes, round_seq)
-                .await;
-        }
+        let t_send = std::time::Instant::now();
+        let _ = self
+            .send_get_peers_concurrent(&nodes, concurrent, &infohashes, round_seq)
+            .await;
+        info!(
+            "[crawler][probe] get_peers 发送耗时 {}ms（select 后总计 {}ms）",
+            t_send.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
 
         // 5. get_peers 不参与自适应决策（发送量小、反馈无代表性），仅清理本轮账目防泄漏
         let _ = self.take_round_feedback(round_seq);
@@ -1865,11 +1909,14 @@ impl CrawlerEngine {
             .as_ref()
             .map(|c| c.next_rate_multiplier())
             .unwrap_or(1.0);
-        let target_count = ((64.0_f64 * multiplier).round() as usize).clamp(8, 256);
+        let target_count = ((128.0_f64 * multiplier.max(0.5)).round() as usize).clamp(64, 512);
 
-        // 2. 选取节点
-        let nodes = if self.node_repo.is_some() {
-            self.select_diverse_nodes(target_count, 3)
+        // fix11 探针：分段耗时定位（select / 发送）
+        let t0 = std::time::Instant::now();
+
+        // 2. 选取节点（2026-10 fix2：改分层选择，与 active_crawl 统一；L0 已验证优先）
+        let tagged_nodes = if self.node_repo.is_some() {
+            self.select_diverse_nodes_tagged(target_count, 3)
         } else {
             let known = self.known_nodes.read();
             if known.is_empty() {
@@ -1882,40 +1929,37 @@ impl CrawlerEngine {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             all.truncate(32);
-            all
+            all.into_iter().map(|e| (e, 2u8)).collect()
         };
+        let nodes: Vec<KBucketEntry> = tagged_nodes.into_iter().map(|(e, _)| e).collect();
 
         if nodes.is_empty() {
             return;
         }
+        info!(
+            "[crawler][probe] sample select 耗时 {}ms，选中 {}",
+            t0.elapsed().as_millis(),
+            nodes.len()
+        );
 
         // 3. 打开本轮反馈账目
         let round_seq = self.next_round_seq();
         self.open_round_feedback(round_seq, [0, 0, 0]);
 
-        // 4. 发送：paced 入队 / round 直发
+        // 4. 发送：2026-10 fix2 统一直发（paced 入队已被观测证实在运行中可能不消费）
         let concurrent = self.resolve_concurrent_sockets(nodes.len());
         {
             let mut state = self.state.write();
-            state.concurrent_sockets_in_use = if self.is_paced() {
-                self.sockets.len()
-            } else {
-                concurrent
-            };
+            state.concurrent_sockets_in_use = concurrent;
         }
-        if self.is_paced() {
-            for node in &nodes {
-                self.enqueue_send(SendWorkItem::Sample {
-                    addr: node.addr,
-                    layer: 0,
-                    round_seq,
-                });
-            }
-        } else {
-            let _ = self
-                .send_sample_infohashes_concurrent(&nodes, concurrent, round_seq)
-                .await;
-        }
+        let t_send = std::time::Instant::now();
+        let _ = self
+            .send_sample_infohashes_concurrent(&nodes, concurrent, round_seq)
+            .await;
+        info!(
+            "[crawler][probe] sample 发送耗时 {}ms",
+            t_send.elapsed().as_millis()
+        );
 
         // 5. sample_infohashes 不参与自适应决策（发送量小、反馈无代表性），仅清理本轮账目防泄漏
         let _ = self.take_round_feedback(round_seq);
@@ -2085,6 +2129,97 @@ impl CrawlerEngine {
                 state.nodes_crawled += 1;
             }
         }
+
+        // 2026-10 fix3：实时邻居直接采集。
+        // 观测结论：主动路径发往 hot 池（历史活跃节点为主）响应率趋近 0（L1 0/252），
+        // 而链式爬行发往「刚响应过的节点返回的邻居」matched 持续增长——实时邻居活性
+        // 远高于 hot 池。对其直接发 get_peers（内置热门 infohash）即可最短链路采集 peer，
+        // 并借 get_peers 成功响应（claim 命中 → record_query_with_nodes_sync）为这些节点
+        // 打上 last_verified → L0 池即时积累（打破「L0 空 → 只能发 hot 池死节点」死循环）。
+        // 量级：每次响应 ≤8 节点 × 2 查询 = ≤16 个 get_peers，风暴可控。
+        const MAX_CHAIN_GET_PEERS: usize = 8;
+        const GET_PEERS_PER_NODE: usize = 2;
+        // 2026-10 fix5：查询目标优先用「最近活跃 infohash」（score 活跃度排序）。
+        // 内置 POPULAR 为 2010 年代镜像 infohash，国内 DHT 节点不跟踪 → get_peers
+        // 响应 values 恒空（fix4 观测 5 条响应全 peers=0）；top_infohashes 反映最近
+        // 被发现/验证的活跃 infohash，节点持有其 peers 的概率高。空/超时回退 POPULAR。
+        let infohashes: Vec<Infohash> = {
+            let mut ihs: Vec<Infohash> = Vec::new();
+            if let Some(repo) = &self.infohash_repo {
+                if let Ok(active) = tokio::time::timeout(
+                    // [ALLOWED-HARDCODED: top_infohashes 查询保护性超时 50ms，防 repo 锁竞争阻塞发送循环；配置化收益低]
+                    std::time::Duration::from_millis(50),
+                    repo.top_infohashes(16),
+                )
+                .await
+                {
+                    ihs = active.into_iter().map(|(ih, _)| ih).collect();
+                }
+            }
+            if ihs.is_empty() {
+                for hex_str in POPULAR_INFOHASHES {
+                    if let Ok(bytes) = hex::decode(hex_str) {
+                        if bytes.len() == 20 {
+                            let mut ih = [0u8; 20];
+                            ih.copy_from_slice(&bytes);
+                            ihs.push(ih);
+                        }
+                    }
+                }
+            }
+            ihs
+        };
+        if infohashes.is_empty() {
+            return;
+        }
+        for node in new_nodes.iter().take(MAX_CHAIN_GET_PEERS) {
+            if node.addr.port() == 0 {
+                continue;
+            }
+            for _ in 0..GET_PEERS_PER_NODE {
+                let ih = infohashes[rand::random::<usize>() % infohashes.len()];
+                let mut tid = rand::thread_rng().gen::<[u8; 4]>();
+                tid[0] = socket_idx as u8;
+                let vid = self.random_virtual_node_id();
+                let msg = DhtMessage::build_get_peers(&tid, &vid, &ih);
+
+                {
+                    let shard = pending_shard(&tid);
+                    let mut pending = self.pending[shard].write();
+                    pending.insert(
+                        tid.to_vec(),
+                        PendingRequest {
+                            _method: QueryMethod::GetPeers,
+                            target: ih,
+                            addr: node.addr,
+                            sent_at: Instant::now(),
+                            round_seq: 0,
+                            layer: 0,
+                        },
+                    );
+                }
+
+                if socket.send_to(&msg, node.addr).await.is_ok() {
+                    self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
+                    let mut state = self.state.write();
+                    state.requests_sent += 1;
+                    if let Some(rl) = &self.rate_limiter {
+                        rl.record_request(socket_idx);
+                    }
+                }
+            }
+        }
+        // 2026-10 fix4：链式直接采集发送观测（每 20 次采样一条）
+        {
+            static CHAIN_GP_LOG: AtomicU64 = AtomicU64::new(0);
+            let n = CHAIN_GP_LOG.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(20) {
+                info!(
+                    "[crawler] 链式直接采集: 已对实时邻居累计发起 {} 轮 get_peers",
+                    n + 1
+                );
+            }
+        }
     }
 
     /// 刷新所有非空 bucket（Kademlia 标准 bucket 刷新）
@@ -2160,30 +2295,58 @@ impl CrawlerEngine {
         // pending 超时由配置控制（默认 120s）：响应到达/处理延迟实测远超 15s，
         // 过短超时会在响应到达前清空 pending → claim 未命中 → responded 失真
         let timeout = Duration::from_secs(self.config.pending_timeout_secs);
+        // 2026-10 fix2：单轮失败记录上限。观测：响应延迟可达 2 分钟+，超时堆积时
+        // 单轮逐个 record_query_sync（每次一个写锁）会造成写锁风暴，曾致
+        // cleanup_pending 任务在飞 457s 被强制回收、同期 API 8-20s 超时。
+        // 移除（内存操作）仍全量进行；失败记录限流，余量留待下轮。
+        // 2026-10 fix9：100 → 50、批次 50 → 20。fix7 已从 300 降到 100，但写锁竞争下
+        // cleanup 仍卡 128s+（40 轮心跳观测）。单轮记录进一步减半、批次缩小，
+        // 让 cleanup 在 spawn_blocking + 45s 超时下尽快结束，释放 Crawl 槽位。
+        const MAX_FAILURE_RECORDS_PER_ROUND: usize = 50;
 
-        // 跨 16 个分片收集超时请求的地址，用于记录失败统计
+        // 跨 16 个分片收集超时请求的地址（去重），用于记录失败统计
         let mut expired_addrs: Vec<SocketAddr> = Vec::new();
+        let mut seen_addrs: std::collections::HashSet<SocketAddr> =
+            std::collections::HashSet::with_capacity(256);
         for shard in self.pending.iter() {
             let mut map = shard.write();
-            expired_addrs.extend(
-                map.iter()
-                    .filter(|(_, req)| req.sent_at.elapsed() >= timeout)
-                    .map(|(_, req)| req.addr),
-            );
+            for (_, req) in map
+                .iter()
+                .filter(|(_, req)| req.sent_at.elapsed() >= timeout)
+            {
+                if seen_addrs.insert(req.addr) {
+                    expired_addrs.push(req.addr);
+                }
+            }
             map.retain(|_, req| req.sent_at.elapsed() < timeout);
         }
 
-        // 记录失败统计到 NodeRepo
+        // 记录失败统计到 NodeRepo（分批写，每批 20 减少单次持锁时长）
         if !expired_addrs.is_empty() {
             if let Some(repo) = &self.node_repo {
-                for addr in &expired_addrs {
-                    repo.record_query_sync(*addr, false, 0);
+                let batch: Vec<SocketAddr> = expired_addrs
+                    .iter()
+                    .take(MAX_FAILURE_RECORDS_PER_ROUND)
+                    .copied()
+                    .collect();
+                for chunk in batch.chunks(20) {
+                    for addr in chunk {
+                        repo.record_query_sync(*addr, false, 0);
+                    }
+                }
+                if expired_addrs.len() > MAX_FAILURE_RECORDS_PER_ROUND {
+                    debug!(
+                        "[crawler] 超时请求 {} 个（本轮记录 {} 个失败，余量留待下轮）",
+                        expired_addrs.len(),
+                        batch.len()
+                    );
+                } else {
+                    debug!(
+                        "[crawler] 超时请求 {} 个，已记录失败统计",
+                        expired_addrs.len()
+                    );
                 }
             }
-            debug!(
-                "[crawler] 超时请求 {} 个，已记录失败统计",
-                expired_addrs.len()
-            );
         }
     }
 
@@ -2203,67 +2366,86 @@ impl CrawlerEngine {
         // 注意：响应率计数收敛到 claim_pending（tid 命中 pending 才计）。
         // 此处不再对每个入站数据报无条件计数——其他节点的未请求查询、
         // 迟到/伪造响应都不再进入响应率信号。
-        // 尝试解析 find_node 响应
-        if let Some((tid, nodes)) = DhtMessage::parse_find_node_response(data) {
-            debug!(
-                "[crawler] 收到 find_node 响应 from {}, nodes={}",
-                from,
-                nodes.len()
-            );
+        // 2026-10 fix4：特化类型判定——get_peers/sample 响应不得由 find_node 分支吞掉。
+        // parse_get_peers/sample 已严格化（分别要求 values|token / num|samples），但
+        // parse_find_node_response 对任何 y=r 响应都会成功（nodes 可为空），若 find_node
+        // 分支先处理并 return，get_peers 的 peers（values）与 sample 的 infohash 均被
+        // 丢弃——此前 peers/infos 采集恒为 0 的直接根因。携带 values/token 或
+        // num/samples 特征的响应放行给下方对应分支处理。
+        let is_get_peers_resp = DhtMessage::response_has_field(data, b"values")
+            || DhtMessage::response_has_field(data, b"token");
+        let is_sample_resp = DhtMessage::response_has_field(data, b"num")
+            || DhtMessage::response_has_field(data, b"samples");
+        if !is_get_peers_resp && !is_sample_resp {
+            // 尝试解析 find_node 响应
+            if let Some((tid, nodes)) = DhtMessage::parse_find_node_response(data) {
+                debug!(
+                    "[crawler] 收到 find_node 响应 from {}, nodes={}",
+                    from,
+                    nodes.len()
+                );
 
-            // tid 认领：命中则计入响应率/轮次反馈并移除 pending，未命中计迟到
-            let claimed = self.claim_pending(socket_idx, &tid);
+                // tid 认领：命中则计入响应率/轮次反馈并移除 pending，未命中计迟到
+                let claimed = self.claim_pending(socket_idx, &tid);
 
-            // 记录查询成功统计（响应来源节点 → NodeRepo，含返回节点数）
-            {
-                let latency_ms = claimed.as_ref().map(|(ms, _)| *ms);
-                if let Some(repo) = &self.node_repo {
-                    repo.record_query_with_nodes_sync(
-                        from,
-                        latency_ms.unwrap_or(0),
-                        nodes.len() as u64,
-                    );
+                // 记录查询统计：命中记成功，迟到/伪造（tid 未命中）记失败——
+                // 旧实现无条件记成功，迟到响应会把死节点刷成 Good+热池（2026-10 修复#3）
+                match &claimed {
+                    Some((latency_ms, _)) => {
+                        if let Some(repo) = &self.node_repo {
+                            repo.record_query_with_nodes_sync(
+                                from,
+                                *latency_ms,
+                                nodes.len() as u64,
+                            );
+                        }
+                    }
+                    None => {
+                        if let Some(repo) = &self.node_repo {
+                            repo.record_query_sync(from, false, 0);
+                        }
+                    }
                 }
-            }
 
-            // 方向C：新节点加入 NodeRepo（无容量限制，主候选池），同时尝试加入路由表（DHT路由用）
-            if !nodes.is_empty() {
-                // 过滤无效端口，批量处理以减少锁获取次数和 Merkle/Gossip 传播次数
-                let valid: Vec<([u8; 20], SocketAddr)> = nodes
-                    .iter()
-                    .filter(|n| n.addr.port() != 0)
-                    .map(|n| (n.id, n.addr))
-                    .collect();
-
-                let repo_added = if let Some(repo) = &self.node_repo {
-                    repo.add_nodes_sync_batch(&valid)
-                } else {
-                    0
-                };
-
-                // 批量加入路由表（一次写锁）
-                let rt_added = {
-                    let mut known = self.known_nodes.write();
-                    valid
+                // 方向C：新节点加入 NodeRepo（无容量限制，主候选池），同时尝试加入路由表（DHT路由用）
+                if !nodes.is_empty() {
+                    // 过滤无效端口，批量处理以减少锁获取次数和 Merkle/Gossip 传播次数
+                    let valid: Vec<([u8; 20], SocketAddr)> = nodes
                         .iter()
-                        .filter(|(id, addr)| known.add_node(*id, *addr))
-                        .count()
-                };
+                        .filter(|n| n.addr.port() != 0)
+                        .map(|n| (n.id, n.addr))
+                        .collect();
 
-                if repo_added > 0 || rt_added > 0 {
-                    debug!("[crawler] 响应节点={} NodeRepo新增={} 路由表新增={} NodeRepo总计={} 路由表={}",
+                    let repo_added = if let Some(repo) = &self.node_repo {
+                        repo.add_nodes_sync_batch(&valid)
+                    } else {
+                        0
+                    };
+
+                    // 批量加入路由表（一次写锁）
+                    let rt_added = {
+                        let mut known = self.known_nodes.write();
+                        valid
+                            .iter()
+                            .filter(|(id, addr)| known.add_node(*id, *addr))
+                            .count()
+                    };
+
+                    if repo_added > 0 || rt_added > 0 {
+                        debug!("[crawler] 响应节点={} NodeRepo新增={} 路由表新增={} NodeRepo总计={} 路由表={}",
                         nodes.len(), repo_added, rt_added,
                         self.node_repo.as_ref().map(|r| r.len_sync()).unwrap_or(0),
                         self.known_nodes.read().len());
+                    }
+
+                    // 链式爬行节点：收集后由 async 层统一发送
+                    chain_groups.push(nodes.clone());
                 }
 
-                // 链式爬行节点：收集后由 async 层统一发送
-                chain_groups.push(nodes.clone());
+                // pending 已在 claim_pending 中移除
+                // 注意：NodeRepo 持久化由定期任务（每5分钟）负责，不在每次响应后全量保存，避免大量磁盘 IO
+                return chain_groups;
             }
-
-            // pending 已在 claim_pending 中移除
-            // 注意：NodeRepo 持久化由定期任务（每5分钟）负责，不在每次响应后全量保存，避免大量磁盘 IO
-            return chain_groups;
         }
 
         // 尝试解析 get_peers 响应
@@ -2278,15 +2460,21 @@ impl CrawlerEngine {
             // tid 认领：命中则计入响应率/轮次反馈并移除 pending，未命中计迟到
             let claimed = self.claim_pending(socket_idx, &tid);
 
-            // 记录查询成功统计（响应来源节点 → NodeRepo，含返回节点数）
-            {
-                let latency_ms = claimed.as_ref().map(|(ms, _)| *ms);
-                if let Some(repo) = &self.node_repo {
-                    repo.record_query_with_nodes_sync(
-                        from,
-                        latency_ms.unwrap_or(0),
-                        resp.nodes.len() as u64,
-                    );
+            // 记录查询统计：命中记成功，迟到/伪造记失败（2026-10 修复#3，同 find_node 分支）
+            match &claimed {
+                Some((latency_ms, _)) => {
+                    if let Some(repo) = &self.node_repo {
+                        repo.record_query_with_nodes_sync(
+                            from,
+                            *latency_ms,
+                            resp.nodes.len() as u64,
+                        );
+                    }
+                }
+                None => {
+                    if let Some(repo) = &self.node_repo {
+                        repo.record_query_sync(from, false, 0);
+                    }
                 }
             }
 
@@ -2363,20 +2551,26 @@ impl CrawlerEngine {
                 resp.samples.len()
             );
 
-            // 记录查询成功统计
-            {
-                let latency_ms = {
-                    let pending = self.pending[pending_shard(&tid)].read();
-                    pending
-                        .get(&tid.to_vec())
-                        .map(|r| r.sent_at.elapsed().as_millis() as u64)
-                };
-                if let Some(repo) = &self.node_repo {
-                    repo.record_query_with_nodes_sync(
-                        from,
-                        latency_ms.unwrap_or(0),
-                        resp.samples.len() as u64,
-                    );
+            // tid 认领：与 find_node/get_peers 统一——计入响应率/轮次反馈/matched/late，
+            // 并原子移除 pending（旧实现不 claim：sample 响应既不进响应率信号，
+            // 又把迟到响应无条件记为成功，污染评分与热池。2026-10 修复#3）
+            let claimed = self.claim_pending(socket_idx, &tid);
+
+            // 记录查询统计：命中记成功，迟到/伪造记失败
+            match &claimed {
+                Some((latency_ms, _)) => {
+                    if let Some(repo) = &self.node_repo {
+                        repo.record_query_with_nodes_sync(
+                            from,
+                            *latency_ms,
+                            resp.samples.len() as u64,
+                        );
+                    }
+                }
+                None => {
+                    if let Some(repo) = &self.node_repo {
+                        repo.record_query_sync(from, false, 0);
+                    }
                 }
             }
 
@@ -2803,6 +2997,18 @@ impl CrawlerEngine {
 
                             match processed {
                                 Ok((chain_groups, query_out)) => {
+                                    // 2026-10 fix2：未识别/error 消息可观测
+                                    // （响应/查询解析均未命中 → error 响应或非 DHT 数据；采样日志防刷屏）
+                                    if chain_groups.is_empty() && query_out.is_none() {
+                                        let n = UNPARSED_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                        if n.is_multiple_of(200) {
+                                            info!(
+                                                "[crawler] 未识别/error 消息累计 {} 条（采样 from {}）",
+                                                n + 1,
+                                                from
+                                            );
+                                        }
+                                    }
                                     // 链式爬行（异步发送，回到 async worker）
                                     for nodes in chain_groups {
                                         if !nodes.is_empty() {

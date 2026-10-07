@@ -210,7 +210,11 @@ pub struct TaskSchedulerConfig {
 }
 
 fn default_crawl_concurrency() -> u32 {
-    4
+    // 2026-10 fix7：4 → 8。Crawl 类任务共 7 个（bootstrap/keepalive/active_crawl/
+    // active_get_peers/active_sample/cleanup_pending/bucket_refresh），4 槽位在
+    // bootstrap/cleanup 卡顿期会挤掉 active_crawl 的 30s 轮周期，直接压低
+    // find_node 吞吐（实测 1.28/s ≈ 4,594/h < 1 万/h 目标）。
+    8
 }
 
 fn default_persistence_concurrency() -> u32 {
@@ -1565,7 +1569,8 @@ fn default_max_concurrent_msg_handlers() -> u32 {
 }
 
 fn default_concurrent_sockets() -> usize {
-    1
+    // 2026-10 吞吐方案：1 → 16。多 socket 并行发送，支撑 1 万节点/小时目标。
+    16
 }
 
 fn default_inbound_sources_max() -> usize {
@@ -1585,7 +1590,14 @@ fn default_select_mode() -> String {
 }
 
 fn default_select_explore_ratio() -> f64 {
-    0.2
+    // 2026-10 fix3：0.2 → 0.4。观测：探索层（top500 评分序补足池）响应率
+    // 显著高于 L1（hot 池新鲜层：历史活跃为主，实测 0/252）；采集路径
+    // get_peers/sample 依赖高活性节点，探索预算上调以更快吸收活节点。
+    // 2026-10 fix8：0.7 → 0.3。观测：探索预算过高（70%）把大部分轮次发给
+    // top2000 中 last_query 刚刷新但从不响应的「活死节点」（300s 窗口
+    // find_node 0/640、matched 卡死）。预算转回热池（L0/L1 近期验证/响应节点），
+    // 响应率与 matched 认领恢复增长，热池正反馈扩大。
+    0.3
 }
 
 fn default_select_verified_recent_secs() -> u64 {
@@ -1593,7 +1605,8 @@ fn default_select_verified_recent_secs() -> u64 {
 }
 
 fn default_reprobe_min_interval_secs() -> u64 {
-    300
+    // 2026-10 吞吐方案：60 → 20。冷却缩短，节点可更快重选，支撑高吞吐轮次。
+    20
 }
 
 fn default_bad_after_failures() -> u32 {
@@ -1685,7 +1698,9 @@ fn default_adaptive_enabled() -> bool {
     true
 }
 fn default_adaptive_min_multiplier() -> f64 {
-    0.2
+    // 2026-10 吞吐方案：0.2 → 0.5。控制器下限放松（配合 target_count 的 max(0.5) 兜底），
+    // 避免响应率未达 30% 目标时把每轮发送量压到极小。
+    0.5
 }
 fn default_adaptive_max_multiplier() -> f64 {
     2.0
@@ -2080,8 +2095,9 @@ log_level: debug
         assert!(!c.task_scheduler.random_jitter_enabled);
         assert!(!c.task_scheduler.predictive_scheduling_enabled);
         assert!(!c.task_scheduler.adaptive_interval_enabled);
-        // 真正生效的并发度默认值保持不变
-        assert_eq!(c.task_scheduler.crawl_concurrency, 4);
+        // 真正生效的并发度默认值（2026-10 fix7：crawl 4 → 8，缓解 Crawl 槽位被
+        // bootstrap/cleanup 卡顿占满导致 active_crawl 轮周期被拖长）
+        assert_eq!(c.task_scheduler.crawl_concurrency, 8);
         assert_eq!(c.task_scheduler.persistence_concurrency, 1);
         assert_eq!(c.task_scheduler.monitor_concurrency, 2);
         assert_eq!(c.task_scheduler.network_concurrency, 4);

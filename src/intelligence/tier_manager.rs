@@ -311,13 +311,17 @@ impl TierManager {
                 stats.hot_count, stats.warm_count, stats.cold_count
             );
         }
-        if let Some(ref mgr) = self.node_manager {
-            let stats = mgr.check_and_migrate().await;
-            debug!(
-                "[tier_manager] NodeRepo 分层: hot={}, warm={}, cold={}",
-                stats.hot_count, stats.warm_count, stats.cold_count
-            );
-        }
+        // fix15：NodeRepo 分层检查整体跳过 —— check_and_migrate 的 all_nodes() 全表
+        // 遍历 592 万节点统计 + 冷节点驱逐，实测卡 200s+ 占死 Monitor 槽、拖垮准入器。
+        // NodeRepo 的冷热迁移已由 tier_evict(migrate_hot_to_cold，fix12/13 分批+缓存)
+        // 与 memory_monitor(紧急驱逐) 承担，此处重复检查无增益。
+        // if let Some(ref mgr) = self.node_manager {
+        //     let stats = mgr.check_and_migrate().await;
+        //     debug!(
+        //         "[tier_manager] NodeRepo 分层: hot={}, warm={}, cold={}",
+        //         stats.hot_count, stats.warm_count, stats.cold_count
+        //     );
+        // }
     }
 
     /// 启动定期检查任务（已迁移到 TaskScheduler，此方法为空壳保留兼容）

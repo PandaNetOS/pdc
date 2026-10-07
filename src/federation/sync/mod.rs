@@ -709,9 +709,19 @@ impl SyncManager {
         let deserialize_elapsed = deserialize_start.elapsed();
 
         // 第二遍：一次写锁批量写入（调用内部方法，不触发 Merkle/Gossip，避免回环）
+        // fix18：分批写入 —— 单批上限 5000，批间释放写锁。对端推送大块（数万条）
+        // 时一次 add_nodes_batch_internal 持写锁数百 ms，RwLock 写优先直接饿死
+        // select 读锁（sample 卡 292s、Crawl 槽占死、find_node 停摆）。分批后每批
+        // 持锁毫秒级，批间读者可插队，写风暴对爬虫的影响削平。
         let repo_start = Instant::now();
         if !items.is_empty() {
-            self.node_repo.add_nodes_batch_internal(&items);
+            const SYNC_BATCH_WRITE_LIMIT: usize = 5000;
+            let mut idx = 0;
+            while idx < items.len() {
+                let end = (idx + SYNC_BATCH_WRITE_LIMIT).min(items.len());
+                self.node_repo.add_nodes_batch_internal(&items[idx..end]);
+                idx = end;
+            }
         }
         if !deletes.is_empty() {
             let removed = self.node_repo.remove_nodes_batch_internal(&deletes);
@@ -2980,6 +2990,23 @@ impl SyncManager {
     ) {
         if !self.config.range_reconcile_enabled {
             return;
+        }
+        // fix17：联邦对账推送节流 —— 对端持续推送（每 2-3s 一条，每条数百-数千 entries）
+        // 造成本地 nodes 写风暴，RwLock 写优先导致 select 读锁饿死（sample 卡 292s、
+        // Crawl 槽被占死、find_node 停摆）。每 3s 最多处理 1 条推送，削平写风暴；
+        // 联邦同步降速但持续进行，不阻塞对账收敛。
+        {
+            use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+            static LAST_RANGE_PUSH_AT_MS: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = LAST_RANGE_PUSH_AT_MS.load(AtomicOrdering::Relaxed);
+            if now_ms.saturating_sub(last) < 3000 {
+                return; // permit 在此 return 时自然 drop，闸位立即可用
+            }
+            LAST_RANGE_PUSH_AT_MS.store(now_ms, AtomicOrdering::Relaxed);
         }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
         let permit = match self.range_gate.clone().acquire_owned().await {

@@ -244,7 +244,7 @@ mod tests {
     fn test_adaptive_config_default() {
         let config = AdaptiveConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.min_multiplier, 0.2);
+        assert_eq!(config.min_multiplier, 0.5);
         assert_eq!(config.max_multiplier, 2.0);
         assert_eq!(config.warmup_rounds, 50);
         assert!((config.target_rate_standalone - 0.30).abs() < f64::EPSILON);
@@ -310,23 +310,23 @@ mod tests {
     fn test_prediction_divergence_fallback() {
         let config = AdaptiveConfig::default();
         let controller = AdaptiveController::new(config);
-        // 第一阶段：60 轮低响应率（5%）。预热结束后模型被训练为悲观，倍率跌到下限 0.2
+        // 第一阶段：60 轮低响应率（5%）。预热结束后模型被训练为悲观，倍率跌到下限 0.5
         for _ in 0..60 {
             controller.report_round_result(100, 5, 10.0, 100, 200, 0, 0.5);
         }
         assert!(
-            controller.current_multiplier() <= 0.2 + 1e-9,
+            controller.current_multiplier() <= 0.5 + 1e-9,
             "should be clamped at floor, got {}",
             controller.current_multiplier()
         );
         // 第二阶段：30 轮高响应率（80%）。若预测失真（与实测背离 > 50%），应回退用滑动
-        // 均值决策（80% > 目标 30%*0.7 → step_up），倍率从下限回升，不得继续锁死 0.2
+        // 均值决策（80% > 目标 30%*0.7 → step_up），倍率从下限回升，不得继续锁死 0.5
         for _ in 0..30 {
             controller.report_round_result(100, 80, 10.0, 100, 200, 0, 0.9);
         }
         let mult = controller.current_multiplier();
         assert!(
-            mult > 0.2,
+            mult > 0.5,
             "multiplier should recover from floor after divergence fallback, got {}",
             mult
         );
