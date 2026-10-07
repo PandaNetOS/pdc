@@ -1498,18 +1498,22 @@ async fn async_main(
                 let sched_ref = sched_ref.clone();
                 async move {
                     let wal = storage.wal_bytes();
-                    if wal < truncate_min {
-                        return Ok(());
-                    }
-                    // 队列空才做 TRUNCATE（需独占，避免与读者/写者互踩放大成秒级等待）
-                    let queue_empty = sched_ref
+                    // TRUNCATE 需要独占 WAL（读者全退 + 写者锁）。只在「真空闲」时发起，
+                    // 否则等满 busy_timeout 期间全部 DB 写入停摆（.52/.53 2026-10-07 实证，
+                    // 详见 db.rs truncate_advisable 文档）。
+                    let (queue_len, backpressure) = sched_ref
                         .as_ref()
-                        .map(|x| x.queue_len() == 0)
-                        .unwrap_or(true);
-                    if !queue_empty || worker.inflight() {
-                        return Ok(());
+                        .map(|x| (x.queue_len(), x.backpressure_level()))
+                        .unwrap_or((0, 0.0));
+                    if PeerDiscoveryCenter::storage::db::truncate_advisable(
+                        wal,
+                        truncate_min,
+                        queue_len,
+                        backpressure,
+                        worker.inflight(),
+                    ) {
+                        worker.trigger(PeerDiscoveryCenter::storage::CheckpointMode::Truncate);
                     }
-                    worker.trigger(PeerDiscoveryCenter::storage::CheckpointMode::Truncate);
                     Ok(())
                 }
             },

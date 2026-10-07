@@ -318,8 +318,12 @@ fn default_stale_slot_factor() -> f32 {
 /// 「YAML 写了 `task_scheduler:` 节但省略 `intervals`」时会静默丢掉这里的默认覆盖项。
 fn default_task_scheduler_intervals() -> HashMap<String, u64> {
     let mut m = HashMap::new();
-    // 5 分钟（原 3600 秒 / 1 小时，缩短后 WAL 更频繁压缩）
-    m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 300u64);
+    // 恢复 1 小时（2026-09-27 曾缩短为 300s；2026-10-07 .52/.53 双节点实证雪崩后回退）：
+    // TRUNCATE 需要独占 WAL（读者全退 + 写者锁），联邦+爬虫持续写入时几乎不存在
+    // 空闲窗口，300s 周期 = 每 5 分钟一次「等满 busy_timeout 的全量写停摆」，背压
+    // 顶满 → G4 闸门关闭 → 联邦 apply/gossip/delta 连锁卡顿。逻辑帧的及时回填由
+    // PASSIVE（不阻塞写者）负责，TRUNCATE 只承担磁盘空间回收，低频即可。
+    m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 3600u64);
     m
 }
 
@@ -458,6 +462,14 @@ pub struct SqliteConfig {
     /// 忙等待超时（毫秒，0=不等待）。避免 WAL checkpoint/VACUUM 与写事务并发时直接返回 SQLITE_BUSY。
     #[serde(default = "default_sqlite_busy_timeout_ms")]
     pub busy_timeout_ms: u32,
+    /// checkpoint 专用连接的忙等待超时（毫秒）。
+    ///
+    /// 必须远小于 `busy_timeout_ms`：checkpoint（尤其 TRUNCATE）在负载期拿不到独占锁
+    /// 是常态，长等待只会占住锁队列、把所有 DB 写入一起拖住（.52/.53 2026-10-07 实证：
+    /// 5s busy 等待 = 每 5 分钟一次全量写停摆）。注定失败的尝试应当快速放弃，
+    /// PASSIVE 撞 busy 只是部分完成，下个 tick 会继续回填。
+    #[serde(default = "default_sqlite_ckpt_busy_timeout_ms")]
+    pub ckpt_busy_timeout_ms: u32,
     /// v11（A3）：删除 v8 去 Merkle 化后无人查询的 l2_shard 索引（纯写放大）。
     /// 列与写入路径保留；默认 true，因为可证明全仓库无 `WHERE l2_shard` 查询。
     #[serde(default = "default_sqlite_drop_unused_indexes")]
@@ -478,6 +490,10 @@ fn default_sqlite_drop_unused_indexes() -> bool {
 
 fn default_sqlite_busy_timeout_ms() -> u32 {
     5000 // 5s：等待其他写事务/checkpoint 释放锁，而非立即 SQLITE_BUSY 丢写
+}
+
+fn default_sqlite_ckpt_busy_timeout_ms() -> u32 {
+    500 // 0.5s：checkpoint 拿不到锁就立刻放弃（PASSIVE 下个 tick 续传；TRUNCATE 等下个空闲窗口）
 }
 
 fn default_sqlite_mmap_size() -> i64 {
@@ -505,6 +521,7 @@ impl Default for SqliteConfig {
             temp_store: default_sqlite_temp_store(),
             synchronous: default_sqlite_synchronous(),
             busy_timeout_ms: default_sqlite_busy_timeout_ms(),
+            ckpt_busy_timeout_ms: default_sqlite_ckpt_busy_timeout_ms(),
             drop_unused_indexes: default_sqlite_drop_unused_indexes(),
             drop_redundant_peer_indexes: default_sqlite_drop_redundant_peer_indexes(),
         }
@@ -2120,13 +2137,13 @@ log_level: debug
 
         // 路径 1：整个 task_scheduler 节缺失 -> impl Default
         let c1 = PdcConfig::default();
-        assert_eq!(c1.task_scheduler.intervals.get(KEY).copied(), Some(300));
+        assert_eq!(c1.task_scheduler.intervals.get(KEY).copied(), Some(3600));
 
         // 路径 2：节存在但省略 intervals -> 字段级 serde 默认
         let yaml = "task_scheduler:\n  crawl_concurrency: 4\n";
         let c2 = PdcConfig::from_yaml(yaml).unwrap();
         assert_eq!(c2.task_scheduler.crawl_concurrency, 4);
-        assert_eq!(c2.task_scheduler.intervals.get(KEY).copied(), Some(300));
+        assert_eq!(c2.task_scheduler.intervals.get(KEY).copied(), Some(3600));
 
         // 路径 3：两条路径产出的默认表完全一致
         assert_eq!(c1.task_scheduler.intervals, c2.task_scheduler.intervals);

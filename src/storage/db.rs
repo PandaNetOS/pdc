@@ -257,11 +257,15 @@ impl Storage {
         // A1：专用 checkpoint 连接（与写路径不共享锁）。
         // 只设 busy_timeout/synchronous/cache_size；不在 ckpt 连接重复
         // journal_mode/mmap_size/wal_autocheckpoint（那些由写连接统一负责）。
+        // busy_timeout 用 ckpt 专用短超时（ckpt_busy_timeout_ms，默认 500ms）：
+        // 负载期 TRUNCATE 拿不到独占锁是常态，长等待只会占住锁队列、把所有 DB
+        // 写入一起拖住（.52/.53 2026-10-07 实证 5s 等待 = 每 5 分钟一次全量写停摆）；
+        // 注定失败的尝试快速放弃，PASSIVE 下个 tick 续传、TRUNCATE 等下个空闲窗口。
         let ckpt_conn = {
             let c = Connection::open(path_ref)?;
             c.execute_batch(&format!(
                 "PRAGMA busy_timeout={}; PRAGMA synchronous={}; PRAGMA cache_size=-2048;",
-                config.busy_timeout_ms, config.synchronous,
+                config.ckpt_busy_timeout_ms, config.synchronous,
             ))?;
             Some(Arc::new(Mutex::new(c)))
         };
@@ -605,6 +609,39 @@ pub const CHECKPOINT_IDLE_BACKPRESSURE_MAX: f32 = 0.5;
 #[inline]
 pub fn routine_checkpoint_advisable(queue_len: usize, backpressure: f32) -> bool {
     queue_len == 0 && backpressure <= CHECKPOINT_IDLE_BACKPRESSURE_MAX
+}
+
+/// TRUNCATE（WAL 文件压缩回收磁盘）的「真空闲」闸门——比常规 PASSIVE 严格得多。
+///
+/// # 背景与依据（.52/.53 双节点 2026-10-07 实证）
+/// TRUNCATE 需要独占 WAL：所有读者退出 + 拿到写者锁。联邦 + 爬虫持续写入时几乎
+/// 不存在这样的窗口；在非空闲时刻发起 TRUNCATE 的实际效果是：占住锁队列等满
+/// busy_timeout（默认 5s，实测单次 5.5s），期间**所有 DB 写入停摆** → 背压顶满 →
+/// G4 闸门关闭 → 联邦 apply/gossip/delta 连锁卡顿 → 看门狗暂停重协商 → API 线程
+/// 被卡死。`wal_checkpoint_truncate_interval_secs` 曾被调到 300s（9-27），使上述
+/// stall 每 5 分钟必现一次，是「运行 ~1h 即雪崩」的直接推手。
+///
+/// # 治理
+/// 只在**持续空闲**时才允许 TRUNCATE（此时独占锁即刻可得，零等待）：
+/// 1. WAL 文件 ≥ truncate_min（仍有磁盘回收价值）；
+/// 2. 写队列空（既有闸门）；
+/// 3. IO 背压 < 0.3（新闸门：`queue_len==0` 只是瞬时快照，背压低才代表持续空闲；
+///    比 PASSIVE 的 0.5 更严，因为 TRUNCATE 要的是独占而非共存）；
+/// 4. checkpoint worker 空闲（既有闸门）。
+pub const TRUNCATE_IDLE_BACKPRESSURE_MAX: f32 = 0.3;
+
+#[inline]
+pub fn truncate_advisable(
+    wal_bytes: u64,
+    truncate_min_bytes: u64,
+    queue_len: usize,
+    backpressure: f32,
+    worker_inflight: bool,
+) -> bool {
+    wal_bytes >= truncate_min_bytes
+        && queue_len == 0
+        && backpressure < TRUNCATE_IDLE_BACKPRESSURE_MAX
+        && !worker_inflight
 }
 
 impl Storage {
@@ -3401,6 +3438,23 @@ pub struct PeerHistoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_truncate_advisable_gate() {
+        const MB: u64 = 1024 * 1024;
+        // 空闲 + 文件超阈值：允许（唯一放行路径）
+        assert!(truncate_advisable(32 * MB, 16 * MB, 0, 0.0, false));
+        assert!(truncate_advisable(32 * MB, 16 * MB, 0, 0.29, false));
+        // 文件未达 truncate_min：不回收
+        assert!(!truncate_advisable(8 * MB, 16 * MB, 0, 0.0, false));
+        // 写队列非空：负载期，禁止（独占锁必等待）
+        assert!(!truncate_advisable(32 * MB, 16 * MB, 1, 0.0, false));
+        // 背压升高：非持续空闲，禁止（0.3 与 PASSIVE 的 0.5 区分：TRUNCATE 要独占）
+        assert!(!truncate_advisable(32 * MB, 16 * MB, 0, 0.3, false));
+        assert!(!truncate_advisable(32 * MB, 16 * MB, 0, 0.6, false));
+        // worker 在飞：禁止并发 checkpoint
+        assert!(!truncate_advisable(32 * MB, 16 * MB, 0, 0.0, true));
+    }
 
     #[test]
     fn test_init_tables() {
