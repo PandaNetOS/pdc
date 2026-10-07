@@ -110,12 +110,8 @@ pub struct FederationConfig {
     pub range_send_timeout_secs: u64,
     /// TCP 写入超时后的最大重试次数（不含首次）。
     /// 超时后按退避基数指数退避重试，超过此次数才判定写入失败并断开。
-    #[serde(default = "default_transport_write_max_retries")]
-    pub transport_write_max_retries: u32,
     /// TCP 写入重试退避基数（毫秒）。
     /// 第 n 次重试前等待 retry_base_ms * 2^(n-1)。
-    #[serde(default = "default_transport_write_retry_base_ms")]
-    pub transport_write_retry_base_ms: u64,
     /// Gossip 连续发送失败断开阈值，达到此次数则主动断开连接
     #[serde(default = "default_gossip_max_consecutive_failures")]
     pub gossip_max_consecutive_failures: u32,
@@ -538,14 +534,8 @@ fn default_transport_write_timeout() -> u64 {
 }
 /// TCP 写入超时后的最大重试次数（不含首次）。
 /// 超时后按退避基数指数退避重试，超过此次数才判定写入失败并断开。
-fn default_transport_write_max_retries() -> u32 {
-    3
-}
 /// TCP 写入重试退避基数（毫秒）。
 /// 第 n 次重试前等待 retry_base_ms * 2^(n-1)（100/200/400...）。
-fn default_transport_write_retry_base_ms() -> u64 {
-    100
-}
 fn default_gossip_max_consecutive_failures() -> u32 {
     3
 }
@@ -801,8 +791,6 @@ impl Default for FederationConfig {
             peer_cache_max_nodes: default_peer_cache_max(),
             transport_write_timeout_secs: default_transport_write_timeout(),
             range_send_timeout_secs: default_range_send_timeout_secs(),
-            transport_write_max_retries: default_transport_write_max_retries(),
-            transport_write_retry_base_ms: default_transport_write_retry_base_ms(),
             gossip_max_consecutive_failures: default_gossip_max_consecutive_failures(),
             reconnect_cooldown_secs: default_reconnect_cooldown_secs(),
             never_connected_prune_secs: default_never_connected_prune_secs(),

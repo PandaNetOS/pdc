@@ -459,8 +459,6 @@ pub fn session_config_from(config: &FederationConfig, listen: bool) -> SessionCo
         heartbeat_kind: Some(MessageType::Ping.as_u8() as u16),
         heartbeat_reply_kind: Some(MessageType::Pong.as_u8() as u16),
         write_timeout: Duration::from_secs(config.transport_write_timeout_secs),
-        write_max_retries: config.transport_write_max_retries,
-        write_retry_base_ms: config.transport_write_retry_base_ms,
     }
 }
 

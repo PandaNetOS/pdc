@@ -3944,6 +3944,13 @@ impl SyncManager {
         // lo/hi 提升为 owned Vec（原 &[u8] 借用 chunk 非 'static，无法进 'static 闭包）。
         let max_rows = chunk.rows as usize;
         let repo = req.repo;
+        // P批临时诊断：在 move 前快照边界文本
+        let dbg_lo = lo
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let dbg_hi = hi
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
         let entries: Vec<SyncEntry> = match tokio::task::spawn_blocking(move || {
             storage.load_repo_sync_entries_in_range(
                 repo,
@@ -3954,7 +3961,18 @@ impl SyncManager {
         })
         .await
         {
-            Ok(Ok(rows)) => rows.into_iter().take(max_rows).collect(),
+            Ok(Ok(rows)) => {
+                // P批临时诊断：块取数结果观测（定位「实收 0 行」问题后移除）
+                info!(
+                    "[bootstrap][P-debug] 块 {} 取数: lo={:?} hi={:?} max_rows={} loaded={}",
+                    req.index,
+                    dbg_lo,
+                    dbg_hi,
+                    max_rows,
+                    rows.len()
+                );
+                rows.into_iter().take(max_rows).collect()
+            }
             Ok(Err(e)) => {
                 warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
                 self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk entries failed")
