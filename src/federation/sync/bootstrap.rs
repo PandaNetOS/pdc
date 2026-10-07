@@ -687,6 +687,39 @@ pub fn progress_stalled(
     now_ms.saturating_sub(base) > threshold_ms
 }
 
+/// 批次O(O-C)：清单指纹相等 —— 判定两份清单是否为**同一份快照**。
+///
+/// 发送方清单缓存重建必然伴随 `w0_seq`/`version` 变化（oplog 只进不退），而同一
+/// 表状态 + 同一 `chunk_rows` 推导出的分块边界与哈希是确定性的；因此指纹相等
+/// ≡ 同一份清单内容。接收方据此对「60s 发起互斥 TTL 重触发捎回的重复清单响应」
+/// 幂等跳过 —— 不重建本地清单、不替换传输窗口。背景：发起互斥只覆盖清单请求
+/// 阶段，首次对齐（本地全表扫描+哈希，6M 行实测分钟级）不受保护，重复对齐
+/// 叠加会耗尽读池拖死全部同步通道（.52 2026-10-07 实证：applied 冻结、爬虫停摆）。
+///
+/// 指纹取 `(version, w0_seq, total_rows, chunk_rows, 块数, 首末块 hash&rows)`：
+/// 首末块足以区分「同一 w0 下内容不同的清单」这一在现实中不可能出现的构造
+/// （真出现时由竣工对齐校验 + range 反熵兜底）。
+pub fn manifest_fingerprint_eq(a: &BootstrapManifest, b: &BootstrapManifest) -> bool {
+    a.repo == b.repo
+        && a.version == b.version
+        && a.w0_seq == b.w0_seq
+        && a.total_rows == b.total_rows
+        && a.chunk_rows == b.chunk_rows
+        && a.chunks.len() == b.chunks.len()
+        && match (
+            a.chunks.first(),
+            b.chunks.first(),
+            a.chunks.last(),
+            b.chunks.last(),
+        ) {
+            (Some(fa), Some(fb), Some(la), Some(lb)) => {
+                fa.hash == fb.hash && fa.rows == fb.rows && la.hash == lb.hash && la.rows == lb.rows
+            }
+            (None, None, None, None) => true,
+            _ => false,
+        }
+}
+
 /// 活锁治理(任务1-b/任务3)：重拉清单与上次清单的漂移判定（纯函数）。
 ///
 /// 返回 `(是否结构性漂移, 是否可继承旧进度)`：
@@ -1359,6 +1392,73 @@ mod tests {
         );
         // 非法配置兜底：max < base 时不得产出小于基数的等待
         assert_eq!(backoff_delay(base, Duration::from_secs(1), 2), base);
+    }
+
+    /// 批次O(O-C)：清单指纹相等判定 —— 同一快照的重复响应必须判等（幂等跳过的依据）；
+    /// w0/version/行数/块数任一变化必须判不等（触发重对齐）。
+    #[test]
+    fn test_manifest_fingerprint_eq() {
+        let mk = |version: u32, w0: u64, total: u64, chunk_rows: u32, first_hash: u8| {
+            BootstrapManifest {
+                repo: 1,
+                version,
+                w0_seq: w0,
+                chunk_rows,
+                total_rows: total,
+                chunks: vec![
+                    ManifestChunk {
+                        index: 0,
+                        lo: Vec::new(),
+                        hi: b"key-a".to_vec(),
+                        rows: 20_000,
+                        hash: [first_hash; 32],
+                    },
+                    ManifestChunk {
+                        index: 1,
+                        lo: b"key-a".to_vec(),
+                        hi: Vec::new(),
+                        rows: 12_345,
+                        hash: [first_hash.wrapping_add(1); 32],
+                    },
+                ],
+            }
+        };
+        // 完全相同 → 指纹相等（60s 重触发捎回的重复清单响应）
+        assert!(manifest_fingerprint_eq(
+            &mk(7, 101, 32_345, 20_000, 1),
+            &mk(7, 101, 32_345, 20_000, 1)
+        ));
+        // 对端缓存重建 → w0/version 变化 → 必须重对齐
+        assert!(!manifest_fingerprint_eq(
+            &mk(7, 101, 32_345, 20_000, 1),
+            &mk(8, 105, 32_345, 20_000, 1)
+        ));
+        // 活表增长 → total_rows 变化 → 必须重对齐
+        assert!(!manifest_fingerprint_eq(
+            &mk(7, 101, 32_345, 20_000, 1),
+            &mk(7, 101, 32_346, 20_000, 1)
+        ));
+        // 块内容变化（首块 hash 不同，如对端同 w0 重算出不同内容）→ 必须重对齐
+        assert!(!manifest_fingerprint_eq(
+            &mk(7, 101, 32_345, 20_000, 1),
+            &mk(7, 101, 32_345, 20_000, 9)
+        ));
+        // chunk_rows 变化 → 分块结构不同 → 必须重对齐
+        assert!(!manifest_fingerprint_eq(
+            &mk(7, 101, 32_345, 20_000, 1),
+            &mk(7, 101, 32_345, 10_000, 1)
+        ));
+        // 空 chunks 边界：双方皆空 → 相等
+        let empty = |version: u32| BootstrapManifest {
+            repo: 1,
+            version,
+            w0_seq: 0,
+            chunk_rows: 20_000,
+            total_rows: 0,
+            chunks: Vec::new(),
+        };
+        assert!(manifest_fingerprint_eq(&empty(3), &empty(3)));
+        assert!(!manifest_fingerprint_eq(&empty(3), &empty(4)));
     }
 
     /// 活锁治理(任务1-b/任务3)：清单漂移判定 —— total_rows >1% 判结构性漂移；

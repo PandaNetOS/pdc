@@ -180,6 +180,19 @@ fn send_circuits() -> &'static parking_lot::RwLock<FxHashMap<NodeId, SendCircuit
     SEND_CIRCUITS.get_or_init(|| parking_lot::RwLock::new(FxHashMap::default()))
 }
 
+/// 批次O(O-A)：对齐单飞守卫 —— Drop 时把 (peer, repo) 从对齐集合移除。
+/// 对齐段有多条 early-return 路径（直接竣工/退避丢弃/错误返回），守卫保证
+/// 任何退出路径（含 panic unwind）都释放标记，不会永久卡死后续对齐。
+struct AlignGuard<'a> {
+    set: &'a parking_lot::RwLock<FxHashSet<(NodeId, u8)>>,
+    key: (NodeId, u8),
+}
+impl Drop for AlignGuard<'_> {
+    fn drop(&mut self) {
+        self.set.write().remove(&self.key);
+    }
+}
+
 /// A5：serving 标记是否已 idle 过期（纯判定）。`now - last >= idle` 即应移除。
 fn serving_entry_expired(last: Instant, now: Instant, idle: Duration) -> bool {
     now.duration_since(last) >= idle
@@ -411,6 +424,11 @@ pub struct SyncManager {
     bootstrap_breaker: RwLock<FxHashMap<(NodeId, u8), BootstrapBreakerState>>,
     /// v10：bootstrap 发起互斥 —— (peer, repo) → 发起时刻（TTL 内重复触发直接拒绝）。
     bootstrap_inflight: RwLock<FxHashMap<(NodeId, u8), Instant>>,
+    /// 批次O(O-A)：清单对齐单飞 —— 正在对齐（本地清单重建+seed 计算）的 (peer, repo)。
+    /// 首次对齐是分钟级全表扫描，发起互斥 TTL（60s）覆盖不到它；没有单飞闸，
+    /// 60s 重触发捎回的清单响应会叠加多个对齐把读池耗尽（.52 2026-10-07 实证：
+    /// applied 冻结、爬虫停摆、对端块发送/NAK 全部超时）。
+    bootstrap_aligning: RwLock<FxHashSet<(NodeId, u8)>>,
     /// E1：运行时差异复检重触发冷却 —— (peer, repo) → 最近一次因运行时行数差超 D2 阈值
     /// 而重触发 bootstrap 的时刻。冷却期内不再重复点火（防抖），与 v10(F4) 的
     /// `bootstrap_cooldown`（竣工后防死循环）相互独立。
@@ -574,6 +592,7 @@ impl SyncManager {
             bootstrap_cooldown: RwLock::new(FxHashMap::default()),
             bootstrap_breaker: RwLock::new(FxHashMap::default()),
             bootstrap_inflight: RwLock::new(FxHashMap::default()),
+            bootstrap_aligning: RwLock::new(FxHashSet::default()),
             bootstrap_rediff_cooldown: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
@@ -4054,6 +4073,41 @@ impl SyncManager {
             );
             return;
         }
+        // 批次O(O-C)：同清单幂等 —— 与已存清单指纹一致且传输未竣工的响应直接返回。
+        // 既有块窗口按已存清单继续拉取；不重建本地清单、不替换窗口。发起互斥 TTL
+        // （60s）只覆盖清单请求，首次对齐（本地全表扫描+哈希）分钟级不受保护，
+        // 重触发捎回的重复清单响应会叠加对齐耗尽读池（.52 2026-10-07 实证）。
+        if let Ok(Some((p, Some(stored)))) = self
+            .delta_storage()
+            .bootstrap_load(&conn.node_id.0, mf.repo)
+        {
+            if p.peer.as_slice() == conn.node_id.0.as_slice()
+                && p.phase != bootstrap::BootstrapPhase::Done
+                && bootstrap::manifest_fingerprint_eq(&stored, &mf)
+            {
+                debug!(
+                    "[bootstrap] 同清单响应（version={} total_rows={} 块数={}），传输进行中跳过重复对齐: peer={} repo={}",
+                    mf.version, mf.total_rows, mf.chunks.len(), conn.node_id, mf.repo
+                );
+                return;
+            }
+        }
+        // 批次O(O-A)：对齐单飞 —— 同一 (peer, repo) 只允许一个清单对齐在飞（后续响应
+        // 直接丢弃，保留首个对齐产出的窗口/进度）。守卫在任何退出路径清除标记。
+        {
+            let mut w = self.bootstrap_aligning.write();
+            if !w.insert((conn.node_id, mf.repo)) {
+                debug!(
+                    "[bootstrap] 清单对齐已在飞，丢弃重复响应: peer={} repo={}",
+                    conn.node_id, mf.repo
+                );
+                return;
+            }
+        }
+        let _align_guard = AlignGuard {
+            set: &self.bootstrap_aligning,
+            key: (conn.node_id, mf.repo),
+        };
         // v10(B2)：断点继承 —— version 相同（同一快照）直接继承 done_chunks；
         // version 不同（w0 漂移，对端 oplog 持续写则必然）时用 **key 游标** 在新清单
         // 中定位续传起点：块边界随活表写入漂移，边界比对必然失配 → 归零循环
