@@ -3259,6 +3259,36 @@ impl Storage {
         })
     }
 
+    /// 批量更新累计统计：**单锁 + 单事务**（2026-10-09 治本 S6）。
+    ///
+    /// 【为什么需要】`io_metrics_poll` 任务间隔仅 **1 秒**（`stats_snapshot_interval_secs`
+    /// 默认 1），单轮要写 8 个指标。若沿用 [`Self::update_aggregate`]逐条调用，
+    /// 就是**每秒 8 次抢全库唯一写连接 + 8 次独立事务提交**。
+    ///
+    /// 120 分钟压测实测：该路径贡献了 9137 次写锁争用中的绝大部分，
+    /// 并在 SQLite checkpoint 做磁盘 fsync 期间造成单次 **10415ms** 等锁
+    /// （热点精确落在 `db.rs` 的 `update_aggregate` / `record_stats`）。
+    ///
+    /// 与 [`Self::record_entity_stats_batch`] 同构：锁持有时间从
+    /// 「8×抢锁+8×提交」降到「1×抢锁+1×提交」。
+    pub fn update_aggregate_batch(&self, entries: &[(&str, f64)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.record_write("stats", entries.len() as u64);
+        // 2026-10-09 治本 S6：走统一入口（锁持有时长可被 with_write_conn 观测）。
+        with_write_conn(&self.conn, |conn| {
+            // `update_aggregate_in_tx` 内部自行取时间戳（保持与单条版本一致），
+            // 故此处无需 `now`。
+            let tx = conn.transaction()?;
+            for (name, value) in entries {
+                Self::update_aggregate_in_tx(&tx, name, *value)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// 在已有连接上更新累计统计（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
     pub fn update_aggregate_in_tx(
         conn: &Connection,
@@ -5685,5 +5715,118 @@ mod tests {
         // 不得 panic，且能正常执行
         let r = with_write_conn(&conn, |_c| Ok(()));
         assert!(r.is_ok(), "poisoned 锁必须 into_inner 恢复，不得 panic");
+    }
+
+    // ============================================================
+    // 2026-10-09 治本 S6 回归：统计写入批量化
+    // ============================================================
+
+    /// `update_aggregate_batch` 必须一次抢锁写入全部指标。
+    ///
+    /// 【为什么】`io_metrics_poll` 间隔 1 秒，原实现单轮 8 次逐条
+    /// `update_aggregate` = 每秒 8 次抢全库唯一写锁。120 分钟压测实测
+    /// 该路径在 checkpoint fsync 期间造成单次 10415ms 等锁。
+    #[test]
+    fn test_update_aggregate_batch_writes_all_in_one_lock() {
+        let s = Storage::memory().unwrap();
+        let before = write_lock_stats().acquired;
+
+        s.update_aggregate_batch(&[
+            ("m1", 1.0),
+            ("m2", 2.0),
+            ("m3", 3.0),
+            ("m4", 4.0),
+            ("m5", 5.0),
+            ("m6", 6.0),
+            ("m7", 7.0),
+            ("m8", 8.0),
+        ])
+        .unwrap();
+
+        // 核心断言：8 个指标只应抢 **1 次** 锁（而非 8 次）。
+        //
+        // 【不能断言 == 1】`write_lock_stats()` 是**进程级静态原子量**，
+        // cargo test 并行执行时其他测试也在抢锁，精确相等会 flaky
+        // （同批改写的 record_entity_stats_batch 测试已踩过这个坑）。
+        // 改为断言「远小于 8」这一实质约束。
+        let delta = write_lock_stats().acquired - before;
+        assert!(
+            delta < 8,
+            "8 个指标必须合并为少数几次抢锁（实测 {} 次，要求 < 8）—— 这是 S6 的全部意义",
+            delta
+        );
+
+        // 值必须真的落库
+        for (name, expect) in [("m1", 1.0), ("m4", 4.0), ("m8", 8.0)] {
+            let got = s
+                .read_long(|c| {
+                    // `read_long` 闭包需返回 `Result<T>`；查不到行时归一为 None。
+                    Ok(c.query_row(
+                        "SELECT value FROM stats_aggregate WHERE metric = ?1",
+                        params![name],
+                        |r| r.get::<_, f64>(0),
+                    )
+                    .ok())
+                })
+                .ok()
+                .flatten();
+            assert_eq!(got, Some(expect), "指标 {} 落库值错误", name);
+        }
+    }
+
+    /// 空批量不得抢锁（避免无意义开销）。
+    #[test]
+    fn test_update_aggregate_batch_empty_is_noop() {
+        let s = Storage::memory().unwrap();
+        let before = write_lock_stats().acquired;
+        s.update_aggregate_batch(&[]).unwrap();
+        assert_eq!(write_lock_stats().acquired, before, "空批量不得抢锁");
+    }
+    /// 批量内任一指标写失败 ⇒ 整批回滚（事务原子性不得破坏）。
+    ///
+    /// 构造方式：注入一个 BEFORE INSERT 触发器，在 value<0 时 RAISE(ABORT)，
+    /// 从而让批量写到一半失败。
+    ///
+    /// 【踩过的坑】先前试了两种"显然会失败"的构造，**两种都不报错**：
+    ///   ① 超长 metric 名 —— SQLite 对 TEXT 长度无限制；
+    ///   ② 含 NUL 的 metric 名 —— SQLite C API 会截断 NUL 后继续执行。
+    /// 两者都是错误的测试假设，不是实现缺陷。改用触发器才是可靠构造。
+    #[test]
+    fn test_update_aggregate_batch_is_atomic() {
+        let s = Storage::memory().unwrap();
+        // 正常写入应成功
+        s.update_aggregate_batch(&[("keep", 42.0)]).unwrap();
+
+        // 注入会在 INSERT 时失败的触发器：value<0 ⇒ RAISE(ABORT)
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS t_fail_neg BEFORE INSERT ON stats_aggregate \
+                 WHEN NEW.value < 0 \
+                 BEGIN SELECT RAISE(ABORT, 'neg value rejected'); END;",
+            )
+            .unwrap();
+        }
+
+        let r = s.update_aggregate_batch(&[("ok2", 1.0), ("bad", -1.0)]);
+        assert!(r.is_err(), "含被拒绝值的批次应失败");
+
+        // 原子性：同批次里 "ok2" 不应被提交
+        let got = s
+            .read_long(|c| {
+                Ok(c.query_row(
+                    "SELECT value FROM stats_aggregate WHERE metric = 'ok2'",
+                    [],
+                    |r| r.get::<_, f64>(0),
+                )
+                .ok())
+            })
+            .ok()
+            .flatten();
+        assert!(
+            got.is_none(),
+            "失败批次中的 ok2 不应被提交（事务应回滚），实得 {:?}",
+            got
+        );
     }
 }

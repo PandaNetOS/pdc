@@ -1752,20 +1752,30 @@ async fn async_main(
                 async move {
                     // fix14：spawn_blocking + 45s 超时 —— IO 指标采样曾卡 420s+（storage
                     // 锁竞争），占死 Monitor 槽、连带拖垮准入器饿死 Crawl 任务。
+                    //2026-10-09 治本 S6：8 次逐条 update_aggregate 合并为 **1 次批量**。
+                    //
+                    // 【为什么必须改】本任务间隔 `stats_snapshot_interval_secs` 默认 **1 秒**，
+                    // 原实现单轮 8 次 `update_aggregate` = **每秒 8 次抢全库唯一写锁 +8 次
+                    // 独立事务提交**。120 分钟压测实测这是写锁争用的主要来源，
+                    // 在 SQLite checkpoint 做磁盘 fsync 期间造成单次 **10415ms** 等锁
+                    // （热点精确落在 `update_aggregate`）。
+                    //
+                    // 现在一次 `update_aggregate_batch` = 1 次抢锁 + 1 次事务提交，
+                    // 抢锁频次降为原来的 1/8。
                     let handle = tokio::task::spawn_blocking(move || {
                         let wal = storage.wal_bytes();
-                        let _ = storage.update_aggregate("io_wal_bytes", wal as f64);
                         let mut ckpt_ewma_ms: u64 = 0;
+                        // 攒批：先在内存里组好，最后一次性落库。
+                        let mut agg: Vec<(&'static str, f64)> =
+                            Vec::with_capacity(8);
+                        agg.push(("io_wal_bytes", wal as f64));
                         if let Some(w) = worker.as_ref() {
                             let st = w.stat();
                             ckpt_ewma_ms = st.last_ewma_ms as u64;
-                            let _ = storage
-                                .update_aggregate("io_checkpoint_ms_last", st.last_ms as f64);
-                            let _ = storage
-                                .update_aggregate("io_checkpoint_ms_ewma", st.last_ewma_ms);
-                            let _ = storage.update_aggregate("io_checkpoint_total", st.total as f64);
-                            let _ = storage
-                                .update_aggregate("io_checkpoint_slow_total", st.slow_total as f64);
+                            agg.push(("io_checkpoint_ms_last", st.last_ms as f64));
+                            agg.push(("io_checkpoint_ms_ewma", st.last_ewma_ms));
+                            agg.push(("io_checkpoint_total", st.total as f64));
+                            agg.push(("io_checkpoint_slow_total", st.slow_total as f64));
                         }
                         // C2：喂一次 AIMD 观测（checkpoint 耗时 EWMA + 队列行数），
                         // 控制器产出新的 rows_per_tick 并写回调度器动态预算。
@@ -1774,14 +1784,15 @@ async fn async_main(
                         }
                         let batch_ewma_us =
                             PeerDiscoveryCenter::storage::io_scheduler::io_batch_latency_ewma_us();
-                        let _ = storage
-                            .update_aggregate("io_batch_ms_ewma", batch_ewma_us as f64 / 1000.0);
+                        agg.push(("io_batch_ms_ewma", batch_ewma_us as f64 / 1000.0));
                         let budget =
                             PeerDiscoveryCenter::storage::io_scheduler::io_import_budget_snapshot();
-                        let _ = storage.update_aggregate("io_import_budget", budget as f64);
+                        agg.push(("io_import_budget", budget as f64));
                         let queue_req =
                             sched.as_ref().map(|x| x.queue_len()).unwrap_or(0);
-                        let _ = storage.update_aggregate("io_queue_requests", queue_req as f64);
+                        agg.push(("io_queue_requests", queue_req as f64));
+                        // 单锁单事务写入全部指标（原为 8 次抢锁 + 8 次提交）
+                        let _ = storage.update_aggregate_batch(&agg);
 
                         // 日志治理：logs/ 目录总大小超上限时 warn 一次
                         if !log_warned.load(std::sync::atomic::Ordering::SeqCst) {

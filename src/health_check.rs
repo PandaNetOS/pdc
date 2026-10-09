@@ -304,14 +304,31 @@ impl HealthCheckTask {
             });
             debug!("[health_check] 统计快照已入队 WriteQueue");
         } else if let Some(storage) = &self.storage {
-            let _ = storage.record_stats("total_requests", total_requests as f64);
-            let _ = storage.record_stats("success_requests", success_requests as f64);
-            let _ = storage.record_stats("failed_requests", failed_requests as f64);
-            let _ = storage.record_stats("success_rate", success_rate);
-            let _ = storage.record_stats("total_peers_discovered", total_peers as f64);
-            let _ = storage.record_stats("cached_peers", self.cache.len() as f64);
-            let _ = storage.record_stats("health_score", health.overall_score);
-            let _ = storage.update_aggregate("total_requests_ever", total_requests as f64);
+            // 2026-10-09 治本 S6：8 次逐条抢锁 → 2 次批量（单锁单事务）。
+            //
+            // 【为什么必须改】`health_check_main` 间隔 300s，单轮原本
+            // 7 次 `record_stats` + 1 次 `update_aggregate` = **8 次抢全库唯一
+            // 写连接 + 8 次独立事务提交**。120 分钟压测实测该调用点在
+            // SQLite checkpoint 做 fsync 期间出现等锁，与 `io_metrics_poll`
+            // 的高频抢锁叠加，共同构成写锁争用。
+            //
+            // 【为什么是两个批量而不是一个】`record_stats` 写 `stats_history`、
+            // `update_aggregate` 写 `stats_aggregate`，是**两张表**，
+            // 语义不同故保留两个事务；但各自内部已合并为单锁单事务，
+            // 抢锁次数 8 → 2。
+            let history: Vec<(&str, f64)> = vec![
+                ("total_requests", total_requests as f64),
+                ("success_requests", success_requests as f64),
+                ("failed_requests", failed_requests as f64),
+                ("success_rate", success_rate),
+                ("total_peers_discovered", total_peers as f64),
+                ("cached_peers", self.cache.len() as f64),
+                ("health_score", health.overall_score),
+            ];
+            // 复用既有批量实现（写 stats_history，语义与逐条 record_stats 相同）
+            let _ = storage.record_entity_stats_batch(&history);
+            let _ =
+                storage.update_aggregate_batch(&[("total_requests_ever", total_requests as f64)]);
             debug!("[health_check] 统计快照已写入 SQLite");
         }
     }
