@@ -1335,6 +1335,15 @@ pub struct IoStatusSnapshot {
     pub read_pool_total: usize,
     /// 读池空、排队等待归还的累计次数（池饥饿信号）。
     pub read_pool_starved: u64,
+    // ─── 2026-10-09 治本 S5：写连接锁争用观测（进程级静态，见 crate::storage::db）───
+    /// 抢写锁累计次数（= 收敛后走 `with_write_conn` 入口的次数）。
+    pub write_lock_acquired: u64,
+    /// 抢写锁等待 ≥50ms 的累计次数（写锁争用信号）。
+    pub write_lock_slow: u64,
+    /// 抢写锁平均等待时长（毫秒）。
+    pub write_lock_avg_wait_ms: f64,
+    /// 抢写锁单次最长等待（毫秒）。
+    pub write_lock_max_wait_ms: u64,
     /// P4-2：进行中的长查询数（全表扫描级）
     pub long_query_active: usize,
     /// P4-2：长查询等待限流许可的累计次数
@@ -1437,6 +1446,9 @@ pub fn io_status_snapshot(
         .get()
         .map(|m| m.lock().recent_decisions(20))
         .unwrap_or_default();
+    // 2026-10-09 治本 S5：写锁争用快照（4 个字段必须来自同一次读取，
+    // 否则 avg 与 max/count 可能来自不同时刻而相互矛盾）。
+    let wl = crate::storage::db::write_lock_stats();
     IoStatusSnapshot {
         queue_len,
         queue_rows,
@@ -1474,6 +1486,12 @@ pub fn io_status_snapshot(
         read_pool_available: crate::storage::db::read_pool_available(),
         read_pool_total: crate::storage::db::read_pool_total(),
         read_pool_starved: crate::storage::db::read_pool_starved(),
+        // 2026-10-09 治本 S5：写锁争用随同暴露（与读池同构）。
+        // 先取一次快照再填 4 个字段，避免多次原子读之间数值撕裂。
+        write_lock_acquired: wl.acquired,
+        write_lock_slow: wl.slow,
+        write_lock_avg_wait_ms: wl.avg_wait_ms,
+        write_lock_max_wait_ms: wl.max_wait_ms,
         // P4-3（B）：长查询池借出登记巡检（抓 long_pool 泄漏现行）。
         long_query_active: {
             crate::storage::db::long_pool_scan();

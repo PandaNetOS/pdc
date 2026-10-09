@@ -91,6 +91,27 @@ pub struct PdcConfig {
     /// 持久化 runtime 线程数（默认 4）
     #[serde(default = "default_persistence_runtime_threads")]
     pub persistence_runtime_threads: usize,
+    /// Monitor runtime 线程数（2026-10-09 治本 S4，默认 2）
+    ///
+    /// 【为什么需要独立】此前 `TaskCategory::Monitor` 被映射到 `api` runtime
+    /// （`task_scheduler.rs` 的 `runtime_handle` 分派），而 api 只有 4 个
+    /// worker 且与 HTTP 服务共用。实测 Monitor 分类可堆积到 16 个在飞
+    /// （保底放行放大），4 个 worker 被长await 占死 ⇒ memory_monitor /
+    /// checkpoint / 健康检查 / 实体统计校准 全部静默停摆 41 分钟。
+    /// 监控是唯一可观测性来源，必须与HTTP 隔离。
+    #[serde(default = "default_monitor_runtime_threads")]
+    pub monitor_runtime_threads: usize,
+    /// 每个 runtime 的 `max_blocking_threads`（2026-10-09 治本 S3，0=自动）
+    ///
+    /// 【为什么需要】全代码库有 109 处 `spawn_blocking`，而
+    /// `max_blocking_threads` **零配置** ⇒ 全部走 tokio 默认 512，
+    /// 与 worker 争抢线程且无上限保护。显式化后可预期、可分池
+    /// （DB 写 blocking 与爬虫 blocking 分开）。
+    #[serde(default)]
+    pub max_blocking_threads: usize,
+    /// Monitor 的 `max_blocking_threads`（2026-10-09 治本 S3，0=跟随总配置）
+    #[serde(default)]
+    pub monitor_max_blocking_threads: usize,
     /// 统计快照更新间隔（秒，默认 1）
     #[serde(default = "default_stats_snapshot_interval_secs")]
     pub stats_snapshot_interval_secs: u64,
@@ -920,6 +941,14 @@ fn default_persistence_runtime_threads() -> usize {
     4
 }
 
+/// Monitor runtime 线程数默认 2（2026-10-09 治本 S4）
+///
+/// 监控任务以短平快的 tick 为主（30s~60s 间隔），2 个 worker 足够；
+/// 不设更多是为了避免与爬虫抢 CPU。
+fn default_monitor_runtime_threads() -> usize {
+    2
+}
+
 fn default_stats_snapshot_interval_secs() -> u64 {
     1
 }
@@ -1050,6 +1079,10 @@ impl Default for PdcConfig {
             federation_runtime_threads: default_federation_runtime_threads(),
             scheduler_runtime_threads: default_scheduler_runtime_threads(),
             persistence_runtime_threads: default_persistence_runtime_threads(),
+            // 2026-10-09 治本 S3/S4：监控独立 runtime + blocking 配额显式化
+            monitor_runtime_threads: default_monitor_runtime_threads(),
+            max_blocking_threads: 0,
+            monitor_max_blocking_threads: 0,
             stats_snapshot_interval_secs: default_stats_snapshot_interval_secs(),
             runtime_shutdown_timeout_secs: default_runtime_shutdown_timeout_secs(),
             adaptive: AdaptiveConfig::default(),

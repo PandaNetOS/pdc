@@ -461,6 +461,112 @@ pub fn read_pool_starved() -> u64 {
     READ_POOL_STARVED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ==============================================================
+// 写连接锁争用观测（2026-10-09 治本 S5 · 第一步）
+//
+// 【为什么加】此前 `self.conn.lock()` 全库 38 处（db.rs）+ 1 处
+// （io_scheduler.rs），全部**零可观测性**：既看不到等锁时长、也看不到
+// 争用次数。于是 2026-10-09 事故排查时无法证明「锁争用」是否参与其中，
+// 改造后也无法验证是否改善——只能靠猜。
+//
+// 【参照】读侧早已有等价观测（`READ_POOL_STARVED` + 池空超时告警），
+// 写侧照抄同一模式，不发明新概念。
+//
+// 【S5 路线】先量化 → 再收敛。若实测锁争用并不严重，就不值得冒
+// 「改 38 处」的风险去做单一入口重构。
+// ==============================================================
+
+/// 抢写锁累计等待次数（每次进入 `with_write_conn` +1）。
+static WRITE_LOCK_ACQUIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 抢写锁等待超过 [`WRITE_LOCK_SLOW_THRESHOLD_MS`] 的累计次数（争用信号）。
+static WRITE_LOCK_SLOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 抢写锁等待时长累计（微秒）⇒ 可算平均等待时长。
+static WRITE_LOCK_WAIT_US_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// 抢写锁等待时长峰值（毫秒）⇒ 单次最坏情况。
+static WRITE_LOCK_WAIT_MS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 判定「慢锁」的阈值（毫秒）。
+///
+/// 取 50ms：SQLite 单条语句写锁持有通常 <5ms（实测 checkpoint EWMA 约
+/// 36~412ms），故 50ms 已明显偏离常态；但又足够宽，避免把偶发的
+/// WAL checkpoint 抖动（实测峰值 3.2s）全部计为争用。
+const WRITE_LOCK_SLOW_THRESHOLD_MS: u64 = 50;
+
+/// 写锁争用观测快照（供 `/api/v1/io/status` 暴露与压测判据使用）。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WriteLockStats {
+    /// 累计抢锁次数
+    pub acquired: u64,
+    /// 累计慢锁次数（等待 ≥50ms）
+    pub slow: u64,
+    /// 平均等待时长（毫秒）
+    pub avg_wait_ms: f64,
+    /// 单次最长等待（毫秒）
+    pub max_wait_ms: u64,
+}
+
+/// 读取写锁争用观测快照。
+pub fn write_lock_stats() -> WriteLockStats {
+    let acquired = WRITE_LOCK_ACQUIRED.load(std::sync::atomic::Ordering::Relaxed);
+    let wait_us = WRITE_LOCK_WAIT_US_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    WriteLockStats {
+        acquired,
+        slow: WRITE_LOCK_SLOW.load(std::sync::atomic::Ordering::Relaxed),
+        avg_wait_ms: if acquired == 0 {
+            0.0
+        } else {
+            wait_us as f64 / acquired as f64 / 1000.0
+        },
+        max_wait_ms: WRITE_LOCK_WAIT_MS_MAX.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// 执行一个「需要全库唯一写连接」的操作，并记录等锁时长。
+///
+/// 这是 S5 的**唯一入口**：`db.rs` 全部 38 处 `self.conn.lock()`
+/// 逐步收敛到本函数，从而把「锁争用」变成可观测、可量化、可断言的对象。
+///
+/// 与 `read()` 的 P4-3 约定一致：
+/// - **绝不 panic**：poisoned 时 `into_inner()` 取回连接（与既有写法一致）；
+/// - **绝不回退**：拿不到锁就等，不做降级路径（避免静默绕过串行化）。
+#[track_caller]
+pub(crate) fn with_write_conn<T>(
+    conn: &Arc<Mutex<Connection>>,
+    f: impl FnOnce(&mut Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let t0 = std::time::Instant::now();
+    let mut guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+    let waited = t0.elapsed();
+
+    WRITE_LOCK_ACQUIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    WRITE_LOCK_WAIT_US_TOTAL.fetch_add(
+        waited.as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let waited_ms = waited.as_millis() as u64;
+    if waited_ms >= WRITE_LOCK_SLOW_THRESHOLD_MS {
+        let n = WRITE_LOCK_SLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // 峰值用 fetch_max 更新（并发下不丢最大值）。
+        WRITE_LOCK_WAIT_MS_MAX.fetch_max(waited_ms, std::sync::atomic::Ordering::Relaxed);
+        // 慢锁本身不阻断（写锁串行是设计预期），但必须可观测：
+        // 前若干次打 warn，便于定位争用热点；之后降频避免日志风暴。
+        if n <= 10 || n.is_multiple_of(100) {
+            let caller = std::panic::Location::caller();
+            tracing::warn!(
+                "[storage] 写锁争用：等待 {}ms ≥ {}ms（累计慢锁 {}/{} 次，caller={}:{}）",
+                waited_ms,
+                WRITE_LOCK_SLOW_THRESHOLD_MS,
+                n,
+                WRITE_LOCK_ACQUIRED.load(std::sync::atomic::Ordering::Relaxed),
+                caller.file(),
+                caller.line()
+            );
+        }
+    }
+    f(&mut guard)
+}
+
 /// E6：读池配置大小（= `READ_POOL_SIZE`，文件库口径）。
 pub fn read_pool_total() -> usize {
     READ_POOL_SIZE
@@ -696,8 +802,11 @@ impl Storage {
             "trackers",
         ];
         let mut calibrated: Vec<(usize, i64)> = Vec::with_capacity(names.len());
-        {
-            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        //
+        // 原本是一个 `{ let conn = lock; ... }` 自包含块。改为闭包形式后
+        // 块边界与闭包边界重合，**锁释放时机不变**（仍在本段结束时释放）。
+        with_write_conn(&self.conn, |conn| {
             for (i, name) in names.iter().enumerate() {
                 // 单遍扫描同时取 total 与 valid（peers_archive 无墓碑列，valid=total）
                 let sql = if *name == "peers_archive" {
@@ -720,7 +829,18 @@ impl Storage {
                     calibrated.push((i, valid));
                 }
             }
-        }
+            Ok(())
+        })
+        // 本函数返回 `[i64; 5]`（非 Result），故无法用 `?` 传播错误。
+        // 保持原语义：校准失败时 `calibrated` 为空、调用方拿到全 -1 数组，
+        // 由上层`entity_counts_cached` 降级处理。但**记一条 warn** ——
+        // 此前失败是完全静默的（锁不可用时同样静默），运维无从察觉。
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "[storage] refresh_entity_counts 写锁内校准失败（返回全 -1）: {}",
+                e
+            );
+        });
         let mut c = [-1i64; 5];
         for (i, v) in calibrated {
             c[i] = v;
@@ -850,6 +970,15 @@ impl Storage {
             }
             None => {
                 // 仅内存库（pool_enabled=false，测试路径）：回退主连接
+                //
+                // 【2026-10-09 治本 S5 · 刻意不走 with_write_conn】此处的
+                // `self.conn.lock()` 只在**内存库测试路径**生效（生产文件库
+                // `pool_enabled=true` 走 Some(conn) 分支借读池连接，永不走这里）。
+                //
+                // 故它不属于生产写锁争用路径，无需纳入 S5 收敛；且包成
+                // `with_write_conn(&self.conn, |c| f(c))` 会把一个
+                // 「借连接 → 调闭包」的语义压成「持锁 → 调闭包」，
+                // 在测试并发场景下更易触发锁重入。刻意保留原写法。
                 let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                 f(&conn)
             }
@@ -1003,6 +1132,12 @@ impl Storage {
             }
             None => {
                 // 内存库 / 测试路径：回退写连接（活跃计数同口径：执行中即计入）
+                //
+                // 【2026-10-09 治本 S5 · 刻意不走 with_write_conn】与 `read()`
+                // 同理：生产文件库走 Some(conn) 借长查询池连接，此分支仅
+                // 内存库/测试生效，不属生产写锁争用路径。
+                // 另注：此处已持 `LongQueryActiveGuard`，若再包一层写连接闭包，
+                // 会让「许可计数」与「写锁持有」交叠，测试并发下更易放大等待。
                 let _active = LongQueryActiveGuard::enter();
                 let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                 f(&conn)
@@ -1176,10 +1311,12 @@ impl Storage {
     /// 写连接的 SQLite 自动 checkpoint 开关（接管/交还）。
     /// takeover=true 启动时置 0（应用接管）；false 时恢复默认页数。
     pub fn set_wal_autocheckpoint(&self, pages: u32) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // 注意：PRAGMA 赋值会返回一行结果，必须用 pragma_update（execute 会报 "returned results"）
-        conn.pragma_update(None, "wal_autocheckpoint", pages)?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            // 注意：PRAGMA 赋值会返回一行结果，必须用 pragma_update（execute 会报 "returned results"）
+            conn.pragma_update(None, "wal_autocheckpoint", pages)?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上执行 WAL checkpoint（供 IOScheduler 回调使用）
@@ -1191,10 +1328,12 @@ impl Storage {
 
     /// 执行 VACUUM（清理碎片，压缩数据库）
     pub fn vacuum(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch("VACUUM;")?;
-        info!("[storage] VACUUM 已完成");
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute_batch("VACUUM;")?;
+            info!("[storage] VACUUM 已完成");
+            Ok(())
+        })
     }
 
     /// 初始化表结构
@@ -1204,351 +1343,356 @@ impl Storage {
         drop_unused_indexes: bool,
         drop_redundant_peer_indexes: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS dht_nodes (
-                id BLOB NOT NULL,
-                ip TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                score REAL DEFAULT 0,
-                state TEXT DEFAULT 'Good',
-                query_count INTEGER DEFAULT 0,
-                success_count INTEGER DEFAULT 0,
-                total_latency_ms INTEGER DEFAULT 0,
-                consecutive_failures INTEGER DEFAULT 0,
-                nodes_returned INTEGER DEFAULT 0,
-                last_query_time INTEGER,
-                last_active INTEGER,
-                first_seen INTEGER,
-                l2_shard INTEGER DEFAULT 0,
-                PRIMARY KEY (ip, port)
-            );
-
-            CREATE TABLE IF NOT EXISTS trackers (
-                url TEXT PRIMARY KEY,
-                score REAL DEFAULT 0,
-                state TEXT DEFAULT 'active',
-                total_requests INTEGER DEFAULT 0,
-                success_requests INTEGER DEFAULT 0,
-                failed_requests INTEGER DEFAULT 0,
-                total_peers_discovered INTEGER DEFAULT 0,
-                total_response_time_ms REAL DEFAULT 0,
-                consecutive_failures INTEGER DEFAULT 0,
-                disabled INTEGER DEFAULT 0,
-                last_used INTEGER,
-                l2_shard INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS infohashes (
-                infohash BLOB PRIMARY KEY,
-                ref_count INTEGER DEFAULT 1,
-                first_source TEXT,
-                first_seen INTEGER,
-                last_seen INTEGER,
-                score REAL DEFAULT 0,
-                l2_shard INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS peers (
-                infohash BLOB NOT NULL,
-                ip TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                source TEXT,
-                score REAL DEFAULT 0,
-                connection_attempts INTEGER DEFAULT 0,
-                connection_successes INTEGER DEFAULT 0,
-                last_active INTEGER,
-                l2_shard INTEGER DEFAULT 0,
-                PRIMARY KEY (infohash, ip, port)
-            );
-            -- B5-1: idx_peers_infohash 与 PK(infohash,ip,port) 首列重复，已由末尾一次性迁移 DROP。
-            -- 冷数据归档表（超过 2 小时无活跃的 peer 迁移到此，减少主表体积）
-            CREATE TABLE IF NOT EXISTS peers_archive (
-                infohash BLOB NOT NULL,
-                ip TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                source TEXT,
-                score REAL DEFAULT 0,
-                connection_attempts INTEGER DEFAULT 0,
-                connection_successes INTEGER DEFAULT 0,
-                last_active INTEGER,
-                archived_at INTEGER,
-                PRIMARY KEY (infohash, ip, port)
-            );
-            -- P-A（增量块摘要）：bootstrap 清单/对齐的持久化块表。
-            -- lo_key/hi_key 与 load_repo_key_hashes_in_range 的排序键逐字节一致
-            -- （NODE=`ip:port`、PEER=`lower(hex(infohash)):ip:port`、INFOHASH=infohash、TRACKER=url）。
-            -- 写入经 mark_chunks_dirty_in_tx 标 dirty；dirty 块在清单构建/块发送前惰性重算
-            -- （P-B），消除 bootstrap 周期内的全表扫描（600 万行 38s~120s+）。
-            CREATE TABLE IF NOT EXISTS chunk_digests (
-                repo INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                lo_key BLOB NOT NULL,
-                hi_key BLOB NOT NULL,
-                rows INTEGER NOT NULL DEFAULT 0,
-                hash BLOB NOT NULL,
-                dirty INTEGER NOT NULL DEFAULT 0,
-                chunk_rows INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (repo, idx)
-            );
-            CREATE INDEX IF NOT EXISTS idx_chunk_digests_repo_lo
-                ON chunk_digests (repo, lo_key);
-            -- B5-1: idx_peers_archive_infohash 与 PK 首列重复，已 DROP。
-            CREATE INDEX IF NOT EXISTS idx_peers_archive_last_active ON peers_archive(last_active);
-
-            CREATE TABLE IF NOT EXISTS peer_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                infohash BLOB NOT NULL,
-                ip TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                source TEXT,
-                score REAL DEFAULT 0,
-                discovered_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_peer_history_infohash ON peer_history(infohash);
-            CREATE INDEX IF NOT EXISTS idx_peer_history_time ON peer_history(discovered_at);
-
-            CREATE TABLE IF NOT EXISTS stats_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER NOT NULL,
-                metric TEXT NOT NULL,
-                value REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_stats_history_metric ON stats_history(metric, timestamp);
-
-            CREATE TABLE IF NOT EXISTS stats_aggregate (
-                metric TEXT PRIMARY KEY,
-                value REAL NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            "#,
-        )?;
-
-        // 向后兼容迁移：为已存在的 dht_nodes 表添加新列
-        let _ = conn.execute(
-            "ALTER TABLE dht_nodes ADD COLUMN nodes_returned INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE dht_nodes ADD COLUMN last_query_time INTEGER",
-            [],
-        );
-        // 向后兼容迁移：为已存在的 infohashes 表添加 score 列
-        let _ = conn.execute("ALTER TABLE infohashes ADD COLUMN score REAL DEFAULT 0", []);
-        // 向后兼容迁移：为各表添加 l2_shard 分片列（分层 Merkle 同步用）
-        // 旧表此前没有该列，必须先 ALTER 再建索引；新表已在上方 CREATE TABLE 中包含此列，
-        // 重复 ALTER 会报 duplicate column，用 let _ = 吞掉。
-        let _ = conn.execute(
-            "ALTER TABLE dht_nodes ADD COLUMN l2_shard INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trackers ADD COLUMN l2_shard INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE infohashes ADD COLUMN l2_shard INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE peers ADD COLUMN l2_shard INTEGER DEFAULT 0",
-            [],
-        );
-
-        // ===== P1-1：删除闭环 + 版本向量基础列 =====
-        // version   —— 该行最后写入的逻辑版本（LWW 比较用；0 = 未知/旧数据）
-        // origin_node—— 该行最初来源节点 node_id（20B，诊断/溯源用，可空）
-        // updated_at —— 该行最后写入的 unix 秒（可空）
-        // deleted_at —— 软删除墓碑：非 NULL 表示已删除，查询一律过滤（删除闭环的关键，
-        //              否则「侧删了」在集合语义下与「侧从来没有」无法区分，Merkle 永远收敛不到 0）
-        // 全部 ADD COLUMN 用 let _ 吞掉重复列错误，兼容新旧库。
-        for tbl in ["dht_nodes", "trackers", "infohashes", "peers"] {
-            let _ = conn.execute(
-                &format!("ALTER TABLE {} ADD COLUMN version INTEGER DEFAULT 0", tbl),
-                [],
-            );
-            let _ = conn.execute(
-                &format!("ALTER TABLE {} ADD COLUMN origin_node BLOB", tbl),
-                [],
-            );
-            let _ = conn.execute(
-                &format!(
-                    "ALTER TABLE {} ADD COLUMN updated_at INTEGER DEFAULT 0",
-                    tbl
-                ),
-                [],
-            );
-            let _ = conn.execute(
-                &format!("ALTER TABLE {} ADD COLUMN deleted_at INTEGER", tbl),
-                [],
-            );
-        }
-
-        // l2_shard 索引必须在 ALTER TABLE 之后创建（旧表此时才具备该列）。
-        // 严禁放回上方 CREATE TABLE 的 execute_batch 块中：旧库 CREATE TABLE IF NOT EXISTS
-        // 是 no-op，紧接着的 CREATE INDEX 会因列尚不存在而报 no such column: l2_shard 导致启动失败。
-        conn.execute_batch(
-            r#"
-            -- A3（v11）：四个 idx_*_l2_shard 已删除（全仓库无 WHERE l2_shard 查询，纯写放大）。
-            -- 存量库由末尾 drop_unused_l2_shard_indexes() 一次性 DROP（列与写入路径保留）。
-            CREATE INDEX IF NOT EXISTS idx_dht_nodes_deleted ON dht_nodes(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_trackers_deleted ON trackers(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_infohashes_deleted ON infohashes(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_peers_deleted ON peers(deleted_at);
-            "#,
-        )?;
-
-        // ===== 增量行数计数器（消除周期性全表 COUNT 扫描，2026-09-23）=====
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
         //
-        // 背景：统计快照（每秒）、监控 WebSocket、联邦协商都通过 count_table /
-        // valid_entity_counts 触发 `SELECT COUNT(*)` 全表扫描；在慢盘 + 写入高压下
-        // 单次 COUNT 可达分钟级，且 db::read() 在查询期间持有读池锁，一条慢 COUNT
-        // 会卡死全进程读路径（2026-09-23 API 6886 失联事故根因）。
-        //
-        // 方案：table_counts 保存每表 (total, valid)，由行级触发器增量维护——
-        // SQLite 对 `INSERT .. ON CONFLICT DO UPDATE` 只在真插入时触发 INSERT
-        // 触发器、冲突更新时只触发 UPDATE 触发器，因此无需在 Rust 端区分
-        // 插入/更新。触发器在同一事务内执行，崩溃/回滚天然一致。
-        //
-        // 校准：计数器以 calibrated 标记是否可信；空库（新建/内存库）建表即校准，
-        // 存量库由启动校准 + db_entity_stats_refresh 周期任务以真实 COUNT 回写。
-        // 未校准期间读路径回退真实 COUNT（与旧版行为一致）。
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS table_counts (
-                name TEXT PRIMARY KEY,
-                total INTEGER NOT NULL DEFAULT 0,
-                valid INTEGER NOT NULL DEFAULT 0,
-                calibrated INTEGER NOT NULL DEFAULT 0
-            );
-            INSERT OR IGNORE INTO table_counts (name, total, valid, calibrated) VALUES
-                ('dht_nodes', 0, 0, 0),
-                ('peers', 0, 0, 0),
-                ('peers_archive', 0, 0, 0),
-                ('infohashes', 0, 0, 0),
-                ('trackers', 0, 0, 0);
-            "#,
-        )?;
-        {
-            // 软删表（含 deleted_at 列）：INSERT（总+有效）、墓碑/复活（仅有效）、
-            // DELETE（总+按旧值有效）各一组触发器。WHEN 条件保证软删幂等
-            // （重复 UPDATE 同一墓碑不重复计数）。
-            let mut triggers = String::new();
-            for tbl in ["dht_nodes", "peers", "infohashes", "trackers"] {
-                triggers.push_str(&format!(
-                    r#"
-            CREATE TRIGGER IF NOT EXISTS trg_{t}_ins_total AFTER INSERT ON {t}
-            BEGIN UPDATE table_counts SET total = total + 1 WHERE name = '{t}'; END;
-            CREATE TRIGGER IF NOT EXISTS trg_{t}_ins_valid AFTER INSERT ON {t}
-            WHEN new.deleted_at IS NULL
-            BEGIN UPDATE table_counts SET valid = valid + 1 WHERE name = '{t}'; END;
-            CREATE TRIGGER IF NOT EXISTS trg_{t}_tombstone AFTER UPDATE OF deleted_at ON {t}
-            WHEN old.deleted_at IS NULL AND new.deleted_at IS NOT NULL
-            BEGIN UPDATE table_counts SET valid = valid - 1 WHERE name = '{t}'; END;
-            CREATE TRIGGER IF NOT EXISTS trg_{t}_revive AFTER UPDATE OF deleted_at ON {t}
-            WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL
-            BEGIN UPDATE table_counts SET valid = valid + 1 WHERE name = '{t}'; END;
-            CREATE TRIGGER IF NOT EXISTS trg_{t}_del_total AFTER DELETE ON {t}
-            BEGIN UPDATE table_counts SET total = total - 1 WHERE name = '{t}'; END;
-            CREATE TRIGGER IF NOT EXISTS trg_{t}_del_valid AFTER DELETE ON {t}
-            WHEN old.deleted_at IS NULL
-            BEGIN UPDATE table_counts SET valid = valid - 1 WHERE name = '{t}'; END;
-            "#,
-                    t = tbl
-                ));
-            }
-            // peers_archive 无 deleted_at 列，valid 恒等于 total
-            triggers.push_str(
+        // init_tables 是启动期一次性建表（持锁较长），但仍必须纳入统一入口：
+        // 否则它就是「未被观测的长持锁」，一旦启动期与其他写路径竞争便成盲区。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute_batch(
                 r#"
-            CREATE TRIGGER IF NOT EXISTS trg_peers_archive_ins AFTER INSERT ON peers_archive
-            BEGIN
-                UPDATE table_counts SET total = total + 1, valid = valid + 1 WHERE name = 'peers_archive';
-            END;
-            CREATE TRIGGER IF NOT EXISTS trg_peers_archive_del AFTER DELETE ON peers_archive
-            BEGIN
-                UPDATE table_counts SET total = total - 1, valid = valid - 1 WHERE name = 'peers_archive';
-            END;
-            "#,
+                CREATE TABLE IF NOT EXISTS dht_nodes (
+                    id BLOB NOT NULL,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    score REAL DEFAULT 0,
+                    state TEXT DEFAULT 'Good',
+                    query_count INTEGER DEFAULT 0,
+                    success_count INTEGER DEFAULT 0,
+                    total_latency_ms INTEGER DEFAULT 0,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    nodes_returned INTEGER DEFAULT 0,
+                    last_query_time INTEGER,
+                    last_active INTEGER,
+                    first_seen INTEGER,
+                    l2_shard INTEGER DEFAULT 0,
+                    PRIMARY KEY (ip, port)
+                );
+
+                CREATE TABLE IF NOT EXISTS trackers (
+                    url TEXT PRIMARY KEY,
+                    score REAL DEFAULT 0,
+                    state TEXT DEFAULT 'active',
+                    total_requests INTEGER DEFAULT 0,
+                    success_requests INTEGER DEFAULT 0,
+                    failed_requests INTEGER DEFAULT 0,
+                    total_peers_discovered INTEGER DEFAULT 0,
+                    total_response_time_ms REAL DEFAULT 0,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    disabled INTEGER DEFAULT 0,
+                    last_used INTEGER,
+                    l2_shard INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS infohashes (
+                    infohash BLOB PRIMARY KEY,
+                    ref_count INTEGER DEFAULT 1,
+                    first_source TEXT,
+                    first_seen INTEGER,
+                    last_seen INTEGER,
+                    score REAL DEFAULT 0,
+                    l2_shard INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS peers (
+                    infohash BLOB NOT NULL,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    source TEXT,
+                    score REAL DEFAULT 0,
+                    connection_attempts INTEGER DEFAULT 0,
+                    connection_successes INTEGER DEFAULT 0,
+                    last_active INTEGER,
+                    l2_shard INTEGER DEFAULT 0,
+                    PRIMARY KEY (infohash, ip, port)
+                );
+                -- B5-1: idx_peers_infohash 与 PK(infohash,ip,port) 首列重复，已由末尾一次性迁移 DROP。
+                -- 冷数据归档表（超过 2 小时无活跃的 peer 迁移到此，减少主表体积）
+                CREATE TABLE IF NOT EXISTS peers_archive (
+                    infohash BLOB NOT NULL,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    source TEXT,
+                    score REAL DEFAULT 0,
+                    connection_attempts INTEGER DEFAULT 0,
+                    connection_successes INTEGER DEFAULT 0,
+                    last_active INTEGER,
+                    archived_at INTEGER,
+                    PRIMARY KEY (infohash, ip, port)
+                );
+                -- P-A（增量块摘要）：bootstrap 清单/对齐的持久化块表。
+                -- lo_key/hi_key 与 load_repo_key_hashes_in_range 的排序键逐字节一致
+                -- （NODE=`ip:port`、PEER=`lower(hex(infohash)):ip:port`、INFOHASH=infohash、TRACKER=url）。
+                -- 写入经 mark_chunks_dirty_in_tx 标 dirty；dirty 块在清单构建/块发送前惰性重算
+                -- （P-B），消除 bootstrap 周期内的全表扫描（600 万行 38s~120s+）。
+                CREATE TABLE IF NOT EXISTS chunk_digests (
+                    repo INTEGER NOT NULL,
+                    idx INTEGER NOT NULL,
+                    lo_key BLOB NOT NULL,
+                    hi_key BLOB NOT NULL,
+                    rows INTEGER NOT NULL DEFAULT 0,
+                    hash BLOB NOT NULL,
+                    dirty INTEGER NOT NULL DEFAULT 0,
+                    chunk_rows INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (repo, idx)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chunk_digests_repo_lo
+                    ON chunk_digests (repo, lo_key);
+                -- B5-1: idx_peers_archive_infohash 与 PK 首列重复，已 DROP。
+                CREATE INDEX IF NOT EXISTS idx_peers_archive_last_active ON peers_archive(last_active);
+
+                CREATE TABLE IF NOT EXISTS peer_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    infohash BLOB NOT NULL,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    source TEXT,
+                    score REAL DEFAULT 0,
+                    discovered_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_peer_history_infohash ON peer_history(infohash);
+                CREATE INDEX IF NOT EXISTS idx_peer_history_time ON peer_history(discovered_at);
+
+                CREATE TABLE IF NOT EXISTS stats_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    metric TEXT NOT NULL,
+                    value REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_stats_history_metric ON stats_history(metric, timestamp);
+
+                CREATE TABLE IF NOT EXISTS stats_aggregate (
+                    metric TEXT PRIMARY KEY,
+                    value REAL NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                "#,
+            )?;
+
+            // 向后兼容迁移：为已存在的 dht_nodes 表添加新列
+            let _ = conn.execute(
+                "ALTER TABLE dht_nodes ADD COLUMN nodes_returned INTEGER DEFAULT 0",
+                [],
             );
-            conn.execute_batch(&triggers)?;
-        }
-        // 空库（新建文件/内存库）计数值天然为真，直接标记已校准，避免读路径走
-        // COUNT 回退；存量库保持 calibrated=0，由启动校准任务回填真值。
-        let all_entity_tables_empty = [
-            "dht_nodes",
-            "peers",
-            "peers_archive",
-            "infohashes",
-            "trackers",
-        ]
-        .iter()
-        .all(|t| {
-            conn.query_row(&format!("SELECT 1 FROM {} LIMIT 1", t), [], |_| Ok(()))
-                .is_err()
-        });
-        if all_entity_tables_empty {
-            conn.execute("UPDATE table_counts SET calibrated = 1", [])?;
-        }
-
-        // v9：range 反熵 / bootstrap 分块都按**表达式键**做 `ORDER BY` 与区间比较
-        // （NODE `(ip||':'||port)`、PEER `(lower(hex(infohash))||':'||ip||':'||port)`），
-        // 而此前没有任何匹配索引 ⇒ 每次调用都是「全表扫描 + 全量排序」，且全程持有连接锁
-        // （实测 bootstrap 建一次清单 = 74~93 次全表排序，单次重建 >131s，把 HTTP API 与
-        // 写队列一起拖垮）。表达式索引让这两条路径退化为索引有序扫描。
-        // 配合 v9 查询侧「按需拼谓词」（见 `node_range_sql`），索引才真正被用于区间定位。
-        // F9 方案 B：peers_archive 归档表也纳入 PEER 清单/块扫描口径（归档是本地冷分层
-        // 不是数据边界），为其建同款 key 表达式索引。注意 archive 无 deleted_at 列，
-        // 索引表达式不含墓碑过滤（活行过滤语义由查询侧 WHERE 决定）。
-        // 幂等；首次启动会在 165 万行的 dht_nodes 上同步建索引（一次性、数十秒量级），
-        // 失败必须可见（旧写法 `let _ =` 会静默退化为全表排序）。
-        if let Err(e) = conn.execute_batch(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_dht_nodes_ip_port_expr
-                ON dht_nodes((ip || ':' || port));
-            CREATE INDEX IF NOT EXISTS idx_peers_key_expr
-                ON peers((lower(hex(infohash)) || ':' || ip || ':' || port));
-            CREATE INDEX IF NOT EXISTS idx_peers_archive_key_expr
-                ON peers_archive((lower(hex(infohash)) || ':' || ip || ':' || port));
-            CREATE INDEX IF NOT EXISTS idx_infohashes_ih_alive
-                ON infohashes(infohash) WHERE deleted_at IS NULL;
-            CREATE INDEX IF NOT EXISTS idx_trackers_url_alive
-                ON trackers(url) WHERE deleted_at IS NULL;
-            "#,
-        ) {
-            tracing::warn!(
-                "[storage] 表达式索引创建失败（interval 查询将退化为全表排序，性能下降）: {}",
-                e
+            let _ = conn.execute(
+                "ALTER TABLE dht_nodes ADD COLUMN last_query_time INTEGER",
+                [],
             );
-        }
-
-        // A3（v11）：删除 v8 去 Merkle 化后无人查询的 l2_shard 索引（纯写放大）。
-        // 列与 save_* 写入路径保留（诊断/联邦口径仍读该列值）。幂等：新库本就没有这些索引。
-        if drop_unused_indexes {
-            let n = drop_unused_l2_shard_indexes(&conn)?;
-            info!(
-                "[storage] 已删除 {} 个无用索引（l2_shard），减少写入放大",
-                n
+            // 向后兼容迁移：为已存在的 infohashes 表添加 score 列
+            let _ = conn.execute("ALTER TABLE infohashes ADD COLUMN score REAL DEFAULT 0", []);
+            // 向后兼容迁移：为各表添加 l2_shard 分片列（分层 Merkle 同步用）
+            // 旧表此前没有该列，必须先 ALTER 再建索引；新表已在上方 CREATE TABLE 中包含此列，
+            // 重复 ALTER 会报 duplicate column，用 let _ = 吞掉。
+            let _ = conn.execute(
+                "ALTER TABLE dht_nodes ADD COLUMN l2_shard INTEGER DEFAULT 0",
+                [],
             );
-        }
+            let _ = conn.execute(
+                "ALTER TABLE trackers ADD COLUMN l2_shard INTEGER DEFAULT 0",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE infohashes ADD COLUMN l2_shard INTEGER DEFAULT 0",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE peers ADD COLUMN l2_shard INTEGER DEFAULT 0",
+                [],
+            );
 
-        // B5-1：DROP 与 PK 首列重复的 peers 索引（幂等，有开关）。
-        if drop_redundant_peer_indexes {
-            let n = run_drop_redundant_peer_indexes(&conn)?;
-            info!("[storage] 已删除 {} 个冗余 peers 索引（B5-1）", n);
-        }
+            // ===== P1-1：删除闭环 + 版本向量基础列 =====
+            // version   —— 该行最后写入的逻辑版本（LWW 比较用；0 = 未知/旧数据）
+            // origin_node—— 该行最初来源节点 node_id（20B，诊断/溯源用，可空）
+            // updated_at —— 该行最后写入的 unix 秒（可空）
+            // deleted_at —— 软删除墓碑：非 NULL 表示已删除，查询一律过滤（删除闭环的关键，
+            //              否则「侧删了」在集合语义下与「侧从来没有」无法区分，Merkle 永远收敛不到 0）
+            // 全部 ADD COLUMN 用 let _ 吞掉重复列错误，兼容新旧库。
+            for tbl in ["dht_nodes", "trackers", "infohashes", "peers"] {
+                let _ = conn.execute(
+                    &format!("ALTER TABLE {} ADD COLUMN version INTEGER DEFAULT 0", tbl),
+                    [],
+                );
+                let _ = conn.execute(
+                    &format!("ALTER TABLE {} ADD COLUMN origin_node BLOB", tbl),
+                    [],
+                );
+                let _ = conn.execute(
+                    &format!(
+                        "ALTER TABLE {} ADD COLUMN updated_at INTEGER DEFAULT 0",
+                        tbl
+                    ),
+                    [],
+                );
+                let _ = conn.execute(
+                    &format!("ALTER TABLE {} ADD COLUMN deleted_at INTEGER", tbl),
+                    [],
+                );
+            }
 
-        // P1-2：变更日志表（联邦 delta 同步的权威来源）
-        crate::storage::oplog::init_oplog_table(&conn)?;
+            // l2_shard 索引必须在 ALTER TABLE 之后创建（旧表此时才具备该列）。
+            // 严禁放回上方 CREATE TABLE 的 execute_batch 块中：旧库 CREATE TABLE IF NOT EXISTS
+            // 是 no-op，紧接着的 CREATE INDEX 会因列尚不存在而报 no such column: l2_shard 导致启动失败。
+            conn.execute_batch(
+                r#"
+                -- A3（v11）：四个 idx_*_l2_shard 已删除（全仓库无 WHERE l2_shard 查询，纯写放大）。
+                -- 存量库由末尾 drop_unused_l2_shard_indexes() 一次性 DROP（列与写入路径保留）。
+                CREATE INDEX IF NOT EXISTS idx_dht_nodes_deleted ON dht_nodes(deleted_at);
+                CREATE INDEX IF NOT EXISTS idx_trackers_deleted ON trackers(deleted_at);
+                CREATE INDEX IF NOT EXISTS idx_infohashes_deleted ON infohashes(deleted_at);
+                CREATE INDEX IF NOT EXISTS idx_peers_deleted ON peers(deleted_at);
+                "#,
+            )?;
 
-        // P1-3 / P2-1：联邦层拥有的两张表也在此统一建（幂等）。
-        // 放在 init_tables 是为了让 `Storage::memory()`（单元测试）与 `Storage::open`（生产）
-        // 都能拿到完整 schema，避免「运行期才发现 no such table」的隐患。
-        crate::federation::sync::delta::init_delta_tables(&conn)?;
-        crate::federation::sync::bootstrap::init_bootstrap_table(&conn)?;
+            // ===== 增量行数计数器（消除周期性全表 COUNT 扫描，2026-09-23）=====
+            //
+            // 背景：统计快照（每秒）、监控 WebSocket、联邦协商都通过 count_table /
+            // valid_entity_counts 触发 `SELECT COUNT(*)` 全表扫描；在慢盘 + 写入高压下
+            // 单次 COUNT 可达分钟级，且 db::read() 在查询期间持有读池锁，一条慢 COUNT
+            // 会卡死全进程读路径（2026-09-23 API 6886 失联事故根因）。
+            //
+            // 方案：table_counts 保存每表 (total, valid)，由行级触发器增量维护——
+            // SQLite 对 `INSERT .. ON CONFLICT DO UPDATE` 只在真插入时触发 INSERT
+            // 触发器、冲突更新时只触发 UPDATE 触发器，因此无需在 Rust 端区分
+            // 插入/更新。触发器在同一事务内执行，崩溃/回滚天然一致。
+            //
+            // 校准：计数器以 calibrated 标记是否可信；空库（新建/内存库）建表即校准，
+            // 存量库由启动校准 + db_entity_stats_refresh 周期任务以真实 COUNT 回写。
+            // 未校准期间读路径回退真实 COUNT（与旧版行为一致）。
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS table_counts (
+                    name TEXT PRIMARY KEY,
+                    total INTEGER NOT NULL DEFAULT 0,
+                    valid INTEGER NOT NULL DEFAULT 0,
+                    calibrated INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO table_counts (name, total, valid, calibrated) VALUES
+                    ('dht_nodes', 0, 0, 0),
+                    ('peers', 0, 0, 0),
+                    ('peers_archive', 0, 0, 0),
+                    ('infohashes', 0, 0, 0),
+                    ('trackers', 0, 0, 0);
+                "#,
+            )?;
+            {
+                // 软删表（含 deleted_at 列）：INSERT（总+有效）、墓碑/复活（仅有效）、
+                // DELETE（总+按旧值有效）各一组触发器。WHEN 条件保证软删幂等
+                // （重复 UPDATE 同一墓碑不重复计数）。
+                let mut triggers = String::new();
+                for tbl in ["dht_nodes", "peers", "infohashes", "trackers"] {
+                    triggers.push_str(&format!(
+                        r#"
+                CREATE TRIGGER IF NOT EXISTS trg_{t}_ins_total AFTER INSERT ON {t}
+                BEGIN UPDATE table_counts SET total = total + 1 WHERE name = '{t}'; END;
+                CREATE TRIGGER IF NOT EXISTS trg_{t}_ins_valid AFTER INSERT ON {t}
+                WHEN new.deleted_at IS NULL
+                BEGIN UPDATE table_counts SET valid = valid + 1 WHERE name = '{t}'; END;
+                CREATE TRIGGER IF NOT EXISTS trg_{t}_tombstone AFTER UPDATE OF deleted_at ON {t}
+                WHEN old.deleted_at IS NULL AND new.deleted_at IS NOT NULL
+                BEGIN UPDATE table_counts SET valid = valid - 1 WHERE name = '{t}'; END;
+                CREATE TRIGGER IF NOT EXISTS trg_{t}_revive AFTER UPDATE OF deleted_at ON {t}
+                WHEN old.deleted_at IS NOT NULL AND new.deleted_at IS NULL
+                BEGIN UPDATE table_counts SET valid = valid + 1 WHERE name = '{t}'; END;
+                CREATE TRIGGER IF NOT EXISTS trg_{t}_del_total AFTER DELETE ON {t}
+                BEGIN UPDATE table_counts SET total = total - 1 WHERE name = '{t}'; END;
+                CREATE TRIGGER IF NOT EXISTS trg_{t}_del_valid AFTER DELETE ON {t}
+                WHEN old.deleted_at IS NULL
+                BEGIN UPDATE table_counts SET valid = valid - 1 WHERE name = '{t}'; END;
+                "#,
+                        t = tbl
+                    ));
+                }
+                // peers_archive 无 deleted_at 列，valid 恒等于 total
+                triggers.push_str(
+                    r#"
+                CREATE TRIGGER IF NOT EXISTS trg_peers_archive_ins AFTER INSERT ON peers_archive
+                BEGIN
+                    UPDATE table_counts SET total = total + 1, valid = valid + 1 WHERE name = 'peers_archive';
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_peers_archive_del AFTER DELETE ON peers_archive
+                BEGIN
+                    UPDATE table_counts SET total = total - 1, valid = valid - 1 WHERE name = 'peers_archive';
+                END;
+                "#,
+                );
+                conn.execute_batch(&triggers)?;
+            }
+            // 空库（新建文件/内存库）计数值天然为真，直接标记已校准，避免读路径走
+            // COUNT 回退；存量库保持 calibrated=0，由启动校准任务回填真值。
+            let all_entity_tables_empty = [
+                "dht_nodes",
+                "peers",
+                "peers_archive",
+                "infohashes",
+                "trackers",
+            ]
+            .iter()
+            .all(|t| {
+                conn.query_row(&format!("SELECT 1 FROM {} LIMIT 1", t), [], |_| Ok(()))
+                    .is_err()
+            });
+            if all_entity_tables_empty {
+                conn.execute("UPDATE table_counts SET calibrated = 1", [])?;
+            }
 
-        debug!("[storage] 表结构初始化完成");
-        Ok(())
+            // v9：range 反熵 / bootstrap 分块都按**表达式键**做 `ORDER BY` 与区间比较
+            // （NODE `(ip||':'||port)`、PEER `(lower(hex(infohash))||':'||ip||':'||port)`），
+            // 而此前没有任何匹配索引 ⇒ 每次调用都是「全表扫描 + 全量排序」，且全程持有连接锁
+            // （实测 bootstrap 建一次清单 = 74~93 次全表排序，单次重建 >131s，把 HTTP API 与
+            // 写队列一起拖垮）。表达式索引让这两条路径退化为索引有序扫描。
+            // 配合 v9 查询侧「按需拼谓词」（见 `node_range_sql`），索引才真正被用于区间定位。
+            // F9 方案 B：peers_archive 归档表也纳入 PEER 清单/块扫描口径（归档是本地冷分层
+            // 不是数据边界），为其建同款 key 表达式索引。注意 archive 无 deleted_at 列，
+            // 索引表达式不含墓碑过滤（活行过滤语义由查询侧 WHERE 决定）。
+            // 幂等；首次启动会在 165 万行的 dht_nodes 上同步建索引（一次性、数十秒量级），
+            // 失败必须可见（旧写法 `let _ =` 会静默退化为全表排序）。
+            if let Err(e) = conn.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_dht_nodes_ip_port_expr
+                    ON dht_nodes((ip || ':' || port));
+                CREATE INDEX IF NOT EXISTS idx_peers_key_expr
+                    ON peers((lower(hex(infohash)) || ':' || ip || ':' || port));
+                CREATE INDEX IF NOT EXISTS idx_peers_archive_key_expr
+                    ON peers_archive((lower(hex(infohash)) || ':' || ip || ':' || port));
+                CREATE INDEX IF NOT EXISTS idx_infohashes_ih_alive
+                    ON infohashes(infohash) WHERE deleted_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_trackers_url_alive
+                    ON trackers(url) WHERE deleted_at IS NULL;
+                "#,
+            ) {
+                tracing::warn!(
+                    "[storage] 表达式索引创建失败（interval 查询将退化为全表排序，性能下降）: {}",
+                    e
+                );
+            }
+
+            // A3（v11）：删除 v8 去 Merkle 化后无人查询的 l2_shard 索引（纯写放大）。
+            // 列与 save_* 写入路径保留（诊断/联邦口径仍读该列值）。幂等：新库本就没有这些索引。
+            if drop_unused_indexes {
+                let n = drop_unused_l2_shard_indexes(conn)?;
+                info!(
+                    "[storage] 已删除 {} 个无用索引（l2_shard），减少写入放大",
+                    n
+                );
+            }
+
+            // B5-1：DROP 与 PK 首列重复的 peers 索引（幂等，有开关）。
+            if drop_redundant_peer_indexes {
+                let n = run_drop_redundant_peer_indexes(conn)?;
+                info!("[storage] 已删除 {} 个冗余 peers 索引（B5-1）", n);
+            }
+
+            // P1-2：变更日志表（联邦 delta 同步的权威来源）
+            crate::storage::oplog::init_oplog_table(conn)?;
+
+            // P1-3 / P2-1：联邦层拥有的两张表也在此统一建（幂等）。
+            // 放在 init_tables 是为了让 `Storage::memory()`（单元测试）与 `Storage::open`（生产）
+            // 都能拿到完整 schema，避免「运行期才发现 no such table」的隐患。
+            crate::federation::sync::delta::init_delta_tables(conn)?;
+            crate::federation::sync::bootstrap::init_bootstrap_table(conn)?;
+
+            debug!("[storage] 表结构初始化完成");
+            Ok(())
+        })
     }
 
     // ---- DHT 节点 ----
@@ -1569,45 +1713,47 @@ impl Storage {
         nodes_returned: u64,
         last_query_time: Option<i64>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        // P1-7：写入即填 l2_shard（key = "ip:port"），不再依赖周期全表回填
-        let l2 = compute_l2_shard(format!("{}:{}", ip, port).as_bytes()) as i64;
-        conn.execute(
-            r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
-                total_latency_ms, consecutive_failures, nodes_returned, last_query_time,
-                last_active, first_seen, l2_shard, updated_at, deleted_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, NULL)
-               ON CONFLICT(ip, port) DO UPDATE SET
-                id=excluded.id, score=excluded.score, state=excluded.state,
-                query_count=excluded.query_count, success_count=excluded.success_count,
-                total_latency_ms=excluded.total_latency_ms,
-                consecutive_failures=excluded.consecutive_failures,
-                nodes_returned=excluded.nodes_returned,
-                last_query_time=excluded.last_query_time,
-                last_active=excluded.last_active,
-                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
-            params![
-                id.as_slice(),
-                ip,
-                port as i64,
-                score,
-                state,
-                query_count as i64,
-                success_count as i64,
-                total_latency_ms as i64,
-                consecutive_failures as i64,
-                nodes_returned as i64,
-                last_query_time,
-                now,
-                l2,
-                now
-            ],
-        )?;
-        // P-A：块表标 dirty（key = ip:port）
-        let key = format!("{}:{}", ip, port).into_bytes();
-        Self::mark_chunks_dirty_in_tx(&conn, 1 /* NODE */, std::slice::from_ref(&key))?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            // P1-7：写入即填 l2_shard（key = "ip:port"），不再依赖周期全表回填
+            let l2 = compute_l2_shard(format!("{}:{}", ip, port).as_bytes()) as i64;
+            conn.execute(
+                r#"INSERT INTO dht_nodes (id, ip, port, score, state, query_count, success_count,
+                    total_latency_ms, consecutive_failures, nodes_returned, last_query_time,
+                    last_active, first_seen, l2_shard, updated_at, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, NULL)
+                   ON CONFLICT(ip, port) DO UPDATE SET
+                    id=excluded.id, score=excluded.score, state=excluded.state,
+                    query_count=excluded.query_count, success_count=excluded.success_count,
+                    total_latency_ms=excluded.total_latency_ms,
+                    consecutive_failures=excluded.consecutive_failures,
+                    nodes_returned=excluded.nodes_returned,
+                    last_query_time=excluded.last_query_time,
+                    last_active=excluded.last_active,
+                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
+                params![
+                    id.as_slice(),
+                    ip,
+                    port as i64,
+                    score,
+                    state,
+                    query_count as i64,
+                    success_count as i64,
+                    total_latency_ms as i64,
+                    consecutive_failures as i64,
+                    nodes_returned as i64,
+                    last_query_time,
+                    now,
+                    l2,
+                    now
+                ],
+            )?;
+            // P-A：块表标 dirty（key = ip:port）
+            let key = format!("{}:{}", ip, port).into_bytes();
+            Self::mark_chunks_dirty_in_tx(conn, 1 /* NODE */, std::slice::from_ref(&key))?;
+            Ok(())
+        })
     }
 
     /// 加载所有 DHT 节点
@@ -1641,29 +1787,33 @@ impl Storage {
 
     /// 清空 DHT 节点表
     pub fn clear_dht_nodes(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM dht_nodes", [])?;
-        // P-A：块表同清（NODE 数据已清空，摘要失效）
-        conn.execute("DELETE FROM chunk_digests WHERE repo = 1", [])?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute("DELETE FROM dht_nodes", [])?;
+            // P-A：块表同清（NODE 数据已清空，摘要失效）
+            conn.execute("DELETE FROM chunk_digests WHERE repo = 1", [])?;
+            Ok(())
+        })
     }
 
     /// P1-6：软删除单个 DHT 节点（写 deleted_at 墓碑，不物理删除）。
     /// 返回受影响行数（0 表示行不存在或已删除）。upsert 会自动清除墓碑以支持复活。
     pub fn soft_delete_node(&self, ip: &str, port: u16) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let n = conn.execute(
-            "UPDATE dht_nodes SET deleted_at = ?1, updated_at = ?1 \
-             WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
-            params![now, ip, port as i64],
-        )?;
-        if n > 0 {
-            // P-A：块表标 dirty（key = ip:port）
-            let key = format!("{}:{}", ip, port).into_bytes();
-            Self::mark_chunks_dirty_in_tx(&conn, 1 /* NODE */, std::slice::from_ref(&key))?;
-        }
-        Ok(n)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let n = conn.execute(
+                "UPDATE dht_nodes SET deleted_at = ?1, updated_at = ?1 \
+                 WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
+                params![now, ip, port as i64],
+            )?;
+            if n > 0 {
+                // P-A：块表标 dirty（key = ip:port）
+                let key = format!("{}:{}", ip, port).into_bytes();
+                Self::mark_chunks_dirty_in_tx(conn, 1 /* NODE */, std::slice::from_ref(&key))?;
+            }
+            Ok(n)
+        })
     }
 
     /// P1-6：批量软删除 DHT 节点（一次事务）。
@@ -1671,27 +1821,29 @@ impl Storage {
         if addrs.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let tx = conn.unchecked_transaction()?;
-        let mut total = 0usize;
-        {
-            let mut stmt = tx.prepare(
-                "UPDATE dht_nodes SET deleted_at = ?1, updated_at = ?1 \
-                 WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
-            )?;
-            for (ip, port) in addrs {
-                total += stmt.execute(params![now, ip, *port as i64])?;
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let tx = conn.unchecked_transaction()?;
+            let mut total = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE dht_nodes SET deleted_at = ?1, updated_at = ?1 \
+                     WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
+                )?;
+                for (ip, port) in addrs {
+                    total += stmt.execute(params![now, ip, *port as i64])?;
+                }
             }
-        }
-        // P-A：块表标 dirty（key = ip:port）
-        let keys: Vec<Vec<u8>> = addrs
-            .iter()
-            .map(|(ip, port)| format!("{}:{}", ip, port).into_bytes())
-            .collect();
-        Self::mark_chunks_dirty_in_tx(&tx, 1 /* NODE */, &keys)?;
-        tx.commit()?;
-        Ok(total)
+            // P-A：块表标 dirty（key = ip:port）
+            let keys: Vec<Vec<u8>> = addrs
+                .iter()
+                .map(|(ip, port)| format!("{}:{}", ip, port).into_bytes())
+                .collect();
+            Self::mark_chunks_dirty_in_tx(&tx, 1 /* NODE */, &keys)?;
+            tx.commit()?;
+            Ok(total)
+        })
     }
 
     /// 批量保存 DHT 节点（事务批量插入，一次获取锁完成所有操作）
@@ -1700,8 +1852,10 @@ impl Storage {
             return Ok(());
         }
         self.record_write("dht_nodes", nodes.len() as u64);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Self::save_dht_nodes_batch_conn(&conn, nodes)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            Self::save_dht_nodes_batch_conn(conn, nodes)
+        })
     }
 
     /// 使用给定连接批量保存 DHT 节点（供 WriteQueue 闭包调用，避免重复加锁）
@@ -1817,12 +1971,14 @@ impl Storage {
 
     /// P-A：整 repo 标 dirty（全表 DELETE / 批量 UPDATE 等无法逐 key 定位的操作后）。
     pub fn mark_repo_all_dirty(&self, repo: u8) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "UPDATE chunk_digests SET dirty = 1 WHERE repo = ?1",
-            params![repo],
-        )?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute(
+                "UPDATE chunk_digests SET dirty = 1 WHERE repo = ?1",
+                params![repo],
+            )?;
+            Ok(())
+        })
     }
 
     /// P-A/P-B：读取某 repo 块表（清单构建 / 对齐验证用）。
@@ -1900,16 +2056,20 @@ impl Storage {
         dirty: bool,
         chunk_rows: u32,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Self::upsert_chunk_digest_in_tx(
-            &conn, repo, idx, lo_key, hi_key, rows, hash, dirty, chunk_rows,
-        )
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            Self::upsert_chunk_digest_in_tx(
+                conn, repo, idx, lo_key, hi_key, rows, hash, dirty, chunk_rows,
+            )
+        })
     }
 
     /// P-B：&self 包装——清空某 repo 块表（chunk_rows 变化重建前）。
     pub fn delete_chunk_digests(&self, repo: u8) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Self::delete_chunk_digests_in_tx(&conn, repo)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            Self::delete_chunk_digests_in_tx(conn, repo)
+        })
     }
 
     /// P-B：廉价一致性校验——repo 表实际活行数（与清单口径一致：NODE/TRACKER/INFOHASH
@@ -1957,16 +2117,18 @@ impl Storage {
         chunk_rows: u32,
         entries: &[(i64, Vec<u8>, Vec<u8>, i64, Vec<u8>)],
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = conn.unchecked_transaction()?;
-        Self::delete_chunk_digests_in_tx(&tx, repo)?;
-        for (idx, lo, hi, rows, hash) in entries {
-            Self::upsert_chunk_digest_in_tx(
-                &tx, repo, *idx, lo, hi, *rows, hash, false, chunk_rows,
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let tx = conn.unchecked_transaction()?;
+            Self::delete_chunk_digests_in_tx(&tx, repo)?;
+            for (idx, lo, hi, rows, hash) in entries {
+                Self::upsert_chunk_digest_in_tx(
+                    &tx, repo, *idx, lo, hi, *rows, hash, false, chunk_rows,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// P2-6：单事务批量 upsert 脏块摘要（块表优先路径的增量重算）。
@@ -1985,15 +2147,17 @@ impl Storage {
         if entries.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = conn.unchecked_transaction()?;
-        for (idx, lo, hi, rows, hash) in entries {
-            Self::upsert_chunk_digest_in_tx(
-                &tx, repo, *idx, lo, hi, *rows, hash, false, chunk_rows,
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for (idx, lo, hi, rows, hash) in entries {
+                Self::upsert_chunk_digest_in_tx(
+                    &tx, repo, *idx, lo, hi, *rows, hash, false, chunk_rows,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub fn save_dht_nodes_batch_in_tx(
@@ -2062,52 +2226,60 @@ impl Storage {
         disabled: bool,
     ) -> anyhow::Result<()> {
         self.record_write("trackers", 1);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        // P1-7：写入即填 l2_shard（key = url）
-        let l2 = compute_l2_shard(url.as_bytes()) as i64;
-        conn.execute(
-            r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
-                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
-                l2_shard, updated_at, deleted_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
-               ON CONFLICT(url) DO UPDATE SET
-                score=excluded.score, total_requests=excluded.total_requests,
-                success_requests=excluded.success_requests,
-                failed_requests=excluded.failed_requests,
-                total_peers_discovered=excluded.total_peers_discovered,
-                total_response_time_ms=excluded.total_response_time_ms,
-                consecutive_failures=excluded.consecutive_failures,
-                disabled=excluded.disabled, last_used=excluded.last_used,
-                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
-            params![
-                url, score, total_requests as i64, success_requests as i64,
-                failed_requests as i64, total_peers_discovered as i64,
-                total_response_time_ms, consecutive_failures as i64,
-                disabled as i64, now, l2, now
-            ],
-        )?;
-        // P-A：块表标 dirty（key = url）
-        Self::mark_chunks_dirty_in_tx(&conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            // P1-7：写入即填 l2_shard（key = url）
+            let l2 = compute_l2_shard(url.as_bytes()) as i64;
+            conn.execute(
+                r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
+                    total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
+                    l2_shard, updated_at, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+                   ON CONFLICT(url) DO UPDATE SET
+                    score=excluded.score, total_requests=excluded.total_requests,
+                    success_requests=excluded.success_requests,
+                    failed_requests=excluded.failed_requests,
+                    total_peers_discovered=excluded.total_peers_discovered,
+                    total_response_time_ms=excluded.total_response_time_ms,
+                    consecutive_failures=excluded.consecutive_failures,
+                    disabled=excluded.disabled, last_used=excluded.last_used,
+                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
+                params![
+                    url, score, total_requests as i64, success_requests as i64,
+                    failed_requests as i64, total_peers_discovered as i64,
+                    total_response_time_ms, consecutive_failures as i64,
+                    disabled as i64, now, l2, now
+                ],
+            )?;
+            // P-A：块表标 dirty（key = url）
+            Self::mark_chunks_dirty_in_tx(conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
+            Ok(())
+        })
     }
 
     /// P1-6：软删除指定 tracker（写 `deleted_at` 墓碑，不物理删除）。用于 `remove_tracker`。
     /// 物理删除会让「本地删了」与「本地从来没有」在集合语义下无法区分，重启后
     /// `load_trackers` 回源又会把它"复活"；改成墓碑 + 查询过滤后两端 Merkle 才能收敛到 0。
     pub fn soft_delete_tracker(&self, url: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let n = conn.execute(
-            "UPDATE trackers SET deleted_at = ?1, updated_at = ?1 \
-             WHERE url = ?2 AND deleted_at IS NULL",
-            params![now, url],
-        )?;
-        if n > 0 {
-            // P-A：块表标 dirty（key = url）
-            Self::mark_chunks_dirty_in_tx(&conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
-        }
-        Ok(n)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let n = conn.execute(
+                "UPDATE trackers SET deleted_at = ?1, updated_at = ?1 \
+                 WHERE url = ?2 AND deleted_at IS NULL",
+                params![now, url],
+            )?;
+            if n > 0 {
+                // P-A：块表标 dirty（key = url）
+                Self::mark_chunks_dirty_in_tx(
+                    conn,
+                    4, /* TRACKER */
+                    &[url.as_bytes().to_vec()],
+                )?;
+            }
+            Ok(n)
+        })
     }
 
     /// 批次I(#5)：peer 软删墓碑——入站 DELETE 落墓碑，防止
@@ -2118,19 +2290,21 @@ impl Storage {
         ip: &str,
         port: u16,
     ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let n = conn.execute(
-            "UPDATE peers SET deleted_at = ?1 \
-             WHERE lower(hex(infohash)) = ?2 AND ip = ?3 AND port = ?4 AND deleted_at IS NULL",
-            params![now, infohash_hex, ip, port as i64],
-        )?;
-        if n > 0 {
-            // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port）
-            let key = format!("{}:{}:{}", infohash_hex.to_lowercase(), ip, port).into_bytes();
-            Self::mark_chunks_dirty_in_tx(&conn, 2 /* PEER */, &[key])?;
-        }
-        Ok(n)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let n = conn.execute(
+                "UPDATE peers SET deleted_at = ?1 \
+                 WHERE lower(hex(infohash)) = ?2 AND ip = ?3 AND port = ?4 AND deleted_at IS NULL",
+                params![now, infohash_hex, ip, port as i64],
+            )?;
+            if n > 0 {
+                // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port）
+                let key = format!("{}:{}:{}", infohash_hex.to_lowercase(), ip, port).into_bytes();
+                Self::mark_chunks_dirty_in_tx(conn, 2 /* PEER */, &[key])?;
+            }
+            Ok(n)
+        })
     }
 
     /// 批次I(#5)：判断 peer 是否存在软删墓碑（入站 upsert 仲裁用）。
@@ -2158,18 +2332,20 @@ impl Storage {
 
     /// 批次I(#5)：infohash 软删墓碑（语义同 peer）。
     pub fn soft_delete_infohash(&self, infohash_hex: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let n = conn.execute(
-            "UPDATE infohashes SET deleted_at = ?1 \
-             WHERE lower(hex(infohash)) = ?2 AND deleted_at IS NULL",
-            params![now, infohash_hex],
-        )?;
-        if n > 0 {
-            // P-A：块表标 dirty（key = infohash raw；hex 参数解码成本高，整 repo 保守标脏）
-            conn.execute("UPDATE chunk_digests SET dirty = 1 WHERE repo = 3", [])?;
-        }
-        Ok(n)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let n = conn.execute(
+                "UPDATE infohashes SET deleted_at = ?1 \
+                 WHERE lower(hex(infohash)) = ?2 AND deleted_at IS NULL",
+                params![now, infohash_hex],
+            )?;
+            if n > 0 {
+                // P-A：块表标 dirty（key = infohash raw；hex 参数解码成本高，整 repo 保守标脏）
+                conn.execute("UPDATE chunk_digests SET dirty = 1 WHERE repo = 3", [])?;
+            }
+            Ok(n)
+        })
     }
 
     /// 批次I(#5)：判断 infohash 是否存在软删墓碑。
@@ -2232,33 +2408,35 @@ impl Storage {
         disabled: bool,
     ) -> anyhow::Result<()> {
         self.record_write("trackers", 1);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let l2 = compute_l2_shard(url.as_bytes()) as i64;
-        conn.execute(
-            r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
-                total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
-                l2_shard, updated_at, deleted_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
-               ON CONFLICT(url) DO UPDATE SET
-                score=excluded.score, total_requests=excluded.total_requests,
-                success_requests=excluded.success_requests,
-                failed_requests=excluded.failed_requests,
-                total_peers_discovered=excluded.total_peers_discovered,
-                total_response_time_ms=excluded.total_response_time_ms,
-                consecutive_failures=excluded.consecutive_failures,
-                disabled=excluded.disabled, last_used=excluded.last_used,
-                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at"#,
-            params![
-                url, score, total_requests as i64, success_requests as i64,
-                failed_requests as i64, total_peers_discovered as i64,
-                total_response_time_ms, consecutive_failures as i64,
-                disabled as i64, now, l2, now
-            ],
-        )?;
-        // P-A：块表标 dirty（key = url）
-        Self::mark_chunks_dirty_in_tx(&conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let l2 = compute_l2_shard(url.as_bytes()) as i64;
+            conn.execute(
+                r#"INSERT INTO trackers (url, score, total_requests, success_requests, failed_requests,
+                    total_peers_discovered, total_response_time_ms, consecutive_failures, disabled, last_used,
+                    l2_shard, updated_at, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+                   ON CONFLICT(url) DO UPDATE SET
+                    score=excluded.score, total_requests=excluded.total_requests,
+                    success_requests=excluded.success_requests,
+                    failed_requests=excluded.failed_requests,
+                    total_peers_discovered=excluded.total_peers_discovered,
+                    total_response_time_ms=excluded.total_response_time_ms,
+                    consecutive_failures=excluded.consecutive_failures,
+                    disabled=excluded.disabled, last_used=excluded.last_used,
+                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at"#,
+                params![
+                    url, score, total_requests as i64, success_requests as i64,
+                    failed_requests as i64, total_peers_discovered as i64,
+                    total_response_time_ms, consecutive_failures as i64,
+                    disabled as i64, now, l2, now
+                ],
+            )?;
+            // P-A：块表标 dirty（key = url）
+            Self::mark_chunks_dirty_in_tx(conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上批量保存 trackers（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -2366,8 +2544,10 @@ impl Storage {
         score: f64,
     ) -> anyhow::Result<()> {
         self.record_write("infohashes", 1);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Self::save_infohash_in_tx(&conn, infohash, ref_count, first_source, score)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            Self::save_infohash_in_tx(conn, infohash, ref_count, first_source, score)
+        })
     }
 
     /// 在已有连接（事务）上写入单个 infohash（供 WriteQueue/IOScheduler 闭包使用）
@@ -2594,12 +2774,14 @@ impl Storage {
 
     /// 更新 infohash 评分
     pub fn update_infohash_score(&self, infohash: &[u8; 20], score: f64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "UPDATE infohashes SET score = ?1 WHERE infohash = ?2",
-            params![score, infohash.as_slice()],
-        )?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute(
+                "UPDATE infohashes SET score = ?1 WHERE infohash = ?2",
+                params![score, infohash.as_slice()],
+            )?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上更新单个 infohash 评分（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -2620,16 +2802,19 @@ impl Storage {
         if scores.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare("UPDATE infohashes SET score = ?1 WHERE infohash = ?2")?;
-            for (infohash, score) in scores {
-                stmt.execute(params![score, infohash.as_slice()])?;
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt =
+                    tx.prepare("UPDATE infohashes SET score = ?1 WHERE infohash = ?2")?;
+                for (infohash, score) in scores {
+                    stmt.execute(params![score, infohash.as_slice()])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上批量更新 infohash 评分（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -2649,11 +2834,13 @@ impl Storage {
 
     /// 清空 infohash 表
     pub fn clear_infohashes(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM infohashes", [])?;
-        // P-A：块表同清（INFOHASH 数据已清空）
-        conn.execute("DELETE FROM chunk_digests WHERE repo = 3", [])?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute("DELETE FROM infohashes", [])?;
+            // P-A：块表同清（INFOHASH 数据已清空）
+            conn.execute("DELETE FROM chunk_digests WHERE repo = 3", [])?;
+            Ok(())
+        })
     }
 
     // ---- Peers（运行时活跃 peer 全量持久化）----
@@ -2671,28 +2858,30 @@ impl Storage {
         connection_successes: u32,
         last_active: i64,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        // P1-7：写入即填 l2_shard（key = "<hex_ih>:<ip>:<port>"）
-        let l2 = peer_shard_index(infohash, ip, port);
-        conn.execute(
-            r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
-                l2_shard, updated_at, deleted_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
-               ON CONFLICT(infohash, ip, port) DO UPDATE SET
-                source=excluded.source, score=excluded.score,
-                connection_attempts=excluded.connection_attempts,
-                connection_successes=excluded.connection_successes,
-                last_active=excluded.last_active,
-                l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
-            params![
-                infohash.as_slice(), ip, port as i64, source,
-                score, connection_attempts as i64,
-                connection_successes as i64, last_active,
-                l2, now,
-            ],
-        )?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            // P1-7：写入即填 l2_shard（key = "<hex_ih>:<ip>:<port>"）
+            let l2 = peer_shard_index(infohash, ip, port);
+            conn.execute(
+                r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
+                    l2_shard, updated_at, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
+                   ON CONFLICT(infohash, ip, port) DO UPDATE SET
+                    source=excluded.source, score=excluded.score,
+                    connection_attempts=excluded.connection_attempts,
+                    connection_successes=excluded.connection_successes,
+                    last_active=excluded.last_active,
+                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
+                params![
+                    infohash.as_slice(), ip, port as i64, source,
+                    score, connection_attempts as i64,
+                    connection_successes as i64, last_active,
+                    l2, now,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// 加载所有 peer
@@ -2722,12 +2911,14 @@ impl Storage {
 
     /// 清空 peers 表
     pub fn clear_peers(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM peers", [])?;
-        // P-A：块表同清（PEER 数据已清空；归档表仍存在时清单仍覆盖 archive，故仅标脏更稳——
-        // 此处按清空语义直接删块表，由 P-C 回填重建）
-        conn.execute("DELETE FROM chunk_digests WHERE repo = 2", [])?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            conn.execute("DELETE FROM peers", [])?;
+            // P-A：块表同清（PEER 数据已清空；归档表仍存在时清单仍覆盖 archive，故仅标脏更稳——
+            // 此处按清空语义直接删块表，由 P-C 回填重建）
+            conn.execute("DELETE FROM chunk_digests WHERE repo = 2", [])?;
+            Ok(())
+        })
     }
 
     /// 批量保存 peers（事务批量插入）
@@ -2736,45 +2927,47 @@ impl Storage {
             return Ok(());
         }
         self.record_write("peers", peers.len() as u64);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
-                    l2_shard, updated_at, deleted_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
-                   ON CONFLICT(infohash, ip, port) DO UPDATE SET
-                    source=excluded.source, score=excluded.score,
-                    connection_attempts=excluded.connection_attempts,
-                    connection_successes=excluded.connection_successes,
-                    last_active=excluded.last_active,
-                    l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
-            )?;
-            for peer in peers {
-                let l2 = peer_shard_index(&peer.infohash, peer.ip.as_str(), peer.port);
-                stmt.execute(params![
-                    peer.infohash.as_slice(),
-                    peer.ip.as_str(),
-                    peer.port as i64,
-                    peer.source.as_str(),
-                    peer.score,
-                    peer.connection_attempts as i64,
-                    peer.connection_successes as i64,
-                    peer.last_active,
-                    l2,
-                    now,
-                ])?;
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    r#"INSERT INTO peers (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active,
+                        l2_shard, updated_at, deleted_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
+                       ON CONFLICT(infohash, ip, port) DO UPDATE SET
+                        source=excluded.source, score=excluded.score,
+                        connection_attempts=excluded.connection_attempts,
+                        connection_successes=excluded.connection_successes,
+                        last_active=excluded.last_active,
+                        l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
+                )?;
+                for peer in peers {
+                    let l2 = peer_shard_index(&peer.infohash, peer.ip.as_str(), peer.port);
+                    stmt.execute(params![
+                        peer.infohash.as_slice(),
+                        peer.ip.as_str(),
+                        peer.port as i64,
+                        peer.source.as_str(),
+                        peer.score,
+                        peer.connection_attempts as i64,
+                        peer.connection_successes as i64,
+                        peer.last_active,
+                        l2,
+                        now,
+                    ])?;
+                }
             }
-        }
-        // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port）
-        let keys: Vec<Vec<u8>> = peers
-            .iter()
-            .map(|p| format!("{}:{}:{}", hex_lower(&p.infohash), p.ip, p.port).into_bytes())
-            .collect();
-        Self::mark_chunks_dirty_in_tx(&tx, 2 /* PEER */, &keys)?;
-        tx.commit()?;
-        Ok(())
+            // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port）
+            let keys: Vec<Vec<u8>> = peers
+                .iter()
+                .map(|p| format!("{}:{}:{}", hex_lower(&p.infohash), p.ip, p.port).into_bytes())
+                .collect();
+            Self::mark_chunks_dirty_in_tx(&tx, 2 /* PEER */, &keys)?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上批量保存 peers（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -2822,56 +3015,58 @@ impl Storage {
     /// 归档冷数据：将超过指定时间无活跃的 peer 从主表迁移到归档表
     /// 返回归档的 peer 数量
     pub fn archive_cold_peers(&self, older_than_secs: i64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        let threshold = now - older_than_secs;
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            let threshold = now - older_than_secs;
 
-        // 先查询需要归档的数量
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM peers WHERE last_active < ?1",
-            params![threshold],
-            |row| row.get(0),
-        )?;
-
-        if count == 0 {
-            return Ok(0);
-        }
-
-        let tx = conn.unchecked_transaction()?;
-        // P-A：先取受影响 key（archive 移动行 = PEER 清单内容变化，需精确标脏）
-        let keys: Vec<Vec<u8>> = {
-            let mut key_stmt = tx.prepare(
-                "SELECT lower(hex(infohash)), ip, port FROM peers WHERE last_active < ?1",
+            // 先查询需要归档的数量
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM peers WHERE last_active < ?1",
+                params![threshold],
+                |row| row.get(0),
             )?;
-            let ks: Vec<Vec<u8>> = key_stmt
-                .query_map(params![threshold], |row| {
-                    let ih_hex: String = row.get(0)?;
-                    let ip: String = row.get(1)?;
-                    let port: i64 = row.get(2)?;
-                    Ok(format!("{}:{}:{}", ih_hex, ip, port).into_bytes())
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(key_stmt);
-            ks
-        };
-        // 插入到归档表
-        tx.execute(
-            "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, archived_at)
-             SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, ?1
-             FROM peers WHERE last_active < ?2",
-            params![now, threshold],
-        )?;
-        // 从主表删除
-        tx.execute(
-            "DELETE FROM peers WHERE last_active < ?1",
-            params![threshold],
-        )?;
-        // P-A：块表标 dirty（精确 key）
-        Self::mark_chunks_dirty_in_tx(&tx, 2 /* PEER */, &keys)?;
-        tx.commit()?;
 
-        Ok(count as usize)
+            if count == 0 {
+                return Ok(0);
+            }
+
+            let tx = conn.unchecked_transaction()?;
+            // P-A：先取受影响 key（archive 移动行 = PEER 清单内容变化，需精确标脏）
+            let keys: Vec<Vec<u8>> = {
+                let mut key_stmt = tx.prepare(
+                    "SELECT lower(hex(infohash)), ip, port FROM peers WHERE last_active < ?1",
+                )?;
+                let ks: Vec<Vec<u8>> = key_stmt
+                    .query_map(params![threshold], |row| {
+                        let ih_hex: String = row.get(0)?;
+                        let ip: String = row.get(1)?;
+                        let port: i64 = row.get(2)?;
+                        Ok(format!("{}:{}:{}", ih_hex, ip, port).into_bytes())
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                drop(key_stmt);
+                ks
+            };
+            // 插入到归档表
+            tx.execute(
+                "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, archived_at)
+                 SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, ?1
+                 FROM peers WHERE last_active < ?2",
+                params![now, threshold],
+            )?;
+            // 从主表删除
+            tx.execute(
+                "DELETE FROM peers WHERE last_active < ?1",
+                params![threshold],
+            )?;
+            // P-A：块表标 dirty（精确 key）
+            Self::mark_chunks_dirty_in_tx(&tx, 2 /* PEER */, &keys)?;
+            tx.commit()?;
+
+            Ok(count as usize)
+        })
     }
 
     /// 在已有连接上归档冷 peer（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -2919,13 +3114,15 @@ impl Storage {
         source: &str,
         score: f64,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO peer_history (infohash, ip, port, source, score, discovered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![infohash.as_slice(), ip, port as i64, source, score, now],
-        )?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO peer_history (infohash, ip, port, source, score, discovered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![infohash.as_slice(), ip, port as i64, source, score, now],
+            )?;
+            Ok(())
+        })
     }
 
     /// 批量写入 peer 历史（攒批写入，减少 fsync 次数）
@@ -2934,12 +3131,14 @@ impl Storage {
             return Ok(());
         }
         self.record_write("peer_history", entries.len() as u64);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // 单独调用时自行开启事务（批量原子性）；WriteQueue/IOScheduler 路径使用 _in_tx 变体
-        let tx = conn.unchecked_transaction()?;
-        Self::save_peer_history_batch_in_tx(&tx, entries)?;
-        tx.commit()?;
-        Ok(())
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            // 单独调用时自行开启事务（批量原子性）；WriteQueue/IOScheduler 路径使用 _in_tx 变体
+            let tx = conn.unchecked_transaction()?;
+            Self::save_peer_history_batch_in_tx(&tx, entries)?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// 在已有连接/事务上批量写入 peer_history（供 WriteQueue/IOScheduler 闭包使用）
@@ -2991,16 +3190,18 @@ impl Storage {
 
     /// 清理过期 peer 历史（保留 days 天）
     pub fn cleanup_peer_history(&self, days: u64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86400);
-        let deleted = conn.execute(
-            "DELETE FROM peer_history WHERE discovered_at < ?1",
-            params![cutoff],
-        )?;
-        if deleted > 0 {
-            debug!("[storage] 清理了 {} 条过期 peer 历史", deleted);
-        }
-        Ok(deleted)
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        with_write_conn(&self.conn, |conn| {
+            let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 86400);
+            let deleted = conn.execute(
+                "DELETE FROM peer_history WHERE discovered_at < ?1",
+                params![cutoff],
+            )?;
+            if deleted > 0 {
+                debug!("[storage] 清理了 {} 条过期 peer 历史", deleted);
+            }
+            Ok(deleted)
+        })
     }
 
     // ---- Stats History ----
@@ -3008,13 +3209,15 @@ impl Storage {
     /// 记录统计快照
     pub fn record_stats(&self, metric: &str, value: f64) -> anyhow::Result<()> {
         self.record_write("stats", 1);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO stats_history (timestamp, metric, value) VALUES (?1, ?2, ?3)",
-            params![now, metric, value],
-        )?;
-        Ok(())
+        // 2026-10-09 治本 S5：走统一入口 with_write_conn，使写锁争用可观测。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO stats_history (timestamp, metric, value) VALUES (?1, ?2, ?3)",
+                params![now, metric, value],
+            )?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上记录统计快照（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -3044,14 +3247,16 @@ impl Storage {
     /// 更新累计统计
     pub fn update_aggregate(&self, metric: &str, value: f64) -> anyhow::Result<()> {
         self.record_write("stats", 1);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO stats_aggregate (metric, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(metric) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            params![metric, value, now],
-        )?;
-        Ok(())
+        // 2026-10-09 治本 S5：走统一入口 with_write_conn。
+        with_write_conn(&self.conn, |conn| {
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO stats_aggregate (metric, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(metric) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                params![metric, value, now],
+            )?;
+            Ok(())
+        })
     }
 
     /// 在已有连接上更新累计统计（供 WriteQueue/IOScheduler 闭包使用，调用方已开启事务）
@@ -3087,17 +3292,19 @@ impl Storage {
             return Ok(());
         }
         self.record_write("stats", entries.len() as u64 * 2);
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = conn.transaction()?;
-        for (name, value) in entries {
-            if *value < 0.0 {
-                continue;
+        // 2026-10-09 治本 S5：走统一入口（锁持有时长现可被观测/量化）。
+        with_write_conn(&self.conn, |conn| {
+            let tx = conn.transaction()?;
+            for (name, value) in entries {
+                if *value < 0.0 {
+                    continue;
+                }
+                Self::record_stats_in_tx(&tx, name, *value)?;
+                Self::update_aggregate_in_tx(&tx, name, *value)?;
             }
-            Self::record_stats_in_tx(&tx, name, *value)?;
-            Self::update_aggregate_in_tx(&tx, name, *value)?;
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// 加载累计统计
@@ -4347,8 +4554,15 @@ impl Storage {
 
     /// 释放 SQLite 内部缓存内存（PRAGMA shrink_memory），内存压力大时调用。
     pub fn shrink_memory(&self) {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = conn.execute_batch("PRAGMA shrink_memory;");
+        // 2026-10-09 治本 S5：统一走 with_write_conn 入口（写锁争用可观测）。
+        // 原语义：`let _ = ...` 吞掉错误（PRAGMA 是尽力而为的性能提示，
+        // 失败不应影响调用方）。with_write_conn 返回 Result<()>，同样忽略。
+        let _ = with_write_conn(&self.conn, |conn| {
+            // `execute_batch` 返回 `rusqlite::Error`，而 `with_write_conn`
+            // 的闭包要求 `anyhow::Error` —— 需用 `Ok(..?..)` 显式转换
+            // （两者同名但类型不同，直接返回会 E0308）。
+            Ok(conn.execute_batch("PRAGMA shrink_memory;")?)
+        });
     }
 }
 /// 计算 key 所属 L2 二级分片（0..65535）。
@@ -5363,5 +5577,113 @@ mod tests {
             "save_dht_node 后块 0 应 dirty"
         );
         assert!(!s.get_chunk_digests(1).unwrap()[1].dirty, "块 1 不应受影响");
+    }
+
+    // ============================================================
+    // 2026-10-09 治本 S5 回归：写锁争用可观测性
+    // ============================================================
+
+    /// S5 的地基：`with_write_conn` 必须正确计数并执行闭包。
+    ///
+    /// 此前 38 处 `self.conn.lock()` 零可观测性，导致「锁争用是否参与
+    /// 2026-10-09 事故」无法证明、改造后无法验证。本测试固定该入口语义。
+    #[test]
+    fn test_with_write_conn_counts_and_executes() {
+        let conn = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        let before = write_lock_stats().acquired;
+
+        let n: i64 = with_write_conn(&conn, |c| {
+            c.execute_batch("CREATE TABLE IF NOT EXISTS t(x INTEGER);")?;
+            c.execute("INSERT INTO t(x) VALUES (42)", [])?;
+            // `query_row` 返回 `rusqlite::Result<i64>`，而 `with_write_conn`
+            // 的闭包要求 `anyhow::Result<T>` —— 需 `Ok(..?..)` 转一层，
+            // 且只包一层（写成 `Ok(c.query_row(..)? )` 会得到嵌套 Result）。
+            Ok(c.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))?)
+        })
+        .unwrap();
+
+        assert_eq!(n, 42, "闭包返回值必须原样透传");
+        // 用「至少 +1」而非精确相等：`acquired` 是进程级静态原子量，
+        // cargo test 并行执行时其他测试也在调用 with_write_conn，
+        // 精确相等会因跨测试干扰而flaky（实测 left=23/right=22）。
+        let after = write_lock_stats().acquired;
+        assert!(
+            after > before,
+            "进入 with_write_conn 后计数必须增长（否则无法量化锁争用），             实测 before={} after={}",
+            before,
+            after
+        );
+    }
+
+    /// 无争用时（单线程串行）慢锁计数**不得**增长。
+    ///
+    /// 这是 S5 指标的可信性前提：若无争用也算慢锁，指标就恒为正，
+    /// 压测判据将完全失去区分能力。
+    #[test]
+    fn test_no_slow_lock_when_uncontended() {
+        let conn = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        let before = write_lock_stats().slow;
+        for _ in 0..20 {
+            with_write_conn(&conn, |_c| Ok(())).unwrap();
+        }
+        assert_eq!(
+            write_lock_stats().slow,
+            before,
+            "无争用的串行调用不得计入慢锁（否则指标恒为正、失去意义）"
+        );
+    }
+
+    /// 真争用（并发持锁）必须被计入慢锁 —— 指标必须能反映真实争用。
+    #[test]
+    fn test_slow_lock_counted_under_real_contention() {
+        let conn = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        let before_slow = write_lock_stats().slow;
+        let before_max = write_lock_stats().max_wait_ms;
+
+        // 8 线程各抢 60 次，锁被占满 → 必然出现 ≥50ms 的等待
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let conn = conn.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..60 {
+                        let _ = with_write_conn(&conn, |_c| {
+                            // 持锁 15ms（模拟慢写），使并发调用必然排队超阈值
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+                            Ok(())
+                        });
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let after = write_lock_stats();
+        assert!(
+            after.slow > before_slow,
+            "真实争用（8线程×60次×持锁15ms）必须产生慢锁计数，\
+             实测 slow: {} → {}",
+            before_slow,
+            after.slow
+        );
+        assert!(after.max_wait_ms >= before_max, "峰值等待时长不得回退");
+    }
+
+    /// poisoned 锁不得 panic（契约：绝不 panic，与 `read()` 一致）。
+    #[test]
+    fn test_with_write_conn_survives_poisoned_mutex() {
+        let conn = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        // 故意 poison：在持锁线程里 panic
+        let c2 = conn.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+
+        // 不得 panic，且能正常执行
+        let r = with_write_conn(&conn, |_c| Ok(()));
+        assert!(r.is_ok(), "poisoned 锁必须 into_inner 恢复，不得 panic");
     }
 }

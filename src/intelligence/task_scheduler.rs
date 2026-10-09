@@ -14,7 +14,7 @@
 //! - 自适应调度（基于历史数据动态调整）
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,46 @@ const CONCURRENCY_FULL_DELAY: Duration = Duration::from_secs(5);
 const CONCURRENCY_STARVE_ROUNDS: u32 = 6;
 /// 饥饿补偿的**每分类**超额上限（硬并发 = max + 该值）。
 const CONCURRENCY_OVERSUBSCRIBE: u32 = 2;
+///
+/// 【判据1】队列中「已到期却仍未被取出」连续命中轮数达到该值 ⇒ 主循环已停。
+///
+/// watchdog 每 `WATCHDOG_CHECK_INTERVAL_SECS`(30s) 跑一轮，
+/// 取 2 轮 ⇒ 约 60s 持续积压才判定，避免单轮抖动误判。
+const STALL_OVERDUE_ROUNDS: u32 = 2;
+
+/// 【判据2】**在飞高水位归零** + 队列全在未来 ⇒ 全局停摆。
+///
+/// **为什么不能用「in_flight==0 + 队列项距今很大」**：这两种状态从队列
+/// 本身**无法区分**——
+///   · 事故态：20 个执行体全部挂在 `.await` 上被唤醒丢失，队列停在未来；
+///   · 正常空闲态：系统本来就没有待跑任务，长任务（`interval` 达 300s 的
+///     bootstrap / range 反熵类）刚入队，同样是「在飞 0 + 队列全在未来」。
+/// 单元测试 `test_no_false_trigger_when_long_task_just_scheduled` 已证明
+/// 仅靠队列判据必然误杀正常空闲期。
+///
+/// **区分信号 = 在飞高水位**（`peak_in_flight`）：
+///   · 事故态：崩溃前有大量在飞（本次事故 33 个泄漏槽位），高水位 > 0，
+///     之后归零 ⇒ 「曾有活、现在全没了」⇒ 停摆；
+///   · 正常空闲态：高水位恒为 0 ⇒ 从未有过在飞 ⇒ 不是停摆。
+const STALL_PEAK_IN_FLIGHT_MIN: usize = 1;
+
+/// 判据2 的连续命中轮数（30s/轮 ⇒ 2 轮 ≈ 60s 持续空闲且无到期项）。
+const STALL_IDLE_ROUNDS: u32 = 2;
+
+/// 自愈触发最小间隔（秒）：避免反复触发把正常长任务误当成停摆。
+const STALL_MIN_TRIGGER_INTERVAL_SECS: u64 = 30;
+
+/// 【启动宽限期】调度器启动后的这段时间内**不做停摆判定**（秒）。
+///
+/// 依据：2026-10-09 首次部署自愈时实测误报——启动后 ~2 分钟内
+/// 任务正陆续注册，`in_flight == 0` 是**正常**的（还没轮到执行），
+/// 而高水位已因部分任务完成而累积，于是判据2 命中并误触发一次 abort。
+///
+/// 启动期与停摆期的形态差异在于：启动期任务仍在被陆续准入
+///（`admitted_total` 持续增长），停摆期则完全停滞。故以
+/// 「最近一次准入距今」作为豁免依据。
+const STALL_STARTUP_GRACE_SECS: u64 = 300;
+
 /// 分类「卡死保底」阈值（秒）：某分类在飞任务最老年龄超过该值时，
 /// 判定该分类已被慢任务实质性卡死，**保底放行**该分类任务（不再等槽），
 /// 避免面板/监控类被写路径饿死。
@@ -1126,6 +1166,14 @@ pub struct RuntimeHandles {
     pub api: tokio::runtime::Handle,
     pub scheduler: tokio::runtime::Handle,
     pub persistence: tokio::runtime::Handle,
+    /// 监控专用 runtime（2026-10-09 治本 S4）
+    ///
+    /// 为何不能复用 `api`：本次事故中 Monitor 类全部挂在 api runtime
+    /// （仅 4 worker 且与 HTTP 共用），保底放行把 Monitor 堆到 16 个在飞，
+    /// 4 个 worker 全被长await 占死 ⇒ memory_monitor / checkpoint /
+    /// 健康检查 / 实体统计校准 集体静默 41 分钟。监控是唯一可观测性来源，
+    /// 必须与请求处理线程池隔离。
+    pub monitor: tokio::runtime::Handle,
 }
 
 /// 智能任务调度器
@@ -1188,6 +1236,30 @@ pub struct TaskScheduler {
     released_total: Arc<AtomicU64>,
     /// 累计被强制回收的泄漏槽位数（> 0 说明发生过槽位泄漏事故）
     reclaimed_total: Arc<AtomicU64>,
+    /// 累计触发全局停摆自愈的次数（2026-10-09 治本 S2）
+    ///
+    /// > 0 说明本进程发生过「任务体挂在 .await 上无人唤醒」型全局停摆。
+    /// > 该事故原表现为：33 槽位回收后在飞/队列恒定 41 分钟，无人恢复。
+    stall_recovery_total: Arc<AtomicU64>,
+    /// 判据1 的连续命中轮数（已到期项积压持续性）
+    stall_overdue_rounds: Arc<AtomicU32>,
+    /// 判据2 的连续命中轮数（空闲但队列全在未来，持续性）
+    stall_idle_rounds: Arc<AtomicU32>,
+    /// 最近一次任务准入的毫秒时间戳（2026-10-09 治本 S2）
+    ///
+    /// 用于「启动/预热宽限期」判定：只要近期还有任务在被准入，
+    /// 说明系统仍在正常调度，不该判为停摆。
+    last_admit_ms: Arc<AtomicU64>,
+    /// 在飞高水位（历史峰值，2026-10-09 治本 S2）
+    ///
+    /// **这是区分「事故态」与「正常空闲态」的唯一信号**：
+    /// 正常空闲期从未有在飞（=0），事故态曾有大量在飞后归零。
+    /// 见 `STALL_PEAK_IN_FLIGHT_MIN` 注释。
+    peak_in_flight: Arc<AtomicUsize>,
+    /// 上次触发自愈的毫秒时间戳（限流，避免反复触发误伤正常长任务）
+    last_stall_recovery: Arc<AtomicU64>,
+    /// 自愈后请求下一 tick 立即重跑 `process_queue`（缩短恢复延迟）
+    process_queue_nudge: Arc<AtomicBool>,
 }
 
 impl TaskScheduler {
@@ -1240,6 +1312,14 @@ impl TaskScheduler {
             admitted_total: Arc::new(AtomicU64::new(0)),
             released_total: Arc::new(AtomicU64::new(0)),
             reclaimed_total: Arc::new(AtomicU64::new(0)),
+            // 2026-10-09 治本 S2：全局停摆自愈状态
+            stall_recovery_total: Arc::new(AtomicU64::new(0)),
+            stall_overdue_rounds: Arc::new(AtomicU32::new(0)),
+            stall_idle_rounds: Arc::new(AtomicU32::new(0)),
+            last_admit_ms: Arc::new(AtomicU64::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+            last_stall_recovery: Arc::new(AtomicU64::new(0)),
+            process_queue_nudge: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1786,6 +1866,12 @@ impl TaskScheduler {
                             watchdog_scheduler.in_flight_count()
                         );
                     }
+                    // P0/治本 S2（2026-10-09）：全局停摆探测 + 自愈。
+                    //
+                    // 必须在 `reclaim_stale_slots` **之后**执行：槽位回收只摘登记、
+                    // 不重驱动队列，2026-10-09 事故正是「回收 33 个槽位后在飞/队列
+                    // 恒定 41 分钟」—— 本方法才是唯一能让系统自己爬起来的出路。
+                    watchdog_scheduler.detect_and_recover_global_stall();
                 }
             })
             .expect("failed to spawn watchdog thread");
@@ -1810,6 +1896,162 @@ impl TaskScheduler {
         if was_running {
             info!("[task_scheduler] 已请求停止调度器（主循环与 watchdog 将退出）");
         }
+    }
+
+    /// 全局停摆自愈阈值（2026-10-09 治本 S2）。
+    /// 全局停摆探测 + 自愈（2026-10-09 治本 S2）。
+    ///
+    /// 2026-10-09 事故：08:10~08:21 watchdog 强制回收 33 个槽位后，
+    /// `crawl=0/8` 与 `队列待执行=21` 恒定 **41 分钟**，无人恢复。
+    /// 根因是任务体挂在 `.await` 上无人唤醒，而「执行完成后重新入队」
+    /// 的代码在 `fut` 内部 —— 执行体永不返回 ⇒ 永不重新入队。
+    ///
+    /// 本方法给出**唯一能自愈**的路径，运行在 watchdog 独立OS 线程上
+    /// （不依赖任何 tokio runtime，故runtime 全停时仍可执行）：
+    /// 1. abort 全部在飞执行体（`0da7730` 已回填 `abort_handle`）
+    /// 2. 把队列中所有项的 `scheduled_at` 重置为 now
+    /// 3. 下一tick 让 `process_queue` 正常取走
+    ///
+    /// 判据（任一成立即触发）：
+    /// - 【判据1】队列中有已到期项却未被取走，且该状态连续命中
+    ///   `STALL_OVERDUE_ROUNDS` 轮（watchdog 每 `WATCHDOG_CHECK_INTERVAL_SECS`
+    ///   = 30s 一轮 ⇒ 60s ≈ 连续 2 轮）⇒ 调度主循环已停。
+    /// - 【判据2】在飞为 0、**队列无到期项**、队列最晚到期项距今超过
+    ///   `STALL_IDLE_GAP_SECS`，连续命中 `STALL_IDLE_ROUNDS` 轮。
+    fn detect_and_recover_global_stall(&self) -> bool {
+        let in_flight = self.in_flight_count();
+        let queue_len = self.queue.read().len();
+        let overdue = self.queue_overdue_count();
+        let span = self.queue_delay_span();
+        let (min_gap, max_gap) = span.unwrap_or((0, 0));
+
+        if queue_len == 0 {
+            // 队列空 ⇒ 无积压。顺带清零两个判据的连续计数，避免残留导致误判。
+            self.stall_overdue_rounds.store(0, Ordering::Relaxed);
+            self.stall_idle_rounds.store(0, Ordering::Relaxed);
+            return false;
+        }
+
+        // 判据1：已到期项积压 ⇒ 调度主循环（tick）已停。
+        // 用连续命中轮数表达「持续」，单轮命中不足以判定（可能有正常抖动）。
+        let tripped_by_overdue = if overdue > 0 && min_gap == 0 {
+            let n = self.stall_overdue_rounds.fetch_add(1, Ordering::Relaxed) + 1;
+            n >= STALL_OVERDUE_ROUNDS
+        } else {
+            self.stall_overdue_rounds.store(0, Ordering::Relaxed);
+            false
+        };
+        // 判据2：**在飞高水位归零** + 队列全在未来 ⇒ 执行体全挂死。
+        //
+        // `peak_in_flight` 是唯一能区分「事故态」与「正常空闲态」的信号：
+        // 正常空闲期从没有过在飞（高水位=0），事故态则曾有大量在飞后归零。
+        // 详见 STALL_PEAK_IN_FLIGHT_MIN 常量注释。
+        let tripped_by_idle_queue = if in_flight == 0
+            && overdue == 0
+            && self
+                .peak_in_flight
+                .load(Ordering::Relaxed)
+                .saturating_sub(in_flight)
+                >= STALL_PEAK_IN_FLIGHT_MIN
+        {
+            let n = self.stall_idle_rounds.fetch_add(1, Ordering::Relaxed) + 1;
+            n >= STALL_IDLE_ROUNDS
+        } else {
+            self.stall_idle_rounds.store(0, Ordering::Relaxed);
+            false
+        };
+        if !(tripped_by_overdue || tripped_by_idle_queue) {
+            return false;
+        }
+
+        // 触发间隔限流：避免反复触发把正常的长任务误当成停摆。
+        let last = self.last_stall_recovery.load(Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // 【豁免1】系统仍在正常调度：近期（宽限期内）还有任务被准入。
+        // 启动/预热期 `in_flight==0` 属正常，若无此豁免会误报。
+        let since_admit_ms = now_ms.saturating_sub(self.last_admit_ms.load(Ordering::Relaxed));
+        let still_scheduling = since_admit_ms < STALL_STARTUP_GRACE_SECS * 1000;
+        if still_scheduling {
+            debug!(
+                "[task_scheduler] STALL 判定豁免：最近准入距今 {}ms（< {}ms 宽限期），系统仍在正常调度",
+                since_admit_ms, STALL_STARTUP_GRACE_SECS * 1000
+            );
+            return false;
+        }
+        if last != 0 && now_ms.saturating_sub(last) / 1000 < STALL_MIN_TRIGGER_INTERVAL_SECS {
+            return false;
+        }
+
+        let total = self.stall_recovery_total.fetch_add(1, Ordering::Relaxed) + 1;
+        self.last_stall_recovery.store(now_ms, Ordering::Relaxed);
+        error!(
+            "[task_scheduler] STALL 自愈触发（第 {} 次）: 在飞={} 队列={} 已到期积压={} 队列延迟=+{}s..+{}s。\
+             执行体挂在 .await 上无人唤醒（重新入队代码在 fut 内部，永不执行）⇒ 立即 abort 全部执行体并重置队列",
+            total, in_flight, queue_len, overdue, min_gap, max_gap
+        );
+
+        // ① abort 全部在飞执行体：释放它们的 socket / DB 占用，让下一次执行
+        //    拿到干净环境。注意 abort 只对已 poll 过的 future 生效；
+        //    若执行体正卡在同步段，abort 会在下一次 await 点生效。
+        let aborted = self.abort_all_in_flight();
+
+        // ② 队列全部重置为 now：清掉「停在未来」的远期项。
+        //    必须在 abort 之后做——执行体被 abort 时也会试图重新入队
+        //    （若它恰好已poll 到末尾），避免被覆盖掉。
+        let reset = self.reset_queue_due_now();
+
+        // ③ 主动触发一轮准入：下一 tick（≤100ms）process_queue 会取走全部到期项。
+        //    这里显式 nudge 一次，缩短自愈延迟。
+        self.nudge_process_queue();
+
+        error!(
+            "[task_scheduler] STALL 自愈完成（第 {} 次）: abort {} 个执行体，重置 {} 个队列项为立即到期，\
+             调度主循环将在下一 tick 重新拉起全部任务",
+            total, aborted, reset
+        );
+        true
+    }
+
+    /// abort 全部在飞登记项对应的执行体（2026-10-09 治本 S2）。
+    fn abort_all_in_flight(&self) -> usize {
+        let handles: Vec<_> = {
+            let in_flight = self.in_flight.read();
+            in_flight
+                .values()
+                .filter_map(|e| e.abort_handle.clone())
+                .collect()
+        };
+        let n = handles.len();
+        for h in &handles {
+            h.abort();
+        }
+        n
+    }
+
+    /// 把队列中所有项的 `scheduled_at` 重置为 now（2026-10-09 治本 S2）。
+    fn reset_queue_due_now(&self) -> usize {
+        let mut q = self.queue.write();
+        let n = q.len();
+        let now = Instant::now();
+        // BinaryHeap 无 `iter_mut`，重建为等价集合（保留原 task_id/priority/seq）。
+        let items: Vec<ScheduledItem> = q.drain().collect();
+        for mut it in items {
+            it.scheduled_at = now;
+            q.push(it);
+        }
+        n
+    }
+
+    /// 发起一次立即重跑 `process_queue`（缩短自愈延迟，2026-10-09 治本 S2）。
+    ///
+    /// `process_queue` 已在主循环每 100ms 调用一次；本方法在自愈后请求
+    /// 主循环「下一次心跳窗口内额外跑一轮」，把恢复延迟从 ≤100ms 压到 ~0。
+    fn nudge_process_queue(&self) {
+        self.process_queue_nudge.store(true, Ordering::Release);
     }
 
     /// 调度器是否正在运行
@@ -1866,6 +2108,24 @@ impl TaskScheduler {
                 // 三路维护留下的漂移（本轮判据与打印都用校正后的值）。
                 self.reconcile_counters();
                 let queue_len = self.queue.read().len();
+                // 2026-10-09 治本 S1：把「队列里有没有真正会执行的任务」打进心跳。
+                // 旧日志只有 `队列待执行=N`，无法区分「N 个正常等待」与
+                // 「N 个全被推到未来、一个都不会执行」——后者即本次事故全貌。
+                let (overdue, span) = (self.queue_overdue_count(), self.queue_delay_span());
+                let queue_health = match (overdue, span) {
+                    (0, Some((min_d, max_d))) => {
+                        format!(
+                            "已到期={} 最早到期=+{}s 最晚到期=+{}s",
+                            overdue, min_d, max_d
+                        )
+                    }
+                    (0, None) => "队列空".to_string(),
+                    (n, _) => format!(
+                        "⚠ 已到期却未被执行={} 最早到期=+{:?}s",
+                        n,
+                        span.map(|(a, _)| a).unwrap_or(0)
+                    ),
+                };
                 let brief = self.category_brief();
                 let in_flight = self.in_flight_count();
                 let oldest = match self.oldest_in_flight() {
@@ -1874,8 +2134,9 @@ impl TaskScheduler {
                 };
                 // 对账不变式：累计准入 − 累计释放 − 强制回收 = 当前在飞
                 info!(
-                    "[task_scheduler] 调度器心跳: 队列待执行={}, 运行中[{}], 在飞={}（准入{} − 释放{} − 回收{}）, {}",
+                    "[task_scheduler] 调度器心跳: 队列待执行={}（{}）, 运行中[{}], 在飞={}（准入{} − 释放{} − 回收{}）, {}",
                     queue_len,
+                    queue_health,
                     brief,
                     in_flight,
                     self.admitted_total.load(Ordering::Relaxed),
@@ -1890,9 +2151,58 @@ impl TaskScheduler {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
                 self.last_heartbeat.store(now_ms, Ordering::Relaxed);
+                // 2026-10-09 治本 S2：自愈后立即重跑一轮，不等下一个 100ms tick。
+                // 闸门在 watchdog 线程的「主循环心跳已停」分支（不可达，因为
+                // 该分支本身就是心跳停止才进入），故此处只消费 nudge 标记。
+                if self.process_queue_nudge.swap(false, Ordering::AcqRel) {
+                    Self::process_queue(self.clone()).await;
+                    continue;
+                }
             }
             Self::process_queue(self.clone()).await;
         }
+    }
+
+    /// 队列延迟观测（2026-10-09 治本 S1）。
+    ///
+    /// 返回 `(最早到期距今秒, 最晚到期距今秒)`。队列为空时返回 `None`。
+    ///
+    /// **为什么必须暴露**：2026-10-09 事故里心跳只打 `队列待执行=21`，
+    /// 运维无法区分「21 个任务在正常等待」与「21 个任务全被推到未来、
+    /// 一个都不会执行」——后者正是 41 分钟全局停摆的全貌。这是事故
+    /// 不可见的直接原因，本方法补上这个判据。
+    pub fn queue_delay_span(&self) -> Option<(u64, u64)> {
+        let q = self.queue.read();
+        let now = Instant::now();
+        let mut min_d = u64::MAX;
+        let mut max_d = 0u64;
+        // BinaryHeap 无 iter 全序遍历保证，此处仅做统计取min/max，不依赖顺序。
+        for item in q.iter() {
+            // scheduled_at 可能已被重置为 now（停摆自愈后），负值夹到 0。
+            let d = item.scheduled_at.saturating_duration_since(now).as_secs();
+            min_d = min_d.min(d);
+            max_d = max_d.max(d);
+        }
+        if min_d == u64::MAX {
+            None
+        } else {
+            Some((min_d, max_d))
+        }
+    }
+
+    /// 队列中「已经到期却仍未被取出」的任务数（2026-10-09 治本 S1）。
+    ///
+    /// 正常恒为 0 —— `process_queue` 每 tick（100ms）必然取走全部到期项。
+    /// 若持续 > 0，说明调度主循环已停摆（tick 断了或被卡住），
+    /// 此时即使 `in_flight == 0` 也不代表系统健康。
+    pub fn queue_overdue_count(&self) -> usize {
+        let q = self.queue.read();
+        let now = Instant::now();
+        q.iter()
+            .filter(|item| item.scheduled_at <= now)
+            .map(|item| item.task_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     }
 
     /// 安排任务执行
@@ -2279,6 +2589,21 @@ impl TaskScheduler {
             *cnt
         };
         scheduler.admitted_total.fetch_add(1, Ordering::Relaxed);
+        // 2026-10-09 治本 S2：维护在飞高水位。
+        //
+        // 这是「全局停摆自愈」判据2 的核心信号：正常空闲期高水位恒为 0，
+        // 事故态则是「曾有大量在飞、之后归零」。用 fetch_max 记录峰值。
+        scheduler
+            .peak_in_flight
+            .fetch_max(running_now as usize, Ordering::Relaxed);
+        // 打点最近准入时刻：供停摆判定做「系统仍在调度」豁免。
+        scheduler.last_admit_ms.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
         // 准入埋点：此前只打 task_id，running 不可见 ⇒ 槽位爬升轨迹无法从日志还原
         debug!(
             "[task_scheduler] 任务准入: {}（{:?} {}/{}）",
@@ -2302,7 +2627,10 @@ impl TaskScheduler {
             TaskCategory::Federation => h.federation.clone(),
             TaskCategory::Tracker => h.tracker.clone(),
             TaskCategory::Persistence => h.persistence.clone(),
-            TaskCategory::Monitor => h.api.clone(),
+            // 2026-10-09 治本 S4：Monitor 走**独立 monitor runtime**，
+            // 不再与 HTTP(api) 争抢 4 个 worker。事故中 Monitor 堆到 16 个
+            // 在飞把api worker 全占死，监控静默 41 分钟。
+            TaskCategory::Monitor => h.monitor.clone(),
         });
 
         // 克隆一份引用供 spawn 之后回填中止句柄用（`scheduler` 本身被 move 进 fut）
@@ -3703,5 +4031,271 @@ mod tests {
             "persistence 单槽会让互相关联的写路径任务互锁（生产实证 2.5h 停摆）"
         );
         assert!(c.monitor >= 3, "监控是唯一可观测性来源，需要额外余量");
+    }
+
+    // ============================================================
+    // 2026-10-09 治本 S1/S2 回归测试：全局停摆探测与自愈
+    // ============================================================
+
+    /// 构造一个只含单个 tick 任务、且**不启动主循环**的调度器。
+    ///
+    /// 不启动主循环是刻意的：这样队列不会被 `process_queue` 消费，
+    /// 测试才能精确构造「队列停在未来、在飞为 0」的停摆形态。
+    fn scheduler_without_loop() -> Arc<TaskScheduler> {
+        Arc::new(TaskScheduler::new())
+    }
+
+    /// 往队列塞一个指定「距今多少秒后到期」的任务。
+    fn push_due_in(s: &Arc<TaskScheduler>, task_id: &str, secs_from_now: u64) {
+        s.queue.write().push(ScheduledItem {
+            task_id: task_id.to_string(),
+            scheduled_at: Instant::now() + Duration::from_secs(secs_from_now),
+            priority: TaskPriority::Background,
+            seq: {
+                let mut c = s.seq_counter.write();
+                *c += 1;
+                *c
+            },
+        });
+    }
+
+    /// 回归（治本 S1）：心跳必须暴露队列延迟，否则运维无法区分
+    /// 「N 个任务正常等待」与「N 个任务全停在未来」——后者即本次事故全貌。
+    #[test]
+    fn test_queue_delay_span_reports_future_items() {
+        let s = scheduler_without_loop();
+        assert!(s.queue_delay_span().is_none(), "空队列应返回 None");
+
+        push_due_in(&s, "a", 10);
+        push_due_in(&s, "b", 200);
+
+        let (min_gap, max_gap) = s.queue_delay_span().expect("队列非空");
+        assert!(
+            (9..=11).contains(&min_gap),
+            "最早到期应≈10s，实得 {}",
+            min_gap
+        );
+        assert!(
+            (199..=201).contains(&max_gap),
+            "最晚到期应≈200s，实得 {}",
+            max_gap
+        );
+    }
+
+    /// 回归（治本 S1）：`queue_overdue_count` 正常必须恒为 0。
+    /// 它非0 是「调度主循环已停」的唯一直接信号。
+    #[test]
+    fn test_queue_overdue_count_zero_when_healthy() {
+        let s = scheduler_without_loop();
+        push_due_in(&s, "future", 60);
+        assert_eq!(s.queue_overdue_count(), 0, "未到期项不应计入 overdue");
+    }
+
+    /// 核心回归（治本 S2）：复现 2026-10-09 事故形态 ——
+    /// 队列 21 个任务全部停在未来、在飞为 0 ⇒ 必须被判停摆并自愈。
+    #[test]
+    fn test_stall_detected_when_queue_stuck_in_future() {
+        let s = scheduler_without_loop();
+        // 复现事故前提：崩溃前曾有大量在飞（本次事故 33 个泄漏槽位）。
+        // 高水位是区分「事故态」与「正常空闲态」的唯一信号，必须先置高。
+        s.peak_in_flight.store(30, Ordering::Relaxed);
+        for i in 0..21 {
+            push_due_in(&s, &format!("t{}", i), 300);
+        }
+
+        // 第1 轮：连续命中次数不足（需连续 2 轮），不应触发
+        assert!(
+            !s.detect_and_recover_global_stall(),
+            "第 1 轮命中数不足，不应触发自愈"
+        );
+
+        // 第 2 轮：连续命中达阈值 ⇒ 触发
+        assert!(
+            s.detect_and_recover_global_stall(),
+            "连续 2 轮满足停摆判据，必须触发自愈"
+        );
+        assert_eq!(
+            s.stall_recovery_total.load(Ordering::Relaxed),
+            1,
+            "应累计一次自愈"
+        );
+
+        // 自愈后：队列全部被重置为立即到期，下一 tick 必然被 process_queue 取走
+        assert_eq!(
+            s.queue_overdue_count(),
+            21,
+            "自愈后所有队列项应变为已到期，等待主循环取走"
+        );
+    }
+
+    /// 核心防误杀回归：正常空闲期**高水位恒为 0**，
+    /// 即使队列里全是停在未来的长任务，也绝不能判为停摆。
+    ///
+    /// 这是本次测试迭代中最关键的一条：纯队列判据无法区分
+    /// 「事故态」与「正常空闲态」，必须靠高水位区分。
+    #[test]
+    fn test_idle_system_with_zero_peak_never_triggers() {
+        let s = scheduler_without_loop();
+        assert_eq!(
+            s.peak_in_flight.load(Ordering::Relaxed),
+            0,
+            "尚未准入过任何任务"
+        );
+        for i in 0..21 {
+            push_due_in(&s, &format!("idle{}", i), 300);
+        }
+        for _ in 0..5 {
+            assert!(
+                !s.detect_and_recover_global_stall(),
+                "高水位=0 ⇒ 正常空闲期，无论持续多久都不得触发自愈"
+            );
+        }
+        assert_eq!(s.stall_recovery_total.load(Ordering::Relaxed), 0);
+    }
+
+    /// 对照：一旦高水位被抬起来（说明系统确实跑过任务），
+    /// 同样的队列形态就必须被判停摆 —— 证明上一条不是靠「永不触发」过测试。
+    #[test]
+    fn test_same_queue_shape_triggers_once_peak_is_nonzero() {
+        let s = scheduler_without_loop();
+        for i in 0..21 {
+            push_due_in(&s, &format!("x{}", i), 300);
+        }
+        // 高水位 0 ⇒ 不触发
+        assert!(!s.detect_and_recover_global_stall());
+        // 抬升高水位（模拟此前有 33 个任务在飞后全部挂死）。
+        // 判据2 需连续 STALL_IDLE_ROUNDS(2) 轮命中，故调两轮。
+        s.peak_in_flight.store(33, Ordering::Relaxed);
+        assert!(
+            !s.detect_and_recover_global_stall(),
+            "高水位刚抬起的第 1 轮，连续命中数不足"
+        );
+        assert!(
+            s.detect_and_recover_global_stall(),
+            "高水位>0 且连续 2 轮命中 ⇒ 必须触发"
+        );
+    }
+
+    /// 关键防误杀回归（治本 S2）：系统存在 `interval` 达 300s 的长任务
+    /// （bootstrap / range 反熵类）。若只判「在飞为 0 且队列项距今 ≥120s」，
+    /// 正常空闲期会被误杀并触发无谓 abort。
+    ///
+    /// 这里构造「长任务刚入队 + 系统空闲」：在飞为 0、队列项距今 300s，
+    /// 但**此时存在已到期项**（另一个 5s 后到期的 tick 任务被推为现在到期）
+    /// ⇒ 必须不触发。
+    #[test]
+    fn test_no_false_trigger_when_long_task_just_scheduled() {
+        let s = scheduler_without_loop();
+        // 长任务排到 300s 后
+        push_due_in(&s, "long_bootstrap", 300);
+        assert!(
+            !s.detect_and_recover_global_stall(),
+            "空闲期 + 长任务在未来 ⇒ 不得误判为停摆"
+        );
+        // 再来一轮，仍不得触发（连续计数也不该累积到阈值）
+        assert!(
+            !s.detect_and_recover_global_stall(),
+            "空闲期持续也不得误判为停摆（防误杀是硬要求）"
+        );
+    }
+
+    /// 关键防误杀：单轮命中不得触发（watchdog 有 30s 抖动，一次不算停摆）。
+    #[test]
+    fn test_single_round_overdue_does_not_trigger() {
+        let s = scheduler_without_loop();
+        // 造一个「已到期但未被取走」：scheduled_at 在过去
+        s.queue.write().push(ScheduledItem {
+            task_id: "stuck".to_string(),
+            scheduled_at: Instant::now() - Duration::from_secs(5),
+            priority: TaskPriority::Background,
+            seq: 1,
+        });
+        assert!(
+            !s.detect_and_recover_global_stall(),
+            "单轮已到期积压不应触发（需连续 2 轮）"
+        );
+    }
+
+    /// 队列为空时不得触发（避免正常空闲期被abort）。
+    #[test]
+    fn test_no_trigger_when_queue_empty() {
+        let s = scheduler_without_loop();
+        for _ in 0..3 {
+            assert!(!s.detect_and_recover_global_stall(), "空队列不得触发自愈");
+        }
+        assert_eq!(s.stall_recovery_total.load(Ordering::Relaxed), 0);
+    }
+
+    /// 回归：启动/预热期不得误判停摆（2026-10-09 首次部署实测误报）。
+    ///
+    /// 现场：进程启动后 ~2 分钟内任务正陆续注册，`in_flight==0` 属正常，
+    /// 而高水位已因部分任务完成而累积 ⇒ 判据2 命中并误触发一次 abort。
+    /// 该abort 本身无害（系统随后正常），但它是**误报**，必须消除。
+    #[test]
+    fn test_no_trigger_during_warmup_while_still_scheduling() {
+        let s = scheduler_without_loop();
+        // 高水位已累积（有任务跑过）
+        s.peak_in_flight.store(43, Ordering::Relaxed);
+        // 但最近刚刚还有任务被准入 ⇒ 系统仍在正常调度
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        s.last_admit_ms.store(now_ms, Ordering::Relaxed);
+        for i in 0..54 {
+            push_due_in(&s, &format!("warm{}", i), 3500);
+        }
+        for _ in 0..3 {
+            assert!(
+                !s.detect_and_recover_global_stall(),
+                "预热期仍在准入任务 ⇒ 不得判为停摆（不得误abort）"
+            );
+        }
+        assert_eq!(s.stall_recovery_total.load(Ordering::Relaxed), 0);
+    }
+
+    /// 对照：超过宽限期且长期无准入 ⇒ 必须能触发（确保上一条不是靠豁免掩盖问题）。
+    #[test]
+    fn test_triggers_after_warmup_expires() {
+        let s = scheduler_without_loop();
+        s.peak_in_flight.store(43, Ordering::Relaxed);
+        // 最近准入时间设为很久以前（模拟宽限期已过）
+        let old_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            .saturating_sub((STALL_STARTUP_GRACE_SECS + 600) * 1000);
+        s.last_admit_ms.store(old_ms, Ordering::Relaxed);
+        for i in 0..54 {
+            push_due_in(&s, &format!("cold{}", i), 3500);
+        }
+        assert!(!s.detect_and_recover_global_stall(), "第 1 轮连续数不足");
+        assert!(
+            s.detect_and_recover_global_stall(),
+            "宽限期已过且长期无准入 ⇒ 必须能触发停摆自愈"
+        );
+    }
+
+    /// 自愈限流：连续触发不得高频抖动（否则正常长任务会被反复 abort）。
+    #[test]
+    fn test_stall_recovery_rate_limited() {
+        let s = scheduler_without_loop();
+        s.peak_in_flight.store(30, Ordering::Relaxed);
+        for i in 0..21 {
+            push_due_in(&s, &format!("t{}", i), 300);
+        }
+        // 判据2 需连续 2 轮命中
+        assert!(!s.detect_and_recover_global_stall(), "第 1 轮连续数不足");
+        assert!(s.detect_and_recover_global_stall(), "第 2 轮应触发");
+        // 立刻重跑：受 STALL_MIN_TRIGGER_INTERVAL_SECS 限流，不应再次触发
+        assert!(
+            !s.detect_and_recover_global_stall(),
+            "限流窗口内不得重复触发"
+        );
+        assert_eq!(
+            s.stall_recovery_total.load(Ordering::Relaxed),
+            1,
+            "限流窗口内累计数不得增加"
+        );
     }
 }

@@ -203,18 +203,45 @@ fn main() -> anyhow::Result<()> {
         worker_threads, federation_threads, tracker_threads, api_threads, scheduler_threads, persistence_threads
     );
 
+    // 2026-10-09 治本 S3：显式化 max_blocking_threads。
+    //
+    // 全代码库 109 处 spawn_blocking，此前零配置 ⇒ 走 tokio 默认 512。
+    // 默认 512 意味着 DB 写blocking 与爬虫 blocking 挤在同一池里争抢
+    // tokio blocking 线程，且无上限保护 —— 慢盘/大 WAL 时会把池打满，
+    // 表现为「所有 await 任务集体挂起、无事件唤醒」（本次事故形态）。
+    //
+    // 取值策略：与 worker 数同量级（DB IO 是同步阻塞操作，线程数不应远超
+    // 真正的 CPU 并行度，否则只是把争抢从 worker 挪到 blocking 池）。
+    let blocking_threads = if config.max_blocking_threads == 0 {
+        worker_threads.max(8)
+    } else {
+        config.max_blocking_threads
+    };
+    let monitor_blocking_threads = if config.monitor_max_blocking_threads == 0 {
+        blocking_threads
+    } else {
+        config.monitor_max_blocking_threads
+    };
+    info!(
+        "[main] blocking 池上限: 全局={} monitor={}（显式化，2026-10-09 治本 S3）",
+        blocking_threads, monitor_blocking_threads
+    );
+
     let crawler_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
+        .max_blocking_threads(blocking_threads)
         .thread_name("pdc-crawler")
         .enable_all()
         .build()?;
     let federation_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(federation_threads)
+        .max_blocking_threads(blocking_threads)
         .thread_name("pdc-federation")
         .enable_all()
         .build()?;
     let tracker_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tracker_threads)
+        .max_blocking_threads(blocking_threads)
         .thread_name("pdc-tracker")
         .enable_all()
         .build()?;
@@ -224,6 +251,7 @@ fn main() -> anyhow::Result<()> {
     // 回退多线程。爬虫节流（L1-⑪）已另行根治风暴。
     let api_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(api_threads)
+        .max_blocking_threads(blocking_threads)
         .thread_name("pdc-api")
         .enable_all()
         .build()?;
@@ -234,7 +262,22 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let persistence_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(persistence_threads)
+        .max_blocking_threads(blocking_threads)
         .thread_name("pdc-persistence")
+        .enable_all()
+        .build()?;
+
+    // 2026-10-09 治本 S4：Monitor 独立 runtime，与 HTTP(api) 解耦。
+    //
+    // 事故形态：Monitor 类任务被派发到 api runtime（仅 4 worker，与 HTTP 共用），
+    // 3 个 Monitor 槽位在保底放行下堆到 16 个在飞，4 个 worker 被长 await 占死
+    // ⇒ memory_monitor / checkpoint / 健康检查 集体静默 41 分钟。
+    // 监控是唯一可观测性来源，绝不能与请求处理共享线程。
+    let monitor_threads = config.monitor_runtime_threads.max(2);
+    let monitor_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(monitor_threads)
+        .max_blocking_threads(monitor_blocking_threads)
+        .thread_name("pdc-monitor")
         .enable_all()
         .build()?;
 
@@ -244,6 +287,12 @@ fn main() -> anyhow::Result<()> {
     let federation_handle = federation_runtime.handle().clone();
     let scheduler_handle = scheduler_runtime.handle().clone();
     let persistence_handle = persistence_runtime.handle().clone();
+    // 2026-10-09 治本 S4：监控专用 runtime 的 handle 存入全局单例。
+    //
+    // 不走 async_main 入参：该函数入参已有 10+ 个，再加会扩大改动面；
+    // 而 monitor_runtime 的生命周期覆盖整个 main，用 OnceLock 持有 handle
+    // 是安全的（Handle 只借用runtime，不延长其生命周期）。
+    let monitor_handle = monitor_runtime.handle().clone();
     let shutdown_timeout = std::time::Duration::from_secs(config.runtime_shutdown_timeout_secs);
 
     let result = crawler_runtime.block_on(async_main(
@@ -256,6 +305,7 @@ fn main() -> anyhow::Result<()> {
         federation_handle,
         scheduler_handle,
         persistence_handle,
+        monitor_handle,
         log_guard.filter,
     ));
 
@@ -270,6 +320,9 @@ fn main() -> anyhow::Result<()> {
     scheduler_runtime.shutdown_timeout(shutdown_timeout);
     info!("[main] 关闭 persistence_runtime...");
     persistence_runtime.shutdown_timeout(shutdown_timeout);
+    // 2026-10-09 治本 S4：监控 runtime 也要显式关闭（否则进程退出时
+    // 其 worker 可能仍持有 DB 连接，拖慢 shutdown_timeout）。
+    monitor_runtime.shutdown_timeout(shutdown_timeout);
     info!("[main] 所有 runtime 已关闭");
 
     result
@@ -287,6 +340,8 @@ async fn async_main(
     federation_handle: tokio::runtime::Handle,
     scheduler_handle: tokio::runtime::Handle,
     persistence_handle: tokio::runtime::Handle,
+    // 2026-10-09 治本 S4：监控专用 runtime（Monitor 类不再与 HTTP 共用 api）
+    monitor_handle: tokio::runtime::Handle,
     log_filter: PeerDiscoveryCenter::control_plane::config_reload::LogFilterHandle,
 ) -> anyhow::Result<()> {
     // 2.2 加载或生成 PEX/uTP 节点身份（持久化到 work_dir.node_id_file()）
@@ -1098,6 +1153,8 @@ async fn async_main(
                 api: api_handle.clone(),
                 scheduler: scheduler_handle.clone(),
                 persistence: persistence_handle.clone(),
+                // 2026-10-09 治本 S4：Monitor 独立 runtime
+                monitor: monitor_handle.clone(),
             })
             .with_adaptive_controller(adaptive_controller.clone())
             // 把 config.task_scheduler 的准入/抖动/预测/自适应旋钮真正注入调度器（乙类接线）

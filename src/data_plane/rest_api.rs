@@ -1229,6 +1229,14 @@ async fn io_status_handler(State(state): State<AppState>) -> Response {
     }
 }
 
+/// 写锁争用快照（2026-10-09 治本 S5）。
+///
+/// S5 第一步把此前零可观测性的写锁争用暴露出来，使「锁是不是瓶颈」
+/// 从猜测变成可断言。压测判据 F7 直接读这个字段。
+pub fn write_lock_snapshot() -> crate::storage::db::WriteLockStats {
+    crate::storage::db::write_lock_stats()
+}
+
 // 联邦同步通道状态轮询：GET /api/v1/sync/channels
 async fn sync_channels_handler(State(state): State<AppState>) -> Response {
     Json(sync_channels_snapshot(&state)).into_response()
