@@ -60,6 +60,17 @@ const CONCURRENCY_FULL_DELAY: Duration = Duration::from_secs(5);
 const CONCURRENCY_STARVE_ROUNDS: u32 = 6;
 /// 饥饿补偿的**每分类**超额上限（硬并发 = max + 该值）。
 const CONCURRENCY_OVERSUBSCRIBE: u32 = 2;
+/// 分类「卡死保底」阈值（秒）：某分类在飞任务最老年龄超过该值时，
+/// 判定该分类已被慢任务实质性卡死，**保底放行**该分类任务（不再等槽），
+/// 避免面板/监控类被写路径饿死。
+///
+/// 背景（2026-10-09 生产实证）：Persistence 上限 1，被`WAL checkpoint` /
+/// `WriteQueue 刷盘` / `TRUNCATE` / `oplog裁剪` 互相关联任务长期争抢唯一槽位
+/// （00:49起持续 2.5 小时、50 次「已连续延迟 6 轮」）。Monitor 只有 2 槽且排在
+/// 后面拿不到 → 面板指标不刷新 → `io/status` 15s 超时，而 CPU 100% 空闲、
+/// 调度器心跳正常。**监控拿不到数据 ⇒ 故障不可见**，比慢更糟。
+/// 保底放行让监控永远能拿到数据，代价是最多多 1~2 个并发监控任务。
+pub const CATEGORY_STALL_FALLBACK_SECS: u64 = 120;
 
 /// Watchdog 检测间隔（秒）：独立 OS 线程定期检查心跳
 const WATCHDOG_CHECK_INTERVAL_SECS: u64 = 30;
@@ -114,8 +125,20 @@ impl Default for CategoryConcurrency {
     fn default() -> Self {
         Self {
             crawl: 4,
-            persistence: 1,
-            monitor: 2,
+            // 2026-10-09 根治：1 → 2。原值 1 让`WAL checkpoint` / `WriteQueue 刷盘`
+            // / `WAL TRUNCATE` / `oplog裁剪` / `全量持久化兜底` 这几个**互相关联**
+            // 的写路径任务串行抢同一个槽位（生产实证：00:49 起持续 2.5 小时、
+            // 50 次「已连续延迟 6 轮」，oplog 3 小时仅增长 919 行）。
+            // 单槽的语义是「写库全局串行」，但 SQLite 侧本就有单写连接 + WAL 串行化，
+            // 再叠加调度器单槽只会把「等写锁」与「等调度槽」两个等待串在一起，
+            // 任何一个慢任务（如 1.4GB 库上的 TRUNCATE）就把整类停摆。
+            // 2 槽允许「刷盘」与「checkpoint」并发推进——它们在 SQLite 写锁处
+            // 天然互斥，调度器层不需要重复串行化。
+            persistence: 2,
+            // 监控类保底 +1：面板/指标是故障可观测性的唯一来源，
+            // 与其被写路径饿死（导致 15s 超时、故障不可见），不如多留一个槽。
+            // 配合 `CATEGORY_STALL_FALLBACK_SECS` 卡死保底双保险。
+            monitor: 3,
             network: 4,
             // v9: 联邦专用并发 4→8（20+ fed_* 周期任务 + 慢 IO 任务如 delta 拉取/bootstrap，
             // 4 槽在欠账大时会被慢任务占满导致联邦内部饿死；federation runtime 本身 ≥4 线程）
@@ -1043,6 +1066,15 @@ struct InFlightTask {
     category: TaskCategory,
     started_at: Instant,
     timeout: Duration,
+    /// 执行体的中止句柄（2026-10-09 新增）。
+    ///
+    /// 此前强制回收只把登记摘掉 + 计数减1，**执行体本身仍在跑**（多半卡在
+    /// 同步阻塞段，`abort` 对它无效，但至少 await 点能被取消）。于是出现
+    /// 「账面并发 = max，实际并发 = max + 泄漏数」——新任务被放进来后，
+    /// 真实并发已经超限，资源进一步恶化。保留句柄是为了在回收时**尽力取消**：
+    /// 卡在 await 的执行体立即停止并Drop 槽位；卡在同步段的则等它自己结束
+    /// （此时 `CategorySlotGuard` 发现登记已被摘除，不会重复减计数）。
+    abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 /// RAII 守卫：任务执行体退出（含 panic 展开）时释放分类并发槽位。
@@ -1106,6 +1138,10 @@ pub struct TaskScheduler {
     running_by_category: RwLock<HashMap<TaskCategory, u32>>,
     /// 各分类最大并发度（RwLock 包装：支持运行时热更，见 `update_category_concurrency`）
     max_concurrency: RwLock<CategoryConcurrency>,
+    /// 各分类最大在飞年龄（秒）：某分类在飞任务超过该值即判定为「卡死」，
+    /// 准入时对该分类任务**一律放行**（不再等槽），避免面板/监控类被写路径饿死。
+    /// Key = 分类，Value = 秒。缺省表示该分类无此保底。
+    category_stall_threshold_secs: RwLock<HashMap<TaskCategory, u64>>,
     resource_monitor: Arc<ResourceMonitor>,
     seq_counter: RwLock<u64>,
     completed_dependencies: RwLock<HashSet<String>>,
@@ -1175,6 +1211,7 @@ impl TaskScheduler {
                 m
             }),
             max_concurrency: RwLock::new(CategoryConcurrency::default()),
+            category_stall_threshold_secs: RwLock::new(HashMap::new()),
             resource_monitor,
             seq_counter: RwLock::new(0),
             completed_dependencies: RwLock::new(HashSet::new()),
@@ -1351,6 +1388,101 @@ impl TaskScheduler {
         *self.running_by_category.read().get(&cat).unwrap_or(&0)
     }
 
+    /// 某分类当前**最老在飞任务**的年龄（秒）；无在飞任务时返回 0。
+    ///
+    /// 用于「分类卡死保底」判定：以 `in_flight` 登记表为**唯一事实来源**，
+    /// 不依赖可能失真的 `running_by_category` 计数（见 `reconcile_counters`）。
+    pub fn category_oldest_in_flight_secs(&self, cat: TaskCategory) -> u64 {
+        let in_flight = self.in_flight.read();
+        in_flight
+            .values()
+            .filter(|e| e.category == cat)
+            .map(|e| e.started_at.elapsed().as_secs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 某分类当前在飞任务数，**以 `in_flight` 登记表实时统计**。
+    ///
+    /// 准入判据必须用这个而不是 [`Self::running_count`]（读`running_by_category`）：
+    /// 后者是独立维护的可变计数器，跨锁竞争下会与登记表漂移，漂移后会把分类
+    /// 永久判成「已满」而把所有任务拒之门外（2026-10-09 实证）。
+    fn category_running_count(&self, cat: TaskCategory) -> u32 {
+        let in_flight = self.in_flight.read();
+        in_flight.values().filter(|e| e.category == cat).count() as u32
+    }
+
+    /// 读取某分类的卡死保底阈值（秒）；0 表示未设置。
+    fn category_stall_threshold(&self, cat: TaskCategory) -> u64 {
+        self.category_stall_threshold_secs
+            .read()
+            .get(&cat)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 该分类是否已「卡死」（最老在飞任务年龄超过阈值）。
+    fn category_is_stalled(&self, cat: TaskCategory) -> bool {
+        let threshold = self
+            .category_stall_threshold_secs
+            .read()
+            .get(&cat)
+            .copied()
+            .unwrap_or(0);
+        if threshold == 0 {
+            return false;
+        }
+        self.category_oldest_in_flight_secs(cat) >= threshold
+    }
+
+    /// 设置某分类的「卡死保底」阈值（秒）；传 0 关闭该分类的保底放行。
+    ///
+    /// 供 main.rs 按分类装配：Monitor 类设 [`CATEGORY_STALL_FALLBACK_SECS`]，
+    /// 其余分类不设（保持原有严格并发语义不变）。
+    pub fn set_category_stall_threshold(&self, cat: TaskCategory, secs: u64) {
+        self.category_stall_threshold_secs.write().insert(cat, secs);
+    }
+
+    /// 以 `in_flight` 登记表为唯一事实来源，重建 `running_by_category`。
+    ///
+    /// 为什么需要（2026-10-09 生产实证）：`running_by_category` 与 `in_flight`
+    /// 是两套独立维护的状态——准入时 +1、释放/回收时 -1。任一路径漏减（或
+    /// 强回收与正常释放跨锁竞争）都会让两者**永久漂移**，实测出现
+    /// `monitor=4/2`（超限）而 `在飞=1`、`最老在飞=-` 的自相矛盾状态：
+    /// 计数超限 ⇒ 准入被拒 ⇒ 监控任务永远排不上；`最老在飞=-` 又让卡死保底
+    /// 判定失效（读的是登记表而非计数器），两条路一起堵死。
+    ///
+    /// 改为**每次心跳从登记表重算**，漂移最多存活一个心跳周期（30s），
+    /// 且 `最老在飞` 与 `在飞` 与准入判据三者恒等���。
+    fn reconcile_counters(&self) {
+        let mut by_cat: HashMap<TaskCategory, u32> = HashMap::new();
+        {
+            let in_flight = self.in_flight.read();
+            for e in in_flight.values() {
+                *by_cat.entry(e.category).or_insert(0) += 1;
+            }
+        }
+        let mut running = self.running_by_category.write();
+        for cat in [
+            TaskCategory::Crawl,
+            TaskCategory::Persistence,
+            TaskCategory::Monitor,
+            TaskCategory::Network,
+            TaskCategory::Federation,
+            TaskCategory::Tracker,
+        ] {
+            let truth = by_cat.get(&cat).copied().unwrap_or(0);
+            let recorded = running.get(&cat).copied().unwrap_or(0);
+            if recorded != truth {
+                warn!(
+                    "[task_scheduler] 分类计数漂移自愈: {:?} 记录={} 实际在飞={}，按登记表校正",
+                    cat, recorded, truth
+                );
+                running.insert(cat, truth);
+            }
+        }
+    }
+
     /// 查询指定分类最大并发度
     pub fn max_concurrency_for(&self, cat: TaskCategory) -> u32 {
         self.max_concurrency.read().max_for(cat)
@@ -1427,13 +1559,38 @@ impl TaskScheduler {
                 .filter(|(_, e)| cat.is_none_or(|c| e.category == c))
                 .filter_map(|(token, e)| {
                     let age = e.started_at.elapsed().as_secs_f64();
-                    // L1-⑫：绝对上限兜底 —— 调度器任务均为 tick 级（秒级），任何任务在飞
-                    // 超过 RECLAIM_ABS_CAP_SECS（240s）一律判泄漏强制回收，无论 timeout×factor
-                    // 多大。根治「回收长期为 0」的泄漏链（日志实证：准入480−释放465−回收0、
-                    // Monitor 任务 419s 挂起未回收）：回收 0 → 槽位永久占满 → 分类停摆 →
-                    // 任务/句柄/内存无限累积（5.89GB 提交内存主因）。
+                    // 判据 = min(任务自身预算 × factor, 按任务分级的绝对上限)。
+                    //
+                    // 2026-10-09 方案A（分级，取代此前的单一 240s 上限）：
+                    // 原来的 240s 对**所有**任务一视同仁，把默认任务
+                    // （timeout=300s）的真实阈值 450s 压到 240s —— 配置项
+                    // `stale_slot_factor=1.5` 被静默架空，日志打出「已在飞 240s >
+                    // 超时 300s×1.5」这种自相矛盾判据，无法区分「真泄漏」与「只是慢」。
+                    // 但也不能整体放开到 600s：tick 级任务（timeout 30~120s）
+                    // 挂死数百秒本身就是缺陷，必须有硬兜底，否则句柄/内存会累积
+                    // （.52 曾观测 5.89GB 提交内存）。
+                    //
+                    // 故按**任务自身 timeout** 分级（不是按分类——同分类内既有
+                    // tick 也有长任务）：
+                    //   · tick 级（timeout ≤ `RECLAIM_TICK_TIMEOUT_SECS`）：保留 240s
+                    //     硬上限，行为与 b99bf4e 一致，不回退该缺陷修复；
+                    //   · 长任务（timeout > 阈值）：**不设绝对上限**，只用
+                    //     `timeout × factor`。bootstrap / range 反熵 / 清单重建
+                    //     这类任务 timeout 本就 300~900s，240s 判据会把它们
+                    //     在正常执行途中误杀（实测在飞 240~268s 被误回收）。
                     const RECLAIM_ABS_CAP_SECS: f64 = 240.0;
-                    if age > (e.timeout.as_secs_f64() * factor).min(RECLAIM_ABS_CAP_SECS) {
+                    const RECLAIM_TICK_TIMEOUT_SECS: f64 = 180.0;
+                    let own_budget = e.timeout.as_secs_f64() * factor;
+                    let cap = if e.timeout.as_secs_f64() <= RECLAIM_TICK_TIMEOUT_SECS {
+                        Some(RECLAIM_ABS_CAP_SECS)
+                    } else {
+                        None
+                    };
+                    let is_stale = match cap {
+                        Some(c) => age > own_budget.min(c),
+                        None => age > own_budget,
+                    };
+                    if is_stale {
                         Some((*token, e.clone(), age))
                     } else {
                         None
@@ -1447,10 +1604,15 @@ impl TaskScheduler {
 
         // ② 摘除登记（与 CategorySlotGuard::drop 竞争，谁摘到谁负责递减）
         let mut reclaimed_by_cat: HashMap<TaskCategory, u32> = HashMap::new();
+        let mut abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
         {
             let mut in_flight = self.in_flight.write();
             for (token, entry, age_secs) in &stale {
-                if in_flight.remove(token).is_none() {
+                if let Some(removed) = in_flight.remove(token) {
+                    if let Some(h) = removed.abort_handle {
+                        abort_handles.push(h);
+                    }
+                } else {
                     continue;
                 }
                 *reclaimed_by_cat.entry(entry.category).or_insert(0) += 1;
@@ -1465,6 +1627,20 @@ impl TaskScheduler {
                     entry.category
                 );
             }
+        }
+
+        // ②.5 尽力中止仍在跑的执行体（2026-10-09 新增）。
+        // 此前只回收计数不中止 ⇒ 「账面并发 = max，实际并发 = max + 泄漏数」，
+        // 放行新任务时真实并发已超限，资源继续恶化。卡在 await 的执行体会立即
+        // 停止；卡在同步阻塞段的 abort 无效，但登记已摘除，其 Drop 不会重复减计数。
+        for h in &abort_handles {
+            h.abort();
+        }
+        if !abort_handles.is_empty() {
+            debug!(
+                "[task_scheduler] 已中止 {} 个泄漏执行体（回收槽位后）",
+                abort_handles.len()
+            );
         }
 
         // ③ 递减分类计数
@@ -1686,6 +1862,9 @@ impl TaskScheduler {
                 self.recalc_adaptive_intervals();
             }
             if heartbeat.elapsed() >= SCHEDULER_HEARTBEAT_INTERVAL {
+                // 先按`in_flight` 登记表校正分类计数，消除准入/释放/强回收
+                // 三路维护留下的漂移（本轮判据与打印都用校正后的值）。
+                self.reconcile_counters();
                 let queue_len = self.queue.read().len();
                 let brief = self.category_brief();
                 let in_flight = self.in_flight_count();
@@ -1808,12 +1987,36 @@ impl TaskScheduler {
                 }
             }
 
-            // 分级并发控制：按任务分类限流（含饥饿补偿 + 槽位泄漏逃生阀）
+            // 分级并发控制：按任务分类限流（含饥饿补偿 + 槽位泄漏逃生阀 + 卡死保底）
             {
                 let cat = meta.category;
-                let running = scheduler.running_count(cat);
+                // 计数以 `in_flight` 登记表为事实来源实时统计，避免计数器漂移
+                // 把分类永久判成「已满」（见 `reconcile_counters`）。
+                let running = scheduler.category_running_count(cat);
                 let max = scheduler.max_concurrency_for(cat);
+                // 卡死保底是否已放行本次准入（放行则跳过饥饿补偿/排队分支）
+                let mut stall_admitted = false;
                 if running >= max {
+                    // 卡死保底：某分类被慢任务实质性占死时（最老在飞超阈值），
+                    // 保底放行——**监控必须永远能拿到数据**，否则故障不可见。
+                    // 这是 2026-10-09「Persistence 霸占唯一槽 → 面板 15s 超时」
+                    // 事故的直接根治点：此前 Monitor 只有饥饿补偿（需连续被拒
+                    // 6 轮 = 30s）才放行，且该补偿与计数器漂移叠加后完全失效。
+                    if scheduler.category_is_stalled(cat) {
+                        warn!(
+                            "[task_scheduler] 分类卡死保底放行（{:?} {}/{}，最老在飞 {}s ≥ 阈值 {}s）: {}",
+                            cat,
+                            running,
+                            max,
+                            scheduler.category_oldest_in_flight_secs(cat),
+                            scheduler.category_stall_threshold(cat),
+                            meta.name
+                        );
+                        scheduler.concurrency_starve.write().remove(&item.task_id);
+                        stall_admitted = true;
+                    }
+                }
+                if running >= max && !stall_admitted {
                     // 饥饿补偿：分类槽被长 await 任务长期占满时，短任务会无限期排不到执行。
                     // 连续被拒 CONCURRENCY_STARVE_ROUNDS 轮后，允许在硬上限（max + 超额）内
                     // 准入一次，避免「永远不执行」；超额幅度很小（+2），不会打爆资源。
@@ -1830,7 +2033,7 @@ impl TaskScheduler {
                     // `running < max + OVER` 恒为假 ⇒ 分类被**永久封印**（实测联邦 runtime
                     // 静默后 10 个在飞任务永久占槽，Federation 分类封印到进程结束，
                     // 日志刷了 5 万条）。此处先尝试回收「超龄在飞」槽位：只要存在泄漏，
-                    // 无论 running 顶到多少都能解开，不再自锁。
+                    // 无论running 顶到多少都能解开，不再自锁。
                     let reclaimed = if !oversubscribe && running >= max + CONCURRENCY_OVERSUBSCRIBE
                     {
                         scheduler.reclaim_stale_slots(Some(cat))
@@ -2064,6 +2267,9 @@ impl TaskScheduler {
                 category,
                 started_at: Instant::now(),
                 timeout: meta.timeout,
+                // spawn 之后回填（见本函数末尾）：此处先占位，
+                // 使「登记已存在但还没有句柄」这个窗口里回收逻辑不会 panic。
+                abort_handle: None,
             },
         );
         let running_now = {
@@ -2098,6 +2304,9 @@ impl TaskScheduler {
             TaskCategory::Persistence => h.persistence.clone(),
             TaskCategory::Monitor => h.api.clone(),
         });
+
+        // 克隆一份引用供 spawn 之后回填中止句柄用（`scheduler` 本身被 move 进 fut）
+        let scheduler_ref = scheduler.clone();
 
         let fut = async move {
             // 移入 fut：执行体退出（含 panic 展开）时由 Drop 释放槽位
@@ -2235,10 +2444,20 @@ impl TaskScheduler {
             );
         };
 
-        match runtime_handle {
+        // 2026-10-09：回填中止句柄，让「强制回收」能真正中止执行体。
+        // 必须在 spawn 之后——`JoinHandle::abort_handle()` 才能拿到句柄。
+        // 若此刻登记已被 watchdog 回收（极小窗口），则不再回填：
+        // 回收方已按「无句柄」处理过，无需补中止。
+        // 注意 `scheduler` 已被move 进 `fut`，故用执行前克隆的 `scheduler_ref`。
+        let join_handle = match runtime_handle {
             Some(h) => h.spawn(fut),
             None => tokio::spawn(fut),
         };
+        let abort_handle = join_handle.abort_handle();
+        let mut in_flight = scheduler_ref.in_flight.write();
+        if let Some(entry) = in_flight.get_mut(&token) {
+            entry.abort_handle = Some(abort_handle);
+        }
     }
 
     /// 获取任务统计
@@ -2599,7 +2818,10 @@ mod tests {
         let summary = scheduler.summary();
         assert_eq!(summary.registered_tasks, 1);
         assert_eq!(summary.max_concurrency.crawl, 4);
-        assert_eq!(summary.max_concurrency.persistence, 1);
+        // 2026-10-09 根治：persistence 1 → 2。断言随之更新（原值 1 会让
+        // WAL checkpoint / WriteQueue 刷盘 / TRUNCATE / oplog 裁剪 互相关联
+        // 任务串行抢唯一槽位，生产实证停摆 2.5 小时）。
+        assert_eq!(summary.max_concurrency.persistence, 2);
 
         let tasks = scheduler.list_tasks();
         assert_eq!(tasks.len(), 1);
@@ -2967,6 +3189,7 @@ mod tests {
                 // Instant 不能表示"过去"，只能从当前时刻往前退
                 started_at: now.checked_sub(age).unwrap_or(now),
                 timeout: Duration::from_secs(10),
+                abort_handle: None,
             },
         );
         *s.running_by_category.write().entry(cat).or_insert(0) += 1;
@@ -2987,6 +3210,7 @@ mod tests {
                 category: TaskCategory::Federation,
                 started_at: Instant::now(),
                 timeout: Duration::from_secs(300),
+                abort_handle: None,
             },
         );
         *s.running_by_category
@@ -3119,6 +3343,7 @@ mod tests {
                 category: cat,
                 started_at: Instant::now(),
                 timeout: Duration::from_secs(10),
+                abort_handle: None,
             },
         );
         *s.running_by_category.write().entry(cat).or_insert(0) += 1;
@@ -3214,5 +3439,269 @@ mod tests {
         assert_eq!(s2.in_flight_count(), 3, "真过载时不应凭空放行");
         assert_eq!(s2.queue.read().len(), 1, "应当被延迟重排，等待下一轮");
         s2.stop();
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-10-09 根治「运行一段时间卡住」：计数漂移自愈 + 卡死保底
+    // -----------------------------------------------------------------------
+
+    /// 计数器与 `in_flight` 漂移后，必须被自愈校正回真值。
+    ///
+    /// 回归现场（.52 2026-10-09）：心跳打出 `monitor=4/2`（超限）而
+    /// `在飞=1`、`最老在飞=-`，三者自相矛盾——计数超限把准入全拒之门外，
+    /// 而 `最老在飞=-` 又让任何基于登记表年龄的保底判定失效，两条路一起堵死。
+    #[test]
+    fn test_reconcile_counters_heals_drift() {
+        let s = Arc::new(TaskScheduler::new());
+        // 登记表里真实只有 1 个在飞任务，但计数器被历史路径写成 4
+        s.in_flight.write().insert(
+            1,
+            InFlightTask {
+                task_id: "t1".to_string(),
+                name: "真实在飞".to_string(),
+                category: TaskCategory::Monitor,
+                started_at: Instant::now(),
+                timeout: Duration::from_secs(300),
+                abort_handle: None,
+            },
+        );
+        *s.running_by_category
+            .write()
+            .entry(TaskCategory::Monitor)
+            .or_insert(0) = 4;
+        assert_eq!(
+            s.running_count(TaskCategory::Monitor),
+            4,
+            "前置：模拟漂移态"
+        );
+
+        s.reconcile_counters();
+
+        assert_eq!(
+            s.running_count(TaskCategory::Monitor),
+            1,
+            "必须按 in_flight 登记表校正为真值"
+        );
+    }
+
+    /// 心跳的自愈必须让「准入判据 / 在飞数 / 最老在飞」三者恒等。
+    #[test]
+    fn test_reconcile_keeps_admission_and_counters_consistent() {
+        let s = Arc::new(TaskScheduler::new());
+        for (i, cat) in [
+            TaskCategory::Monitor,
+            TaskCategory::Persistence,
+            TaskCategory::Crawl,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.in_flight.write().insert(
+                i as u64 + 1,
+                InFlightTask {
+                    task_id: format!("t{i}"),
+                    name: format!("任务{i}"),
+                    category: cat,
+                    started_at: Instant::now(),
+                    timeout: Duration::from_secs(300),
+                    abort_handle: None,
+                },
+            );
+            // 计数器全部错写成 99
+            *s.running_by_category.write().entry(cat).or_insert(0) = 99;
+        }
+
+        s.reconcile_counters();
+
+        for cat in [
+            TaskCategory::Monitor,
+            TaskCategory::Persistence,
+            TaskCategory::Crawl,
+        ] {
+            assert_eq!(s.category_running_count(cat), 1);
+            assert_eq!(
+                s.running_count(cat),
+                s.category_running_count(cat),
+                "{:?}：准入判据与展示计数必须一致",
+                cat
+            );
+        }
+        assert_eq!(s.in_flight_count(), 3);
+    }
+
+    /// 卡死保底：未设阈值时永不启用（保持既有严格并发语义）。
+    #[test]
+    fn test_stall_fallback_disabled_by_default() {
+        let s = Arc::new(TaskScheduler::new());
+        insert_stale(&s, 1, TaskCategory::Monitor, Duration::from_secs(600));
+        assert!(
+            !s.category_is_stalled(TaskCategory::Monitor),
+            "未设阈值 ⇒ 不启用保底"
+        );
+    }
+
+    /// 卡死保底：最老在飞超阈值时应判定为已卡死，且阈值可热设。
+    #[test]
+    fn test_stall_fallback_triggers_past_threshold() {
+        let s = Arc::new(TaskScheduler::new());
+        s.set_category_stall_threshold(TaskCategory::Monitor, 120);
+        // 最老在飞 600s > 120s ⇒ 卡死
+        insert_stale(&s, 1, TaskCategory::Monitor, Duration::from_secs(600));
+        assert!(s.category_is_stalled(TaskCategory::Monitor));
+
+        // 新鲜在飞（0s）⇒ 未卡死
+        let s2 = Arc::new(TaskScheduler::new());
+        s2.set_category_stall_threshold(TaskCategory::Monitor, 120);
+        insert_fresh(&s2, 1, TaskCategory::Monitor);
+        assert!(!s2.category_is_stalled(TaskCategory::Monitor));
+
+        // 阈值调大到 10000s ⇒ 600s 不再超限
+        s2.set_category_stall_threshold(TaskCategory::Monitor, 10_000);
+        assert!(!s2.category_is_stalled(TaskCategory::Monitor));
+
+        // 传0 关闭保底
+        s2.set_category_stall_threshold(TaskCategory::Monitor, 0);
+        assert!(!s2.category_is_stalled(TaskCategory::Monitor));
+    }
+
+    /// 端到端回归：Monitor 分类被慢任务实质占死时，**监控任务必须能被放行**。
+    ///
+    /// 这是本次生产事故的直接断言——修复前该场景下监控任务被永久拒绝，
+    /// 面板数据源断流（`io/status` 15s 超时而 CPU 100% 空闲）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_monitor_task_admitted_under_stall() {
+        let s2 = Arc::new(TaskScheduler::new());
+        s2.set_category_stall_threshold(TaskCategory::Monitor, CATEGORY_STALL_FALLBACK_SECS);
+        // 一个「卡死」的 Monitor 在飞任务：把槽占满
+        insert_stale(&s2, 1, TaskCategory::Monitor, Duration::from_secs(600));
+        assert_eq!(s2.running_count(TaskCategory::Monitor), 1);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let r2 = ran.clone();
+        s2.register(
+            TaskMetadata::new("m_probe", "面板指标采样", Duration::from_secs(30))
+                .with_category(TaskCategory::Monitor)
+                .with_timeout(Duration::from_secs(5)),
+            move || {
+                let r = r2.clone();
+                async move {
+                    r.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+        // 直接排到「现在」执行，绕开 initial_delay/jitter
+        s2.schedule_task("m_probe", Instant::now(), TaskPriority::Normal);
+        TaskScheduler::process_queue(s2.clone()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "卡死保底必须放行监控任务（否则面板数据源断流）"
+        );
+        s2.stop();
+    }
+
+    /// 泄漏判据分级回归（方案A）：判据按任务自身 timeout 分级。
+    ///
+    /// 背景：b99bf4e 引入的单一 240s 绝对上限把默认任务（timeout=300s）的真实
+    /// 阈值 450s 压到 240s，架空 `stale_slot_factor=1.5`，日志打出
+    /// 「已在飞 240s > 超时 300s×1.5」的自相矛盾判据。
+    /// 方案A：**tick 级保留 240s 硬兜底，长任务不设绝对上限**。
+    #[test]
+    fn test_stale_threshold_tiered_by_task_timeout() {
+        let s = Arc::new(TaskScheduler::new());
+
+        // ① 长任务（timeout=300s > 180s 阈值）：240s 时不得误杀，
+        //    须等到自己的 450s 预算
+        s.in_flight.write().insert(
+            1,
+            InFlightTask {
+                task_id: "long".to_string(),
+                name: "长任务".to_string(),
+                category: TaskCategory::Crawl,
+                started_at: Instant::now()
+                    .checked_sub(Duration::from_secs(240))
+                    .unwrap_or_else(Instant::now),
+                timeout: Duration::from_secs(300),
+                abort_handle: None,
+            },
+        );
+        assert_eq!(
+            s.reclaim_stale_slots(None),
+            0,
+            "长任务在飞 240s（< 自身预算 450s）不得被误杀"
+        );
+        assert_eq!(s.in_flight_count(), 1);
+
+        // 超过自身预算 450s ⇒ 判泄漏
+        s.in_flight.write().get_mut(&1).unwrap().started_at = Instant::now()
+            .checked_sub(Duration::from_secs(500))
+            .unwrap_or_else(Instant::now);
+        assert_eq!(s.reclaim_stale_slots(None), 1, "长任务超 450s 应判泄漏");
+
+        // ② tick 级任务（timeout=60s ≤ 180s 阈值）：保留 240s 硬上限，
+        //    这是 b99bf4e 的缺陷修复，**不得回退**
+        let s2 = Arc::new(TaskScheduler::new());
+        s2.in_flight.write().insert(
+            1,
+            InFlightTask {
+                task_id: "tick".to_string(),
+                name: "tick任务".to_string(),
+                category: TaskCategory::Monitor,
+                // timeout×1.5=90s，早就该判泄漏；但年龄取 200s，
+                // 验证「硬上限」这一层在起作用（对长任务已不适用）
+                started_at: Instant::now()
+                    .checked_sub(Duration::from_secs(200))
+                    .unwrap_or_else(Instant::now),
+                timeout: Duration::from_secs(60),
+                abort_handle: None,
+            },
+        );
+        assert_eq!(
+            s2.reclaim_stale_slots(None),
+            1,
+            "tick 级任务挂死 200s（自身预算仅 90s）必须判泄漏"
+        );
+    }
+
+    /// tick 级任务即便`timeout` 很大，只要 ≤180s 就必须受 240s 硬上限约束。
+    ///
+    /// 这条锁定「分级边界」本身：`timeout=180s` 是 tick 与长任务的分界，
+    /// 若将来有人调大该阈值，tick 级兜底会被静默放宽。
+    #[test]
+    fn test_tick_grade_keeps_240s_hard_cap() {
+        let s = Arc::new(TaskScheduler::new());
+        s.in_flight.write().insert(
+            1,
+            InFlightTask {
+                task_id: "boundary".to_string(),
+                name: "边界任务".to_string(),
+                category: TaskCategory::Monitor,
+                // timeout=180s →预算 270s；若 240s 硬上限被移除，
+                // 270s 以下都不该判泄漏。取 250s 断言「仍被判泄漏」=硬上限生效。
+                started_at: Instant::now()
+                    .checked_sub(Duration::from_secs(250))
+                    .unwrap_or_else(Instant::now),
+                timeout: Duration::from_secs(180),
+                abort_handle: None,
+            },
+        );
+        assert_eq!(
+            s.reclaim_stale_slots(None),
+            1,
+            "timeout=180s 属 tick 级，250s 应被 240s 硬上限判泄漏"
+        );
+    }
+
+    /// 分类并发默认值回归：persistence / monitor 必须 ≥2（2026-10-09 根治）。
+    #[test]
+    fn test_persistence_and_monitor_concurrency_raised() {
+        let c = CategoryConcurrency::default();
+        assert!(
+            c.persistence >= 2,
+            "persistence 单槽会让互相关联的写路径任务互锁（生产实证 2.5h 停摆）"
+        );
+        assert!(c.monitor >= 3, "监控是唯一可观测性来源，需要额外余量");
     }
 }

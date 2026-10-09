@@ -1102,6 +1102,16 @@ async fn async_main(
             // 把 config.task_scheduler 的准入/抖动/预测/自适应旋钮真正注入调度器（乙类接线）
             .with_knobs(SchedulerKnobs::from_config(&config.task_scheduler)),
     );
+    // 2026-10-09 根治「运行一段时间卡住」：给 Monitor 类装卡死保底阈值。
+    // Persistence 单槽被写路径霸占 2.5 小时时，监控类此前只能靠饥饿补偿
+    // （需连续被拒 6 轮 = 30s）才放行，且叠加计数器漂移后完全失效 →
+    // 面板指标停更、`io/status` 15s 超时而 CPU 100% 空闲（故障不可见）。
+    // 阈值内Monitor 无条件保底放行：宁可多1~2 个并发监控任务，
+    // 也不能让「唯一可观测性来源」被写路径饿死。
+    task_scheduler.set_category_stall_threshold(
+        TaskCategory::Monitor,
+        PeerDiscoveryCenter::intelligence::task_scheduler::CATEGORY_STALL_FALLBACK_SECS,
+    );
     // 调度器引用注入 metrics（19号 D4：/metrics 调度器指标导出）
     PeerDiscoveryCenter::data_plane::metrics::set_scheduler(task_scheduler.clone());
 

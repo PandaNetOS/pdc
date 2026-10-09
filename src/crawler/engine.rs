@@ -254,6 +254,140 @@ fn pending_shard(tid: &[u8]) -> usize {
 /// paced 发送队列容量（19号 D3）：兜底轮次突发的缓冲深度
 const PACED_QUEUE_CAPACITY: usize = 8192;
 
+/// 零响应熔断参数（2026-10-09 新增，回应生产事故）。
+///
+/// 全部为**协议级安全常量**，非业务可调参数：熔断是止损手段，取值偏保守
+/// （宁可多空转几轮，也不误杀正常爬取）。
+mod zero_response_circuit {
+    /// 连续多少轮「有发送但零响应」后熔断。
+    /// 取 3：active_crawl 默认轮周期 40s，约 2 分钟内止损；
+    /// 再短会把「网络抖动导致的单轮零响应」误判为故障。
+    pub const TRIGGER_ROUNDS: u32 = 3;
+    /// 熔断后的冷却时长（秒），到期后放行一轮「探测」。
+    pub const COOLDOWN_SECS: u64 = 120;
+    /// 探测轮成功（收到任意响应）后，连续多少轮健康才完全解除熔断。
+    pub const RECOVER_ROUNDS: u32 = 2;
+    /// 单轮「有发送」的最低阈值：低于此值不算「零响应」（样本不足，勿误判）。
+    pub const MIN_SENT_FOR_JUDGEMENT: u64 = 10;
+}
+
+/// 零响应熔断状态机。
+///
+/// 语义：`Idle`（未熔断）→ 连续 [`TRIGGER_ROUNDS`](zero_response_circuit::TRIGGER_ROUNDS)
+/// 轮零响应 → `Tripped`（停止主动外发）→ 冷却 [`COOLDOWN_SECS`](zero_response_circuit::COOLDOWN_SECS)
+/// → `HalfOpen`（放行一轮探测）→ 探测有响应则计数，够
+/// [`RECOVER_ROUNDS`](zero_response_circuit::RECOVER_ROUNDS) 轮完全恢复；
+/// 探测仍零响应则回到 `Tripped` 并再计一次冷却。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitState {
+    /// 正常放行
+    Idle,
+    /// 已熔断：冷却中，主动外发一律跳过
+    Tripped,
+    /// 冷却到期：放行一轮探测
+    HalfOpen,
+}
+
+/// 零响应熔断状态（Mutex 保护，与 `round_feedback` 同层）。
+#[derive(Debug)]
+struct ZeroResponseCircuit {
+    state: CircuitState,
+    /// 连续零响应轮数
+    zero_rounds: u32,
+    /// 连续健康轮数（仅 HalfOpen 探测时累加）
+    healthy_rounds: u32,
+    /// 熔断/冷却起始时刻
+    tripped_at: Option<Instant>,
+    /// 累计熔断次数（观测用）
+    trip_count: u64,
+}
+
+impl Default for ZeroResponseCircuit {
+    fn default() -> Self {
+        Self {
+            state: CircuitState::Idle,
+            zero_rounds: 0,
+            healthy_rounds: 0,
+            tripped_at: None,
+            trip_count: 0,
+        }
+    }
+}
+
+impl ZeroResponseCircuit {
+    /// 喂入一轮观测结果，判定是否熔断；返回熔断后的新状态。
+    fn observe(&mut self, sent: u64, responded: u64) -> CircuitState {
+        use zero_response_circuit as zrc;
+        // 样本不足不判定（避免低流量时误熔）
+        if sent < zrc::MIN_SENT_FOR_JUDGEMENT {
+            return self.state;
+        }
+        let got_response = responded > 0;
+        match self.state {
+            CircuitState::Idle => {
+                if got_response {
+                    self.zero_rounds = 0;
+                } else {
+                    self.zero_rounds += 1;
+                    if self.zero_rounds >= zrc::TRIGGER_ROUNDS {
+                        self.state = CircuitState::Tripped;
+                        self.tripped_at = Some(Instant::now());
+                        self.trip_count += 1;
+                        self.healthy_rounds = 0;
+                    }
+                }
+            }
+            CircuitState::Tripped => {
+                // 冷却未到，继续熔断
+                let cooled = self
+                    .tripped_at
+                    .map(|t| t.elapsed().as_secs() >= zrc::COOLDOWN_SECS)
+                    .unwrap_or(true);
+                if cooled {
+                    // 进入半开。**迁移轮的响应数据同样计入 healthy**：冷却期间
+                    // 仍在发探测包，这些包的响应是有效证据。若丢弃它，恢复会
+                    // 多等一轮（RECOVER_ROUNDS），平白拉长不可观测窗口。
+                    self.state = CircuitState::HalfOpen;
+                    self.healthy_rounds = 0;
+                    if got_response {
+                        self.healthy_rounds = 1;
+                        if self.healthy_rounds >= zrc::RECOVER_ROUNDS {
+                            self.state = CircuitState::Idle;
+                            self.zero_rounds = 0;
+                            self.healthy_rounds = 0;
+                            self.tripped_at = None;
+                        }
+                    }
+                }
+            }
+            CircuitState::HalfOpen => {
+                if got_response {
+                    self.healthy_rounds += 1;
+                    if self.healthy_rounds >= zrc::RECOVER_ROUNDS {
+                        // 完全恢复
+                        self.state = CircuitState::Idle;
+                        self.zero_rounds = 0;
+                        self.healthy_rounds = 0;
+                        self.tripped_at = None;
+                    }
+                } else {
+                    // 探测仍零响应 → 重新熔断并再计一次冷却
+                    self.state = CircuitState::Tripped;
+                    self.tripped_at = Some(Instant::now());
+                    self.trip_count += 1;
+                    self.healthy_rounds = 0;
+                }
+            }
+        }
+        self.state
+    }
+
+    /// 当前是否应**跳过**主动外发。
+    fn should_skip_send(&self) -> bool {
+        self.state == CircuitState::Tripped
+    }
+}
+
 /// 爬虫引擎
 ///
 /// 主动 + 被动混合 DHT 爬虫。
@@ -300,6 +434,16 @@ pub struct CrawlerEngine {
     buffer_pool: Arc<CrawlerBufferPool>,
     /// 预热是否完成（完成前不触发全量爬行）
     warmup_done: Arc<AtomicBool>,
+    /// 零响应熔断状态（2026-10-09 新增）：连续 N 轮「有发送但零响应」后置位，
+    /// 暂停主动外发，直到冷却到期或探测恢复。
+    ///
+    /// 背景（2026-10-09 生产实证）：三级响应率`L0 0/82 L1 0/903 探索 0/409`
+    /// 全零的条件下，「链式直接采集」仍每8 秒发20轮 get_peers 空包且**无成功率
+    /// 熔断**——纯烧 socket 与带宽、零产出。更糟的是这些空包仍走pending 登记
+    /// 与超时清理，写侧持续产出待落盘数据，把 Persistence 分类的唯一槽位压死，
+    /// 间接引发全局停摆（详见 task_scheduler.rs 卡死保底注释）。
+    /// 熔断让「无效外发」在源头停下，而不是在下游靠槽位抢救。
+    zero_response_circuit: Arc<Mutex<ZeroResponseCircuit>>,
     /// 消息处理并发限制（避免多 recv_loop 同时阻塞 worker 线程导致 API 饥饿）
     message_semaphore: Arc<tokio::sync::Semaphore>,
     /// 每 socket 累计发送数（用于计算 PPS，无锁原子计数，Arc 共享）
@@ -374,6 +518,7 @@ impl CrawlerEngine {
             adaptive_controller: None,
             buffer_pool: Arc::new(CrawlerBufferPool::new(16)),
             warmup_done: Arc::new(AtomicBool::new(false)),
+            zero_response_circuit: Arc::new(Mutex::new(ZeroResponseCircuit::default())),
             message_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             socket_send_total: Arc::new((0..16).map(|_| AtomicU64::new(0)).collect()),
             socket_recv_total: Arc::new((0..16).map(|_| AtomicU64::new(0)).collect()),
@@ -1868,7 +2013,10 @@ impl CrawlerEngine {
         // 响应到达延迟可达 ~2 分钟（数倍于 40s 轮周期），此前「只 drain 上一轮账目一次」
         // 使 >40s 才到达的认领永远不会进入控制器输入（限速器 70% vs 控制器 11% 的背离根因）。
         // 现在每轮聚合全部账目的自上次上报以来增量：响应无论多晚到达都会恰好计入一次。
-        if let Some(ac) = &self.adaptive_controller {
+        //
+        // 2026-10-09：零响应熔断的观测点放在这里（**不放在
+        // `if let Some(ac)` 内**）——熔断是止损兜底，不能依赖自适应控制器是否启用。
+        {
             let avg_latency = self.current_latency_ema_ms();
             let (responded, timed_out, layer_sent, layer_resp) =
                 self.drain_all_round_feedback_delta();
@@ -1886,15 +2034,44 @@ impl CrawlerEngine {
                 layer_resp[2],
                 layer_sent[2]
             );
-            ac.report_round_result(
-                sent,
-                responded,
-                avg_latency,
-                pending_before,
-                pending_after,
-                0,
-                1.0,
-            );
+            // 熔断状态机推进（幂等：连续零响应达阈值 → Tripped）
+            let prev_state = {
+                let mut circuit = self.zero_response_circuit.lock().unwrap();
+                let prev = circuit.state;
+                circuit.observe(sent, responded);
+                if circuit.state != prev {
+                    if circuit.state == CircuitState::Tripped {
+                        warn!(
+                            "[crawler] 零响应熔断触发：连续 {}/{} 轮有发送但零响应（累计熔断 {} 次），\
+                             暂停主动外发 {}s 后放行一轮探测",
+                            circuit.zero_rounds,
+                            zero_response_circuit::TRIGGER_ROUNDS,
+                            circuit.trip_count,
+                            zero_response_circuit::COOLDOWN_SECS
+                        );
+                    } else {
+                        info!(
+                            "[crawler] 零响应熔断恢复：探测收到响应（健康 {}/{} 轮），状态 {:?}",
+                            circuit.healthy_rounds,
+                            zero_response_circuit::RECOVER_ROUNDS,
+                            circuit.state
+                        );
+                    }
+                }
+                circuit.state
+            };
+            let _ = prev_state;
+            if let Some(ac) = &self.adaptive_controller {
+                ac.report_round_result(
+                    sent,
+                    responded,
+                    avg_latency,
+                    pending_before,
+                    pending_after,
+                    0,
+                    1.0,
+                );
+            }
         }
 
         {
@@ -2297,6 +2474,22 @@ impl CrawlerEngine {
             ihs
         };
         if infohashes.is_empty() {
+            return;
+        }
+        // 2026-10-09 零响应熔断：连续多轮「有发送零响应」时停止链式直接采集。
+        //
+        // 生产实证（.52，2026-10-09 02:48~00:49）：三级响应率全零
+        // （L0 0/82L1 0/903 探索 0/409）时，此处仍每 8 秒发 20 轮 get_peers 空包，
+        // 累计 1001→1121 轮无一成功。空包并非「无害」：它们照样进pending 登记、
+        // 照样等超时清理，写侧持续产出待落盘记录，把 Persistence 唯一槽位压死，
+        // 最终引发全局停摆。止损要发生在**源头**，而不是在下游靠槽位抢救。
+        if self
+            .zero_response_circuit
+            .lock()
+            .unwrap()
+            .should_skip_send()
+        {
+            debug!("[crawler] 链式直接采集：零响应熔断中，跳过本轮 get_peers 外发");
             return;
         }
         for node in new_nodes.iter().take(MAX_CHAIN_GET_PEERS) {
@@ -3462,6 +3655,10 @@ impl CrawlerEngine {
             adaptive_controller: self.adaptive_controller.clone(),
             buffer_pool: self.buffer_pool.clone(),
             warmup_done: self.warmup_done.clone(),
+            // 熔断状态必须共享：否则各 async 克隆体各持一份独立状态，
+            // 熔断判定会被稀释（每份都只看到自己那几轮的观测），
+            // 退化成"几乎永不熔断"——正是要根治的失败模式。
+            zero_response_circuit: self.zero_response_circuit.clone(),
             message_semaphore: self.message_semaphore.clone(),
             socket_send_total: self.socket_send_total.clone(),
             socket_recv_total: self.socket_recv_total.clone(),
@@ -3481,6 +3678,96 @@ impl CrawlerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // 2026-10-09 零响应熔断（回归 .52 生产事故：三级响应率全零时空转 2.5h）
+    // -----------------------------------------------------------------------
+
+    /// 正常有响应时永不熔断。
+    #[test]
+    fn test_circuit_stays_idle_with_responses() {
+        let mut c = ZeroResponseCircuit::default();
+        for _ in 0..50 {
+            assert_eq!(c.observe(100, 5), CircuitState::Idle);
+        }
+        assert!(!c.should_skip_send());
+        assert_eq!(c.trip_count, 0);
+    }
+
+    /// 核心回归：连续零响应达阈值必须熔断并停止外发。
+    #[test]
+    fn test_circuit_trips_on_sustained_zero_response() {
+        let mut c = ZeroResponseCircuit::default();
+        for i in 0..zero_response_circuit::TRIGGER_ROUNDS - 1 {
+            assert_eq!(
+                c.observe(100, 0),
+                CircuitState::Idle,
+                "第 {} 轮不应过早熔断",
+                i + 1
+            );
+            assert!(!c.should_skip_send());
+        }
+        assert_eq!(c.observe(100, 0), CircuitState::Tripped);
+        assert!(
+            c.should_skip_send(),
+            "熔断后必须停止主动外发，否则空包持续压死持久化槽位"
+        );
+        assert_eq!(c.trip_count, 1);
+    }
+
+    /// 低流量不判定：样本不足时不得熔断（避免误杀正常低频爬取）。
+    #[test]
+    fn test_circuit_ignores_low_sample() {
+        let mut c = ZeroResponseCircuit::default();
+        for _ in 0..20 {
+            assert_eq!(
+                c.observe(zero_response_circuit::MIN_SENT_FOR_JUDGEMENT - 1, 0),
+                CircuitState::Idle
+            );
+        }
+        assert!(!c.should_skip_send());
+    }
+
+    /// 冷却 → 半开 → 探测成功 → 完全恢复的完整路径。
+    #[test]
+    fn test_circuit_recovers_after_cooldown_and_probe() {
+        let mut c = ZeroResponseCircuit::default();
+        for _ in 0..zero_response_circuit::TRIGGER_ROUNDS {
+            c.observe(100, 0);
+        }
+        assert_eq!(c.state, CircuitState::Tripped);
+
+        // 冷却未到 ⇒ 仍熔断
+        assert_eq!(c.observe(100, 0), CircuitState::Tripped);
+
+        // 模拟冷却已过（回拨 tripped_at）
+        c.tripped_at =
+            Some(Instant::now() - Duration::from_secs(zero_response_circuit::COOLDOWN_SECS + 1));
+        // 迁移轮（Tripped → HalfOpen）的响应计入 healthy=1；
+        // 半开再成功一轮⇒ 攒满 RECOVER_ROUNDS ⇒ 完全恢复。
+        assert_eq!(c.observe(100, 3), CircuitState::HalfOpen);
+        assert!(!c.should_skip_send(), "半开应放行一轮探测，否则无法恢复");
+        assert_eq!(c.observe(100, 3), CircuitState::Idle);
+        assert!(!c.should_skip_send());
+        assert_eq!(c.trip_count, 1, "恢复不得增加熔断次数");
+    }
+
+    /// 半开探测仍零响应 ⇒ 重新熔断（不得因为冷却到期就盲目放行）。
+    #[test]
+    fn test_circuit_retrips_on_failed_probe() {
+        let mut c = ZeroResponseCircuit::default();
+        for _ in 0..zero_response_circuit::TRIGGER_ROUNDS {
+            c.observe(100, 0);
+        }
+        c.tripped_at =
+            Some(Instant::now() - Duration::from_secs(zero_response_circuit::COOLDOWN_SECS + 1));
+        let _ = c.observe(100, 0);
+        assert_eq!(c.state, CircuitState::HalfOpen);
+        // 探测仍零响应
+        assert_eq!(c.observe(100, 0), CircuitState::Tripped);
+        assert!(c.should_skip_send());
+        assert_eq!(c.trip_count, 2, "应累计两次熔断");
+    }
 
     /// 分片均匀性（19号 D2）：pending_shard 按 tid[3]%16 路由，随机 tid 均匀落 16 片；
     /// socket_idx 编码在字节 0，不参与分片

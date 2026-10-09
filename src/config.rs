@@ -217,12 +217,17 @@ fn default_crawl_concurrency() -> u32 {
     8
 }
 
+/// 2026-10-09 根治：1 → 2。生产实证 Persistence 单槽被 `WAL checkpoint` /
+/// `WriteQueue 刷盘` / `WAL TRUNCATE` / `oplog 裁剪` 互相关联任务长期争抢
+/// （00:49 起持续 2.5 小时、50 次饥饿告警，oplog 3 小时仅增 919 行），
+/// 连带Monitor 类拿不到槽 → 面板 15s 超时。详见 `CategoryConcurrency::default`。
 fn default_persistence_concurrency() -> u32 {
-    1
+    2
 }
 
+/// 2026-10-09 根治：2 → 3。监控是故障可观测性的唯一来源，不应被写路径饿死。
 fn default_monitor_concurrency() -> u32 {
-    2
+    3
 }
 
 fn default_network_concurrency() -> u32 {
@@ -2124,8 +2129,10 @@ log_level: debug
         // 真正生效的并发度默认值（2026-10 fix7：crawl 4 → 8，缓解 Crawl 槽位被
         // bootstrap/cleanup 卡顿占满导致 active_crawl 轮周期被拖长）
         assert_eq!(c.task_scheduler.crawl_concurrency, 8);
-        assert_eq!(c.task_scheduler.persistence_concurrency, 1);
-        assert_eq!(c.task_scheduler.monitor_concurrency, 2);
+        // 2026-10-09 根治：persistence 1→2（写路径互相关联任务不再串行抢单槽）、
+        // monitor 2→3（监控是唯一可观测性来源，不容被饿死）。
+        assert_eq!(c.task_scheduler.persistence_concurrency, 2);
+        assert_eq!(c.task_scheduler.monitor_concurrency, 3);
         assert_eq!(c.task_scheduler.network_concurrency, 4);
     }
 
