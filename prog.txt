@@ -1,5 +1,0 @@
-14:39:05 52: done=77/3126 dir=recv
-14:39:20 52: done=77/3126 dir=recv
-14:39:35 52: done=77/3126 dir=recv
-14:39:50 52: done=77/3126 dir=recv
-14:40:05 52: done=77/3126 dir=recv

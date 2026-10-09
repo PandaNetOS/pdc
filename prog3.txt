@@ -1,4 +1,0 @@
-15:00:24 52: bs=running dir=recv done=77/3126
-15:00:44 52: bs=running dir=recv done=89/3126
-15:01:04 52: bs=running dir=recv done=89/3126
-15:01:24 52: bs=running dir=recv done=89/3126

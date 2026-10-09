@@ -1,3 +1,0 @@
-52: avail=4 starved=0 longA=0 longW=218 press=0.0 bs=0 inF=0
-53: avail=7 starved=0 longA=0 press=0.0 bs=0 inF=0
-WAL52: 198287392 10/08/2026 13:31:00

@@ -1,6 +1,0 @@
-15:21:40 52: longAct=4 total=8 avail=4 waits=0 bs=idle dir= done=0/0
-15:21:40 53: longAct=1 total=8 avail=7
-15:22:05 52: longAct=5 total=8 avail=3 waits=0 bs=idle dir= done=0/0
-15:22:05 53: longAct=3 total=8 avail=5
-15:22:30 52: longAct=9 total=8 avail=0 waits=292 bs=idle dir= done=0/0
-15:22:30 53: longAct=7 total=8 avail=1

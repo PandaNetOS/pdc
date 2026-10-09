@@ -1,6 +1,0 @@
-total=166
-08:46:52.727790Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=3/8, persistence=0/1, monitor=1/2, network=0/4, federation=0/8, tracker=0/2], 在飞=4（准入647 − 释放643 − 回收0）, 最老在飞=爬虫主动sample_infohashes(Crawl 7s)
-08:47:22.826702Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=4/8, persistence=1/1, monitor=2/2, network=3/4, federation=1/8, tracker=0/2], 在飞=11（准入685 − 释放674 − 回收0）, 最老在飞=爬虫主动sample_infohashes(Crawl 37s)
-08:47:52.917899Z  INFO [task_scheduler] 调度器心跳: 队列待执行=39, 运行中[crawl=6/8, persistence=1/1, monitor=4/2, network=3/4, federation=1/8, tracker=0/2], 在飞=15（准入709 − 释放694 − 回收0）, 最老在飞=爬虫主动sample_infohashes(Crawl 67s)
-08:48:22.919618Z  INFO [task_scheduler] 调度器心跳: 队列待执行=38, 运行中[crawl=7/8, persistence=1/1, monitor=4/2, network=3/4, federation=1/8, tracker=0/2], 在飞=16（准入730 − 释放714 − 回收0）, 最老在飞=爬虫主动sample_infohashes(Crawl 98s)
-08:48:53.031261Z  INFO [task_scheduler] 调度器心跳: 队列待执行=38, 运行中[crawl=7/8, persistence=1/1, monitor=4/2, network=3/4, federation=1/8, tracker=0/2], 在飞=16（准入752 − 释放736 − 回收0）, 最老在飞=爬虫主动sample_infohashes(Crawl 128s)

@@ -1,3 +1,0 @@
-chunk_digests total rows: 0
-counts (nodes, trackers, ih): (6039520, 439, 438801)
-peer counts (peers, archive): (73347, 0)
