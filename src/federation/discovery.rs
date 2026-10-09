@@ -639,6 +639,52 @@ impl DiscoveryService {
         }
     }
 
+    /// 把本节点的公网 + 局域网地址写入 PeerCache（同LAN 兜底通道）。
+    ///
+    /// 2026-10-09：生产观测 `connections=0` 持续 40+ 分钟，根因链是
+    /// `seed_nodes` 为空 → MQTT 全部 broker 超时 + DHT 魔法 infohash 在公网
+    /// 找不到其他 PDC + LPD 组播常被路由器屏蔽 → node_table 无候选 → 无连接。
+    /// 这属于网络现实，但原实现缺兜底：PeerCache 只同步**已连接**节点，
+    /// 连接数为 0 时缓存恒空，即便同LAN 内另有节点在跑也无法互认。
+    ///
+    /// 本方法让本机地址进入同一个 `data/federation_peers.json`，同网节点
+    /// 启动时 `PeerCache::load` 即可读到，零外部依赖、不依赖组播可达。
+    pub fn publish_local_addresses_to_cache(&self) {
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        if let Some(public) = *self.public_addr.read() {
+            addrs.push(public);
+        }
+        // 用 UDP connect 探测出口 LAN 地址（不发送数据）
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect("8.8.8.8:80").is_ok() {
+                if let Ok(local) = socket.local_addr() {
+                    let lan = SocketAddr::new(local.ip(), self.config.listen_port);
+                    if !addrs.contains(&lan) {
+                        addrs.push(lan);
+                    }
+                }
+            }
+        }
+        if addrs.is_empty() {
+            return;
+        }
+        let mut cache = self.peer_cache.write();
+        for a in &addrs {
+            // success=false：这是「我宣布的地址」而非「验证过的对端」，
+            // 不应抬高 best_addr 的优先级。
+            cache.upsert(&self.identity.node_id.0, &a.to_string(), false);
+        }
+        drop(cache);
+        if let Err(e) = self.peer_cache.read().save(&self.data_dir) {
+            warn!("[federation] 本地地址发布到节点缓存失败: {}", e);
+        } else {
+            debug!(
+                "[federation] 本地地址已发布到节点缓存: {:?}（供同 LAN 节点互认）",
+                addrs
+            );
+        }
+    }
+
     /// 将 NodeTable 中已连接节点的状态同步到缓存
     ///
     /// 遍历所有 Connected 状态的节点，更新其 success_count 和 last_seen，
@@ -677,6 +723,27 @@ impl DiscoveryService {
         let connected = self.node_table.connected_count();
         if connected >= self.config.target_neighbors {
             return;
+        }
+
+        // 2026-10-09：补链失败此前全部沉在 debug 级，生产日志一条都看不到
+        // （`target_neighbors` 只在启动日志里打印过一次）。联邦层因此长期是
+        // 黑盒：运维只能从 /federation/status 的 connections=0 反推，
+        // 无法区分「没有候选节点」与「候选连不上」。这里提到 warn 并区分成因。
+        if self.config.seed_nodes.is_empty() && self.node_table.is_empty() {
+            warn!(
+                "[federation] 补链未达标 {}/{}：seed_nodes 为空且 node_table 无候选。\
+                 零配置模式依赖 LPD 多播 + DHT 魔法 infohash + MQTT Rendezvous，\
+                 三者皆不可用时联邦必然 0连接（非代码缺陷）",
+                connected, self.config.target_neighbors
+            );
+        } else if connected < self.config.target_neighbors {
+            warn!(
+                "[federation] 补链未达标 {}/{}：seed_nodes={} 个，node_table 候选 {} 个",
+                connected,
+                self.config.target_neighbors,
+                self.config.seed_nodes.len(),
+                self.node_table.len()
+            );
         }
 
         let need = self.config.target_neighbors - connected;

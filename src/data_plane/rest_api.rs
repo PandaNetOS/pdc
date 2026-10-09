@@ -444,7 +444,8 @@ async fn health_handler(State(state): State<AppState>) -> Response {
         cached_peers: cache_stats.1,
         super_tracker_infohashes: state.super_tracker.infohash_count(),
         super_tracker_peers: state.super_tracker.peer_count(),
-        uptime_seconds: 0,
+        // 2026-10-09：原为字面量 0，恒返回 0。改用进程级锚点。
+        uptime_seconds: crate::uptime_secs(),
         system_health,
     };
 

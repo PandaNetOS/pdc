@@ -498,8 +498,18 @@ impl TrackerDiscoverer {
 
         for tracker_url in active_trackers
             .iter()
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
             .take(self.config.max_concurrent_requests)
         {
+            // 2026-10-09：原实现先 `.take(max_concurrent_requests=10)` 覆盖
+            // **全部**协议，再在循环里对非 http/https `continue`。
+            // 而 `active_trackers_sorted()` 按score 降序，前 10 名常被 UDP 占满
+            // （440 个 tracker 中 udp=212 / http=222），于是 scrape 恒同步返回空——
+            // 实测「阶段1→阶段3」间隔仅 87 微秒、全天 `scrape 完成` 日志 0 次，
+            // 整个评分筛选层从未生效，announce 退化为按 score 盲选。
+            //
+            // 修复：先按协议过滤再 take，确保取到的 10 个都是真正支持 scrape 的。
+            // UDP tracker 的 scrape 见udp.rs::scrape（BEP 48 action=2）。
             if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
                 continue;
             }

@@ -3069,6 +3069,37 @@ impl Storage {
         Ok(())
     }
 
+    /// 批量写入实体行数统计：**单锁 + 单事务**完成，不再逐条加锁提交。
+    ///
+    /// 2026-10-09 卡死事故根因修复。`db_entity_stats_refresh`（Monitor 分类）
+    /// 原实现对 5 个实体表逐个调 [`Self::record_stats`] + [`Self::update_aggregate`]，
+    /// 而这两个方法各自 `self.conn.lock()` 抢**全库唯一写连接**
+    /// （`conn: Arc<Mutex<Connection>>`，db.rs 中共 35 处 `self.conn.lock()`），
+    /// 即单轮 10 次抢锁 + 10 次独立事务提交。在统计高频写入叠加 WAL 压力下，
+    /// 写锁竞争雪崩：34 类后台任务全部被 watchdog 判定「槽位泄漏」强制回收
+    /// （旧进程 52 次、新进程 27 次），API 读路径随之饿死——
+    /// `/health`、`/federation/status`、`/io/status` 三端点同时无响应。
+    ///
+    /// 本方法一次加锁、一个事务写完 10 条，锁持有时间从「10×提交」降到「1×提交」，
+    /// 与既有的 `*_in_tx` 变体设计一致（同批WriteQueue/IOScheduler 闭包也是单事务）。
+    pub fn record_entity_stats_batch(&self, entries: &[(&str, f64)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.record_write("stats", entries.len() as u64 * 2);
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        for (name, value) in entries {
+            if *value < 0.0 {
+                continue;
+            }
+            Self::record_stats_in_tx(&tx, name, *value)?;
+            Self::update_aggregate_in_tx(&tx, name, *value)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 加载累计统计
     pub fn load_aggregate(&self, metric: &str) -> Option<f64> {
         // P1：闭包返回 Result；read_long 超时/池饥饿时降级为 None（视为无该统计）。

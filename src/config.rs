@@ -1257,6 +1257,9 @@ pub struct DiscoverersConfig {
     /// 单次发现超时（秒）
     #[serde(default = "default_discovery_timeout")]
     pub discovery_timeout_secs: u64,
+    /// Tracker scrape 单次超时（秒，tracker_fetcher 阶段1 用）
+    #[serde(default = "default_tracker_scrape_timeout_secs")]
+    pub tracker_scrape_timeout_secs: u64,
     /// 最大并发发现器数
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
@@ -1283,6 +1286,9 @@ pub struct DiscoverersConfig {
 fn default_discovery_timeout() -> u64 {
     30
 }
+fn default_tracker_scrape_timeout_secs() -> u64 {
+    30
+}
 fn default_max_concurrent() -> usize {
     10
 }
@@ -1305,6 +1311,7 @@ impl Default for DiscoverersConfig {
             enable_lpd: true,
             enable_webseed: true,
             discovery_timeout_secs: default_discovery_timeout(),
+            tracker_scrape_timeout_secs: default_tracker_scrape_timeout_secs(),
             max_concurrent: default_max_concurrent(),
             custom_trackers: vec![],
             enable_remote_tracker: default_true(),

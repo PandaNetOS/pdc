@@ -19,6 +19,7 @@ discoverers:
   enable_lpd: false
   enable_webseed: false
   discovery_timeout_secs: 30
+  tracker_scrape_timeout_secs: 30
   max_concurrent: 10
   custom_trackers: []
   enable_remote_tracker: true

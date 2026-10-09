@@ -60,6 +60,20 @@
 
 #![allow(non_snake_case)]
 
+/// 进程启动时刻锚点（跨模块共享）。
+///
+/// 2026-10-09：`/health` 的 `uptime_seconds` 恒为 0 —— `rest_api.rs` 里是
+/// 字面量 `uptime_seconds: 0`，全仓无任何赋值来源；而federation 的
+/// `uptime_secs` 正常递增，因为联邦服务有 `self.started_at`，全局缺这个锚点。
+/// rustc ≥ 1.80 稳定；本仓 edition 2021 + rustc 1.98 可用。
+pub static STARTED_AT: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// 当前进程已运行秒数（供 health 等对外可观测字段使用）。
+pub fn uptime_secs() -> u64 {
+    STARTED_AT.elapsed().as_secs()
+}
+
 pub mod aggregator;
 pub mod config;
 pub mod control_plane;

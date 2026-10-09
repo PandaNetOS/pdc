@@ -260,9 +260,13 @@ const PACED_QUEUE_CAPACITY: usize = 8192;
 /// （宁可多空转几轮，也不误杀正常爬取）。
 mod zero_response_circuit {
     /// 连续多少轮「有发送但零响应」后熔断。
-    /// 取 3：active_crawl 默认轮周期 40s，约 2 分钟内止损；
-    /// 再短会把「网络抖动导致的单轮零响应」误判为故障。
-    pub const TRIGGER_ROUNDS: u32 = 3;
+    /// 取 5：active_crawl 默认轮周期 40s，5 轮 ≈ 3.3 分钟才止损。
+    ///
+    /// 2026-10-09 实测修正（原 3）：3 轮仅约 2 分钟，而 DHT 单轮抖动很常见，
+    /// 生产观测 25 分钟内熔断 5 次、每轮都打断有效探测；但熔断机制本身是
+    /// 有效的（恢复后 L1 响应率可从 0 回升到 28），敏感的是阈值而非逻辑。
+    /// 取 5 仍能在「持续约 3 分钟完全无响应」时止损，且能容忍单轮抖动。
+    pub const TRIGGER_ROUNDS: u32 = 5;
     /// 熔断后的冷却时长（秒），到期后放行一轮「探测」。
     pub const COOLDOWN_SECS: u64 = 120;
     /// 探测轮成功（收到任意响应）后，连续多少轮健康才完全解除熔断。
@@ -2038,6 +2042,10 @@ impl CrawlerEngine {
             let prev_state = {
                 let mut circuit = self.zero_response_circuit.lock().unwrap();
                 let prev = circuit.state;
+                // 2026-10-09：observe() 在healthy_rounds 达标时会**立即清零**，
+                // 所以恢复日志若在 observe() 之后读该字段，永远打印「0/2」——
+                // 运维会误判「熔断失效」并去调参。先取 observe 前的快照。
+                let prev_healthy = circuit.healthy_rounds;
                 circuit.observe(sent, responded);
                 if circuit.state != prev {
                     if circuit.state == CircuitState::Tripped {
@@ -2050,9 +2058,15 @@ impl CrawlerEngine {
                             zero_response_circuit::COOLDOWN_SECS
                         );
                     } else {
+                        // 半开 → 空闲这一跃迁等价于「刚好攒满 RECOVER_ROUNDS 轮」。
+                        let shown_healthy = if prev == CircuitState::HalfOpen {
+                            zero_response_circuit::RECOVER_ROUNDS
+                        } else {
+                            prev_healthy
+                        };
                         info!(
                             "[crawler] 零响应熔断恢复：探测收到响应（健康 {}/{} 轮），状态 {:?}",
-                            circuit.healthy_rounds,
+                            shown_healthy,
                             zero_response_circuit::RECOVER_ROUNDS,
                             circuit.state
                         );
@@ -3767,6 +3781,43 @@ mod tests {
         assert_eq!(c.observe(100, 0), CircuitState::Tripped);
         assert!(c.should_skip_send());
         assert_eq!(c.trip_count, 2, "应累计两次熔断");
+    }
+
+    /// 回归（2026-10-09）：熔断恢复日志必须显示真实攒满的健康轮数。
+    ///
+    /// 缺陷背景：`healthy_rounds` 在 `observe()` 内达标时会被**立即清零**，
+    /// 而恢复日志在其后读取，于是永远打印「健康 0/2 轮，状态 Idle」，
+    /// 运维据此会误判「熔断形同虚设」并去调参。修复后半开→空闲的跃迁
+    /// 应显示 RECOVER_ROUNDS。
+    #[test]
+    fn test_recovery_log_reports_full_healthy_rounds() {
+        let mut c = ZeroResponseCircuit::default();
+        for _ in 0..zero_response_circuit::TRIGGER_ROUNDS {
+            c.observe(100, 0);
+        }
+        assert_eq!(c.state, CircuitState::Tripped);
+        c.tripped_at =
+            Some(Instant::now() - Duration::from_secs(zero_response_circuit::COOLDOWN_SECS + 1));
+
+        // 半开首轮：healthy_rounds=1，仍是 HalfOpen
+        let prev = c.state;
+        let prev_healthy = c.healthy_rounds;
+        assert_eq!(c.observe(100, 3), CircuitState::HalfOpen);
+        assert_eq!(prev, CircuitState::Tripped);
+        assert_eq!(prev_healthy, 0, "迁移轮前 healthy 应为 0");
+
+        // 半开次轮：攒满 ⇒ Idle，但 healthy_rounds 已被 observe 清零
+        let prev = c.state;
+        let prev_healthy = c.healthy_rounds;
+        assert_eq!(c.observe(100, 3), CircuitState::Idle);
+        assert_eq!(prev, CircuitState::HalfOpen);
+        assert_eq!(prev_healthy, 1);
+        assert_eq!(
+            c.healthy_rounds, 0,
+            "observe() 达标后会清零，这正是原日志打印 0/2 的根因"
+        );
+        // 日志应展示 prev_healthy(1) + 本轮1 = RECOVER_ROUNDS，而非清零后的 0
+        assert_eq!(prev_healthy + 1, zero_response_circuit::RECOVER_ROUNDS);
     }
 
     /// 分片均匀性（19号 D2）：pending_shard 按 tid[3]%16 路由，随机 tid 均匀落 16 片；

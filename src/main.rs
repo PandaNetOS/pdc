@@ -854,6 +854,7 @@ async fn async_main(
         );
         let fetcher =
             PeerDiscoveryCenter::services::TrackerPeerFetcher::new(tracker_discoverer.clone())
+                .with_scrape_timeout_secs(config.discoverers.tracker_scrape_timeout_secs)
                 .with_peer_repo(peer_repo.clone())
                 .with_infohash_repo(infohash_repo.clone());
         let fetcher = Arc::new(fetcher);
@@ -1400,26 +1401,31 @@ async fn async_main(
                     // 本任务只读 O(1) 计数并落 stats_history/aggregate 指标，
                     // 不再周期全表 COUNT（旧实现慢盘下单轮 >300s 且持锁拖垮读路径）。
                     // 全量校准仅在启动时执行一次（见 main 3.5.1）。
+                    //
+                    // 2026-10-09：改用批量接口。原先对 5 个表逐个调record_stats +
+                    // update_aggregate，每个都独立抢全库唯一写连接并各自提交
+                    // （单轮 10 次抢锁），在高频统计写入下造成写锁竞争雪崩 ——
+                    // 34 类后台任务被 watchdog 判定槽位泄漏强制回收，API 端点全哑。
+                    // 现改为单锁 + 单事务（见 Storage::record_entity_stats_batch）。
                     match tokio::task::spawn_blocking(move || {
                         let c = storage.entity_counts_cached();
-                        let names = [
-                            "db_dht_nodes",
-                            "db_peers",
-                            "db_peers_archive",
-                            "db_infohashes",
-                            "db_trackers",
-                        ];
-                        for (name, v) in names.iter().zip(c.iter()) {
-                            if *v >= 0 {
-                                let _ = storage.record_stats(name, *v as f64);
-                                let _ = storage.update_aggregate(name, *v as f64);
-                            }
-                        }
+                        let entries: Vec<(&str, f64)> = [
+                            ("db_dht_nodes", c.first().copied().unwrap_or(-1)),
+                            ("db_peers", c.get(1).copied().unwrap_or(-1)),
+                            ("db_peers_archive", c.get(2).copied().unwrap_or(-1)),
+                            ("db_infohashes", c.get(3).copied().unwrap_or(-1)),
+                            ("db_trackers", c.get(4).copied().unwrap_or(-1)),
+                        ]
+                        .into_iter()
+                        .map(|(name, v)| (name, v as f64))
+                        .collect();
+                        storage.record_entity_stats_batch(&entries)
                     })
                     .await
                     {
-                        Ok(_) => debug!("[monitor] 实体统计校准完成"),
-                        Err(e) => warn!("[monitor] 实体统计校准失败: {}", e),
+                        Ok(Ok(())) => debug!("[monitor] 实体统计校准完成"),
+                        Ok(Err(e)) => warn!("[monitor] 实体统计校准失败: {}", e),
+                        Err(e) => warn!("[monitor] 实体统计校准 panic: {}", e),
                     }
                     Ok(())
                 }
@@ -2821,6 +2827,10 @@ async fn async_main(
             move || {
                 let d = disc_cache.clone();
                 async move {
+                    // 2026-10-09：先发布本地地址（同LAN 兜底通道，见
+                    // discovery::publish_local_addresses_to_cache），再保存缓存。
+                    // 原顺序下 PeerCache 只含已连接节点，connections=0 时恒空。
+                    d.publish_local_addresses_to_cache();
                     d.peer_cache_save_tick().await;
                     Ok(())
                 }

@@ -107,6 +107,8 @@ pub struct TrackerPeerFetcher {
     _interval_secs: u64,
     infohashes_per_round: usize,
     peers_per_infohash: usize,
+    /// scrape 单次超时（秒，防单 tracker 挂住整轮）
+    scrape_timeout_secs: u64,
     /// infohash 查询统计（自适应加权用）
     query_stats: Arc<RwLock<HashMap<Infohash, InfohashQueryStats>>>,
     /// scrape 轮换偏移量
@@ -126,6 +128,7 @@ impl TrackerPeerFetcher {
             _interval_secs: 60,
             infohashes_per_round: 20,
             peers_per_infohash: 50,
+            scrape_timeout_secs: 30,
             query_stats: Arc::new(RwLock::new(HashMap::new())),
             scrape_offset: Arc::new(AtomicUsize::new(0)),
             total_rounds: Arc::new(AtomicU64::new(0)),
@@ -159,6 +162,12 @@ impl TrackerPeerFetcher {
             registered
         );
         self.infohash_repo = Some(repo);
+        self
+    }
+
+    /// 设置 scrape 单次超时（秒），由配置注入
+    pub fn with_scrape_timeout_secs(mut self, secs: u64) -> Self {
+        self.scrape_timeout_secs = secs;
         self
     }
 
@@ -323,7 +332,24 @@ impl TrackerPeerFetcher {
             top_pool.len()
         );
 
-        let scrape_results = self.discoverer.scrape(&scrape_ihs).await;
+        // 2026-10-09：原来 scrape 无超时保护。单个 tracker 挂住会让整轮任务
+        // 无限期占用 Network 槽位（原「执行超过 120s」即由此而来）。
+        // 超时上限（默认 30s，可经 config.discoverers.tracker_scrape_timeout_secs 调整）
+        // + 降级为 top_pool score 排序——现有代码在空 Vec 时已自动
+        // 走该分支（见下方 ranked 的 `if scrape_results.is_empty()`），无额外改动。
+        let scrape_timeout_secs = self.scrape_timeout_secs;
+        let scrape_results = tokio::time::timeout(
+            std::time::Duration::from_secs(scrape_timeout_secs),
+            self.discoverer.scrape(&scrape_ihs),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            warn!(
+                "[tracker_fetcher] scrape 超时 {}s，本轮降级为 top_pool score 排序",
+                scrape_timeout_secs
+            );
+            Vec::new()
+        });
         if !scrape_results.is_empty() {
             info!(
                 "[tracker_fetcher] scrape 完成: {} 个 infohash 有统计",
@@ -366,19 +392,41 @@ impl TrackerPeerFetcher {
         let mut total_peers = 0;
         let mut total_added = 0;
 
-        for ih in &announce_ihs {
-            let peers_count = match self
-                .discoverer
-                .discover_peers(ih, self.peers_per_infohash)
+        // 2026-10-09：原为 `for` 串行，20 个 ih × ~15s = 300s，稳定撞上
+        // main.rs 的 120s 兜底 → 每轮中止时已完成的那10 个 ih 进度**全部丢弃**，
+        // 下一轮又从同一批 ih 重来（日志可见 c84b227d / 26b8be70 / 1235d8b8
+        // 各出现 2 次，首轮分别已拿到 25 / 50 / 23 个 peer 却白跑）。
+        //
+        // 改为并发 4：20 个 ih 约 75s，留足 120s 余量，让兜底回归为真正的
+        // 异常保护而非常态触发。
+        //
+        // 安全性：`self` 字段全为 Arc/Atomic（RwLock 保护），peer_repo 以
+        // 引用传入，故 futures 无需 Clone，无独占冲突。
+        let fetched = {
+            use futures::stream::{self, StreamExt};
+            stream::iter(announce_ihs.iter().copied())
+                .map(|ih| {
+                    let discoverer = self.discoverer.clone();
+                    let per_ih = self.peers_per_infohash;
+                    async move {
+                        let res = discoverer.discover_peers(&ih, per_ih).await;
+                        (ih, res)
+                    }
+                })
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
                 .await
-            {
+        };
+
+        for (ih, res) in fetched {
+            let peers_count = match res {
                 Ok(peers) => {
                     let count = peers.len();
                     total_peers += count;
                     // 存入 PeerRepo（统一数据归口，DhtProbe 会定期从 PeerRepo 拉取探测）
                     if let Some(repo) = &self.peer_repo {
                         if !peers.is_empty() {
-                            repo.add_peers_sync(ih, &peers);
+                            repo.add_peers_sync(&ih, &peers);
                             total_added += count;
                         }
                     }
@@ -400,7 +448,7 @@ impl TrackerPeerFetcher {
             };
 
             // 阶段4：反馈更新
-            self.update_query_stats(ih, peers_count);
+            self.update_query_stats(&ih, peers_count);
         }
 
         // 更新统计
