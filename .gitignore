@@ -17,3 +17,7 @@ dht_routing_table.json
 # 调试截图
 *screenshot*.png
 *screenshot*.jpg
+
+# 根目录调试输出/脚本（防止再误提交）
+/*.txt
+/*.py
