@@ -848,7 +848,9 @@ mod tests {
         // create_dir_all 偶发失败（flaky）。加进程内自增序号即消除竞争。
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        // 测试临时根用 crate::test_tmp_dir()（构建目录 target/test-tmp）：本机安全策略
+        // 拒绝 target 构建目录进程写 %TEMP% 根与数据盘（PermissionDenied code 5）。
+        let dir = crate::test_tmp_dir().join(format!(
             "pdc_disc_test_{}_{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)

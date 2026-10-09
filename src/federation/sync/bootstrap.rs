@@ -35,12 +35,15 @@ use tracing::debug;
 use crate::storage::db::Storage;
 
 /// 支持 bootstrap 专用通道的协议版本（握手能力协商）。
-pub const BOOTSTRAP_PROTOCOL_VERSION: u32 = 6;
+/// v7：BootstrapChunkResponseMessage 增加 lz4 压缩载荷（compressed_payload）。
+pub const BOOTSTRAP_PROTOCOL_VERSION: u32 = 7;
 
 /// 单块默认行数（约 2 万行 × ~100 B ≈ 2 MB，远低于 `MAX_FRAME_SIZE`）。
-pub const DEFAULT_CHUNK_ROWS: u32 = 20_000;
+pub const DEFAULT_CHUNK_ROWS: u32 = 2_000;
 /// 默认服务端带宽预算（字节/秒）。0 = 不限流。
-pub const DEFAULT_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+/// preP36：8MB/s（=64Mbps）是 500Mbps 目标的直接天花板 —— 内网千兆链路下
+/// 把应答方限流提到 125MB/s（=1Gbps 满速），由令牌桶做软上限保护对端。
+pub const DEFAULT_RATE_BYTES_PER_SEC: u64 = 125 * 1024 * 1024;
 /// bootstrap 追尾后判定「已收敛」的 Δ 阈值（行）。
 pub const DEFAULT_TAIL_CONVERGE_DELTA: u64 = 10_000;
 
@@ -144,7 +147,7 @@ impl BootstrapProgress {
 }
 
 /// 清单中的单个块。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestChunk {
     /// 块序号（升序，与 `chunks` 下标一致）。
     pub index: u32,
@@ -159,7 +162,7 @@ pub struct ManifestChunk {
 }
 
 /// bootstrap 清单。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapManifest {
     /// 仓库类型。
     pub repo: u8,
@@ -354,30 +357,36 @@ impl Storage {
     }
 
     /// 读取某 (peer, repo) 的 bootstrap 进度与清单。
+    ///
+    /// P2（读写分离）：SELECT 改走短读池 `self.read`，不再拿 `self.conn` 写锁——
+    /// 此前每块应答/flush 都内联抢写锁读进度，写锁被 checkpoint 占住时整条 bootstrap
+    /// 链路停滞。反序列化在闭包内（conn 作用域内）完成。
     pub fn bootstrap_load(
         &self,
         peer: &[u8],
         repo: u8,
     ) -> anyhow::Result<Option<(BootstrapProgress, Option<BootstrapManifest>)>> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let row = conn.query_row(
-            "SELECT payload, manifest FROM bootstrap_state WHERE peer = ?1 AND repo = ?2",
-            params![peer, repo as i64],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
-        );
-        match row {
-            Ok((payload, mf)) => {
-                let progress: BootstrapProgress = serde_json::from_slice(&payload)?;
-                let manifest = match mf {
-                    Some(b) => Some(serde_json::from_slice(&b)?),
-                    None => None,
-                };
-                Ok(Some((progress, manifest)))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.read(
+            move |conn| -> anyhow::Result<Option<(BootstrapProgress, Option<BootstrapManifest>)>> {
+                let row = conn.query_row(
+                    "SELECT payload, manifest FROM bootstrap_state WHERE peer = ?1 AND repo = ?2",
+                    params![peer, repo as i64],
+                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
+                );
+                match row {
+                    Ok((payload, mf)) => {
+                        let progress: BootstrapProgress = serde_json::from_slice(&payload)?;
+                        let manifest = match mf {
+                            Some(b) => Some(serde_json::from_slice(&b)?),
+                            None => None,
+                        };
+                        Ok(Some((progress, manifest)))
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            },
+        )
     }
 
     /// 清除某 (peer, repo) 的 bootstrap 进度（完成或放弃时调用）。
@@ -392,29 +401,36 @@ impl Storage {
     }
 
     /// 列出所有 bootstrap 进度（重启后恢复用）。`payload` 内含 peer，调用方自行归属。
+    ///
+    /// P2（读写分离）：SELECT 改走短读池 `self.read`，不再拿 `self.conn` 写锁——
+    /// delta tick 内每轮调用，此前抢写锁读全部 bootstrap 状态（写锁被占时 tick 停滞）。
     pub fn bootstrap_list(&self) -> anyhow::Result<Vec<BootstrapProgress>> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT payload FROM bootstrap_state ORDER BY repo")?;
-        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for p in rows.flatten() {
-            if let Ok(progress) = serde_json::from_slice::<BootstrapProgress>(&p) {
-                out.push(progress);
+        self.read(move |conn| -> anyhow::Result<Vec<BootstrapProgress>> {
+            let mut stmt = conn.prepare("SELECT payload FROM bootstrap_state ORDER BY repo")?;
+            let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+            let mut out = Vec::new();
+            for p in rows.flatten() {
+                if let Ok(progress) = serde_json::from_slice::<BootstrapProgress>(&p) {
+                    out.push(progress);
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 }
 
-/// 全 repo 通用清单构建（流式分块，内存开销 O(chunk_rows)）。
+/// 全 repo 通用清单构建（P-B：块表优先，脏块惰性重算；首填/重建走全表扫描）。
 ///
-/// 逐块推进游标：每块取 `chunk_rows + 1` 行，多取的 1 行用作下一块的 `lo`（即本块 `hi`），
-/// 使 `[lo, hi)` 恰好覆盖 `chunk_rows` 行；末块的 `hi = None`（+∞）。
+/// 语义（与旧逐块实现等价）：按 key 升序把表切成每块恰好 `chunk_rows` 行的区间
+/// `[lo, hi)`，`hi` 为下一块首行 key；首块 `lo` 为空（-∞），末块 `hi` 为空（+∞）。
+///
+/// P-B（增量块摘要立项，替代 bootstrap 全表扫描）：清单构建优先读持久化块表
+/// `chunk_digests`——干净块零扫描直接复用 hash/rows；仅 dirty 块重扫区间
+/// `[lo, hi)` 重算并写回清 dirty。首填（旧库块表空）与 chunk_rows 变化时走
+/// 全表扫描（旧 O5 分批逻辑）并回填块表。清单构建从「每次全表扫（6.2M 行
+/// 38s~120s+，读池耗尽）」降为「只扫脏块区间（写入挂接标 dirty 的局部变化）」。
 ///
 /// A7：这是**唯一**的清单构建入口，区间读取走 `load_repo_key_hashes_in_range(repo, …)`。
-/// 原 `build_node_manifest` 包装函数把 repo 写死成 NODE，与「全 repo 统一逻辑」冲突，
-/// 已删除 —— 调用方必须显式传 repo。
 pub fn build_repo_manifest_impl(
     storage: &Storage,
     repo: u8,
@@ -423,31 +439,233 @@ pub fn build_repo_manifest_impl(
     version: u32,
 ) -> anyhow::Result<BootstrapManifest> {
     let chunk_rows = chunk_rows.max(1) as usize;
+    let digests = storage.get_chunk_digests(repo)?;
+
+    // P-B：块表路径（边界 chunk_rows 一致 → 增量重算；不一致 → 全量重建）
+    if !digests.is_empty() && digests[0].chunk_rows as usize == chunk_rows {
+        // 全干净时做廉价一致性校验（count vs 块表 rows 总和），兜住绕过挂接的直接
+        // SQL 写入造成的陈旧摘要；有脏块时直接走脏块重算（重算后 rows 自动对齐）。
+        if !digests.iter().any(|d| d.dirty) {
+            let rows_sum: i64 = digests.iter().map(|d| d.rows).sum();
+            if storage.count_repo_rows(repo)? == rows_sum {
+                return build_manifest_from_digests(
+                    storage,
+                    repo,
+                    chunk_rows as u32,
+                    w0_seq,
+                    version,
+                    digests,
+                );
+            }
+            // count 不一致 → 落到全扫重建（陈旧摘要不可信）
+        } else {
+            return build_manifest_from_digests(
+                storage,
+                repo,
+                chunk_rows as u32,
+                w0_seq,
+                version,
+                digests,
+            );
+        }
+    }
+
+    // 首填 / chunk_rows 变化：全表扫描（旧 O5 分批逻辑）→ 单事务回填块表
+    let mf = build_repo_manifest_full_scan(storage, repo, chunk_rows, w0_seq, version)?;
+    let entries: Vec<(i64, Vec<u8>, Vec<u8>, i64, Vec<u8>)> = mf
+        .chunks
+        .iter()
+        .map(|c| {
+            (
+                c.index as i64,
+                c.lo.clone(),
+                c.hi.clone(),
+                c.rows as i64,
+                c.hash.to_vec(),
+            )
+        })
+        .collect();
+    storage.backfill_chunk_digests(repo, chunk_rows as u32, &entries)?;
+    Ok(mf)
+}
+
+/// P-B：块表优先路径——干净块零扫描复用；dirty 块重扫区间重算并写回清脏。
+fn build_manifest_from_digests(
+    storage: &Storage,
+    repo: u8,
+    chunk_rows: u32,
+    w0_seq: u64,
+    version: u32,
+    digests: Vec<crate::storage::db::ChunkDigest>,
+) -> anyhow::Result<BootstrapManifest> {
+    let mut chunks: Vec<ManifestChunk> = Vec::with_capacity(digests.len());
+    let mut total_rows: u64 = 0;
+    // P2-6：扫描期只把脏块重算结果攒进 Vec（纯内存），循环结束后【一次写锁 +
+    // 单事务】批量 upsert，消除旧实现"每脏块一次 scan(read_long_priority)→一次
+    // upsert(抢写锁)"的读写乒乓。语义等价（同一次扫描的同一批脏块，幂等 upsert）。
+    let mut dirty_writes: Vec<(i64, Vec<u8>, Vec<u8>, i64, Vec<u8>)> = Vec::new();
+    for d in &digests {
+        if d.dirty {
+            let rows = scan_repo_range(storage, repo, &d.lo_key, &d.hi_key)?;
+            let hash = chunk_hash(&rows);
+            // 仅记录待写元组，不在循环内抢写锁
+            dirty_writes.push((
+                d.idx,
+                d.lo_key.clone(),
+                d.hi_key.clone(),
+                rows.len() as i64,
+                hash.to_vec(),
+            ));
+            chunks.push(ManifestChunk {
+                index: d.idx as u32,
+                lo: d.lo_key.clone(),
+                hi: d.hi_key.clone(),
+                rows: rows.len() as u64,
+                hash,
+            });
+            total_rows += rows.len() as u64;
+        } else {
+            // 干净块：零扫描，直接复用持久化摘要
+            let mut hash = [0u8; 32];
+            if d.hash.len() == 32 {
+                hash.copy_from_slice(&d.hash);
+            }
+            chunks.push(ManifestChunk {
+                index: d.idx as u32,
+                lo: d.lo_key.clone(),
+                hi: d.hi_key.clone(),
+                rows: d.rows as u64,
+                hash,
+            });
+            total_rows += d.rows as u64;
+        }
+    }
+    // P2-6：所有脏块扫描完毕，一次写锁 + 单事务批量写回（含清 dirty）。
+    storage.upsert_chunk_digests_batch(repo, chunk_rows, &dirty_writes)?;
+    Ok(BootstrapManifest {
+        repo,
+        version,
+        w0_seq,
+        chunk_rows,
+        total_rows,
+        chunks,
+    })
+}
+
+/// P-B：重扫单块区间 `[lo, hi)`（半开；空 = ±∞），分批循环取完（块行数 dirty 期间可增长）。
+fn scan_repo_range(
+    storage: &Storage,
+    repo: u8,
+    lo: &[u8],
+    hi: &[u8],
+) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let lo_opt = if lo.is_empty() { None } else { Some(lo) };
+    let hi_opt = if hi.is_empty() { None } else { Some(hi) };
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut first = true;
+    let mut cursor: Option<Vec<u8>> = lo_opt.map(|l| l.to_vec());
+    loop {
+        // 首查直接用块下界（SQL `>= lo` 已含块首行，不得跳过）；
+        // 后续批次用上一批最后 key 作下界（SQL 会重读该行，需 start=1 去重）。
+        let lo_arg: Option<&[u8]> = if first { lo_opt } else { cursor.as_deref() };
+        let batch = storage.load_repo_key_hashes_in_range_priority(
+            repo,
+            lo_arg,
+            hi_opt,
+            MANIFEST_SCAN_BATCH_ROWS,
+        )?;
+        if batch.is_empty() {
+            break;
+        }
+        let full = batch.len() == MANIFEST_SCAN_BATCH_ROWS;
+        let start = if first {
+            0
+        } else {
+            match (cursor.as_deref(), batch.first()) {
+                (Some(prev), Some((k, _))) if k.as_slice() == prev => 1,
+                _ => 0,
+            }
+        };
+        for (k, h) in batch.into_iter().skip(start) {
+            out.push((k, h));
+        }
+        first = false;
+        if !full {
+            break;
+        }
+        cursor = out.last().map(|(k, _)| k.clone());
+    }
+    Ok(out)
+}
+
+/// 全表扫描构建（旧 O5 分批逻辑原样保留，P-B 仅用于首填/chunk_rows 变化重建）。
+fn build_repo_manifest_full_scan(
+    storage: &Storage,
+    repo: u8,
+    chunk_rows: usize,
+    w0_seq: u64,
+    version: u32,
+) -> anyhow::Result<BootstrapManifest> {
     let mut chunks: Vec<ManifestChunk> = Vec::new();
-    let mut cursor: Option<Vec<u8>> = None; // -∞ 起
     let mut total_rows: u64 = 0;
     let mut index: u32 = 0;
 
+    // 批次O(O5)：**分批读取 + 内存切块**。旧实现每块发一次区间查询
+    // （`LIMIT chunk_rows + 1`；6.2M 行 / 2000 行块 = 3108 次查询，实测分钟级），
+    // 这是应答方「清单重建」耗时超过重建租约、进而被重复触发（多个全表扫描抢读池、
+    // 谁都不返回）的根因。现在每批 `MANIFEST_SCAN_BATCH_ROWS`（5 万）行只发一次查询
+    // （~125 次），在内存里按同一 `chunk_rows` 切分 —— 输出与逐块查询**等价**
+    // （同一有序行流、同一分块规则、`hi` 同为下一块首行 key）。
+    let mut pending: std::collections::VecDeque<(Vec<u8>, Vec<u8>)> =
+        std::collections::VecDeque::new();
+    let mut cursor: Option<Vec<u8>> = None; // 闭区间下界（下一批会重读该行，需去重）
+    let mut stream_done = false;
+
     loop {
-        let fetch = chunk_rows + 1;
-        let rows = storage.load_repo_key_hashes_in_range(repo, cursor.as_deref(), None, fetch)?;
-        if rows.is_empty() {
+        // 补齐到 chunk_rows + 1 行：多出的 1 行用于判定本块上界（即下一块首行 key）。
+        while !stream_done && pending.len() < chunk_rows + 1 {
+            let batch = storage.load_repo_key_hashes_in_range_priority(
+                repo,
+                cursor.as_deref(),
+                None,
+                MANIFEST_SCAN_BATCH_ROWS,
+            )?;
+            if batch.is_empty() {
+                stream_done = true;
+                break;
+            }
+            let full = batch.len() == MANIFEST_SCAN_BATCH_ROWS;
+            let start = match (cursor.as_deref(), batch.first()) {
+                (Some(prev), Some((k, _))) if k.as_slice() == prev => 1,
+                _ => 0,
+            };
+            for (k, h) in batch.into_iter().skip(start) {
+                pending.push_back((k, h));
+            }
+            if !full {
+                stream_done = true;
+                break;
+            }
+            cursor = pending.back().map(|(k, _)| k.clone());
+        }
+        if pending.is_empty() {
             break;
         }
-        let is_last = rows.len() <= chunk_rows;
-        let take = rows.len().min(chunk_rows);
-        let body = &rows[..take];
-        let lo = if index == 0 || cursor.is_none() {
+        let take = pending.len().min(chunk_rows);
+        let is_last = pending.len() <= chunk_rows;
+        let body: Vec<(Vec<u8>, Vec<u8>)> = pending.iter().take(take).cloned().collect();
+        // `lo`：首块 -∞（空）；后续块 = 本块首行 key（= 上一块的 `hi`）
+        let lo = if index == 0 {
             Vec::new()
         } else {
-            cursor.clone().unwrap_or_default()
+            body[0].0.clone()
         };
         let hi = if is_last {
             Vec::new()
         } else {
-            rows[take].0.clone()
+            pending[take].0.clone()
         };
-        let hash = chunk_hash(body);
+        let hash = chunk_hash(&body);
         chunks.push(ManifestChunk {
             index,
             lo,
@@ -459,13 +677,14 @@ pub fn build_repo_manifest_impl(
         if is_last {
             break;
         }
-        cursor = Some(hi);
+        // 保留 `pending[take]`（本块 `hi`）作为下一块的首行
+        for _ in 0..take {
+            pending.pop_front();
+        }
         index += 1;
     }
 
     // P0-2：清单 `repo` 必须回填入参，不能硬编码 NODE。
-    // 旧实现写死 NODE，导致应答方为 PEER/INFOHASH/TRACKER 构造出的清单被标记成 NODE，
-    // 请求方（handle_bootstrap_manifest_response）按 repo 校验时全部错位丢弃。
     Ok(BootstrapManifest {
         repo,
         version,
@@ -795,6 +1014,21 @@ pub struct ChunkWindow {
     attempts: std::collections::HashMap<u32, u32>,
     /// 重试队列（失败/NAK 的块，fill() 优先重发）
     retry: std::collections::VecDeque<u32>,
+    /// 批次O(O3)：逐块重发退避截止时刻 —— index → 最早可重发时刻。
+    ///
+    /// 对端 NAK（空 entries）的语义是「本端过载、稍后再来」；旧实现收到 NAK 立即
+    /// `fill()` 重发同一块，形成 90 次/秒的自激循环（实测单块 9000 次重发、对端
+    /// 发送槽被打满、bootstrap 零进展）。失败块进入本表按指数退避推迟重发，
+    /// 其它块照常流水线推进；成功落地即移除。
+    retry_at: std::collections::HashMap<u32, Instant>,
+    /// 批次O(O6)：**窗口级暂停**截止时刻 —— 对端明确回 NAK（空 entries）时，
+    /// 整个窗口暂停到该时刻再发请求。
+    ///
+    /// 为什么需要窗口级：逐块退避只挡住「刚失败的那一块」，`fill()` 仍会继续从
+    /// `next_request` 取下一批块发出去 —— 对端正在重建清单（分钟级）时，请求方会以
+    /// 窗口速度把**整张 3100+ 块的清单走一遍**（实测每 30s ~110 次 NAK），既无收益
+    /// 又把对端压得更死。NAK 是通道级信号，应按通道级退避暂停。
+    pause_until: Option<Instant>,
     /// E2：最后一块成功落地（on_response）的时刻。窗口级空闲看门狗据此判定
     /// 「距最后一块落地已超过阈值仍有在途块」→ 在途块丢失（OOM 驱逐阻塞 actor 后
     /// 消息超时丢帧），回收重发。从未收到过块时为 None（由逐块 sent_at 超时兜底）。
@@ -802,6 +1036,332 @@ pub struct ChunkWindow {
     /// E2：窗口级空闲恢复已执行的次数。超过 `idle_max_retries` 即放弃本窗口重拉清单，
     /// 避免对端不可达时无限重刷同一批在途块。
     idle_recoveries: u32,
+}
+
+// ========================================================================
+// 批次O(O2)：按远端 key 区间对齐 —— 边界无关的本地摘要（单遍归并扫描）
+// ========================================================================
+//
+// 为什么必须按**区间**而不是按 index 比对：
+// 清单分块由各自表的行数推导（每块固定 `chunk_rows` 行），两端行集不同 ⇒ 同 index
+// 块的 key 区间不同 ⇒ `hash` 永不相等。实测 .52(6.02M) 对 .53(6.2M) 只对上 8/3108 块，
+// 即 97% 本端已有的数据被当作缺失重拉（3108 块 × 2000 行），分钟级收敛不可能达成。
+// 按「远端块声明的 [lo,hi)」统计本端摘要则与块边界漂移无关：本端在该区间内的
+// (key, data_hash) 与远端块内容一致即可跳过，不一致才拉取（幂等 upsert）。
+
+/// 单个远端块区间内的本地摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeDigest {
+    /// 本端落在该区间内的行数。
+    pub rows: u64,
+    /// 该区间内 (key, data_hash) 升序流的内容哈希（与 [`chunk_hash`] 同构）。
+    pub hash: [u8; 32],
+}
+
+/// 本地摘要扫描的分批行数（单批内存 O(batch × (key+hash))）。
+// [ALLOWED-HARDCODED: 内部扫描批大小，非业务可调参数]
+pub const MANIFEST_SCAN_BATCH_ROWS: usize = 50_000;
+
+/// 摘要缓存 TTL（秒）。
+///
+/// 权衡：缓存内陈旧视图只会让「本端已拥有的块被重拉」（幂等 upsert 无害），
+/// 不会漏拉——本端缺数据的区间行数/哈希必然与远端声明不符、照常进待拉集合；
+/// 唯一的例外是本端在缓存期内**软删**了行（tombstone），此时跳过该块会少拉；
+/// 残差由竣工覆盖校验 + delta/Range 反熵兜底。120s 足以覆盖一轮窗口传输。
+// [ALLOWED-HARDCODED: 缓存 TTL 常量，非业务可调参数]
+pub const LOCAL_DIGEST_CACHE_TTL_SECS: u64 = 120;
+
+/// O2：把按 key 升序的本地行流归入远端块的 `[lo, hi)` 区间并逐块增量摘要。
+///
+/// 单遍归并：远端块区间按 lo 升序且首尾相接（第 i 块的 `hi` 即第 i+1 块的 `lo`），
+/// 因此随着本地行 key 升序推进，只需维护「当前块」一个累加器即可，内存 O(1)。
+pub struct RemoteRangeDigester {
+    bounds: Vec<(Vec<u8>, Vec<u8>)>,
+    idx: usize,
+    rows: u64,
+    hasher: blake3::Hasher,
+    out: Vec<RangeDigest>,
+}
+
+impl RemoteRangeDigester {
+    pub fn new(remote: &[ManifestChunk]) -> Self {
+        Self {
+            bounds: remote
+                .iter()
+                .map(|c| (c.lo.clone(), c.hi.clone()))
+                .collect(),
+            idx: 0,
+            rows: 0,
+            hasher: blake3::Hasher::new(),
+            out: Vec::with_capacity(remote.len()),
+        }
+    }
+
+    /// 喂入一批按 key **严格升序**的本地 `(key, data_hash)`。
+    pub fn push_batch(&mut self, rows: &[(Vec<u8>, Vec<u8>)]) {
+        for (k, h) in rows {
+            self.push_one(k, h);
+        }
+    }
+
+    fn seal(&mut self) {
+        self.out.push(RangeDigest {
+            rows: self.rows,
+            hash: *self.hasher.finalize().as_bytes(),
+        });
+        self.rows = 0;
+        self.hasher = blake3::Hasher::new();
+    }
+
+    fn push_one(&mut self, key: &[u8], data_hash: &[u8]) {
+        loop {
+            if self.idx >= self.bounds.len() {
+                // 超出末块（末块 hi 为空 = +∞，正常不可达）：丢弃，不污染任何块的摘要。
+                return;
+            }
+            let (lo, hi) = &self.bounds[self.idx];
+            if !hi.is_empty() && key >= hi.as_slice() {
+                self.seal();
+                self.idx += 1;
+                continue;
+            }
+            if !lo.is_empty() && key < lo.as_slice() {
+                // 落在本块 lo 之前（仅首块之前可能出现）：不属于任何块。
+                return;
+            }
+            self.rows += 1;
+            self.hasher.update(&(key.len() as u32).to_le_bytes());
+            self.hasher.update(key);
+            self.hasher.update(&(data_hash.len() as u32).to_le_bytes());
+            self.hasher.update(data_hash);
+            return;
+        }
+    }
+
+    /// 收尾：补齐尚未 seal 的块（无本地行的块 rows=0、hash 为空流哈希）。
+    pub fn finish(mut self) -> Vec<RangeDigest> {
+        while self.idx < self.bounds.len() {
+            self.seal();
+            self.idx += 1;
+        }
+        self.out
+    }
+}
+
+/// O2：单遍扫描本地 `repo` 全表，按远端清单块区间产出摘要。
+///
+/// 走 `load_repo_key_hashes_in_range` 的游标分批读取（表达式索引区间定位），
+/// 每批 `MANIFEST_SCAN_BATCH_ROWS` 行，避免逐块查询（3108 次区间查询）与
+/// 全表重建清单（后者每块一次查询、实测 1-2 分钟）。
+///
+/// P-B：**远端边界与本端块表逐块一致时零扫描复用**——两端收敛后（同一
+/// `chunk_rows`、同边界），干净块直接取块表 hash/rows；dirty 块仅重扫该块
+/// 区间并写回清 dirty。边界不匹配（两端行数不同 ⇒ 边界漂移）才走全扫兜底。
+/// 这是「请求方对齐」从每次 bootstrap 全表扫（38s~120s+，读池耗尽饿死普通读）
+/// 降为「零扫描 + 局部脏块重算」的关键路径。
+pub fn digest_local_by_remote_chunks(
+    storage: &Storage,
+    repo: u8,
+    chunk_rows: u32,
+    remote: &[ManifestChunk],
+) -> anyhow::Result<Vec<RangeDigest>> {
+    // P-B：块表边界匹配 → 零扫描复用
+    let digests = storage.get_chunk_digests(repo)?;
+    if !digests.is_empty()
+        && digests[0].chunk_rows == chunk_rows
+        && digests.len() == remote.len()
+        && digests
+            .iter()
+            .zip(remote)
+            .all(|(d, r)| d.lo_key == r.lo && d.hi_key == r.hi)
+    {
+        let mut out = Vec::with_capacity(digests.len());
+        for d in &digests {
+            if d.dirty {
+                // L1-⑦（2026-10-08）：dirty 块不再重算本地摘要——脏意味着本端该区间
+                // 已被爬虫/写入改动，内容与对端清单 hash 必然不一致，重算只是再确认
+                // 一次「不可继承」。此前 dirty 块 scan_repo_range 重算在活表上几乎全块
+                // 命中（NODE 646/671 脏），每次对齐=分钟级全扫且全程持全局连接锁，
+                // 把 task_scheduler 全部任务与 HTTP 读饿死（现场实证 WATCHDOG 连续
+                // 回收 14 个泄漏槽位）。改为直接输出占位摘要（rows=0 + 零哈希），
+                // `align_seed_by_digests` 必然判「不可继承 → 需要传输」，语义等价、
+                // 对齐秒级；传输由 `verify_transport` 行数门槛兜底，竣工由 count 覆盖校验兜底。
+                out.push(RangeDigest {
+                    rows: 0,
+                    hash: [0u8; 32],
+                });
+            } else {
+                let mut hash = [0u8; 32];
+                if d.hash.len() == 32 {
+                    hash.copy_from_slice(&d.hash);
+                }
+                out.push(RangeDigest {
+                    rows: d.rows as u64,
+                    hash,
+                });
+            }
+        }
+        return Ok(out);
+    }
+    // 边界不匹配：旧单遍全扫路径（bootstrap 传输链，走 priority 不被去重饿死）
+    let mut digester = RemoteRangeDigester::new(remote);
+    let mut cursor: Option<Vec<u8>> = None;
+    // 上一批已计入的末行 key：`lo` 为闭区间，翻页时该行会被重读一次，需去重。
+    let mut counted_last: Option<Vec<u8>> = None;
+    loop {
+        let batch = storage.load_repo_key_hashes_in_range_priority(
+            repo,
+            cursor.as_deref(),
+            None,
+            MANIFEST_SCAN_BATCH_ROWS,
+        )?;
+        if batch.is_empty() {
+            break;
+        }
+        let full = batch.len() == MANIFEST_SCAN_BATCH_ROWS;
+        let start = match (counted_last.as_deref(), batch.first()) {
+            (Some(prev), Some((k, _))) if k.as_slice() == prev => 1,
+            _ => 0,
+        };
+        digester.push_batch(&batch[start..]);
+        if !full {
+            break;
+        }
+        counted_last = batch.last().map(|(k, _)| k.clone());
+        cursor = counted_last.clone();
+    }
+    Ok(digester.finish())
+}
+
+/// O2：远端清单的**边界指纹** —— 仅由分块边界/行数结构决定，不含内容哈希。
+///
+/// 用途：摘要缓存键。本地摘要描述的是「本端在给定区间内的内容」，其有效性只取决于
+/// **区间**与本端表的新鲜度（TTL），与远端块内容是否变化无关；因此同一份边界
+/// （对端频繁重建清单但表未变、仅 w0/version 变化）可直接复用本地摘要。
+pub fn manifest_bounds_fingerprint(mf: &BootstrapManifest) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(&mf.chunk_rows.to_le_bytes());
+    h.update(&mf.total_rows.to_le_bytes());
+    h.update(&(mf.chunks.len() as u64).to_le_bytes());
+    for c in [mf.chunks.first(), mf.chunks.last()].into_iter().flatten() {
+        h.update(&(c.lo.len() as u32).to_le_bytes());
+        h.update(&c.lo);
+        h.update(&(c.hi.len() as u32).to_le_bytes());
+        h.update(&c.hi);
+    }
+    let d = h.finalize();
+    u64::from_le_bytes(d.as_bytes()[..8].try_into().unwrap_or([0u8; 8]))
+}
+
+/// O2：按区间摘要算出「可跳过块集合」与「验证通过的连续前缀」。
+///
+/// 可跳过 = 行数与内容哈希**同时**与远端声明一致（该区间本端内容与远端块全等）。
+/// 连续前缀 = 从 index 0 起连续可跳过的长度（持久化为 `done_chunks`）。
+pub fn align_seed_by_digests(
+    remote: &[ManifestChunk],
+    digests: &[RangeDigest],
+) -> (u32, std::collections::HashSet<u32>) {
+    let matching: std::collections::HashSet<u32> = remote
+        .iter()
+        .filter(|c| {
+            digests
+                .get(c.index as usize)
+                .map(|d| d.rows == c.rows && d.hash == c.hash)
+                .unwrap_or(false)
+        })
+        .map(|c| c.index)
+        .collect();
+    let mut prefix = 0u32;
+    while matching.contains(&prefix) {
+        prefix += 1;
+    }
+    (prefix, matching)
+}
+
+/// O2：竣工覆盖校验（边界无关）—— 远端每个块区间在本端的行数都不少于其声明行数。
+///
+/// 用于 NODE/TRACKER 的竣工前校验，替代旧的「按 index 逐块 hash&rows 全等」：
+/// 后者在活表（爬虫持续写入本端 node 表）上恒不成立 ⇒ 竣工校验永远失败 ⇒
+/// 「传完 → 校验失败 → 重拉」循环，done 永不为 Done。
+/// 行数覆盖可区分「真传完」（本端 ⊇ 远端）与「假竣工」（块返回极少行 ⇒ 该区间行数不足）。
+pub fn digests_cover_remote(remote: &[ManifestChunk], digests: &[RangeDigest]) -> bool {
+    if digests.len() != remote.len() {
+        return false;
+    }
+    remote.iter().all(|c| {
+        digests
+            .get(c.index as usize)
+            .map(|d| d.rows >= c.rows)
+            .unwrap_or(false)
+    })
+}
+
+/// O2：本地摘要缓存（线程安全）。
+///
+/// 背景：每次清单对齐都要按远端块边界扫一遍本地表（6M 行）；对端表持续写入使
+/// 清单 w0/version 频繁变化，但**边界**在表未增行时不变 ⇒ 摘要可复用。
+/// 缓存后 TTL 内的同边界重对齐免扫描（.52/.53 2026-10-07 实测旧路径
+/// 每轮全表重建 1-2 分钟，成为大表快照吞吐第一瓶颈）。
+pub struct LocalDigestCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(u8, u32), CachedDigests>>,
+    ttl: Duration,
+}
+
+struct CachedDigests {
+    fingerprint: u64,
+    digests: Vec<RangeDigest>,
+    at: Instant,
+}
+
+impl LocalDigestCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// 命中：同 (repo, chunk_rows) 且**边界指纹相同**且未过 TTL。
+    pub fn get(&self, repo: u8, chunk_rows: u32, fingerprint: u64) -> Option<Vec<RangeDigest>> {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&(repo, chunk_rows)).and_then(|e| {
+            (e.fingerprint == fingerprint && e.at.elapsed() <= self.ttl).then(|| e.digests.clone())
+        })
+    }
+
+    /// 写入（覆盖同键旧条目）。
+    pub fn insert(&self, repo: u8, chunk_rows: u32, fingerprint: u64, digests: Vec<RangeDigest>) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(
+            (repo, chunk_rows),
+            CachedDigests {
+                fingerprint,
+                digests,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// 作废某 (repo, chunk_rows) 的缓存。
+    ///
+    /// 必须在**本端内容发生变化**（快照块落地/落库）后调用：摘要缓存只说「本端在
+    /// 某区间内有多少行、内容哈希」，一旦本端写入新行，用它做**竣工覆盖校验**就会
+    /// 看到「行数仍然不足」的陈旧视图 → 校验恒失败 → 重拉循环。
+    /// （对齐方向本身对陈旧视图是安全的：只会多拉不会漏拉；竣工校验方向不安全。）
+    pub fn invalidate(&self, repo: u8, chunk_rows: u32) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&(repo, chunk_rows));
+    }
+
+    /// 当前条目数（观测/测试用）。
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// 是否为空（观测/测试用）。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl ChunkWindow {
@@ -819,6 +1379,8 @@ impl ChunkWindow {
             received,
             attempts: std::collections::HashMap::new(),
             retry: std::collections::VecDeque::new(),
+            retry_at: std::collections::HashMap::new(),
+            pause_until: None,
             last_response_at: None,
             idle_recoveries: 0,
         }
@@ -847,6 +1409,8 @@ impl ChunkWindow {
             received,
             attempts: std::collections::HashMap::new(),
             retry: std::collections::VecDeque::new(),
+            retry_at: std::collections::HashMap::new(),
+            pause_until: None,
             last_response_at: None,
             idle_recoveries: 0,
         }
@@ -855,6 +1419,14 @@ impl ChunkWindow {
     /// 计算当前应发送的 index 列表（填满窗口；重试块优先）。
     /// 传 0 表示使用自身 window 配置。
     pub fn fill(&mut self, max_inflight: usize) -> Vec<u32> {
+        // 批次O(O6)：窗口级暂停期内不发任何请求（对端明确过载/正在重建清单）。
+        // 关键：**不推进 `next_request`** —— 否则暂停形同虚设，恢复后清单已被走完。
+        if let Some(until) = self.pause_until {
+            if Instant::now() < until {
+                return Vec::new();
+            }
+            self.pause_until = None;
+        }
         let cap = if max_inflight == 0 {
             self.window
         } else {
@@ -862,16 +1434,26 @@ impl ChunkWindow {
         };
         let now = Instant::now();
         let mut out = Vec::new();
-        // 重试块优先（失败计数不在此清零，由 on_response 成功时清）
-        while self.inflight.len() < cap {
-            match self.retry.pop_front() {
-                Some(i) => {
-                    if self.inflight.insert(i) {
-                        self.sent_at.insert(i, now);
-                        out.push(i);
-                    }
-                }
+        // 重试块优先（失败计数不在此清零，由 on_response 成功时清）。
+        // 批次O(O3)：处于逐块退避窗口内的重试块本轮跳过（放回队尾等下一轮），
+        // 避免「NAK → 立即重发 → NAK」自激循环。
+        let queue_len = self.retry.len();
+        let mut scanned = 0usize;
+        while self.inflight.len() < cap && scanned < queue_len {
+            let i = match self.retry.pop_front() {
+                Some(i) => i,
                 None => break,
+            };
+            scanned += 1;
+            if let Some(at) = self.retry_at.get(&i) {
+                if now < *at {
+                    self.retry.push_back(i);
+                    continue;
+                }
+            }
+            if self.inflight.insert(i) {
+                self.sent_at.insert(i, now);
+                out.push(i);
             }
         }
         while self.next_request < self.total && self.inflight.len() < cap {
@@ -890,17 +1472,50 @@ impl ChunkWindow {
         out
     }
 
+    /// 批次O(O3)：把某块的重发时刻按指数退避推迟（NAK/校验失败后调用）。
+    ///
+    /// 退避只作用于该 index：其它块照常流水线推进，窗口不因一个块的失败整体停摆。
+    pub fn defer_retry(&mut self, index: u32, delay: Duration) {
+        self.retry_at.insert(index, Instant::now() + delay);
+    }
+
+    /// 批次O(O6)：暂停整个窗口 `delay` 时长（对端 NAK = 通道级过载/重建信号）。
+    ///
+    /// `fill()` 在暂停期内返回空且**不推进** `next_request`（清单不会被走完），
+    /// 恢复后从原位置继续。
+    pub fn pause_for(&mut self, delay: Duration) {
+        let until = Instant::now() + delay;
+        if self.pause_until.map(|cur| cur < until).unwrap_or(true) {
+            self.pause_until = Some(until);
+        }
+    }
+
+    /// 批次O(O6)：当前是否处于窗口级暂停期（观测/测试用）。
+    pub fn paused(&self) -> bool {
+        self.pause_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
     /// 记录一次成功响应。返回 true = 全部块收齐（竣工）。
     pub fn on_response(&mut self, index: u32) -> bool {
         self.inflight.remove(&index);
         self.sent_at.remove(&index);
         self.attempts.remove(&index);
+        self.retry_at.remove(&index);
         self.received.insert(index);
         self.last_response_at = Some(Instant::now());
         // 活锁治理(任务1)：E2 的「连续」空闲恢复计数在真进度出现时归零 ——
         // 否则窗口生命周期内累计 3 次就放弃，长传输（数百块）中途一次慢段即被误判不可恢复。
         self.idle_recoveries = 0;
         self.received.len() as u32 >= self.total
+    }
+
+    /// v7（L1-②）：撤销某块的「已收」标记（攒批落库失败时调用），使其回到
+    /// 待请求集合，下轮 fill() 会重发该块（upsert 幂等，重复落地无害）。
+    pub fn unreceive(&mut self, index: u32) {
+        self.received.remove(&index);
+        self.retry.push_back(index);
     }
 
     /// 记录一次失败（NAK/校验失败）：移出在途并进重试队列，返回累计失败次数。
@@ -1008,6 +1623,31 @@ impl ChunkWindow {
     }
 }
 
+/// v7：lz4 压缩 SyncEntry 列表（bincode 序列化后压缩）。返回压缩载荷。
+/// 压缩比 ~3:1（NODE 行 500B→~150B），内网千兆下网络侧吞吐 ×3。
+pub fn compress_entries(entries: &[crate::federation::protocol::SyncEntry]) -> Option<Vec<u8>> {
+    if entries.is_empty() {
+        return None;
+    }
+    match bincode::serialize(entries) {
+        Ok(raw) => {
+            let compressed = lz4_flex::compress_prepend_size(&raw);
+            // 压缩后不更小则放弃（占位保护），退回未压缩 entries。
+            if compressed.len() >= raw.len() {
+                return None;
+            }
+            Some(compressed)
+        }
+        Err(_) => None,
+    }
+}
+
+/// v7：解压 lz4 载荷为 SyncEntry 列表。解压失败返回 None（接收方按空块/失败处理）。
+pub fn decompress_entries(payload: &[u8]) -> Option<Vec<crate::federation::protocol::SyncEntry>> {
+    let raw = lz4_flex::decompress_size_prepended(payload).ok()?;
+    bincode::deserialize(&raw).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,6 +1721,139 @@ mod tests {
             .unwrap();
         assert_eq!(mf.total_rows, 0);
         assert!(mf.chunks.is_empty());
+    }
+
+    /// P-B：块表路径与全扫等价——首填回填后，干净块零扫描复用输出一致；
+    /// 写入触发标 dirty → 脏块重算反映新行并清 dirty；chunk_rows 变化 → 全量重建。
+    #[test]
+    fn test_manifest_digests_path_equivalence() {
+        let st = Storage::memory().unwrap();
+        seed_nodes(&st, 1000);
+        // 首次构建：全扫 + 回填块表
+        let mf1 =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 256, 42, 1)
+                .unwrap();
+        assert_eq!(mf1.total_rows, 1000);
+        assert_eq!(mf1.chunks.len(), 4);
+        let digests = st
+            .get_chunk_digests(crate::federation::sync::repo_type::NODE)
+            .unwrap();
+        assert_eq!(digests.len(), 4, "全扫后应回填块表");
+        assert!(digests.iter().all(|d| !d.dirty), "回填后应全干净");
+        assert_eq!(digests[0].chunk_rows, 256);
+        // 第二次构建（块表路径、全干净）：输出与全扫一致
+        let mf2 =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 256, 42, 1)
+                .unwrap();
+        assert_eq!(mf2.chunks, mf1.chunks, "干净块路径输出应与全扫一致");
+        assert_eq!(mf2.total_rows, 1000);
+        // 写入新行（经 save_dht_node 挂接 → 标 dirty）
+        st.save_dht_node(
+            &[1u8; 20], "10.9.9.9", 6881, 1.0, "Good", 1, 1, 5, 0, 8, None,
+        )
+        .unwrap();
+        let digests = st
+            .get_chunk_digests(crate::federation::sync::repo_type::NODE)
+            .unwrap();
+        assert!(digests.iter().any(|d| d.dirty), "新写入后应有脏块");
+        // 第三次构建：脏块重算 + 清 dirty，总行数 +1，块数不变（边界稳定）
+        let mf3 =
+            build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 256, 42, 1)
+                .unwrap();
+        assert_eq!(mf3.total_rows, 1001);
+        assert_eq!(mf3.chunks.len(), 4, "块边界应保持稳定");
+        let digests = st
+            .get_chunk_digests(crate::federation::sync::repo_type::NODE)
+            .unwrap();
+        assert!(digests.iter().all(|d| !d.dirty), "重算后应全干净");
+        // 逐块校验：清单块与区间重取一致
+        for c in &mf3.chunks {
+            let lo = if c.lo.is_empty() {
+                None
+            } else {
+                Some(c.lo.as_slice())
+            };
+            let hi = if c.hi.is_empty() {
+                None
+            } else {
+                Some(c.hi.as_slice())
+            };
+            let rows = st
+                .load_node_key_hashes_in_range(lo, hi, c.rows as usize + 1)
+                .unwrap();
+            assert_eq!(rows.len() as u64, c.rows);
+            assert!(verify_chunk(&c.hash, &rows), "块 {} 哈希不符", c.index);
+        }
+    }
+
+    /// P-B：chunk_rows 变化 → 块表重建（边界一致性校验）。
+    #[test]
+    fn test_manifest_digests_rebuild_on_chunk_rows_change() {
+        let st = Storage::memory().unwrap();
+        seed_nodes(&st, 1000);
+        build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 256, 1, 1).unwrap();
+        // 不同 chunk_rows → 全量重建
+        let mf = build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 100, 1, 1)
+            .unwrap();
+        assert_eq!(mf.chunks.len(), 10); // 1000 / 100
+        let digests = st
+            .get_chunk_digests(crate::federation::sync::repo_type::NODE)
+            .unwrap();
+        assert_eq!(digests.len(), 10);
+        assert_eq!(digests[0].chunk_rows, 100);
+    }
+
+    /// P-B：对齐摘要块表加速——远端边界与本端块表一致时零扫描复用，
+    /// 输出与全扫等价；dirty 块重算后同样一致。
+    #[test]
+    fn test_digest_local_by_remote_chunks_block_table_path() {
+        let st = Storage::memory().unwrap();
+        seed_nodes(&st, 1000);
+        // 首次构建：全扫 + 回填块表
+        let mf = build_repo_manifest_impl(&st, crate::federation::sync::repo_type::NODE, 256, 1, 1)
+            .unwrap();
+        assert_eq!(mf.chunks.len(), 4);
+        // 远端边界 == 本端块表边界 → 零扫描复用路径，输出与全扫一致
+        let d1 = digest_local_by_remote_chunks(
+            &st,
+            crate::federation::sync::repo_type::NODE,
+            256,
+            &mf.chunks,
+        )
+        .unwrap();
+        assert_eq!(d1.len(), 4);
+        for (i, d) in d1.iter().enumerate() {
+            assert_eq!(d.rows, mf.chunks[i].rows, "块 {} 行数应等于清单", i);
+            assert_eq!(&d.hash, &mf.chunks[i].hash, "块 {} 摘要应等于清单 hash", i);
+        }
+        // 写入新行（挂接标 dirty）→ L1-⑦：dirty 块不再重算，直接占位（不可继承 → 需传输）
+        st.save_dht_node(
+            &[1u8; 20], "10.9.9.9", 6881, 1.0, "Good", 1, 1, 5, 0, 8, None,
+        )
+        .unwrap();
+        let d2 = digest_local_by_remote_chunks(
+            &st,
+            crate::federation::sync::repo_type::NODE,
+            256,
+            &mf.chunks,
+        )
+        .unwrap();
+        // 目标块已脏 → 占位摘要（rows=0、零哈希），与清单 hash 必然不等 ⇒ 该块不可继承
+        assert_eq!(
+            d2.iter().filter(|d| d.rows == 0).count(),
+            1,
+            "恰 1 个脏块应占位"
+        );
+        assert_eq!(
+            d2.iter().filter(|d| d.rows > 0).count(),
+            3,
+            "其余干净块零扫描复用"
+        );
+        // 块表 dirty 标记保留（对齐不再清脏，传输落库/清单构建时才清）
+        let digests = st
+            .get_chunk_digests(crate::federation::sync::repo_type::NODE)
+            .unwrap();
+        assert!(digests.iter().any(|d| d.dirty));
     }
 
     /// D批(D3)：verify_transport 50% 收紧规则 —— 实收必须 ≥ ⌊声明/2⌋；
@@ -1392,6 +2165,284 @@ mod tests {
         );
         // 非法配置兜底：max < base 时不得产出小于基数的等待
         assert_eq!(backoff_delay(base, Duration::from_secs(1), 2), base);
+    }
+
+    /// 批次O(O5)：分批切块清单构建必须与旧「逐块查询 + 取 chunk_rows+1 行」**完全等价**。
+    ///
+    /// 参考实现内联为测试本地函数（即批次O之前的生产算法），逐字段比对
+    /// （lo/hi/rows/hash/index/total_rows）。
+    #[test]
+    fn test_batched_manifest_build_matches_per_chunk_reference() {
+        // 与旧实现等价的参考实现（逐块区间查询）。
+        fn reference(
+            storage: &Storage,
+            repo: u8,
+            chunk_rows: u32,
+            w0_seq: u64,
+            version: u32,
+        ) -> BootstrapManifest {
+            let chunk_rows = chunk_rows.max(1) as usize;
+            let mut chunks: Vec<ManifestChunk> = Vec::new();
+            let mut cursor: Option<Vec<u8>> = None;
+            let mut total_rows: u64 = 0;
+            let mut index: u32 = 0;
+            loop {
+                let rows = storage
+                    .load_repo_key_hashes_in_range(repo, cursor.as_deref(), None, chunk_rows + 1)
+                    .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                let is_last = rows.len() <= chunk_rows;
+                let take = rows.len().min(chunk_rows);
+                let body = &rows[..take];
+                let lo = if index == 0 || cursor.is_none() {
+                    Vec::new()
+                } else {
+                    cursor.clone().unwrap_or_default()
+                };
+                let hi = if is_last {
+                    Vec::new()
+                } else {
+                    rows[take].0.clone()
+                };
+                chunks.push(ManifestChunk {
+                    index,
+                    lo,
+                    hi: hi.clone(),
+                    rows: take as u64,
+                    hash: chunk_hash(body),
+                });
+                total_rows += take as u64;
+                if is_last {
+                    break;
+                }
+                cursor = Some(hi);
+                index += 1;
+            }
+            BootstrapManifest {
+                repo,
+                version,
+                w0_seq,
+                chunk_rows: chunk_rows as u32,
+                total_rows,
+                chunks,
+            }
+        }
+
+        let repo = crate::federation::sync::repo_type::NODE;
+        // 覆盖：空表 / 不足一块 / 恰好多块 / 整块 + 残块（跨批与不跨批两种走法）
+        for n in [0u32, 1, 99, 200, 201, 400, 999] {
+            let st = Storage::memory().unwrap();
+            if n > 0 {
+                seed_nodes(&st, n);
+            }
+            for chunk_rows in [100u32, 200] {
+                let got = build_repo_manifest_impl(&st, repo, chunk_rows, 7, 9).unwrap();
+                let want = reference(&st, repo, chunk_rows, 7, 9);
+                assert_eq!(
+                    got.total_rows, want.total_rows,
+                    "rows n={} cr={}",
+                    n, chunk_rows
+                );
+                assert_eq!(
+                    got.chunks.len(),
+                    want.chunks.len(),
+                    "块数 n={} cr={}",
+                    n,
+                    chunk_rows
+                );
+                for (a, b) in got.chunks.iter().zip(want.chunks.iter()) {
+                    assert_eq!(a.index, b.index);
+                    assert_eq!(a.lo, b.lo, "块 {} lo (n={})", a.index, n);
+                    assert_eq!(a.hi, b.hi, "块 {} hi (n={})", a.index, n);
+                    assert_eq!(a.rows, b.rows, "块 {} rows (n={})", a.index, n);
+                    assert_eq!(a.hash, b.hash, "块 {} hash (n={})", a.index, n);
+                }
+            }
+        }
+        // 跨批：行数 > MANIFEST_SCAN_BATCH_ROWS 时走多批路径，仍须与前缀一致
+        let st = Storage::memory().unwrap();
+        seed_nodes(&st, (MANIFEST_SCAN_BATCH_ROWS + 1_234) as u32);
+        let got = build_repo_manifest_impl(&st, repo, 20_000, 1, 1).unwrap();
+        assert_eq!(got.total_rows, (MANIFEST_SCAN_BATCH_ROWS + 1_234) as u64);
+        // 连续性不变量：块 i 的 hi == 块 i+1 的 lo；首块 lo 空、末块 hi 空
+        assert!(got.chunks.first().map(|c| c.lo.is_empty()).unwrap_or(true));
+        assert!(got.chunks.last().map(|c| c.hi.is_empty()).unwrap_or(true));
+        for w in got.chunks.windows(2) {
+            assert_eq!(
+                w[0].hi, w[1].lo,
+                "块 {} 与 {} 必须首尾相接",
+                w[0].index, w[1].index
+            );
+            assert_eq!(w[0].rows, 20_000);
+        }
+    }
+
+    /// 批次O(O2)：按区间对齐的核心不变量 —— 两端行集不同（块边界漂移）时，
+    /// 本端已有的块必须全部被识别为可跳过（旧按 index 比对只能对上首块）。
+    #[test]
+    fn test_range_alignment_is_boundary_independent() {
+        let st_a = Storage::memory().unwrap();
+        let st_b = Storage::memory().unwrap();
+        // A（本端）600 行、B（远端）800 行：B 多出的 200 行**插在中段**，
+        // 使两端第 1 块之后的块边界全部错位（旧 index 比对在此必然失效）。
+        seed_nodes(&st_a, 600);
+        seed_nodes(&st_b, 800);
+        {
+            let conn = st_b.connection();
+            let conn = conn.lock().unwrap();
+            for i in 0..200i64 {
+                // key 落在前 1/3 区段内，把后续所有块边界推后
+                let ip = format!("1.0.{}.{}", i / 256, i % 256);
+                let id = vec![(200 + (i % 50)) as u8; 20];
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) VALUES (?1, ?2, ?3, 0, NULL)",
+                    params![id, ip, 6881i64],
+                )
+                .unwrap();
+            }
+        }
+        let remote =
+            build_repo_manifest_impl(&st_b, crate::federation::sync::repo_type::NODE, 100, 1, 1)
+                .unwrap();
+        // 按 index 比对（旧语义）只能跳过极少数块
+        let local_mf =
+            build_repo_manifest_impl(&st_a, crate::federation::sync::repo_type::NODE, 100, 1, 1)
+                .unwrap();
+        let old_style = align_bootstrap_seed(&remote.chunks, &local_mf).1.len();
+        // 按区间比对（新语义）：B 在本端已存在的行全部应被识别为一致
+        let digests = digest_local_by_remote_chunks(
+            &st_a,
+            crate::federation::sync::repo_type::NODE,
+            100,
+            &remote.chunks,
+        )
+        .unwrap();
+        assert_eq!(digests.len(), remote.chunks.len());
+        let (_, matching) = align_seed_by_digests(&remote.chunks, &digests);
+        assert!(
+            matching.len() > old_style,
+            "按区间对齐（{} 块）必须显著优于按 index 对齐（{} 块）",
+            matching.len(),
+            old_style
+        );
+        // 本端缺失的区间不得被判为可跳过（B 独有 200 行落在中段，至少一块因此不可跳过）
+        assert!(matching.len() < remote.chunks.len());
+        // 全部远端块区间在本端的行数合计 = 本端表内、且落在远端区间内的行数
+        let local_rows: u64 = digests.iter().map(|d| d.rows).sum();
+        assert!(local_rows > 0 && local_rows <= 600);
+    }
+
+    /// 批次O(O2)：竣工覆盖校验 —— 本端行数不足的区间必须判失败（防假竣工），
+    /// 本端多出行（活表持续写入）不得阻碍竣工。
+    #[test]
+    fn test_digests_cover_remote_rejects_deficit() {
+        let remote = vec![
+            ManifestChunk {
+                index: 0,
+                lo: vec![],
+                hi: b"b".to_vec(),
+                rows: 10,
+                hash: [1u8; 32],
+            },
+            ManifestChunk {
+                index: 1,
+                lo: b"b".to_vec(),
+                hi: vec![],
+                rows: 10,
+                hash: [2u8; 32],
+            },
+        ];
+        let covered = vec![
+            RangeDigest {
+                rows: 10,
+                hash: [1u8; 32],
+            },
+            RangeDigest {
+                rows: 12,
+                hash: [9u8; 32],
+            },
+        ];
+        assert!(digests_cover_remote(&remote, &covered), "多出行不影响竣工");
+        let deficit = vec![
+            RangeDigest {
+                rows: 10,
+                hash: [1u8; 32],
+            },
+            RangeDigest {
+                rows: 3,
+                hash: [2u8; 32],
+            },
+        ];
+        assert!(
+            !digests_cover_remote(&remote, &deficit),
+            "行数不足必须判假竣工"
+        );
+        assert!(
+            !digests_cover_remote(&remote, &covered[..1]),
+            "块数不齐判失败"
+        );
+    }
+
+    /// 批次O(O2)：远端边界指纹 —— 边界相同（仅 w0/version 变化）必须同指纹（摘要可复用）；
+    /// 边界或行数变化必须不同（摘要必须重算）。
+    #[test]
+    fn test_manifest_bounds_fingerprint() {
+        let mk = |version: u32, total: u64, hi: &[u8]| BootstrapManifest {
+            repo: 1,
+            version,
+            w0_seq: 1,
+            chunk_rows: 2000,
+            total_rows: total,
+            chunks: vec![ManifestChunk {
+                index: 0,
+                lo: vec![],
+                hi: hi.to_vec(),
+                rows: 2000,
+                hash: [7u8; 32],
+            }],
+        };
+        let a = mk(1, 6_200_000, b"9.9.9.9:1");
+        let b = mk(99, 6_200_000, b"9.9.9.9:1");
+        assert_eq!(
+            manifest_bounds_fingerprint(&a),
+            manifest_bounds_fingerprint(&b),
+            "仅 version/w0 变化 → 边界未变 → 同指纹"
+        );
+        assert_ne!(
+            manifest_bounds_fingerprint(&a),
+            manifest_bounds_fingerprint(&mk(1, 6_200_001, b"9.9.9.9:1")),
+            "行数变化 → 边界可能已变 → 必须换指纹"
+        );
+        assert_ne!(
+            manifest_bounds_fingerprint(&a),
+            manifest_bounds_fingerprint(&mk(1, 6_200_000, b"9.9.9.9:2")),
+            "边界变化 → 必须换指纹"
+        );
+    }
+
+    /// 批次O(O2)：本地摘要缓存 —— 同键同指纹 TTL 内命中；换指纹/过期/换 repo 即 miss。
+    #[test]
+    fn test_local_digest_cache() {
+        let cache = LocalDigestCache::new(Duration::from_millis(50));
+        assert!(cache.is_empty());
+        let d = vec![RangeDigest {
+            rows: 7,
+            hash: [3u8; 32],
+        }];
+        assert!(cache.get(1, 2000, 42).is_none());
+        cache.insert(1, 2000, 42, d.clone());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(1, 2000, 42), Some(d.clone()));
+        // 指纹变化（对端边界变了）→ 必须重算
+        assert!(cache.get(1, 2000, 43).is_none());
+        // 不同 chunk_rows / repo → 独立键
+        assert!(cache.get(1, 10_000, 42).is_none());
+        assert!(cache.get(2, 2000, 42).is_none());
+        // TTL 过期 → miss
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(cache.get(1, 2000, 42).is_none());
     }
 
     /// 批次O(O-C)：清单指纹相等判定 —— 同一快照的重复响应必须判等（幂等跳过的依据）；

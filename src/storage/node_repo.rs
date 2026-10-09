@@ -412,6 +412,25 @@ impl NodeRepoImpl {
         &self,
         items: &[(NodeId, SocketAddr)],
     ) -> Vec<(NodeId, SocketAddr)> {
+        self.add_nodes_batch_internal_impl(items, false)
+    }
+
+    /// v7（L1-②）：bootstrap 攒批快速落库 —— 跳过 existing_node_keys 预查询。
+    /// 语义差异仅「DB 已知但冷驱逐出内存的节点」会多标一次 dirty（幂等无害，
+    /// 持久化 upsert 覆盖原行）；内存已命中的节点走 get_mut 更新分支不受影响。
+    /// 收益：每块省去 ~400ms（10000 行）读池预查询，落库吞吐不受读池限制。
+    pub(crate) fn add_nodes_batch_internal_fast(
+        &self,
+        items: &[(NodeId, SocketAddr)],
+    ) -> Vec<(NodeId, SocketAddr)> {
+        self.add_nodes_batch_internal_impl(items, true)
+    }
+
+    fn add_nodes_batch_internal_impl(
+        &self,
+        items: &[(NodeId, SocketAddr)],
+        skip_db_check: bool,
+    ) -> Vec<(NodeId, SocketAddr)> {
         if items.is_empty() {
             return Vec::new();
         }
@@ -429,7 +448,8 @@ impl NodeRepoImpl {
                 .map(|(_, a)| format!("{}:{}", a.ip(), a.port()))
                 .collect()
         };
-        let db_known: std::collections::HashSet<String> = if candidates.is_empty() {
+        let db_known: std::collections::HashSet<String> = if skip_db_check || candidates.is_empty()
+        {
             std::collections::HashSet::new()
         } else {
             self.storage

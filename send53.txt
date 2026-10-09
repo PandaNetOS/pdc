@@ -1,0 +1,131 @@
+total=676
+06:45:52.225094Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:45:52.225245Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:46:06.725535Z  INFO [checkpoint] 累计成功 100 次：mode=Passive wal_frames=16 busy累计=0 本次耗时 1ms，EWMA 1ms
+06:46:08.518733Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+06:46:15.431724Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 5ms）
+06:46:15.431859Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:46:23.333154Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:46:23.333255Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:46:27.636433Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 7ms）
+06:46:27.636552Z  INFO [crawler] 分层响应率: L0已验证 0/13 L1新鲜 0/1079 探索 0/636（300s窗口 响应增量/选中）
+06:46:38.604816Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 72ms）
+06:46:38.604970Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:46:59.424551Z  INFO [crawler][probe] sample 发送耗时 2ms
+06:46:59.424695Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:47:00.728430Z  INFO [crawler][probe] crawl 发送耗时 5ms（select 后总计 9ms）
+06:47:00.728608Z  INFO [crawler] 分层响应率: L0已验证 0/13 L1新鲜 0/1193 探索 0/522（300s窗口 响应增量/选中）
+06:47:04.628425Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 5ms）
+06:47:04.628552Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:47:30.739934Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 6ms）
+06:47:30.740090Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:47:35.830876Z  INFO [crawler][probe] crawl 发送耗时 3ms（select 后总计 5ms）
+06:47:35.830994Z  INFO [crawler] 分层响应率: L0已验证 0/13 L1新鲜 0/1193 探索 0/522（300s窗口 响应增量/选中）
+06:47:36.533376Z  INFO [crawler][probe] sample 发送耗时 2ms
+06:47:36.533518Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:47:40.032792Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入1508 − 释放1507 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 26s)
+06:47:55.835969Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 4ms）
+06:47:55.836102Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:48:14.628804Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:48:14.628914Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:48:14.927019Z  INFO [crawler][probe] crawl 发送耗时 5ms（select 后总计 7ms）
+06:48:14.927194Z  INFO [crawler] 分层响应率: L0已验证 0/15 L1新鲜 0/1191 探索 0/522（300s窗口 响应增量/选中）
+06:48:15.925994Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 5ms）
+06:48:15.926132Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:48:41.234299Z  INFO [checkpoint] 累计成功 120 次：mode=Passive wal_frames=442 busy累计=0 本次耗时 2ms，EWMA 3ms
+06:48:45.931437Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 4ms）
+06:48:45.931659Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:48:48.634317Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:48:48.634429Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:48:54.934100Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 6ms）
+06:48:54.934224Z  INFO [crawler] 分层响应率: L0已验证 0/14 L1新鲜 0/1192 探索 0/522（300s窗口 响应增量/选中）
+06:49:11.411523Z  WARN [bootstrap] 发送块 77 失败: 对端无活跃会话: 89a5c03c
+06:49:11.441465Z  WARN [bootstrap] 发送块 89 失败: 对端无活跃会话: 89a5c03c
+06:49:11.857621Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:11.858533Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.242364Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.298344Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.344318Z  WARN [bootstrap] 发送块 80 失败: 对端无活跃会话: 89a5c03c
+06:49:12.347834Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.410778Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:14.035580Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 5ms）
+06:49:14.035807Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:49:14.908858Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 发送块 91 失败: 对端无活跃会话: 89a5c03c
+06:49:14.918050Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 发送块 85 失败: 对端无活跃会话: 89a5c03c
+06:49:14.918235Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 对端 89a5c03c 连续发送失败 5 次，进入熔断退避（新块请求 NAK circuit open）
+06:49:15.000760Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:15.051300Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.610295Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.618281Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.672761Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.732567Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.794080Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.856971Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.922292Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:18.344090Z  WARN [bootstrap] 发送块 88 失败: 对端无活跃会话: 89a5c03c
+06:49:18.344180Z  WARN [bootstrap] 对端 89a5c03c 连续发送失败 6 次，进入熔断退避（新块请求 NAK circuit open）
+06:49:21.068998Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}:actor:reportgen-actor:captive-portal: check_captive_portal error: HTTP request failed: error sending request for url (http://use1-1.relay.n0.iroh.link./generate_204): client error (SendRequest): connection closed before message completed
+06:49:25.027590Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 9ms）
+06:49:25.027834Z  INFO [crawler] 分层响应率: L0已验证 0/19 L1新鲜 0/1187 探索 0/522（300s窗口 响应增量/选中）
+06:49:52.055000Z  INFO [crawler] 启动预热（加载最多 100000 节点，并行 bootstrap 8 个）...
+06:49:52.124440Z  INFO [crawler] paced 流式发送已启用：tick=250ms 配额=8/socket/tick 容量=8192
+06:49:55.395096Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+06:50:42.205680Z  INFO [crawler] 预热: 向 2 个 bootstrap 地址发送了 find_node
+06:50:42.205815Z  INFO [crawler] 向 2 个 bootstrap 地址发送了 find_node
+06:50:50.492204Z  INFO [crawler][probe] get_peers 发送耗时 4ms（select 后总计 5ms）
+06:50:50.492392Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:51:10.487224Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:51:10.487317Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:51:14.599749Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 7ms）
+06:51:14.599981Z  INFO [crawler] 分层响应率: L0已验证 0/0 L1新鲜 0/36 探索 0/156（300s窗口 响应增量/选中）
+06:51:19.396264Z  INFO [negotiate] 已发送协商请求 to=89a5c03c（存活 76s）
+06:51:19.599841Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 4ms）
+06:51:19.600021Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:51:27.286171Z  INFO [bootstrap] 分块请求触发清单重建（缓存缺失）: peer=89a5c03c repo=1 chunk_rows=2000 index=77
+06:51:45.688839Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 5ms）
+06:51:45.689139Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:51:47.501218Z  INFO [checkpoint] 累计成功 20 次：mode=Passive wal_frames=1350 busy累计=1 本次耗时 2ms，EWMA 20ms
+06:51:50.500793Z  INFO [crawler][probe] sample 发送耗时 2ms
+06:51:50.500998Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:51:52.691919Z  INFO [crawler][probe] crawl 发送耗时 5ms（select 后总计 7ms）
+06:51:52.692094Z  INFO [crawler] 分层响应率: L0已验证 0/2 L1新鲜 0/47 探索 0/335（300s窗口 响应增量/选中）
+06:52:05.770116Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 74ms）
+06:52:05.770294Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:52:19.979303Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [negotiate] 已发送协商请求 to=89a5c03c（存活 137s）
+06:52:22.589614Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入281 − 释放279 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 24s)
+06:52:25.791047Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 4ms）
+06:52:25.791472Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:52:26.796524Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 5ms）
+06:52:26.796800Z  INFO [crawler] 分层响应率: L0已验证 0/3 L1新鲜 0/47 探索 0/526（300s窗口 响应增量/选中）
+06:52:28.596303Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:52:28.596489Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:52:33.396291Z  WARN [bootstrap] 回显式 NAK ×8（30s 限流汇总）: peer=89a5c03c repo=1 最近 index=84 reason=manifest rebuilding
+06:52:43.400472Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+06:52:48.803412Z  INFO [crawler][probe] get_peers 发送耗时 4ms（select 后总计 5ms）
+06:52:48.803709Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:52:59.689565Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:52:59.689716Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:53:00.890600Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 5ms）
+06:53:00.890765Z  INFO [crawler] 分层响应率: L0已验证 0/4 L1新鲜 0/72 探索 0/692（300s窗口 响应增量/选中）
+06:53:13.961041Z  INFO [crawler][probe] get_peers 发送耗时 1ms（select 后总计 72ms）
+06:53:13.961275Z  INFO [crawler] 主动 get_peers: 向 96 节点发送了 11 infohash 查询
+06:53:23.103409Z  INFO [negotiate] 已发送协商请求 to=89a5c03c（存活 200s）
+06:53:31.000753Z  INFO [crawler][probe] crawl 发送耗时 1ms（select 后总计 2ms）
+06:53:31.000933Z  INFO [crawler] 分层响应率: L0已验证 0/9 L1新鲜 0/96 探索 0/692（300s窗口 响应增量/选中）
+06:53:31.499033Z  INFO [checkpoint] 累计成功 40 次：mode=Passive wal_frames=13984 busy累计=1 本次耗时 1ms，EWMA 8ms
+06:53:34.494751Z  WARN [bootstrap] 回显式 NAK ×8（30s 限流汇总）: peer=89a5c03c repo=1 最近 index=84 reason=manifest rebuilding
+06:53:36.692385Z  INFO [crawler][probe] sample 发送耗时 0ms
+06:53:36.692494Z  INFO [crawler] 主动 sample_infohashes: 向 4 节点发送了请求
+06:53:42.992611Z  INFO [crawler][probe] get_peers 发送耗时 0ms（select 后总计 1ms）
+06:53:42.992740Z  INFO [crawler] 主动 get_peers: 向 2 节点发送了 11 infohash 查询
+06:54:01.096168Z  INFO [crawler][probe] crawl 发送耗时 1ms（select 后总计 2ms）
+06:54:01.096322Z  INFO [crawler] 分层响应率: L0已验证 0/10 L1新鲜 0/140 探索 0/692（300s窗口 响应增量/选中）
+06:54:06.997368Z  INFO [crawler][probe] get_peers 发送耗时 0ms（select 后总计 1ms）
+06:54:06.997478Z  INFO [crawler] 主动 get_peers: 向 3 节点发送了 11 infohash 查询
+06:54:13.696648Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:54:13.696804Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:54:24.190961Z  INFO [negotiate] 已发送协商请求 to=89a5c03c（存活 261s）
+06:54:36.095872Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 5ms）
+06:54:36.096112Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+06:54:36.205239Z  INFO [crawler][probe] crawl 发送耗时 5ms（select 后总计 6ms）
+06:54:36.205505Z  INFO [crawler] 分层响应率: L0已验证 0/10 L1新鲜 0/274 探索 0/750（300s窗口 响应增量/选中）

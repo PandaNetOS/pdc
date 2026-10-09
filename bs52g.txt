@@ -1,0 +1,32 @@
+total=343
+07:54:11.050622Z  WARN [bootstrap] 块 119 传输校验失败（声明 2020 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.050645Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=119
+07:54:11.068278Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 块 120 传输校验失败（声明 2006 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.068302Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=120
+07:54:11.077815Z  WARN [bootstrap] 块 115 传输校验失败（声明 2006 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.077894Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=115
+07:54:11.088184Z  WARN [bootstrap] 块 117 传输校验失败（声明 2005 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.088296Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=117
+07:54:11.098183Z  WARN [bootstrap] 块 122 传输校验失败（声明 2028 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.098263Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=122
+07:54:11.109083Z  WARN [bootstrap] 块 121 传输校验失败（声明 2010 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.109443Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=121
+07:54:11.118514Z  WARN [bootstrap] 块 116 传输校验失败（声明 2006 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.118594Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=116
+07:54:11.128707Z  WARN [bootstrap] 块 118 传输校验失败（声明 2011 行 / 实收 0 行），保持进度 done=115/3126
+07:54:11.128741Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=118
+07:54:23.530152Z  INFO [crawler] 分层响应率: L0已验证 0/37 L1新鲜 0/207 探索 0/790（300s窗口 响应增量/选中）
+07:54:34.545522Z  WARN [range] 应答按键拉取任务失败: task 8489 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:54:54.626104Z  INFO [crawler] 分层响应率: L0已验证 0/43 L1新鲜 0/335 探索 0/848（300s窗口 响应增量/选中）
+07:55:11.979780Z  INFO [nonsteady] 协商确认+1 peer=22335aa9 (清单同意(第1次协商确认)) 共 1 次（阈值 3）
+07:55:34.779266Z  INFO [crawler] 分层响应率: L0已验证 0/58 L1新鲜 0/387 探索 0/973（300s窗口 响应增量/选中）
+07:56:06.827825Z  INFO [crawler] 分层响应率: L0已验证 0/71 L1新鲜 0/449 探索 0/973（300s窗口 响应增量/选中）
+07:56:20.297277Z  INFO [bootstrap] 重拉进度继承（任务3）：旧进度 done=115 按 index 继承（新清单 3126 块，差异 ≤2%）: peer=22335aa9 repo=1
+07:56:20.297298Z  INFO [bootstrap] 断点继承/对齐验证（来源 last_key）verified_done=115/3126 跳过/继承块=115: peer=22335aa9 repo=1
+07:56:20.305388Z  INFO [bootstrap] 收到清单 from=22335aa9: 总行=6269218, 块数=3126, w0=10160368, 续传前缀=115, hash一致跳过块=115
+07:56:20.305640Z  INFO [bootstrap] 窗口化传输启动: peer=22335aa9 repo=1 块数=3126 窗口=8 首批=8
+07:56:43.985901Z  INFO [crawler] 分层响应率: L0已验证 0/74 L1新鲜 0/578 探索 0/649（300s窗口 响应增量/选中）
+07:57:15.034611Z  INFO [crawler] 分层响应率: L0已验证 0/69 L1新鲜 0/615 探索 0/617（300s窗口 响应增量/选中）
+07:57:32.644057Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=1
+07:57:54.721823Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入850 − 释放849 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 12s)
+07:57:55.174375Z  INFO [crawler] 分层响应率: L0已验证 0/69 L1新鲜 0/590 探索 0/642（300s窗口 响应增量/选中）

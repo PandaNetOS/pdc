@@ -50,6 +50,10 @@ pub struct BootstrapChannelStatus {
     /// 由核心运行时在 sync 各写入点落值；观测侧只读。
     #[serde(default)]
     pub direction: String,
+    /// 运行状态（观测侧派生，四态）：`running`（传输进行中）/ `paused`（暂停止步）/
+    /// `failed`（熔断/失效）/ `done`（已竣工）/ `idle`（闲置）。REST handler 落值。
+    #[serde(default)]
+    pub state: String,
 }
 
 /// Delta（oplog 增量）通道状态。
@@ -70,6 +74,9 @@ pub struct DeltaChannelStatus {
     /// 是否检测到 oplog 空洞（被裁剪、中间段缺失）。
     #[serde(default)]
     pub oplog_gap_detected: bool,
+    /// 运行状态（观测侧派生）：`running` / `paused`（非稳态或看门狗暂停）/ `failed` / `idle`。
+    #[serde(default)]
+    pub state: String,
 }
 
 /// Range（区间反熵）通道状态。
@@ -93,6 +100,9 @@ pub struct RangeReconcileStatus {
     /// 运行模式（小写 snake）：`repair`（实际修复）/ `diagnostic`（只读诊断）/ `idle`。
     #[serde(default)]
     pub mode: String,
+    /// 运行状态（观测侧派生）：`running` / `paused`（非稳态暂停）/ `failed` / `idle`。
+    #[serde(default)]
+    pub state: String,
 }
 
 /// 三个通道的聚合快照（REST handler 直接序列化整个结构体）。
@@ -131,7 +141,7 @@ mod tests {
             assert!(v.get(k).is_some(), "顶层缺少 key: {}, body={}", k, v);
         }
 
-        // bootstrap 子结构 10 个字段（含 E3 direction）
+        // bootstrap 子结构 11 个字段（含 E3 direction / state）
         let b = v.get("bootstrap").unwrap();
         for k in [
             "active",
@@ -144,11 +154,12 @@ mod tests {
             "phase",
             "idle_recoveries",
             "direction",
+            "state",
         ] {
             assert!(b.get(k).is_some(), "bootstrap 缺少字段: {}", k);
         }
 
-        // delta 子结构 5 个字段
+        // delta 子结构 6 个字段（含 state）
         let d = v.get("delta").unwrap();
         for k in [
             "oplog_len",
@@ -156,11 +167,12 @@ mod tests {
             "since_seq",
             "batch_send_failures",
             "oplog_gap_detected",
+            "state",
         ] {
             assert!(d.get(k).is_some(), "delta 缺少字段: {}", k);
         }
 
-        // range_reconcile 子结构 6 个字段
+        // range_reconcile 子结构 7 个字段（含 state）
         let r = v.get("range_reconcile").unwrap();
         for k in [
             "leaf_compares",
@@ -169,6 +181,7 @@ mod tests {
             "repairs_triggered",
             "rounds_completed",
             "mode",
+            "state",
         ] {
             assert!(r.get(k).is_some(), "range_reconcile 缺少字段: {}", k);
         }

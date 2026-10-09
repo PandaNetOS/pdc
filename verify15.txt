@@ -1,0 +1,5 @@
+16:44:30 done=43/43 bs=idle avail=8 waits=0 rg=idle
+16:44:50 done=43/43 bs=idle avail=4 waits=0 rg=idle
+16:45:10 done=43/43 bs=idle avail=8 waits=0 rg=idle
+16:45:30 done=43/43 bs=idle avail=8 waits=0 rg=idle
+16:45:50 done=43/43 bs=idle avail=7 waits=0 rg=paused

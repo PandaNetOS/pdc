@@ -28,6 +28,10 @@ pub struct InfohashRepoImpl {
     pending: RwLock<Vec<(Infohash, String)>>,
     /// 鑴?infohash 闆嗗悎锛堢粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒嗭級
     dirty: RwLock<FxHashSet<Infohash>>,
+    /// P1-8：持久化 dirty（ref_count 变化需增量落库）。
+    /// 与评分 dirty（dirty）相互独立：ScoreMaintainer 会用 dirty 重算评分后清空，
+    /// 持久化标记不得被其误清，故单独维护。Arc 包装供落库闭包共享清脏。
+    persist_dirty: Arc<RwLock<FxHashSet<Infohash>>>,
     /// 鑱旈偊寮曠敤锛圤nceLock 娉ㄥ叆锛涙湭璁剧疆鏃舵湰鍦板啓鍏ヤ笉瑙﹀彂 Merkle/Gossip锛宺epo 姝ｅ父宸ヤ綔锛?
     gossip: OnceLock<Arc<GossipEngine>>,
     /// 鍐欏叆闃熷垪锛堝彲閫夛紝Some 鏃?flush_pending 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛?
@@ -49,6 +53,7 @@ impl InfohashRepoImpl {
             storage,
             pending: RwLock::new(Vec::new()),
             dirty: RwLock::new(FxHashSet::default()),
+            persist_dirty: Arc::new(RwLock::new(FxHashSet::default())),
             gossip: OnceLock::new(),
             write_queue: None,
         }
@@ -118,6 +123,27 @@ impl InfohashRepoImpl {
         self.dirty.write().clear();
     }
 
+    // 鈹€鈹€ P1-8 鎸佷箙鍖?dirty 鏂规硶锛堜笌璇勫垎 dirty 鐙珛锛夆攢鈹€
+
+    pub fn mark_persist_dirty_sync(&self, infohash: &Infohash) {
+        self.persist_dirty.write().insert(*infohash);
+    }
+
+    pub fn persist_dirty_sync(&self) -> Vec<Infohash> {
+        self.persist_dirty.read().iter().copied().collect()
+    }
+
+    /// 只清除指定 infohash 的持久化脏标记（落库成功后调用）
+    pub fn clear_persist_dirty_sync(&self, hashes: &[Infohash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let mut pd = self.persist_dirty.write();
+        for h in hashes {
+            pd.remove(h);
+        }
+    }
+
     /// 灏嗘湰鍦版柊鍐欏叆鐨勬潯鐩壒閲忔洿鏂?Merkle 骞舵彁浜?Gossip锛堝啓閿佸鎵ц锛岀函鍐呭瓨鎿嶄綔锛夈€?
     /// merkle/gossip 鏈敞鍏ユ椂鐩存帴璺宠繃锛屼笉 panic銆?
     #[inline]
@@ -171,15 +197,36 @@ impl InfohashRepoImpl {
         if items.is_empty() {
             return Vec::new();
         }
-        let mut view = self.entries.write_all();
-        // 批次G(F4)：内存未命中 ≠ 真新增。先查 DB——已存在的条目（曾被驱逐/裁剪后再遇）
-        // 只回内存，不进 new_items，否则「驱逐→再遇→当新建→oplog+gossip」的churn
-        // 会把 INFOHASH oplog 灌到百万级，联邦 delta 永远追不完 → 对齐失败 → 全量重拉风暴。
-        let candidates: Vec<Infohash> = items
-            .iter()
-            .map(|(ih, _, _)| *ih)
-            .filter(|ih| !view.contains_key(ih))
-            .collect();
+        // P2-7：拆分临界区——旧实现持 entries 内存写锁期间调 existing_infohashes
+        // （read_long 等 permit 门），门饱和时持写锁等 permit，拖死 infohash 读者
+        // （crawl/discovery）。现：①短临界区只处理"已在内存"条目并收集待查 key；
+        // ②放锁后做 DB 查重；③重锁仲裁"不在内存"条目（重锁后二次 contains_key，
+        // 防并发插入，幂等口径不变：DB 已提交态判定新/旧）。
+        let mut ref_count_changed: Vec<Infohash> = Vec::new();
+        // ① not_in_memory = 内存未命中、待 DB 仲裁的 (infohash, source, last_seen)
+        let mut not_in_memory: Vec<(Infohash, String, u64)> = Vec::new();
+        {
+            let mut view = self.entries.write_all();
+            for (infohash, source, last_seen) in items {
+                // LWW: if local exists and remote last_seen is older, skip
+                if let Some(entry) = view.get_mut(infohash) {
+                    if *last_seen < entry.3 {
+                        continue;
+                    }
+                    entry.0 += 1;
+                    // update last_seen (take max)
+                    if *last_seen > entry.3 {
+                        entry.3 = *last_seen;
+                    }
+                    ref_count_changed.push(*infohash);
+                } else {
+                    not_in_memory.push((*infohash, source.clone(), *last_seen));
+                }
+            }
+        } // ①释放 entries 写锁
+
+        // ②DB 查重（不持内存写锁）
+        let candidates: Vec<Infohash> = not_in_memory.iter().map(|(ih, _, _)| *ih).collect();
         let db_known = if candidates.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -187,30 +234,34 @@ impl InfohashRepoImpl {
                 .existing_infohashes(&candidates)
                 .unwrap_or_default()
         };
+
+        // ③重锁仲裁不在内存的条目
         let mut new_items: Vec<(Infohash, String)> = Vec::new();
-        for (infohash, source, last_seen) in items {
-            // LWW: if local exists and remote last_seen is older, skip
-            if let Some(entry) = view.get_mut(infohash) {
-                if *last_seen < entry.3 {
+        if !not_in_memory.is_empty() {
+            let mut view = self.entries.write_all();
+            for (infohash, source, last_seen) in not_in_memory {
+                // 重锁后二次判定：期间可能已被其它线程写入，避免误标新建
+                if view.contains_key(&infohash) {
                     continue;
                 }
-                entry.0 += 1;
-                // update last_seen (take max)
-                if *last_seen > entry.3 {
-                    entry.3 = *last_seen;
+                if db_known.contains(&infohash) {
+                    // 批次G(F4)：DB 已知 → 只回内存（引用计数置 1），不作为「真新增」传播。
+                    view.insert(infohash, (1, source, 0.0, last_seen));
+                } else {
+                    view.insert(infohash, (1, source.clone(), 0.0, last_seen));
+                    new_items.push((infohash, source));
                 }
-            } else if db_known.contains(infohash) {
-                // 批次G(F4)：DB 已知 → 只回内存（引用计数置 1），不作为「真新增」传播。
-                // 保留 DB 行，不做 pending 重写（原行数据更完整）。
-                view.insert(*infohash, (1, source.clone(), 0.0, *last_seen));
-            } else {
-                view.insert(*infohash, (1, source.clone(), 0.0, *last_seen));
-                new_items.push((*infohash, source.clone()));
             }
         }
-        drop(view);
 
         // 鏂?infohash 鎵归噺鍐欏叆 pending 缂撳啿鍖猴紝鐢?flush_pending 鎵归噺鍐欏叆 SQLite
+        if !ref_count_changed.is_empty() {
+            let mut pd = self.persist_dirty.write();
+            for ih in ref_count_changed {
+                pd.insert(ih);
+            }
+        }
+
         if !new_items.is_empty() {
             let mut pending = self.pending.write();
             for item in &new_items {
@@ -360,8 +411,64 @@ impl InfohashRepoImpl {
 
     /// 浠?SQLite 鍔犺浇鍏ㄩ儴 infohash
     /// 澧為噺鎸佷箙鍖栵紙鍏ㄩ噺淇濆瓨妯″紡锛氭墍鏈夋暟鎹潎瑙嗕负 dirty锛岀洿鎺ュ叏閲忎繚瀛橈級
-    pub async fn save_dirty(&self) -> anyhow::Result<()> {
-        self.save_all().await
+    /// P1-8：增量持久化——先落 pending（新 infohash），再批量写 persist_dirty
+    /// （ref_count 变化），落库成功后才清 persist_dirty（B3 语义）。
+    pub async fn save_dirty(&self) -> anyhow::Result<usize> {
+        let flushed = self.flush_pending().await?;
+        let dirty = self.persist_dirty_sync();
+        if dirty.is_empty() {
+            return Ok(flushed);
+        }
+        let entries: Vec<InfohashRow> = {
+            let view = self.entries.read_all();
+            dirty
+                .iter()
+                .filter_map(|ih| {
+                    view.get(ih).map(|(count, src, score, _ls)| InfohashRow {
+                        infohash: *ih,
+                        ref_count: *count,
+                        first_source: src.clone(),
+                        score: *score,
+                    })
+                })
+                .collect()
+        };
+        if entries.is_empty() {
+            // 内存中已不存在的 dirty infohash（可能已被清理），清理残留标记
+            self.clear_persist_dirty_sync(&dirty);
+            return Ok(flushed);
+        }
+        if let Some(wq) = &self.write_queue {
+            let written = entries.len();
+            let pd_arc = self.persist_dirty.clone();
+            let ack = dirty.clone();
+            wq.send_sized(written, move |conn| {
+                Storage::save_infohashes_batch_in_tx(conn, &entries)?;
+                // 落库（同事务）成功后才清 persist_dirty；失败保留待重试
+                for h in &ack {
+                    pd_arc.write().remove(h);
+                }
+                Ok(())
+            })?;
+            Ok(flushed + written)
+        } else {
+            let written = entries.len();
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                for row in &entries {
+                    storage.save_infohash(
+                        &row.infohash,
+                        row.ref_count,
+                        &row.first_source,
+                        row.score,
+                    )?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            self.clear_persist_dirty_sync(&dirty);
+            Ok(flushed + written)
+        }
     }
 
     /// 启动时限量加载：按引用数降序加载最多 limit 个 infohash。
@@ -538,5 +645,57 @@ mod tests {
         let flushed = repo.flush_pending().await.unwrap();
         assert_eq!(flushed, 2);
         assert_eq!(repo.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_incremental_ref_count() {
+        // P1-8：新 infohash 走 pending 落库（初值 ref_count=1）；
+        // 重复 register 使 ref_count+1 → 标 persist_dirty → save_dirty 更新 DB 行
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo = InfohashRepoImpl::new(storage.clone());
+        let ih = [3u8; 20];
+        repo.register(ih, "dht").await;
+        repo.save_dirty().await.unwrap();
+        let rc1: i64 = storage
+            .read(|c| -> anyhow::Result<i64> {
+                Ok(c.query_row(
+                    "SELECT ref_count FROM infohashes WHERE infohash = ?1",
+                    rusqlite::params![&ih[..]],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(rc1, 1, "新 infohash 落库初值 ref_count=1");
+        // 重复 register：ref_count=2 → persist_dirty
+        repo.register(ih, "dht").await;
+        assert_eq!(
+            repo.persist_dirty_sync().len(),
+            1,
+            "ref_count 变化应标 persist_dirty"
+        );
+        repo.save_dirty().await.unwrap();
+        let rc2: i64 = storage
+            .read(|c| -> anyhow::Result<i64> {
+                Ok(c.query_row(
+                    "SELECT ref_count FROM infohashes WHERE infohash = ?1",
+                    rusqlite::params![&ih[..]],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(rc2, 2, "save_dirty 应更新 ref_count=2");
+        assert_eq!(
+            repo.persist_dirty_sync().len(),
+            0,
+            "落库成功后清 persist_dirty"
+        );
+        // 再次 save_dirty：无 dirty 空转
+        repo.save_dirty().await.unwrap();
+        let rows: i64 = storage
+            .read(|c| -> anyhow::Result<i64> {
+                Ok(c.query_row("SELECT COUNT(*) FROM infohashes", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "无 dirty 时不得重复写行");
     }
 }

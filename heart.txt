@@ -1,0 +1,319 @@
+02:21:19.924485Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入47 − 释放47 − 回收0）, 最老在飞=-
+02:21:49.929797Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入94 − 释放94 − 回收0）, 最老在飞=-
+02:22:19.932079Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入156 − 释放156 − 回收0）, 最老在飞=-
+02:22:49.936347Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入184 − 释放184 − 回收0）, 最老在飞=-
+02:23:20.025828Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入193 − 释放193 − 回收0）, 最老在飞=-
+02:23:50.036968Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入212 − 释放211 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 4s)
+02:24:20.038878Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入272 − 释放270 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 34s)
+02:24:50.141864Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入321 − 释放320 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 54s)
+02:25:20.241022Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入383 − 释放382 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 84s)
+02:25:50.335006Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入443 − 释放442 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 114s)
+02:26:20.346179Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入501 − 释放501 − 回收0）, 最老在飞=-
+02:26:50.439104Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入553 − 释放553 − 回收0）, 最老在飞=-
+02:27:20.547239Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入612 − 释放612 − 回收0）, 最老在飞=-
+02:27:50.643932Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入638 − 释放638 − 回收0）, 最老在飞=-
+02:28:20.748518Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入645 − 释放645 − 回收0）, 最老在飞=-
+02:28:50.841177Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入653 − 释放653 − 回收0）, 最老在飞=-
+02:29:20.949912Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入658 − 释放658 − 回收0）, 最老在飞=-
+02:29:51.051369Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入666 − 释放664 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 23s)
+02:30:21.151242Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=4（准入720 − 释放716 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 53s)
+02:30:51.251060Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=3/8, tracker=0/2], 在飞=3（准入771 − 释放768 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 84s)
+02:31:21.353778Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入829 − 释放825 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 114s)
+02:31:51.443034Z  INFO [task_scheduler] 调度器心跳: 队列待执行=48, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=4/8, tracker=0/2], 在飞=6（准入878 − 释放872 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 144s)
+02:32:21.455219Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=8/8, tracker=0/2], 在飞=11（准入913 − 释放902 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 174s)
+02:32:51.556916Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入942 − 释放929 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 204s)
+02:33:21.646956Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入959 − 释放946 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 234s)
+02:33:51.658341Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入980 − 释放967 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 264s)
+02:34:21.746155Z  INFO [task_scheduler] 调度器心跳: 队列待执行=42, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=10/8, tracker=0/2], 在飞=12（准入1005 − 释放993 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 294s)
+02:34:51.755958Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入1031 − 释放1018 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 324s)
+02:35:21.757327Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入1056 − 释放1043 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 354s)
+02:35:51.863044Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入1077 − 释放1064 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 384s)
+02:36:21.952910Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入1108 − 释放1095 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 414s)
+02:36:51.958371Z  INFO [task_scheduler] 调度器心跳: 队列待执行=42, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=10/8, tracker=0/2], 在飞=12（准入1133 − 释放1121 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 444s)
+02:37:22.063710Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=10/8, tracker=0/2], 在飞=12（准入1166 − 释放1153 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 474s)
+02:37:52.065257Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入1195 − 释放1181 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 504s)
+02:38:22.163761Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入1211 − 释放1197 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 534s)
+02:38:52.165845Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=10/8, tracker=0/2], 在飞=12（准入1239 − 释放1225 − 回收2）, 最老在飞=联邦bootstrap续传(Federation 564s)
+02:39:22.266098Z  INFO [task_scheduler] 调度器心跳: 队列待执行=39, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=10/8, tracker=0/2], 在飞=12（准入1262 − 释放1247 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 595s)
+02:39:52.361154Z  INFO [task_scheduler] 调度器心跳: 队列待执行=36, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=8/8, tracker=0/2], 在飞=10（准入1286 − 释放1268 − 回收8）, 最老在飞=联邦bootstrap续传(Federation 625s)
+02:40:22.369515Z  INFO [task_scheduler] 调度器心跳: 队列待执行=36, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=7/8, tracker=0/2], 在飞=9（准入1309 − 释放1291 − 回收9）, 最老在飞=联邦bootstrap续传(Federation 655s)
+02:40:52.462261Z  INFO [task_scheduler] 调度器心跳: 队列待执行=36, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=7/8, tracker=0/2], 在飞=9（准入1331 − 释放1313 − 回收9）, 最老在飞=联邦bootstrap续传(Federation 685s)
+02:41:22.571526Z  INFO [task_scheduler] 调度器心跳: 队列待执行=36, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=7/8, tracker=0/2], 在飞=9（准入1355 − 释放1337 − 回收9）, 最老在飞=联邦bootstrap续传(Federation 715s)
+02:41:52.661637Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=0/4, federation=3/8, tracker=0/2], 在飞=6（准入1383 − 释放1368 − 回收9）, 最老在飞=联邦bootstrap续传(Federation 745s)
+02:42:22.671134Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=1/8, persistence=0/1, monitor=3/2, network=0/4, federation=7/8, tracker=0/2], 在飞=11（准入1413 − 释放1393 − 回收9）, 最老在飞=联邦bootstrap续传(Federation 775s)
+02:42:52.673338Z  INFO [task_scheduler] 调度器心跳: 队列待执行=45, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=0/4, federation=4/8, tracker=0/2], 在飞=7（准入1441 − 释放1425 − 回收9）, 最老在飞=联邦bootstrap续传(Federation 805s)
+02:43:22.761665Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1496 − 释放1487 − 回收9）, 最老在飞=-
+02:43:52.769528Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1527 − 释放1518 − 回收9）, 最老在飞=-
+02:44:22.771801Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1554 − 释放1544 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 11s)
+02:44:52.863742Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=1/8, tracker=0/2], 在飞=2（准入1607 − 释放1596 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 41s)
+02:45:22.867856Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1660 − 释放1649 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 71s)
+02:45:52.872874Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入1716 − 释放1704 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 101s)
+02:46:22.982155Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=7/8, tracker=0/2], 在飞=8（准入1758 − 释放1741 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 131s)
+02:46:53.076414Z  INFO [task_scheduler] 调度器心跳: 队列待执行=45, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=8/8, tracker=0/2], 在飞=9（准入1795 − 释放1777 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 161s)
+02:47:23.078429Z  INFO [task_scheduler] 调度器心跳: 队列待执行=45, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=8/8, tracker=0/2], 在飞=9（准入1828 − 释放1810 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 191s)
+02:47:53.182675Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=2/8, tracker=0/2], 在飞=4（准入1869 − 释放1856 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 221s)
+02:48:23.273521Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=1/4, federation=4/8, tracker=0/2], 在飞=8（准入1909 − 释放1892 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 251s)
+02:48:53.378537Z  INFO [task_scheduler] 调度器心跳: 队列待执行=44, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=1/4, federation=6/8, tracker=0/2], 在飞=10（准入1948 − 释放1929 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 281s)
+02:49:23.381901Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=8/8, tracker=0/2], 在飞=11（准入1979 − 释放1959 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 311s)
+02:49:53.485104Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=6/8, tracker=0/2], 在飞=8（准入2020 − 释放2003 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 341s)
+02:50:23.488596Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=8/8, tracker=0/2], 在飞=11（准入2046 − 释放2026 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 371s)
+02:50:53.576221Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=3/8, tracker=0/2], 在飞=4（准入2070 − 释放2057 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 401s)
+02:51:23.579877Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=3/8, tracker=0/2], 在飞=4（准入2126 − 释放2113 − 回收9）, 最老在飞=联邦delta增量拉取(Federation 431s)
+02:51:53.585880Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=6/8, tracker=0/2], 在飞=7（准入2153 − 释放2136 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 403s)
+02:52:23.687389Z  INFO [task_scheduler] 调度器心跳: 队列待执行=44, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=0/4, federation=7/8, tracker=0/2], 在飞=9（准入2180 − 释放2161 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 433s)
+02:52:53.689386Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=9/8, tracker=0/2], 在飞=10（准入2215 − 释放2195 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 463s)
+02:53:23.779319Z  INFO [task_scheduler] 调度器心跳: 队列待执行=44, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=9/8, tracker=0/2], 在飞=9（准入2248 − 释放2229 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 494s)
+02:53:53.794254Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=10/8, tracker=0/2], 在飞=10（准入2270 − 释放2250 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 524s)
+02:54:23.891949Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入2281 − 释放2269 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 554s)
+02:54:53.991088Z  INFO [task_scheduler] 调度器心跳: 队列待执行=47, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=4/8, tracker=0/2], 在飞=6（准入2336 − 释放2320 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 584s)
+02:55:23.992317Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入2370 − 释放2358 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 614s)
+02:55:53.997236Z  INFO [task_scheduler] 调度器心跳: 队列待执行=48, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=3/8, tracker=0/2], 在飞=5（准入2395 − 释放2380 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 644s)
+02:56:24.106785Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=6/8, tracker=0/2], 在飞=7（准入2410 − 释放2393 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 674s)
+02:56:54.188995Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=8/8, tracker=0/2], 在飞=10（准入2447 − 释放2427 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 704s)
+02:57:24.192980Z  INFO [task_scheduler] 调度器心跳: 队列待执行=42, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=9/8, tracker=0/2], 在飞=11（准入2477 − 释放2456 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 734s)
+02:57:54.298831Z  INFO [task_scheduler] 调度器心跳: 队列待执行=44, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=6/8, tracker=0/2], 在飞=9（准入2512 − 释放2493 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 764s)
+02:58:24.403370Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=7/8, tracker=0/2], 在飞=10（准入2541 − 释放2521 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 794s)
+02:58:54.488343Z  INFO [task_scheduler] 调度器心跳: 队列待执行=42, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=8/8, tracker=0/2], 在飞=11（准入2563 − 释放2542 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 824s)
+02:59:24.490035Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入2589 − 释放2566 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 854s)
+02:59:54.493516Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入2625 − 释放2612 − 回收10）, 最老在飞=联邦Range反熵对账(Federation 675s)
+03:00:24.496791Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入2645 − 释放2634 − 回收10）, 最老在飞=IO 指标采样(Monitor 30s)
+03:00:54.606474Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=1/8, tracker=0/2], 在飞=3（准入2671 − 释放2658 − 回收10）, 最老在飞=爬虫Bootstrap(Crawl 28s)
+03:01:24.704104Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入2677 − 释放2665 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 30s)
+03:01:54.797564Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入2683 − 释放2672 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 60s)
+03:02:24.803415Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入2690 − 释放2678 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 90s)
+03:02:54.892924Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入2700 − 释放2688 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 120s)
+03:03:24.896572Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入2754 − 释放2741 − 回收10）, 最老在飞=联邦bootstrap续传(Federation 150s)
+03:03:55.003614Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=3/8, tracker=0/2], 在飞=3（准入2793 − 释放2780 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 107s)
+03:04:25.109070Z  INFO [task_scheduler] 调度器心跳: 队列待执行=44, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=8/8, tracker=0/2], 在飞=10（准入2836 − 释放2816 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 137s)
+03:04:55.208242Z  INFO [task_scheduler] 调度器心跳: 队列待执行=42, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=1/4, federation=8/8, tracker=0/2], 在飞=12（准入2862 − 释放2840 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 167s)
+03:05:25.299250Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=1/8, persistence=0/1, monitor=3/2, network=1/4, federation=8/8, tracker=0/2], 在飞=13（准入2895 − 释放2872 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 197s)
+03:05:55.305580Z  INFO [task_scheduler] 调度器心跳: 队列待执行=41, 运行中[crawl=1/8, persistence=0/1, monitor=3/2, network=1/4, federation=8/8, tracker=0/2], 在飞=13（准入2917 − 释放2894 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 227s)
+03:06:25.309181Z  INFO [task_scheduler] 调度器心跳: 队列待执行=47, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=1/4, federation=3/8, tracker=0/2], 在飞=7（准入2921 − 释放2904 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 257s)
+03:06:55.409105Z  INFO [task_scheduler] 调度器心跳: 队列待执行=47, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=1/4, federation=3/8, tracker=0/2], 在飞=7（准入2957 − 释放2940 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 287s)
+03:07:25.410800Z  INFO [task_scheduler] 调度器心跳: 队列待执行=48, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=4/8, tracker=0/2], 在飞=6（准入2976 − 释放2960 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 317s)
+03:07:55.512878Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=3/8, tracker=0/2], 在飞=5（准入2978 − 释放2963 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 347s)
+03:08:25.613452Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=3/8, tracker=0/2], 在飞=5（准入3004 − 释放2989 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 377s)
+03:08:55.709252Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=3/8, tracker=0/2], 在飞=5（准入3009 − 释放2994 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 407s)
+03:09:25.713140Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=3/8, tracker=0/2], 在飞=5（准入3014 − 释放2999 − 回收10）, 最老在飞=联邦delta增量拉取(Federation 437s)
+03:09:55.714636Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入3019 − 释放3006 − 回收11）, 最老在飞=联邦Range反熵对账(Federation 355s)
+03:10:25.804081Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入3025 − 释放3012 − 回收11）, 最老在飞=联邦Range反熵对账(Federation 385s)
+03:10:55.812190Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入3031 − 释放3019 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 352s)
+03:11:25.917484Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入3055 − 释放3042 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 382s)
+03:11:56.020943Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入3108 − 释放3096 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 413s)
+03:12:26.103678Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=1/8, tracker=0/2], 在飞=3（准入3159 − 释放3145 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 443s)
+03:12:56.112346Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=1/8, tracker=0/2], 在飞=3（准入3209 − 释放3195 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 473s)
+03:13:26.207426Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入3256 − 释放3242 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 503s)
+03:13:56.213471Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入3311 − 释放3297 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 533s)
+03:14:26.320203Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入3350 − 释放3336 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 563s)
+03:14:56.420615Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入3400 − 释放3385 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 593s)
+03:15:26.521143Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入3436 − 释放3421 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 623s)
+03:15:56.609293Z  INFO [task_scheduler] 调度器心跳: 队列待执行=46, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=4/8, tracker=0/2], 在飞=7（准入3476 − 释放3458 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 653s)
+03:16:26.719203Z  INFO [task_scheduler] 调度器心跳: 队列待执行=42, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=8/8, tracker=0/2], 在飞=11（准入3505 − 释放3483 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 683s)
+03:16:56.724836Z  INFO [task_scheduler] 调度器心跳: 队列待执行=39, 运行中[crawl=0/8, persistence=0/1, monitor=3/2, network=1/4, federation=10/8, tracker=0/2], 在飞=14（准入3529 − 释放3504 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 713s)
+03:17:26.821319Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入3550 − 释放3526 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 743s)
+03:17:56.915475Z  INFO [task_scheduler] 调度器心跳: 队列待执行=39, 运行中[crawl=0/8, persistence=0/1, monitor=3/2, network=1/4, federation=10/8, tracker=0/2], 在飞=14（准入3576 − 释放3551 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 773s)
+03:18:26.922014Z  INFO [task_scheduler] 调度器心跳: 队列待执行=39, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=14（准入3600 − 释放3575 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 803s)
+03:18:57.012475Z  INFO [task_scheduler] 调度器心跳: 队列待执行=38, 运行中[crawl=1/8, persistence=0/1, monitor=3/2, network=1/4, federation=10/8, tracker=0/2], 在飞=15（准入3620 − 释放3594 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 833s)
+03:19:27.016886Z  INFO [task_scheduler] 调度器心跳: 队列待执行=39, 运行中[crawl=0/8, persistence=0/1, monitor=3/2, network=1/4, federation=10/8, tracker=0/2], 在飞=14（准入3647 − 释放3622 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 863s)
+03:19:57.022048Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入3667 − 释放3643 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 893s)
+03:20:27.113551Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入3690 − 释放3666 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 924s)
+03:20:57.145911Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入3720 − 释放3696 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 954s)
+03:21:27.219023Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入3744 − 释放3720 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 984s)
+03:21:57.325718Z  INFO [task_scheduler] 调度器心跳: 队列待执行=40, 运行中[crawl=0/8, persistence=0/1, monitor=2/2, network=1/4, federation=10/8, tracker=0/2], 在飞=13（准入3763 − 释放3739 − 回收11）, 最老在飞=联邦bootstrap续传(Federation 1014s)
+03:22:36.567244Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入48 − 释放48 − 回收0）, 最老在飞=-
+03:23:06.658914Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入91 − 释放91 − 回收0）, 最老在飞=-
+03:23:36.659584Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入154 − 释放154 − 回收0）, 最老在飞=-
+03:24:06.668235Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入202 − 释放202 − 回收0）, 最老在飞=-
+03:24:36.755404Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入260 − 释放258 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 23s)
+03:25:06.764486Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入306 − 释放305 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 51s)
+03:25:36.860323Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入362 − 释放361 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 81s)
+03:26:06.970990Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入413 − 释放412 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 111s)
+03:26:37.057745Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入470 − 释放470 − 回收0）, 最老在飞=-
+03:27:07.073695Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入518 − 释放518 − 回收0）, 最老在飞=-
+03:27:37.174209Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入581 − 释放580 − 回收0）, 最老在飞=联邦DHT发现(Federation 2s)
+03:28:07.263283Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入636 − 释放636 − 回收0）, 最老在飞=-
+03:28:37.369927Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入688 − 释放688 − 回收0）, 最老在飞=-
+03:29:07.462629Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入743 − 释放743 − 回收0）, 最老在飞=-
+03:29:37.471446Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入798 − 释放798 − 回收0）, 最老在飞=-
+03:30:07.476640Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入855 − 释放854 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 3s)
+03:30:37.573532Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入906 − 释放906 − 回收0）, 最老在飞=-
+03:31:07.668311Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入969 − 释放969 − 回收0）, 最老在飞=-
+03:31:37.676865Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1017 − 释放1016 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 21s)
+03:32:07.766639Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1071 − 释放1070 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 51s)
+03:32:37.775316Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1121 − 释放1120 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 81s)
+03:33:07.868039Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1178 − 释放1177 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 111s)
+03:33:37.873110Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1231 − 释放1231 − 回收0）, 最老在飞=-
+03:34:07.979792Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1288 − 释放1288 − 回收0）, 最老在飞=-
+03:34:37.980548Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1339 − 释放1339 − 回收0）, 最老在飞=-
+03:35:08.073342Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1394 − 释放1394 − 回收0）, 最老在飞=-
+03:35:38.081789Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入1445 − 释放1444 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 15s)
+03:36:08.175499Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1495 − 释放1495 − 回收0）, 最老在飞=-
+03:36:38.282032Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1551 − 释放1551 − 回收0）, 最老在飞=-
+03:37:08.283909Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1605 − 释放1605 − 回收0）, 最老在飞=-
+03:37:38.372236Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1662 − 释放1662 − 回收0）, 最老在飞=-
+03:38:08.379733Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1714 − 释放1714 − 回收0）, 最老在飞=-
+03:38:38.384598Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1770 − 释放1769 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 13s)
+03:39:08.385443Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1821 − 释放1820 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 43s)
+03:39:38.479690Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1882 − 释放1881 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 73s)
+03:40:08.584702Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1935 − 释放1934 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 103s)
+03:40:38.679411Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1987 − 释放1987 − 回收0）, 最老在飞=-
+03:41:08.773941Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入2046 − 释放2045 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 7s)
+03:41:38.882973Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=1/2, network=0/4, federation=0/8, tracker=0/2], 在飞=2（准入2101 − 释放2099 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 38s)
+03:42:08.886528Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2157 − 释放2157 − 回收0）, 最老在飞=-
+03:42:38.974318Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2217 − 释放2217 − 回收0）, 最老在飞=-
+03:43:08.975918Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2276 − 释放2276 − 回收0）, 最老在飞=-
+03:43:38.978427Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入2333 − 释放2332 − 回收0）, 最老在飞=联邦DHT发现(Federation 5s)
+03:44:08.979879Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2386 − 释放2386 − 回收0）, 最老在飞=-
+03:44:38.982344Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2422 − 释放2422 − 回收0）, 最老在飞=-
+03:45:08.989761Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2478 − 释放2478 − 回收0）, 最老在飞=-
+03:45:39.078605Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入2533 − 释放2532 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 9s)
+03:46:09.080123Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=1/8, tracker=0/2], 在飞=2（准入2590 − 释放2588 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 39s)
+03:46:39.084560Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入2643 − 释放2642 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 69s)
+03:47:09.190241Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入2698 − 释放2696 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 99s)
+03:47:39.289857Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2754 − 释放2754 − 回收0）, 最老在飞=-
+03:48:09.391568Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2802 − 释放2802 − 回收0）, 最老在飞=-
+03:48:39.479021Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2855 − 释放2855 − 回收0）, 最老在飞=-
+03:49:09.492523Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入2912 − 释放2911 − 回收0）, 最老在飞=联邦DHT发现(Federation 6s)
+03:49:39.590284Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入2970 − 释放2970 − 回收0）, 最老在飞=-
+03:50:09.693285Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3020 − 释放3020 − 回收0）, 最老在飞=-
+03:50:39.783436Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3079 − 释放3079 − 回收0）, 最老在飞=-
+03:51:09.793183Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3126 − 释放3126 − 回收0）, 最老在飞=-
+03:51:39.892711Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3190 − 释放3190 − 回收0）, 最老在飞=-
+03:52:09.997241Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3237 − 释放3237 − 回收0）, 最老在飞=-
+03:52:40.085807Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入3294 − 释放3293 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 1s)
+03:53:10.086486Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入3350 − 释放3348 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 31s)
+03:53:40.194975Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入3403 − 释放3402 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 61s)
+03:54:10.289534Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入3461 − 释放3460 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 91s)
+03:54:40.298145Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入3513 − 释放3512 − 回收0）, 最老在飞=联邦DHT发现(Federation 9s)
+03:55:10.399653Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3566 − 释放3566 − 回收0）, 最老在飞=-
+03:55:40.485418Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3618 − 释放3618 − 回收0）, 最老在飞=-
+03:56:10.489589Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3676 − 释放3676 − 回收0）, 最老在飞=-
+03:56:40.492869Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3727 − 释放3727 − 回收0）, 最老在飞=-
+03:57:10.500236Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3779 − 释放3779 − 回收0）, 最老在飞=-
+03:57:40.501516Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3831 − 释放3831 − 回收0）, 最老在飞=-
+03:58:10.595962Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入3888 − 释放3888 − 回收0）, 最老在飞=-
+03:58:40.601504Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入3942 − 释放3941 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 6s)
+03:59:10.702198Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入3994 − 释放3993 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 36s)
+03:59:40.799730Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4049 − 释放4049 − 回收0）, 最老在飞=-
+04:00:10.902365Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=1/8, tracker=0/2], 在飞=2（准入4107 − 释放4105 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 23s)
+04:00:41.003915Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入4159 − 释放4158 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 53s)
+04:01:11.004774Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入4218 − 释放4217 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 84s)
+04:01:41.090984Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入4273 − 释放4272 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 114s)
+04:02:11.096598Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4317 − 释放4317 − 回收0）, 最老在飞=-
+04:02:41.100076Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4364 − 释放4364 − 回收0）, 最老在飞=-
+04:03:11.102712Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4420 − 释放4420 − 回收0）, 最老在飞=-
+04:03:41.197196Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4477 − 释放4477 − 回收0）, 最老在飞=-
+04:04:11.198671Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4531 − 释放4531 − 回收0）, 最老在飞=-
+04:04:41.303345Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入4588 − 释放4587 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 17s)
+04:05:11.307752Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4643 − 释放4643 − 回收0）, 最老在飞=-
+04:05:41.401358Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4688 − 释放4688 − 回收0）, 最老在飞=-
+04:06:11.495060Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入4717 − 释放4717 − 回收0）, 最老在飞=-
+04:06:42.056880Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入4748 − 释放4747 − 回收0）, 最老在飞=联邦Range反熵对账(Federation 1s)
+04:07:12.094560Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入4774 − 释放4773 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 3s)
+04:07:42.097240Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入4825 − 释放4824 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 33s)
+04:09:10.929020Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入41 − 释放41 − 回收0）, 最老在飞=-
+04:09:41.040468Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入93 − 释放93 − 回收0）, 最老在飞=-
+04:10:11.142028Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入159 − 释放159 − 回收0）, 最老在飞=-
+04:10:41.241455Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入208 − 释放207 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 0s)
+04:11:11.345181Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入270 − 释放268 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 30s)
+04:11:41.444797Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入319 − 释放318 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 60s)
+04:12:11.537159Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入387 − 释放386 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 90s)
+04:12:41.644839Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入439 − 释放439 − 回收0）, 最老在飞=-
+04:13:11.735140Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入497 − 释放497 − 回收0）, 最老在飞=-
+04:13:41.844844Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入551 − 释放551 − 回收0）, 最老在飞=-
+04:14:11.946333Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入610 − 释放609 − 回收0）, 最老在飞=联邦DHT发现(Federation 11s)
+04:14:42.033909Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入662 − 释放662 − 回收0）, 最老在飞=-
+04:15:12.038786Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入716 − 释放716 − 回收0）, 最老在飞=-
+04:15:42.143293Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入771 − 释放771 − 回收0）, 最老在飞=-
+04:16:12.143977Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入822 − 释放822 − 回收0）, 最老在飞=-
+04:16:42.233204Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入870 − 释放869 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 7s)
+04:17:12.234046Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入886 − 释放885 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 37s)
+04:17:42.241884Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入894 − 释放894 − 回收0）, 最老在飞=-
+04:18:12.340040Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入900 − 释放900 − 回收0）, 最老在飞=-
+04:18:42.445393Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入908 − 释放908 − 回收0）, 最老在飞=-
+04:19:12.535082Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入913 − 释放913 − 回收0）, 最老在飞=-
+04:19:42.537571Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入922 − 释放922 − 回收0）, 最老在飞=-
+04:20:12.550697Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入928 − 释放928 − 回收0）, 最老在飞=-
+04:20:42.649156Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入937 − 释放937 − 回收0）, 最老在飞=-
+04:21:12.740977Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入941 − 释放941 − 回收0）, 最老在飞=-
+04:21:42.844975Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入991 − 释放989 − 回收0）, 最老在飞=实体表 DB 级统计校准(Monitor 21s)
+04:22:12.848218Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=1/8, tracker=0/2], 在飞=2（准入998 − 释放996 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 43s)
+04:22:42.850139Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=1/8, tracker=0/2], 在飞=2（准入1004 − 释放1002 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 73s)
+04:23:12.952909Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=1/8, tracker=0/2], 在飞=2（准入1010 − 释放1008 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 103s)
+04:23:43.048466Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=1/8, tracker=0/2], 在飞=3（准入1015 − 释放1012 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 133s)
+04:24:13.146603Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1020 − 释放1016 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 163s)
+04:24:43.148280Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1022 − 释放1018 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 193s)
+04:25:13.252588Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1026 − 释放1022 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 223s)
+04:25:43.342617Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1029 − 释放1025 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 253s)
+04:26:13.350041Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1032 − 释放1028 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 283s)
+04:26:43.448654Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1035 − 释放1031 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 313s)
+04:27:13.555523Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1039 − 释放1035 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 343s)
+04:27:43.644784Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1041 − 释放1037 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 373s)
+04:28:13.750964Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1045 − 释放1041 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 403s)
+04:28:43.857065Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=2/8, tracker=0/2], 在飞=4（准入1048 − 释放1044 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 434s)
+04:29:13.946173Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入1052 − 释放1048 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 450s)
+04:29:44.048123Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入1055 − 释放1051 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 480s)
+04:30:14.053043Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入1058 − 释放1054 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 510s)
+04:30:44.157888Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=2/8, tracker=0/2], 在飞=3（准入1061 − 释放1057 − 回收1）, 最老在飞=联邦bootstrap续传(Federation 540s)
+04:31:14.254466Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1064 − 释放1060 − 回收2）, 最老在飞=联邦bootstrap续传(Federation 571s)
+04:31:44.344408Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1068 − 释放1064 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 601s)
+04:32:14.358558Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1071 − 释放1067 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 631s)
+04:32:44.457387Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1074 − 释放1070 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 661s)
+04:33:14.555194Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1077 − 释放1073 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 691s)
+04:33:44.654413Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1080 − 释放1076 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 721s)
+04:34:14.759537Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1083 − 释放1079 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 751s)
+04:34:44.847710Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1086 − 释放1082 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 781s)
+04:35:14.849244Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1090 − 释放1085 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 811s)
+04:35:44.952282Z  INFO [task_scheduler] 调度器心跳: 队列待执行=49, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1090 − 释放1085 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 841s)
+04:36:15.055321Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1091 − 释放1087 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 871s)
+04:36:45.156185Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1093 − 释放1088 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 901s)
+04:37:15.254329Z  INFO [task_scheduler] 调度器心跳: 队列待执行=50, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1094 − 释放1089 − 回收3）, 最老在飞=联邦bootstrap续传(Federation 932s)
+04:37:45.263325Z  INFO [task_scheduler] 调度器心跳: 队列待执行=43, 运行中[crawl=1/8, persistence=0/1, monitor=2/2, network=0/4, federation=8/8, tracker=0/2], 在飞=11（准入1124 − 释放1110 − 回收3）, 最老在飞=联邦DHT发现(Federation 13s)
+04:38:15.265726Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=2（准入1172 − 释放1167 − 回收3）, 最老在飞=爬虫Bootstrap(Crawl 33s)
+04:38:45.353099Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1192 − 释放1187 − 回收3）, 最老在飞=联邦delta增量拉取(Federation 16s)
+04:39:15.357901Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1229 − 释放1226 − 回收3）, 最老在飞=-
+04:39:45.363979Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1235 − 释放1232 − 回收3）, 最老在飞=-
+04:40:15.460001Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1243 − 释放1238 − 回收3）, 最老在飞=联邦delta增量拉取(Federation 13s)
+04:40:48.861771Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=2/8, tracker=0/2], 在飞=2（准入1248 − 释放1243 − 回收3）, 最老在飞=联邦delta增量拉取(Federation 46s)
+04:41:18.863188Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1255 − 释放1252 − 回收3）, 最老在飞=-
+04:41:48.965387Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入1260 − 释放1256 − 回收3）, 最老在飞=系统资源监控(Monitor 12s)
+04:42:47.416431Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入47 − 释放47 − 回收0）, 最老在飞=-
+04:43:17.425978Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入94 − 释放94 − 回收0）, 最老在飞=-
+04:43:47.520798Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入157 − 释放157 − 回收0）, 最老在飞=-
+04:44:17.625201Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入207 − 释放207 − 回收0）, 最老在飞=-
+04:44:47.626515Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入271 − 释放269 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 29s)
+04:45:17.627010Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入319 − 释放318 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 59s)
+04:45:47.728428Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入381 − 释放380 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 89s)
+04:46:17.826079Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入430 − 释放429 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 119s)
+04:46:47.830492Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入485 − 释放485 − 回收0）, 最老在飞=-
+04:47:17.914915Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入536 − 释放536 − 回收0）, 最老在飞=-
+04:47:47.926661Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入597 − 释放596 − 回收0）, 最老在飞=联邦DHT发现(Federation 9s)
+04:48:18.016954Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入647 − 释放647 − 回收0）, 最老在飞=-
+04:48:48.022461Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入703 − 释放703 − 回收0）, 最老在飞=-
+04:49:18.025874Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入761 − 释放761 − 回收0）, 最老在飞=-
+04:49:48.128456Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入815 − 释放815 − 回收0）, 最老在飞=-
+04:50:18.231352Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入875 − 释放875 − 回收0）, 最老在飞=-
+04:50:48.321832Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入924 − 释放924 − 回收0）, 最老在飞=-
+04:51:18.432324Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入980 − 释放980 − 回收0）, 最老在飞=-
+04:51:48.525068Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1033 − 释放1032 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 21s)
+04:52:18.531130Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1085 − 释放1084 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 51s)
+04:52:48.622060Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1094 − 释放1093 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 81s)
+04:53:18.624479Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1101 − 释放1100 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 111s)
+04:53:48.632767Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1108 − 释放1108 − 回收0）, 最老在飞=-
+04:54:18.731709Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1115 − 释放1115 − 回收0）, 最老在飞=-
+04:54:48.732461Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1121 − 释放1121 − 回收0）, 最老在飞=-
+04:55:18.834555Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1130 − 释放1130 − 回收0）, 最老在飞=-
+04:55:48.927085Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1135 − 释放1135 − 回收0）, 最老在飞=-
+04:56:18.934727Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1144 − 释放1144 − 回收0）, 最老在飞=-
+04:56:48.937672Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入1156 − 释放1155 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 3s)
+04:57:19.035305Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=2（准入1189 − 释放1187 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 33s)
+04:57:49.134086Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1201 − 释放1201 − 回收0）, 最老在飞=-
+04:58:19.222758Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1236 − 释放1236 − 回收0）, 最老在飞=-
+04:58:49.228980Z  INFO [task_scheduler] 调度器心跳: 队列待执行=51, 运行中[crawl=0/8, persistence=0/1, monitor=1/2, network=1/4, federation=1/8, tracker=0/2], 在飞=3（准入1291 − 释放1288 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 20s)
+04:59:19.323568Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1337 − 释放1336 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 50s)
+04:59:49.337041Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1367 − 释放1366 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 80s)
+05:00:19.428176Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=1（准入1414 − 释放1413 − 回收0）, 最老在飞=Tracker主动拉取peer(Network 110s)
+05:00:49.439233Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1447 − 释放1447 − 回收0）, 最老在飞=-
+05:01:19.528189Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=1/8, tracker=0/2], 在飞=1（准入1481 − 释放1480 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 4s)
+05:01:49.637290Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1529 − 释放1529 − 回收0）, 最老在飞=-
+05:02:19.725519Z  INFO [task_scheduler] 调度器心跳: 队列待执行=54, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=0（准入1567 − 释放1567 − 回收0）, 最老在飞=-

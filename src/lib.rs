@@ -112,6 +112,21 @@ pub const GIT_BRANCH: &str = env!("GIT_BRANCH");
 /// 库名称
 pub const NAME: &str = "PeerDiscoveryCenter";
 
+/// 测试临时目录根（仅 `cfg(test)` 可用）。
+///
+/// 2026-10-08 迁移：本机安全策略（EDR/防勒索类）会拒绝「target 构建目录镜像进程」
+/// 对 %TEMP% 根目录与 D:\test\ 等数据盘的直写（PermissionDenied code 5，项目
+/// config.rs 已有先例注释），但对**构建目录内**（`target/`）的写入放行。故测试
+/// 临时文件统一落在 `target/test-tmp/`（构建产物目录，与 config.rs 先例一致），
+/// 各测试模块的临时目录都从它下面派生，不再使用 `std::env::temp_dir()`。
+#[cfg(test)]
+pub fn test_tmp_dir() -> std::path::PathBuf {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+    std::fs::create_dir_all(&base)
+        .unwrap_or_else(|e| panic!("test_tmp_dir 创建失败 {}: {}", base.display(), e));
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +135,13 @@ mod tests {
     fn test_version() {
         assert!(!VERSION.is_empty());
         assert_eq!(NAME, "PeerDiscoveryCenter");
+    }
+
+    #[test]
+    fn test_test_tmp_dir_writable() {
+        let base = test_tmp_dir();
+        let probe = base.join(format!("wprobe_{}", std::process::id()));
+        std::fs::write(&probe, b"x").expect("测试临时目录应可写");
+        let _ = std::fs::remove_file(&probe);
     }
 }

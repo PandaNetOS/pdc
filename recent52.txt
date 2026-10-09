@@ -1,0 +1,75 @@
+total=481
+07:33:16.821397Z  INFO [tracker] 发现完成: 9 个 peer (去重后)
+07:33:31.575047Z  INFO [crawler] 分层响应率: L0已验证 0/7 L1新鲜 0/4 探索 0/796（300s窗口 响应增量/选中）
+07:33:36.149819Z  WARN [bootstrap] 块 105 传输校验失败（声明 2003 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.149891Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=105
+07:33:36.158300Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 块 110 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.158328Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=110
+07:33:36.168151Z  WARN [bootstrap] 块 106 传输校验失败（声明 2003 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.168215Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=106
+07:33:36.177036Z  WARN [bootstrap] 块 111 传输校验失败（声明 2011 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.177120Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=111
+07:33:36.185860Z  WARN [bootstrap] 块 107 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.185888Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=107
+07:33:36.194568Z  WARN [bootstrap] 块 112 传输校验失败（声明 2009 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.194632Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=112
+07:33:36.204128Z  WARN [bootstrap] 块 109 传输校验失败（声明 2014 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.204217Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=109
+07:33:36.213821Z  WARN [bootstrap] 块 108 传输校验失败（声明 2005 行 / 实收 0 行），保持进度 done=105/3126
+07:33:36.213870Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 120s 后重试: peer=22335aa9 repo=1 index=108
+07:34:03.607545Z  INFO [crawler] 分层响应率: L0已验证 0/7 L1新鲜 0/138 探索 0/854（300s窗口 响应增量/选中）
+07:34:41.676325Z  INFO [crawler] 分层响应率: L0已验证 0/18 L1新鲜 0/261 探索 0/912（300s窗口 响应增量/选中）
+07:35:13.709376Z  INFO [crawler] 分层响应率: L0已验证 0/22 L1新鲜 0/294 探索 0/912（300s窗口 响应增量/选中）
+07:35:44.777572Z  INFO [crawler] 分层响应率: L0已验证 0/28 L1新鲜 0/421 探索 0/779（300s窗口 响应增量/选中）
+07:36:15.821376Z  INFO [crawler] 分层响应率: L0已验证 0/24 L1新鲜 0/554 探索 0/650（300s窗口 响应增量/选中）
+07:36:33.878473Z  WARN [range] 应答按键拉取任务失败: task 15459 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:36:39.091786Z  WARN [range] 加载区间任务异常 repo=3: task 15626 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:36:40.937558Z  WARN [range] 加载区间任务异常 repo=2: task 15707 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:36:54.566681Z  WARN [range] 加载区间任务异常 repo=2: task 16043 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:36:55.970250Z  INFO [crawler] 分层响应率: L0已验证 0/24 L1新鲜 0/688 探索 0/516（300s窗口 响应增量/选中）
+07:37:02.731141Z  WARN [bootstrap] 本地区间摘要扫描失败，不继承任何断点、退回全量拉取: repo=1 peer=22335aa9: 本地区间摘要扫描任务 join 失败: task 15367 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:3692）"
+07:37:05.155819Z  INFO [bootstrap] 窗口化传输启动: peer=22335aa9 repo=1 块数=3126 窗口=8 首批=8
+07:37:11.447474Z  WARN [range] 加载区间任务异常 repo=3: task 16270 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:37:11.537774Z  WARN [range] 加载区间任务异常 repo=3: task 16353 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:37:17.946538Z  WARN [range] 加载区间任务异常 repo=3: task 16717 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:37:28.181519Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [range] 应答按键拉取任务失败: task 16832 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:37:33.883179Z  WARN [range] 应答按键拉取任务失败: task 16965 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:37:35.009949Z  INFO [crawler] 分层响应率: L0已验证 0/24 L1新鲜 0/687 探索 0/517（300s窗口 响应增量/选中）
+07:37:39.098327Z  WARN [range] 应答按键拉取任务失败: task 17223 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:37:40.939805Z  WARN [range] 加载区间任务异常 repo=1: task 17311 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:37:54.568765Z  WARN [range] 加载区间任务异常 repo=1: task 17793 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:38:11.461307Z  WARN [range] 加载区间任务异常 repo=1: task 18220 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:38:11.541419Z  WARN [range] 加载区间任务异常 repo=1: task 18446 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:38:11.542146Z  WARN [bootstrap] 块 111 apply 任务 join 失败（按空块处理）: task 18442 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.542178Z  WARN [bootstrap] 块 111 传输校验失败（声明 2012 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.542196Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=111
+07:38:11.556496Z  WARN [bootstrap] 块 112 apply 任务 join 失败（按空块处理）: task 18439 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.556618Z  WARN [bootstrap] 块 112 传输校验失败（声明 2009 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.556657Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=112
+07:38:11.557171Z  WARN [bootstrap] 块 107 apply 任务 join 失败（按空块处理）: task 18437 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.557199Z  WARN [bootstrap] 块 107 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.557215Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=107
+07:38:11.565127Z  WARN [bootstrap] 块 105 apply 任务 join 失败（按空块处理）: task 18443 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.565159Z  WARN [bootstrap] 块 105 传输校验失败（声明 2003 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.565176Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=105
+07:38:11.566454Z  WARN [bootstrap] 块 108 apply 任务 join 失败（按空块处理）: task 18440 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.566490Z  WARN [bootstrap] 块 108 传输校验失败（声明 2005 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.566509Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=108
+07:38:11.574483Z  WARN [bootstrap] 块 106 apply 任务 join 失败（按空块处理）: task 18217 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.574516Z  WARN [bootstrap] 块 106 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.574593Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=106
+07:38:11.581171Z  WARN [bootstrap] 块 110 apply 任务 join 失败（按空块处理）: task 18241 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.581216Z  WARN [bootstrap] 块 110 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.581238Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=110
+07:38:11.589395Z  WARN [bootstrap] 块 109 apply 任务 join 失败（按空块处理）: task 18441 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:2387）"
+07:38:11.589432Z  WARN [bootstrap] 块 109 传输校验失败（声明 2014 行 / 实收 0 行），保持进度 done=105/3126
+07:38:11.589452Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=109
+07:38:13.025548Z  INFO [crawler] 分层响应率: L0已验证 0/24 L1新鲜 0/821 探索 0/570（300s窗口 响应增量/选中）
+07:38:17.972316Z  WARN [range] 加载区间任务异常 repo=1: task 18641 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"
+07:38:28.190495Z  WARN [range] 加载区间任务异常 repo=1: task 18801 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:38:33.890316Z  WARN [range] 加载区间任务异常 repo=1: task 18875 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:38:39.103873Z  WARN [range] 加载区间任务异常 repo=1: task 18958 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:38:40.950804Z  WARN [range] 加载区间任务异常 repo=1: task 18965 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:835）"
+07:38:46.107403Z  INFO [crawler] 分层响应率: L0已验证 0/21 L1新鲜 0/954 探索 0/598（300s窗口 响应增量/选中）
+07:38:48.352330Z  INFO [tracker] 发现完成: 17 个 peer (去重后)
+07:38:54.651253Z  WARN [range] 加载区间任务异常 repo=1: task 19107 panicked with message "长查询连接池饥饿（等待 >60s 无连接归还），调用方按失败重试（caller=src\\storage\\db.rs:855）"

@@ -323,7 +323,11 @@ fn default_task_scheduler_intervals() -> HashMap<String, u64> {
     // 空闲窗口，300s 周期 = 每 5 分钟一次「等满 busy_timeout 的全量写停摆」，背压
     // 顶满 → G4 闸门关闭 → 联邦 apply/gossip/delta 连锁卡顿。逻辑帧的及时回填由
     // PASSIVE（不阻塞写者）负责，TRUNCATE 只承担磁盘空间回收，低频即可。
-    m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 3600u64);
+    // preP37+（L1-⑥）：3600→120 —— WAL 失控实证（WAL 996MB→读慢→读池占满→HTTP/
+    // 任务全卡）。PASSIVE 遇大量读者持续让步时 WAL 只涨不缩；周期 TRUNCATE 每 2 分钟
+    // 在写锁短窗尽力抢独占压缩 WAL（busy 拿不到由下轮重试，不阻塞写者——调度器任务
+    // 失败路径有 busy 记录，不 panic）。
+    m.insert("wal_checkpoint_truncate_interval_secs".to_string(), 120u64);
     m
 }
 
@@ -503,7 +507,11 @@ fn default_sqlite_cache_size() -> i64 {
     -65_536 // 64MB 页缓存（负数表示页数，原256MB过大导致内存占用高）
 }
 fn default_sqlite_wal_autocheckpoint() -> u32 {
-    1000 // 恢复SQLite自动checkpoint兜底（1000页），IOScheduler仍为主调度
+    // preP37（L1-⑥）：1000→250 页（约 1MB）。背景：PASSIVE autocheckpoint 遇大量读者
+    // 持续让步，WAL 放任涨到 GB 级后读查询扫 WAL 变慢、读池被慢读占满 → HTTP/任务全卡
+    // （2026-10-08 双端实证 WAL 996MB、全进程 450s 卡死）。更小阈值让 PASSIVE 更频繁
+    // 尝试回收逻辑帧；结合 flush 落库后的主动 checkpoint（见 bootstrap flush），WAL 稳定。
+    250
 }
 fn default_sqlite_temp_store() -> String {
     "MEMORY".to_string()
@@ -2043,8 +2051,9 @@ mod tests {
     /// （2026-09 生产事故回归测试：BOM 导致整份配置被静默弃用）。
     #[test]
     fn test_from_file_strips_utf8_bom() {
-        // 不用 %TEMP% 根目录：安全策略会拒绝 target 构建目录镜像进程对 Temp 根的直写
-        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        // 测试临时根用 crate::test_tmp_dir()（构建目录 target/test-tmp）：本机安全策略
+        // 拒绝 target 构建目录进程对 %TEMP% 根与数据盘的直写（PermissionDenied code 5）。
+        let tmp = crate::test_tmp_dir();
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join(format!("pdc-bom-test-{}.yaml", std::process::id()));
         let mut content = String::from("\u{feff}");
@@ -2137,13 +2146,13 @@ log_level: debug
 
         // 路径 1：整个 task_scheduler 节缺失 -> impl Default
         let c1 = PdcConfig::default();
-        assert_eq!(c1.task_scheduler.intervals.get(KEY).copied(), Some(3600));
+        assert_eq!(c1.task_scheduler.intervals.get(KEY).copied(), Some(120));
 
         // 路径 2：节存在但省略 intervals -> 字段级 serde 默认
         let yaml = "task_scheduler:\n  crawl_concurrency: 4\n";
         let c2 = PdcConfig::from_yaml(yaml).unwrap();
         assert_eq!(c2.task_scheduler.crawl_concurrency, 4);
-        assert_eq!(c2.task_scheduler.intervals.get(KEY).copied(), Some(3600));
+        assert_eq!(c2.task_scheduler.intervals.get(KEY).copied(), Some(120));
 
         // 路径 3：两条路径产出的默认表完全一致
         assert_eq!(c1.task_scheduler.intervals, c2.task_scheduler.intervals);

@@ -234,8 +234,19 @@ pub struct FederationConfig {
     /// v10(C)：bootstrap 块传输的并发窗口（在途块请求数）。链式传输的吞吐被
     /// 单块「生成+传输+RTT」线性叠加钉死（实测 0.33MB/s）；窗口化预取后吞吐
     /// 随窗口扩大，直至撞上落库/磁盘上限。
+    ///
+    /// 批次O(O4)：默认值 16→4。窗口是**请求方**参数，而应答方按自己的
+    /// `bootstrap_send_concurrency` 限制同时服务的块数；窗口大于应答方并发时，
+    /// 多出的请求只会拿到 busy NAK（旧实现下演变成 90 次/秒重试风暴）。
+    /// 经验配比：窗口 ≤ 应答方并发的 1/2。
     #[serde(default = "default_bootstrap_window_size")]
     pub bootstrap_window_size: usize,
+    /// 批次O(O4)：应答方拿不到发送槽时的等待时长（毫秒），超时才回 busy NAK。
+    #[serde(default = "default_bootstrap_send_permit_wait_ms")]
+    pub bootstrap_send_permit_wait_ms: u64,
+    /// 批次O(O4)：NAK 原因限流日志间隔（秒）。0/未配时按 30s 汇总一次。
+    #[serde(default = "default_bootstrap_nak_log_interval_secs")]
+    pub bootstrap_nak_log_interval_secs: u64,
     /// D批(D1)：收到对端 bootstrap 清单后，本地按相同 chunk_rows 重建清单并逐块比对 hash，
     /// hash 一致的块不再请求（只拉差异块）。默认 true；置 false 退回全量盲拉。
     /// 本地清单重建是全表扫描，内部已 spawn_blocking，不阻塞 tokio worker。
@@ -281,14 +292,35 @@ pub struct FederationConfig {
     /// v9：同一 index 的分块请求保持无响应的最长时间（秒），超时同样重拉清单。
     #[serde(default = "default_bootstrap_chunk_timeout_secs")]
     pub bootstrap_chunk_timeout_secs: u64,
+    /// 批次O(O7)：**在途块回收超时**（秒）—— `bootstrap_resume_tick` 用它判定
+    /// 「已发出但无回帧」的块并回收重发。
+    ///
+    /// 必须显著小于 `bootstrap_chunk_timeout_secs`：后者是「请求帧发送超时」，
+    /// 生产上配到 600s；若回收也用它，**一个被丢弃的请求会占住窗口槽 10 分钟**
+    /// （实测 .52 2026-10-07：窗口 8 全满、inflight 冻结、吞吐掉到 ~8 块/2-3 分钟）。
+    /// 显式 NAK 已经覆盖「对端忙」的情形，因此无回帧只可能是丢帧/会话卡顿。
+    ///
+    /// 批次O(O12)：60→**20**。现网实测分块响应在高负载下会**成批丢失**（对端
+    /// `bootstrap_send_total` 增长而本端 `sync_entries_applied` 几乎不动，且
+    /// `federation_frame_decode_errors=0`、无 `验证失败` 告警、事件通道 `Lagged=0`），
+    /// 丢失成批发生时整窗要等到回收才重发 —— 回收超时直接决定该场景的吞吐
+    /// （60s→20s ≈ 3×）。一次正常分块往返是亚秒级，20s 足够宽裕；
+    /// 对端重建清单期间由窗口暂停（`pause_for`）挡住，不会因短回收而刷请求。
+    #[serde(default = "default_bootstrap_chunk_wait_secs")]
+    pub bootstrap_chunk_wait_secs: u64,
     /// v9：bootstrap 是否阻断同 repo 的 delta。默认 **false**（两通道并行）。
     ///
     /// 旧实现无条件 `continue` 跳过 delta，与「bootstrap 卡死」构成互锁闭环；
     /// 置 true 可退回旧行为（仅供对照排查）。
     #[serde(default)]
     pub bootstrap_blocks_delta: bool,
-    /// v9：应答方「清单重建」租约（秒）。租约内到达的块请求直接回显式空块（NAK），
+    /// v9：应答方「清单重建」单飞租约（秒）。租约内到达的块请求直接回显式空块（NAK），
     /// 让请求方按失败计数自愈，而不是静默不回帧。
+    ///
+    /// 批次O(O5)：该租约同时是**重建单飞**的夺取阈值 —— 重建期间标记不释放，
+    /// 只有超过租约（旧重建疑似卡死）才允许下一次夺取。因此它必须显著大于一次
+    /// 全表重建的耗时（分批切块后 6.2M 行约十秒级）；旧值 60 小于重建实际耗时，
+    /// 导致每 60s 再起一个全表扫描、多个重建互抢读池（谁都不返回、块请求持续被 NAK）。
     #[serde(default = "default_bootstrap_rebuild_lease_secs")]
     pub bootstrap_rebuild_lease_secs: u64,
     /// v9：单轮 range 反熵最多处理的 repo 数（1 = 每轮只做一个 repo）。
@@ -443,8 +475,12 @@ fn default_bootstrap_repo_done_cooldown_secs() -> u64 {
 }
 
 /// A1：bootstrap 发送并发上限默认 4（在途块任务数）。
+///
+/// 批次O(O4)：4→16。该值是**应答方**同时服务块请求的上限，必须显著大于请求方
+/// `bootstrap_window_size`（默认 4），否则请求超出服务能力、只能拿 busy NAK。
+/// 内存上界仍受 per-permit 的 entries 加载与 A4 内存反压 override 约束。
 fn default_bootstrap_send_concurrency() -> usize {
-    4
+    16
 }
 /// A2：单块发送超时默认 10s（覆盖慢盘单块 ~2MB 的一次 RTT + 写缓冲等待）。
 fn default_bootstrap_send_timeout_secs() -> u64 {
@@ -630,8 +666,30 @@ fn default_bootstrap_rate_bytes_per_sec() -> u64 {
     crate::federation::sync::bootstrap::DEFAULT_RATE_BYTES_PER_SEC
 }
 /// v10(C)：bootstrap 块传输并发窗口（见 `bootstrap_window_size`）。
+///
+/// 批次O(O4)：16→8。窗口必须不超过应答方 `bootstrap_send_concurrency`（默认 16）的
+/// 一半，否则请求超出对方同时服务能力、只能拿 busy NAK（旧默认 16 vs 4 必然打满）。
+/// preP35b：8→4 —— 双端实测窗口 8 并发时传输高峰（清单/块落地/协商）与 HTTP 监控
+/// 争抢读池与写锁，HTTP 响应 >6s（面板超时）；降为 4 后高峰资源占用减半，稳定优先。
+/// preP36（L1-④）：4→12 —— 管道化（块请求不等落库）+ 攒批落库（50k 行/批）+ 压缩
+/// 后，落库不再是窗口补发的串行瓶颈；窗口 12 × 10000 行 ≈ 12 万行在途（~18MB），
+/// 应答方 16 槽仍有余量（不 NAK），千兆链路下吞吐目标 500Mbps。
+/// preP37（L1-⑥）：12→8 —— 应答方取块全部走长查询池（8→12 槽），窗口 12 会把
+/// 取块排队压到 HTTP 查询上（双端 HTTP 全卡 12 分钟实证）；窗口 8 + 长查询池 12
+/// 1:1 不排队，8 并发 × 10000 行 × ~100ms ≈ 80 万行/s ≈ 120MB/s 仍远超 500Mbps 目标。
 fn default_bootstrap_window_size() -> usize {
-    16
+    8
+}
+/// 批次O(O4)：应答方拿不到发送槽时的等待时长（毫秒），超时才回 busy NAK。
+///
+/// 排队发生在加载 entries **之前**（内存上界不变），因此短暂排队是安全的；
+/// 立即回 NAK 会让请求方把它当传输失败并立即重发（自激风暴）。
+fn default_bootstrap_send_permit_wait_ms() -> u64 {
+    500
+}
+/// 批次O(O4)：NAK 原因限流日志间隔（秒）——每个原因每该间隔最多一条汇总 WARN。
+fn default_bootstrap_nak_log_interval_secs() -> u64 {
+    30
 }
 /// D批(D3)：对端负载保护节流（见 `bootstrap_peer_protect_delay_ms`）。默认 30ms。
 fn default_bootstrap_peer_protect_delay_ms() -> u64 {
@@ -659,13 +717,22 @@ fn default_bootstrap_chunk_max_attempts() -> u32 {
 fn default_bootstrap_chunk_timeout_secs() -> u64 {
     90
 }
+/// 批次O(O7/O12)：在途块回收超时默认 20s（见 `bootstrap_chunk_wait_secs`）。
+///
+/// 正常分块往返亚秒级；该值只在「响应成批丢失」时决定重发节奏，是丢帧场景下的吞吐开关。
+fn default_bootstrap_chunk_wait_secs() -> u64 {
+    20
+}
 /// Range 数据块发送超时默认值（秒）。
 fn default_range_send_timeout_secs() -> u64 {
     30
 }
 /// v9：清单重建租约（秒）。旧值 900 过长：租约内所有块请求被静默丢弃（实测卡死主因之一）。
+///
+/// 批次O(O5)：60→300。该值是「重建单飞」的夺取阈值，必须大于一次全表重建耗时；
+/// 分批切块后 6.2M 行重建为十秒级，300s 只用于兜住「重建任务卡死/泄漏」的极端情形。
 fn default_bootstrap_rebuild_lease_secs() -> u64 {
-    60
+    300
 }
 fn default_range_repos_per_tick() -> u32 {
     1
@@ -784,6 +851,8 @@ impl Default for FederationConfig {
             sync_tracker_enabled: default_true(),
             dht_discovery_enabled: default_true(),
             bootstrap_window_size: default_bootstrap_window_size(),
+            bootstrap_send_permit_wait_ms: default_bootstrap_send_permit_wait_ms(),
+            bootstrap_nak_log_interval_secs: default_bootstrap_nak_log_interval_secs(),
             bootstrap_skip_identical_chunks: default_true(),
             bootstrap_peer_protect_delay_ms: default_bootstrap_peer_protect_delay_ms(),
             dht_discovery_interval_secs: default_dht_interval(),
@@ -835,6 +904,7 @@ impl Default for FederationConfig {
             bootstrap_stall_secs: default_bootstrap_stall_secs(),
             bootstrap_chunk_max_attempts: default_bootstrap_chunk_max_attempts(),
             bootstrap_chunk_timeout_secs: default_bootstrap_chunk_timeout_secs(),
+            bootstrap_chunk_wait_secs: default_bootstrap_chunk_wait_secs(),
             bootstrap_blocks_delta: false,
             bootstrap_rebuild_lease_secs: default_bootstrap_rebuild_lease_secs(),
             range_repos_per_tick: default_range_repos_per_tick(),
@@ -911,7 +981,14 @@ mod tests {
             "默认仅 NODE(1)，保持现行为"
         );
         // 核心运行时切片（2026-09-30）：发送并发/超时/熔断/idle/range 超时默认值
-        assert_eq!(cfg.bootstrap_send_concurrency, 4);
+        // 批次O(O4)：发送并发 4→16、窗口 16→8（窗口 ≤ 应答方并发的一半，否则 busy NAK）
+        // preP35b：窗口 8→4（传输高峰与 HTTP 监控争抢读池/写锁，HTTP >6s，稳定优先）
+        // preP36（L1-④）：窗口 4→12（管道化+攒批+压缩后落库不再是串行瓶颈，500Mbps 目标）
+        // preP37（L1-⑥）：窗口 12→8（取块走长查询池，窗口 12 排队压死 HTTP；8 并发仍超 500Mbps）
+        assert_eq!(cfg.bootstrap_send_concurrency, 16);
+        assert_eq!(cfg.bootstrap_window_size, 8);
+        assert_eq!(cfg.bootstrap_send_permit_wait_ms, 500);
+        assert_eq!(cfg.bootstrap_nak_log_interval_secs, 30);
         assert_eq!(cfg.bootstrap_send_timeout_secs, 10);
         assert_eq!(cfg.bootstrap_send_circuit_break_threshold, 5);
         assert_eq!(cfg.bootstrap_send_idle_timeout_secs, 60);

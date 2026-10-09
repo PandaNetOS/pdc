@@ -69,17 +69,21 @@ pub fn init_delta_tables(conn: &Connection) -> anyhow::Result<()> {
 
 impl crate::storage::db::Storage {
     /// 读取某对端在某 repo 上已同步到的 seq（不存在时 0）。
+    ///
+    /// P2（读写分离）：SELECT 改走短读池 `self.read`，不再拿 `self.conn` 写锁——
+    /// delta tick 此前逐 (peer,repo) 抢写锁读游标，写锁被 checkpoint 占住时整 tick
+    /// 停滞（v9 遗留#4）。read Err 向上传播，调用方按失败重试/降级。
     pub fn get_peer_seq(&self, peer: &[u8], repo: u8) -> anyhow::Result<i64> {
-        let conn = self.connection();
-        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        let v: i64 = conn
-            .query_row(
-                "SELECT seq FROM delta_peer_seq WHERE peer = ?1 AND repo = ?2",
-                params![peer, repo as i64],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        Ok(v)
+        self.read(move |conn| -> anyhow::Result<i64> {
+            let v: i64 = conn
+                .query_row(
+                    "SELECT seq FROM delta_peer_seq WHERE peer = ?1 AND repo = ?2",
+                    params![peer, repo as i64],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok(v)
+        })
     }
 
     /// 写入某对端在某 repo 上已同步到的 seq（幂等 upsert；仅前进，不回退）。

@@ -1,0 +1,42 @@
+total=71
+[2m2026-10-08T08:14:44.834006Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:15:08.236250Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:15:09.582185Z[0m [33m WARN[0m [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=1
+[2m2026-10-08T08:15:18.639999Z[0m [33m WARN[0m [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=3
+[2m2026-10-08T08:15:19.336486Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:15:28.037125Z[0m [33m WARN[0m [1mendpoint[0m[1m{[0m[3mid[0m[2m=[0m9669f68e82[1m}[0m[2m:[0m[1mactor[0m[2m:[0m[1mreportgen-actor[0m[2m:[0m[1mcaptive-portal[0m[2m:[0m check_captive_portal error: HTTP request failed: error sending request for url (http://euc1-1.relay.n0.iroh.link./generate_204): client error (SendRequest): connection closed before message completed
+[2m2026-10-08T08:15:38.527643Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:15:43.539471Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: oplog保留窗口裁剪
+[2m2026-10-08T08:15:45.736512Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 2/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:16:10.639158Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:16:22.137183Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:16:34.679288Z[0m [33m WARN[0m [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=1
+[2m2026-10-08T08:16:46.648702Z[0m [33m WARN[0m [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=3
+[2m2026-10-08T08:16:51.034191Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:16:51.532251Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:17:18.827433Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:17:31.336049Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:17:45.139735Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:18:02.735355Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:18:09.972331Z[0m [33m WARN[0m [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=1
+[2m2026-10-08T08:18:15.533042Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:18:24.721708Z[0m [33m WARN[0m [bootstrap] 回收 8 个超时在途块: peer=22335aa9 repo=3
+[2m2026-10-08T08:18:33.759141Z[0m [33m WARN[0m [1mendpoint[0m[1m{[0m[3mid[0m[2m=[0m9669f68e82[1m}[0m[2m:[0m[1mrelay-actor[0m[2m:[0m[1mactive-relay[0m[1m{[0m[3murl[0m[2m=[0mhttps://usw1-1.relay.n0.iroh.link./[1m}[0m[2m:[0m Lost connection to relay server: Client stream read failed: Stream error: 远程主机强迫关闭了一个现有的连接。 (os error 10054): 远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-10-08T08:18:42.034993Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:18:47.738507Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: 低频全量持久化兜底
+[2m2026-10-08T08:18:48.640723Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WAL checkpoint 决策
+[2m2026-10-08T08:18:52.129737Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 冷热分层驱逐（id=tier_evict）已在飞 451s > 超时 300s×1.5，强制回收槽位（Monitor）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:00.339826Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 增量评分重算（id=score_incremental）已在飞 450s > 超时 300s×1.5，强制回收槽位（Monitor）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:05.259214Z[0m [33m WARN[0m [1mendpoint[0m[1m{[0m[3mid[0m[2m=[0m9669f68e82[1m}[0m[2m:[0m[1mrelay-actor[0m[2m:[0m[1mactive-relay[0m[1m{[0m[3murl[0m[2m=[0mhttps://usw1-1.relay.n0.iroh.link./[1m}[0m[2m:[0m Lost connection to relay server: Client stream read failed: Stream error: 远程主机强迫关闭了一个现有的连接。 (os error 10054): 远程主机强迫关闭了一个现有的连接。 (os error 10054)
+[2m2026-10-08T08:19:13.530811Z[0m [33m WARN[0m [task_scheduler] 分类并发饥饿补偿准入（Persistence 1/1，已连续延迟 6 轮）: WriteQueue定时刷盘
+[2m2026-10-08T08:19:14.237000Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 爬虫主动爬行（id=crawler_active_crawl）已在飞 465s > 超时 300s×1.5，强制回收槽位（Crawl）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:14.237217Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 定期增量持久化（id=periodic_persistence）已在飞 468s > 超时 300s×1.5，强制回收槽位（Persistence）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:14.237256Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 爬虫主动get_peers（id=crawler_get_peers）已在飞 461s > 超时 300s×1.5，强制回收槽位（Crawl）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:14.237270Z[0m [31mERROR[0m [task_scheduler] WATCHDOG: 本轮强制回收 3 个泄漏槽位（累计 5），在飞剩 16
+[2m2026-10-08T08:19:21.427268Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 IO 指标采样（id=io_metrics_poll）已在飞 450s > 超时 300s×1.5，强制回收槽位（Monitor）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:28.338274Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 配置热更新监听（id=config_reloader）已在飞 451s > 超时 300s×1.5，强制回收槽位（Monitor）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:44.238097Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 爬虫主动sample_infohashes（id=crawler_sample_infohashes）已在飞 469s > 超时 300s×1.5，强制回收槽位（Crawl）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:44.238168Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 中继过期连接清理（id=relay_cleanup）已在飞 468s > 超时 300s×1.5，强制回收槽位（Network）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:44.238181Z[0m [31mERROR[0m [task_scheduler] 槽位泄漏：任务 DHT探测PeerRepo拉取（id=dht_probe_poll）已在飞 478s > 超时 300s×1.5，强制回收槽位（Network）。执行体已不可能返回，不回收则该分类将被永久占满
+[2m2026-10-08T08:19:44.238194Z[0m [31mERROR[0m [task_scheduler] WATCHDOG: 本轮强制回收 3 个泄漏槽位（累计 10），在飞剩 13
+THREADS: 156 CPU: 629.84375

@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_node_identity_load_or_create() {
-        let dir = std::env::temp_dir().join(format!("pdc_fed_test2_{}", std::process::id()));
+        let dir = crate::test_tmp_dir().join(format!("pdc_fed_test2_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_legacy_identity_is_migrated_to_derived_node_id() {
-        let dir = std::env::temp_dir().join(format!("pdc_fed_migrate_{}", std::process::id()));
+        let dir = crate::test_tmp_dir().join(format!("pdc_fed_migrate_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let fed_dir = dir.join("federation");
         std::fs::create_dir_all(&fed_dir).unwrap();

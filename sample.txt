@@ -1,0 +1,8 @@
+13:05:00 avail=0 starved=89904 longA=0 longW=1475
+13:05:04 avail=0 starved=90911 longA=0 longW=1475
+13:05:08 avail=0 starved=91900 longA=0 longW=1475
+13:05:12 avail=0 starved=92809 longA=0 longW=1475
+13:05:16 avail=0 starved=93696 longA=0 longW=1475
+13:05:20 avail=0 starved=94704 longA=0 longW=1475
+13:05:24 avail=0 starved=95629 longA=0 longW=1475
+13:05:28 avail=0 starved=96528 longA=0 longW=1475

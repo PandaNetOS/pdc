@@ -187,7 +187,7 @@ fn main() -> anyhow::Result<()> {
     };
     let worker_threads = worker_threads.max(4);
     let tracker_threads = config.tracker_runtime_threads.max(2);
-    let api_threads = config.api_runtime_threads.max(2);
+    let api_threads = config.api_runtime_threads.max(4);
     let federation_threads = if config.federation_runtime_threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -218,6 +218,10 @@ fn main() -> anyhow::Result<()> {
         .thread_name("pdc-tracker")
         .enable_all()
         .build()?;
+    // L1-⑩b：api runtime 回退 multi_thread(4 worker) —— current_thread 试验（L1-⑩A）部署后
+    // HTTP 持续卡死（4/4 超时），而此前 multi_thread 版部署后 HTTP 曾秒回；当前线程转储亦未
+    // 发现 api worker 阻塞，判定 current_thread 单线程事件循环与 axum/hyper 组合引入新问题，
+    // 回退多线程。爬虫节流（L1-⑪）已另行根治风暴。
     let api_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(api_threads)
         .thread_name("pdc-api")
@@ -1210,15 +1214,15 @@ async fn async_main(
                             Ok(_) => saved += 1,
                             Err(e) => warn!("[persistence] NodeRepo 保存失败: {}", e),
                         }
-                        match tr.save_all().await {
+                        match tr.save_dirty().await {
                             Ok(_) => saved += 1,
                             Err(e) => warn!("[persistence] TrackerRepo 保存失败: {}", e),
                         }
-                        match ir.save_all().await {
+                        match ir.save_dirty().await {
                             Ok(_) => saved += 1,
                             Err(e) => warn!("[persistence] InfohashRepo 保存失败: {}", e),
                         }
-                        match pr.save_all().await {
+                        match pr.save_dirty().await {
                             Ok(_) => saved += 1,
                             Err(e) => warn!("[persistence] PeerRepo 保存失败: {}", e),
                         }
@@ -1244,6 +1248,67 @@ async fn async_main(
                             Ok(())
                         }
                     }
+                }
+            },
+        );
+    }
+
+    // P1-8：低频全量兜底（300s）：增量 save_dirty 的兜底——dirty 跟踪失效/遗漏时，
+    // 周期性全量对齐一次，保证 DB 与内存最终一致（Tracker/Infohash/Peer 数据全量写入
+    // 频率从 10s 一次降到 300s 一次，写负载下降 30 倍；NodeRepo 无全量路径，不参与）。
+    {
+        let tr = tracker_repo.clone();
+        let ir = infohash_repo.clone();
+        let pr = peer_repo.clone();
+        task_scheduler.register(
+            TaskMetadata::new(
+                "persistence_full_backfill",
+                "低频全量持久化兜底",
+                std::time::Duration::from_secs(get_interval_secs(
+                    intervals,
+                    "persistence_full_backfill",
+                    300,
+                )),
+            )
+            .with_category(TaskCategory::Persistence)
+            .with_priority(TaskPriority::Background)
+            .with_resource(ResourceProfile {
+                cpu: ResourceLevel::Medium,
+                memory: ResourceLevel::Low,
+                io: ResourceLevel::High,
+                network: ResourceLevel::Low,
+                is_full_task: false,
+            })
+            .with_initial_delay(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "persistence_full_backfill_initial_delay",
+                120,
+            )))
+            .with_jitter(std::time::Duration::from_secs(get_interval_secs(
+                intervals,
+                "persistence_full_backfill_jitter",
+                30,
+            ))),
+            move || {
+                let tr = tr.clone();
+                let ir = ir.clone();
+                let pr = pr.clone();
+                async move {
+                    let mut saved = 0u64;
+                    match tr.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] TrackerRepo 全量兜底失败: {}", e),
+                    }
+                    match ir.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] InfohashRepo 全量兜底失败: {}", e),
+                    }
+                    match pr.save_all().await {
+                        Ok(_) => saved += 1,
+                        Err(e) => warn!("[persistence] PeerRepo 全量兜底失败: {}", e),
+                    }
+                    debug!("[persistence] 全量兜底完成（{} 项）", saved);
+                    Ok(())
                 }
             },
         );
@@ -2438,6 +2503,8 @@ async fn async_main(
             )
             .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
+            // P4-3：关键通道让路保底——delta 推进在资源紧张时不被延迟
+            .non_deferrable()
             .with_resource(ResourceProfile {
                 cpu: ResourceLevel::Low,
                 memory: ResourceLevel::Low,
@@ -2491,6 +2558,8 @@ async fn async_main(
             )
             .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Normal)
+            // P4-3：关键通道让路保底——range 反熵在资源紧张时不被延迟
+            .non_deferrable()
             // F8a 已回滚：实测该任务 avg 127.94s / max 253.61s，并非被 300s 掐死。
             // 放宽到 900s 只是让它「合法」占住 Federation 分类槽更久，反而放大了
             // 槽饥饿（诊断：Federation 8/8 槽满 493 次/窗口，bootstrap 续传 32 次
@@ -2530,6 +2599,8 @@ async fn async_main(
 
         // fed_bootstrap_resume: P2-1 bootstrap 断点续传（默认 bootstrap_enabled=false 时空转）
         let sm_bootstrap = fed.sync_manager.clone();
+        // P-C（L1-⑥）：启动后台回填块表（根治清单重建死循环，见 spawn_backfill_digests 注释）。
+        sm_bootstrap.clone().spawn_backfill_digests();
         task_scheduler.register(
             TaskMetadata::new(
                 "fed_bootstrap_resume",
@@ -2542,6 +2613,8 @@ async fn async_main(
             )
             .with_category(TaskCategory::Federation)
             .with_priority(TaskPriority::Background)
+            // P4-3：关键通道让路保底——bootstrap 续传在资源紧张时不被延迟
+            .non_deferrable()
             // v10(G)：慢响应退避单次等待可达 600s，300s 会被 watchdog 误判泄漏强杀
             .with_timeout(std::time::Duration::from_secs(get_interval_secs(
                 intervals,
@@ -3782,7 +3855,7 @@ async fn async_main(
         }
     }
     if let Some(ref repo) = app_state.tracker_repo {
-        match repo.save_all().await {
+        match repo.save_dirty().await {
             Ok(_) => info!(
                 "[main] TrackerRepo 已保存（{} 个 tracker）",
                 repo.count().await
@@ -3791,7 +3864,7 @@ async fn async_main(
         }
     }
     if let Some(ref repo) = app_state.infohash_repo {
-        match repo.save_all().await {
+        match repo.save_dirty().await {
             Ok(_) => info!(
                 "[main] InfohashRepo 已保存（{} 个 infohash）",
                 repo.count().await
@@ -3801,7 +3874,7 @@ async fn async_main(
     }
     {
         let repo = &app_state.peer_repo;
-        match repo.save_all().await {
+        match repo.save_dirty().await {
             Ok(_) => info!("[main] PeerRepo 已保存（{} 个 peer）", repo.len()),
             Err(e) => warn!("[main] PeerRepo 保存失败: {}", e),
         }

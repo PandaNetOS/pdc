@@ -1,0 +1,3 @@
+total=111
+08:30:59.704900Z  INFO [bootstrap] 清单缓存缺失，现场重建完成并要求请求方重新对齐: peer=89a5c03c, repo=1, 块数=3126, w0=10198884, 丢弃其 index=138, 重建耗时=114493ms
+08:31:07.803061Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[2] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）

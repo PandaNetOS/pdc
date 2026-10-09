@@ -1,0 +1,64 @@
+total=3336
+05:15:19.902193Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:20:25.192535Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入4003 − 释放4002 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 0s)
+05:20:55.286126Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入4065 − 释放4063 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 30s)
+05:21:09.990637Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:26:55.992599Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入4706 − 释放4705 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 37s)
+05:27:03.994973Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:30:44.439818Z  INFO [crawler] 启动预热（加载最多 100000 节点，并行 bootstrap 8 个）...
+05:30:49.834090Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+05:31:38.616069Z  INFO [crawler] 向 2 个 bootstrap 地址发送了 find_node
+05:31:38.616376Z  INFO [crawler] 预热: 向 2 个 bootstrap 地址发送了 find_node
+05:32:32.324873Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:32:32.325691Z  INFO [bootstrap] 清单缓存缺失，开始现场重建: peer=89a5c03c repo=1 chunk_rows=2000
+05:33:31.853272Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:33:33.415057Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:33:33.415530Z  WARN [bootstrap] 清单重建进行中（已 61s），拒绝本次申请: peer=89a5c03c repo=1
+05:33:33.415888Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:34:37.507201Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:34:37.507822Z  WARN [bootstrap] 清单重建进行中（已 125s），拒绝本次申请: peer=89a5c03c repo=1
+05:34:37.508184Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:35:37.620995Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:35:37.622211Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 清单重建进行中（已 185s），拒绝本次申请: peer=89a5c03c repo=1
+05:35:37.622939Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:36:41.725341Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:36:41.725803Z  WARN [bootstrap] 清单重建进行中（已 249s），拒绝本次申请: peer=89a5c03c repo=1
+05:36:41.726872Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:36:54.696707Z  INFO [bootstrap] 响应清单请求 from=89a5c03c: repo=1 总行=6258546, 块数=3126, w0=10154686, 重建耗时=262370ms
+05:37:46.449967Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:38:45.752610Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入842 − 释放841 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 4s)
+05:39:15.843098Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入892 − 释放891 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 34s)
+05:39:25.955605Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:42:58.949869Z  INFO [crawler] 启动预热（加载最多 100000 节点，并行 bootstrap 8 个）...
+05:43:04.283818Z  INFO [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+05:43:49.102720Z  INFO [crawler] 向 2 个 bootstrap 地址发送了 find_node
+05:43:50.107967Z  INFO [crawler] 预热: 向 2 个 bootstrap 地址发送了 find_node
+05:44:44.091866Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:44:44.092263Z  INFO [bootstrap] 清单缓存缺失，开始现场重建: peer=89a5c03c repo=1 chunk_rows=2000
+05:45:44.178584Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:45:44.178712Z  WARN [bootstrap] 清单重建进行中（已 60s），拒绝本次申请: peer=89a5c03c repo=1
+05:45:44.179006Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:45:52.289105Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:46:48.185067Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:46:48.185188Z  WARN [bootstrap] 清单重建进行中（已 124s），拒绝本次申请: peer=89a5c03c repo=1
+05:46:48.185305Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:47:53.208769Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:47:53.209016Z  WARN [bootstrap] 清单重建进行中（已 189s），拒绝本次申请: peer=89a5c03c repo=1
+05:47:53.209172Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:48:54.186076Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:48:54.186218Z  WARN [bootstrap] 清单重建进行中（已 250s），拒绝本次申请: peer=89a5c03c repo=1
+05:48:54.186546Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:49:44.100244Z  WARN [bootstrap] 建清单超时（>300s）repo=1: 89a5c03c
+05:51:00.287614Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:51:00.288168Z  INFO [bootstrap] 清单缓存缺失，开始现场重建: peer=89a5c03c repo=1 chunk_rows=2000
+05:51:30.477530Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入893 − 释放892 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 30s)
+05:51:45.396537Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:52:00.288898Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:52:00.289096Z  WARN [bootstrap] 清单重建进行中（已 60s），拒绝本次申请: peer=89a5c03c repo=1
+05:52:00.289356Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:53:01.383581Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:53:01.383842Z  WARN [bootstrap] 清单重建进行中（已 121s），拒绝本次申请: peer=89a5c03c repo=1
+05:53:01.384165Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1
+05:54:01.477767Z  INFO [nonsteady] 进入非稳态 peer=89a5c03c repos=[1] ttl=14400s phase=3（暂停 delta/range/反熵；Gossip 独立不受影响）
+05:54:01.477907Z  WARN [bootstrap] 清单重建进行中（已 181s），拒绝本次申请: peer=89a5c03c repo=1
+05:54:01.478063Z  INFO [bootstrap] 回拒绝帧 Nak(reason=3) to=89a5c03c repo=1

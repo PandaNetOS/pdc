@@ -1,0 +1,75 @@
+total=1016
+06:49:11.355641Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:11.411523Z  WARN [bootstrap] 发送块 77 失败: 对端无活跃会话: 89a5c03c
+06:49:11.441465Z  WARN [bootstrap] 发送块 89 失败: 对端无活跃会话: 89a5c03c
+06:49:11.808434Z  WARN [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:11.857621Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:11.858533Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.224003Z  WARN [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.242364Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.298344Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.344318Z  WARN [bootstrap] 发送块 80 失败: 对端无活跃会话: 89a5c03c
+06:49:12.347834Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:12.410778Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:14.908858Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 发送块 91 失败: 对端无活跃会话: 89a5c03c
+06:49:14.918050Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 发送块 85 失败: 对端无活跃会话: 89a5c03c
+06:49:15.000760Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:15.051300Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.567983Z  WARN [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.610295Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.618281Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.672761Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.732567Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.794080Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.856971Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:17.922292Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+06:49:18.344090Z  WARN [bootstrap] 发送块 88 失败: 对端无活跃会话: 89a5c03c
+06:49:22.092018Z  INFO [session] s9 建立 inbound 对端=89a5c03c 地址=192.168.30.52:1662
+06:49:22.092216Z  INFO [session] s9 接收循环启动（对端=89a5c03c）
+06:49:22.092384Z  INFO [federation] 会话建立: 89a5c03c @ 192.168.30.52:1662 (proto=v10)
+06:49:52.235012Z  INFO [session] 开始受理入站连接于 0.0.0.0:6885
+06:49:52.235158Z  INFO [federation] SDK 会话层已绑定并独占监听端口 6885（listen=true）
+06:49:55.096716Z  INFO [ws] 新客户端连接，订阅者总数: 3
+06:49:55.395096Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+06:50:00.403058Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [net-agent] 开始连接节点 c20c2deb (地址数=1, 可达性=Unknown)
+06:50:00.403236Z  INFO [net-agent] 开始连接节点 81d03068 (地址数=1, 可达性=Unknown)
+06:50:00.404103Z  INFO [net-mqtt] 正在连接 broker 54.36.178.49:1883 ...
+06:50:00.404972Z  INFO [net-mqtt] 正在连接 broker 137.135.83.217:1883 ...
+06:50:00.405086Z  INFO [net-mqtt] 正在连接 broker 35.156.188.238:1883 ...
+06:50:02.491811Z  WARN [net-mqtt] MQTT 连接错误: I/O: connection closed by peer
+06:50:02.492075Z  WARN [net-mqtt] broker 54.36.178.49:1883 连接失败(1/3)，5秒后重试: MQTT 连接断开: I/O: connection closed by peer
+06:50:02.510655Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [session] s1 建立 outbound 对端=89a5c03c 地址=192.168.30.52:6885
+06:50:02.510982Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [session] s1 接收循环启动（对端=89a5c03c）
+06:50:02.511360Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [federation] 缓存节点连接成功: 89a5c03c (192.168.30.52:6885)
+06:50:02.511567Z  INFO [federation] 会话建立: 89a5c03c @ 192.168.30.52:6885 (proto=v10)
+06:50:05.413574Z  WARN [net-mqtt] MQTT 连接错误: Network timeout
+06:50:05.413750Z  WARN [net-mqtt] MQTT 连接错误: Network timeout
+06:50:05.413900Z  WARN [net-mqtt] broker 35.156.188.238:1883 连接失败(1/3)，5秒后重试: MQTT 连接断开: Network timeout
+06:50:05.414032Z  WARN [net-mqtt] broker 137.135.83.217:1883 连接失败(1/3)，5秒后重试: MQTT 连接断开: Network timeout
+06:50:06.573350Z  WARN [net-connector] 所有 1 个地址连接均失败
+06:50:06.573438Z  WARN [net-strategy] 连接失败（直连+打洞均失败），总耗时 6.1701068s
+06:50:06.899013Z  WARN [nat] UPnP 网关发现失败: IO error: 由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。 (os error 10060)
+06:50:06.899252Z  WARN [main] NAT/UPnP 初始化失败: UPnP 网关发现失败: IO error: 由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。 (os error 10060)
+06:50:07.101594Z  WARN [net-mqtt] broker test.mosquitto.org:1883 连接失败(1/3)，5秒后重试: [net-mqtt] DnsPool 解析 test.mosquitto.org 失败且未启用系统 DNS 回退: DNS 解析 test.mosquitto.org 失败（未启用系统 DNS 回退）: no record found for Query { name: Name("test.mosquitto.org."), query_type: AAAA, query_class: IN }
+06:50:07.101917Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [net-mqtt] broker broker.hivemq.com:1883 连接失败(1/3)，5秒后重试: [net-mqtt] DnsPool 解析 broker.hivemq.com 失败且未启用系统 DNS 回退: DNS 解析 broker.hivemq.com 失败（未启用系统 DNS 回退）: no record found for Query { name: Name("broker.hivemq.com."), query_type: AAAA, query_class: IN }
+06:50:07.102207Z  WARN [net-mqtt] broker mqtt.eclipseprojects.io:1883 连接失败(1/3)，5秒后重试: [net-mqtt] DnsPool 解析 mqtt.eclipseprojects.io 失败且未启用系统 DNS 回退: DNS 解析 mqtt.eclipseprojects.io 失败（未启用系统 DNS 回退）: no record found for Query { name: Name("mqtt.eclipseprojects.io."), query_type: AAAA, query_class: IN }
+06:50:07.507418Z  INFO [net-mqtt] 正在连接 broker 54.36.178.49:1883 ...
+06:50:07.964646Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [net-mqtt] MQTT 连接错误: I/O: connection closed by peer
+06:50:07.964894Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [net-mqtt] broker 54.36.178.49:1883 连接失败(2/3)，5秒后重试: MQTT 连接断开: I/O: connection closed by peer
+06:50:10.424416Z  INFO [net-mqtt] 正在连接 broker 137.135.83.217:1883 ...
+06:50:10.424605Z  INFO [net-mqtt] 正在连接 broker 35.156.188.238:1883 ...
+06:50:12.975776Z  INFO [net-mqtt] 正在连接 broker 54.36.178.49:1883 ...
+06:50:13.352549Z  WARN [net-mqtt] MQTT 连接错误: I/O: 远程主机强迫关闭了一个现有的连接。 (os error 10054)
+06:50:15.452397Z  WARN [net-mqtt] MQTT 连接错误: Network timeout
+06:50:15.452664Z  WARN [net-mqtt] MQTT 连接错误: Network timeout
+06:50:15.452839Z  WARN [net-mqtt] broker 35.156.188.238:1883 连接失败(2/3)，5秒后重试: MQTT 连接断开: Network timeout
+06:50:15.452935Z  WARN [net-mqtt] broker 137.135.83.217:1883 连接失败(2/3)，5秒后重试: MQTT 连接断开: Network timeout
+06:50:17.108594Z  WARN [net-mqtt] broker broker.hivemq.com:1883 连接失败(2/3)，5秒后重试: [net-mqtt] DnsPool 解析 broker.hivemq.com 失败且未启用系统 DNS 回退: DNS 解析 broker.hivemq.com 失败（未启用系统 DNS 回退）: no record found for Query { name: Name("broker.hivemq.com."), query_type: AAAA, query_class: IN }
+06:50:17.108735Z  WARN [net-mqtt] broker test.mosquitto.org:1883 连接失败(2/3)，5秒后重试: [net-mqtt] DnsPool 解析 test.mosquitto.org 失败且未启用系统 DNS 回退: DNS 解析 test.mosquitto.org 失败（未启用系统 DNS 回退）: no record found for Query { name: Name("test.mosquitto.org."), query_type: AAAA, query_class: IN }
+06:50:17.108854Z  WARN [net-mqtt] broker mqtt.eclipseprojects.io:1883 连接失败(2/3)，5秒后重试: [net-mqtt] DnsPool 解析 mqtt.eclipseprojects.io 失败且未启用系统 DNS 回退: DNS 解析 mqtt.eclipseprojects.io 失败（未启用系统 DNS 回退）: no record found for Query { name: Name("mqtt.eclipseprojects.io."), query_type: AAAA, query_class: IN }
+06:50:20.453653Z  INFO [net-mqtt] 正在连接 broker 137.135.83.217:1883 ...
+06:50:20.453742Z  INFO [net-mqtt] 正在连接 broker 35.156.188.238:1883 ...
+06:50:25.474945Z  WARN [net-mqtt] MQTT 连接错误: Network timeout
+06:50:25.475174Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [net-mqtt] MQTT 连接错误: Network timeout
+06:58:20.585431Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}:relay-actor:active-relay{[3murl[0m[2m=[0mhttps://usw1-1.relay.n0.iroh.link./}: Lost connection to relay server: Client stream read failed: Stream error: 远程主机强迫关闭了一个现有的连接。 (os error 10054): 远程主机强迫关闭了一个现有的连接。 (os error 10054)
+06:58:51.670499Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}:relay-actor:active-relay{[3murl[0m[2m=[0mhttps://usw1-1.relay.n0.iroh.link./}: Lost connection to relay server: Client stream read failed: Stream error: 远程主机强迫关闭了一个现有的连接。 (os error 10054): 远程主机强迫关闭了一个现有的连接。 (os error 10054)

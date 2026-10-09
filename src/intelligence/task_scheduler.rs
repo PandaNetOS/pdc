@@ -1427,7 +1427,13 @@ impl TaskScheduler {
                 .filter(|(_, e)| cat.is_none_or(|c| e.category == c))
                 .filter_map(|(token, e)| {
                     let age = e.started_at.elapsed().as_secs_f64();
-                    if age > e.timeout.as_secs_f64() * factor {
+                    // L1-⑫：绝对上限兜底 —— 调度器任务均为 tick 级（秒级），任何任务在飞
+                    // 超过 RECLAIM_ABS_CAP_SECS（240s）一律判泄漏强制回收，无论 timeout×factor
+                    // 多大。根治「回收长期为 0」的泄漏链（日志实证：准入480−释放465−回收0、
+                    // Monitor 任务 419s 挂起未回收）：回收 0 → 槽位永久占满 → 分类停摆 →
+                    // 任务/句柄/内存无限累积（5.89GB 提交内存主因）。
+                    const RECLAIM_ABS_CAP_SECS: f64 = 240.0;
+                    if age > (e.timeout.as_secs_f64() * factor).min(RECLAIM_ABS_CAP_SECS) {
                         Some((*token, e.clone(), age))
                     } else {
                         None

@@ -1,0 +1,15 @@
+﻿18:45:21 http=72ms done=0/669 inflight=0 phase=transfer WAL=773MB
+18:45:26 http=2ms done=0/669 inflight=0 phase=transfer WAL=773MB
+18:45:31 http=2ms done=0/669 inflight=0 phase=transfer WAL=773MB
+18:45:36 http=1ms done=0/669 inflight=0 phase=transfer WAL=773MB
+18:45:41 http=5ms done=0/669 inflight=0 phase=transfer WAL=773MB
+18:45:46 http=2ms done=0/669 inflight=0 phase=transfer WAL=773MB
+18:45:51 http=2ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:45:56 http=2ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:46:01 http=2ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:46:06 http=13ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:46:11 http=1ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:46:16 http=1ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:46:21 http=1ms done=0/669 inflight=0 phase=transfer WAL=0MB
+18:46:26 http=1ms done=0/669 inflight=0 phase=transfer WAL=0MB
+delta: 0 块/65s

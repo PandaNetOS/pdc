@@ -104,6 +104,17 @@ pub enum MessageType {
     /// （OpsBatch 内嵌的 OpEntry 无 version），按项目先例（v7 新增 SyncNegotiate 家族）
     /// 以**新消息类型**演进，旧 OpsBatch 对 v4-v8 对端保持字节级不变。
     OpsBatchV2 = 50,
+    /// P2-2：握手测速请求（请求方 → 应答方）：bootstrap 裁定后、正式拉取前，
+    /// 双方先传一轮测试数据实测通信速率（行/s），据此计算 bootstrap 申请时长 T。
+    SpeedProbe = 51,
+    /// P2-2：握手测速响应（应答方 → 请求方）：返回测试行载荷。
+    SpeedProbeAck = 52,
+    /// v10：bootstrap 清单申请拒绝帧（应答方 → 请求方）。应答方收到清单申请后
+    /// 按当前情况综合判断（方向/忙闲/单飞），不通过时回本帧（reason 见
+    /// `BOOTSTRAP_NAK_*` 常量），**不进非稳态**；请求方收到后不进非稳态、
+    /// 轻量退避，由下一轮协商/巡检重触发。协商成功 = 双端进入非稳态，
+    /// 申请 ≠ 通过。
+    BootstrapManifestNak = 53,
 }
 
 impl MessageType {
@@ -146,6 +157,9 @@ impl MessageType {
             48 => Some(MessageType::RangeReconcilePull),
             49 => Some(MessageType::RangeReconcilePush2),
             50 => Some(MessageType::OpsBatchV2),
+            51 => Some(MessageType::SpeedProbe),
+            52 => Some(MessageType::SpeedProbeAck),
+            53 => Some(MessageType::BootstrapManifestNak),
             _ => None,
         }
     }
@@ -169,6 +183,13 @@ impl MessageType {
 ///    推送/按键拉取完整 SyncEntry，Merkle 反熵协议族（11/12/15/21/28-36/45）同版退役。
 /// 9：delta 通道 version 透传（OpsBatchV2）：ops 携带真实 LWW version，修复「对既有
 ///    条目的更新被静默丢弃」。对端 < 9 时响应方回退旧 OpsBatch（wire 上无 version 字段）。
+/// 10：bootstrap 收敛修复（P2/P3，2026-10-08）：① 握手测速 SpeedProbe=51/SpeedProbeAck=52
+///    —— 协商裁定 BOOTSTRAP 后、申请清单前先实测行速率，T=Δ行数÷行/s×1.5（封顶 4h），
+///    请求方携 T（`BootstrapManifestRequest.bootstrap_ttl_secs`）申请；② 非稳态门控 ——
+///    双侧进入非稳态（phase 2/3），传输期暂停 delta/range/反熵（Gossip 独立不纳入），
+///    ≥3 次协商确认后竣工解除，超 T 且无进展逃生兜底。对端 < 10：不触发测速（请求方
+///    回退旧行为直接申请清单），51/52 帧被旧对端忽略，`bootstrap_ttl_secs` 经 serde
+///    default 缺省为 None，字节级兼容。
 /// 对端 version < 2 时回退到原始全量推送；version == 2 时使用 DiffSync key 交换；version >= 3 时使用分层 Merkle；
 /// version >= 4 且 `federation.delta_sync_enabled=true` 时启用 delta 通道；
 /// version >= 5 且 `federation.range_reconcile_enabled=true` 时启用 range 反熵；
@@ -176,11 +197,12 @@ impl MessageType {
 /// version >= 7 且 `federation.negotiation_enabled=true` 时 delta/bootstrap 大通道需协商通过后才启动
 /// （对端 < v7 回落旧行为：不协商直接按既有开关运行）；
 /// version >= 8 时启用 range 修复的 Pull/Push2 通用通道（对端 < v8 时不发，仅保留叶级对账）；
-/// version >= 9 时 delta 通道响应方改发 OpsBatchV2（条目携带真实 version，对端 < 9 回退旧 OpsBatch）。
+/// version >= 9 时 delta 通道响应方改发 OpsBatchV2（条目携带真实 version，对端 < 9 回退旧 OpsBatch）；
+/// version >= 10 时 bootstrap 走「测速 → 携 T 申请 → 非稳态门控」收敛链路（对端 < 10 回退旧行为）。
 ///
 /// G4 迁移：原定义在 `federation/connection.rs`，随握手实现一并归位到协议层
 /// （`connection.rs` 保留 `pub use` 转发）。
-pub const HELLO_PROTOCOL_VERSION: u32 = 9;
+pub const HELLO_PROTOCOL_VERSION: u32 = 10;
 
 /// 握手消息（阶段2：Ed25519 签名认证）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,6 +688,41 @@ pub struct RangeReconcilePush2Message {
 pub struct BootstrapManifestRequestMessage {
     /// 仓库类型（按 repo 分别 bootstrap，铁律 7）
     pub repo: u8,
+    /// P2-2：请求方按握手测速算出的本次 bootstrap 预期时长（秒）。
+    /// `None` = 旧行为（未测速，不触发非稳态门控）；`serde(default)` 保证
+    /// 与未携带该字段的旧对端字节级兼容。
+    #[serde(default)]
+    pub bootstrap_ttl_secs: Option<u64>,
+}
+
+/// P2-2：握手测速请求（请求方 → 应答方）。
+///
+/// 时机：协商裁定出 BOOTSTRAP 后、正式申请清单之前（测速放裁定前）。
+/// 请求方记录发起时刻 t0；应答方回 `SpeedProbeAck` 载荷（最多 `rows` 行测试数据）；
+/// 请求方收到后以 `elapsed = now - t0` 估算行速率 `rate = rows / elapsed`，
+/// 再按 `T = Δ行数 / rate × SAFETY_FACTOR(1.5)` 计算申请时长（封顶 4h）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SpeedProbeMessage {
+    /// 测速针对的 repo（仅日志/约束用）
+    pub repo: u8,
+    /// 期望返回的测试行数（请求方按双方 row_count 差与上限取 min）
+    pub rows: u32,
+    /// 随机 nonce（请求方配对 Ack）
+    pub nonce: u64,
+}
+
+/// P2-2：握手测速响应（应答方 → 请求方）：返回测试载荷。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SpeedProbeAckMessage {
+    /// 与请求配对的 nonce
+    pub nonce: u64,
+    /// 实际返回的行数（≤ 请求的 rows）
+    pub rows: u32,
+    /// 测试载荷字节（按每行估算 ~200B × rows 构造，用于测真实传输吞吐；
+    /// 请求方以端到端 elapsed = 收到时刻 - 发起时刻 计算行速率）
+    pub payload: Vec<u8>,
+    /// 应答方测得的本批发送耗时（微秒，观测用；请求方仍以端到端 elapsed 为准）
+    pub send_elapsed_us: u64,
 }
 
 /// P2-1：bootstrap 清单响应（A → B）。
@@ -674,6 +731,28 @@ pub struct BootstrapManifestResponseMessage {
     /// 分块清单（含 w0 水位、显式区间边界与内容哈希）
     pub manifest: crate::federation::sync::bootstrap::BootstrapManifest,
 }
+
+/// v10：bootstrap 清单申请拒绝帧（应答方 → 请求方）。
+///
+/// 协商成功 = 双端进入非稳态；申请 ≠ 通过。应答方收到清单申请后按当前
+/// 情况综合判断（方向 / 忙闲 / 单飞），任一不通过即回本帧且**不进非稳态**。
+/// 请求方收到后不进非稳态、轻量退避，由下一轮协商/巡检重触发。
+/// 仅对 `protocol_version >= 10` 的请求方发送（旧对端不理解 53 帧，
+/// 拒绝时仍回空清单保持字节级兼容）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootstrapManifestNakMessage {
+    /// 仓库类型（按 repo 分别 bootstrap）
+    pub repo: u8,
+    /// 拒绝原因：`BOOTSTRAP_NAK_DIRECTION` / `BOOTSTRAP_NAK_BUSY` / `BOOTSTRAP_NAK_REBUILDING`
+    pub reason: u8,
+}
+
+/// 拒绝原因：应答方该 repo 行数不多于请求方自报，服务无意义。
+pub const BOOTSTRAP_NAK_DIRECTION: u8 = 1;
+/// 拒绝原因：应答方 IO 过载（level ≥ 1.0 或 pressure ≥ 0.8），暂不服务。
+pub const BOOTSTRAP_NAK_BUSY: u8 = 2;
+/// 拒绝原因：清单重建在途（单飞未取得），稍后重试。
+pub const BOOTSTRAP_NAK_REBUILDING: u8 = 3;
 
 /// P2-1：bootstrap 分块请求（B → A）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -693,6 +772,10 @@ pub struct BootstrapChunkResponseMessage {
     pub index: u32,
     /// 块内条目（接收方**批量 upsert**，严禁逐条 INSERT）
     pub entries: Vec<SyncEntry>,
+    /// v7：lz4 压缩后的 entries（bincode 序列化后压缩）。None = 未压缩（兼容旧端）。
+    /// 双端 v7 时发送方恒填 Some(压缩载荷) 并留空 entries；接收方优先解压此字段。
+    #[serde(default)]
+    pub compressed_payload: Option<Vec<u8>>,
     /// 服务端该块内容哈希（应等于清单中同 index 块的 `hash`）
     pub hash: [u8; 32],
     /// 是否为最后一块

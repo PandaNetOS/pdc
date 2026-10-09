@@ -1,0 +1,20 @@
+08:11:32.652157Z  INFO [bootstrap] 回拒绝帧 Nak(reason=1) to=22335aa9 repo=1
+08:11:42.851979Z  INFO [bootstrap] 重拉进度继承（任务3）：旧进度 done=43 按 index 继承（新清单 43 块，差异 ≤2%）: peer=22335aa9 repo=2
+08:11:42.851998Z  INFO [bootstrap] 断点继承/对齐验证（来源 last_key）verified_done=43/43 跳过/继承块=43: peer=22335aa9 repo=2
+08:11:42.890225Z  INFO [bootstrap] 断点继承/对齐验证（来源 last_key）verified_done=5/220 跳过/继承块=189: peer=22335aa9 repo=3
+08:12:24.379027Z  WARN [bootstrap] 块 134 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.379054Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=134
+08:12:24.385496Z  WARN [bootstrap] 块 138 传输校验失败（声明 2002 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.385515Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=138
+08:12:24.392005Z  WARN [bootstrap] 块 137 传输校验失败（声明 2005 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.392024Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=137
+08:12:24.398350Z  WARN [bootstrap] 块 133 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.398370Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=133
+08:12:24.404813Z  WARN [bootstrap] 块 132 传输校验失败（声明 2010 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.404870Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=132
+08:12:24.410806Z  WARN [bootstrap] 块 136 传输校验失败（声明 2002 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.410823Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=136
+08:12:24.417151Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 块 135 传输校验失败（声明 2003 行 / 实收 0 行），保持进度 done=131/3126
+08:12:24.417209Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=135
+08:14:15.229476Z  INFO [bootstrap] 重拉进度继承（任务3）：旧进度 done=131 按 index 继承（新清单 3126 块，差异 ≤2%）: peer=22335aa9 repo=1
+08:14:15.229493Z  INFO [bootstrap] 断点继承/对齐验证（来源 last_key）verified_done=131/3126 跳过/继承块=131: peer=22335aa9 repo=1

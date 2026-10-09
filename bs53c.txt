@@ -1,0 +1,57 @@
+total=683
+8T07:29:13.936754Z  WARN [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:14.055388Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:14.399066Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:14.408719Z  WARN [range] 发送 RangeReconcileRequest 失败 to=89a5c03c（区间 54/162，进度保留待续跑）: 对端无活跃会话: 89a5c03c
+07:29:14.590393Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.148137Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.148299Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.251879Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.253329Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.266252Z  WARN [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.276510Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.277685Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.277945Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.278342Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.278563Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.278919Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.279111Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.279211Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.279335Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.279599Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.280088Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.280341Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.280489Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.280587Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.280777Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.280929Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.281368Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.281638Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.281801Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.281927Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.282111Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.282284Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.282510Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.282656Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.283012Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.283119Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.283188Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.283373Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.283607Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.283850Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:15.284041Z  WARN [range] 发送 RangeReconcileResponse 失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:17.807316Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 推送本地多数据失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:17.856665Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:17.861876Z  WARN endpoint{[3mid[0m[2m=[0mf73553c6e3}: [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:17.862080Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:17.862204Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:18.493752Z  WARN [range] 下钻请求发送失败 to=89a5c03c: 对端无活跃会话: 89a5c03c
+07:29:59.410578Z  WARN [net-mqtt] broker broker.hivemq.com:1883 连续失败3次，停止重试
+07:29:59.410831Z  WARN [net-mqtt] broker mqtt.eclipseprojects.io:1883 连续失败3次，停止重试
+07:29:59.410982Z  WARN [net-mqtt] broker test.mosquitto.org:1883 连续失败3次，停止重试
+07:29:59.478025Z  WARN [net-mqtt] broker 137.135.83.217:1883 连续失败3次，停止重试
+07:29:59.478244Z  WARN [net-mqtt] broker 35.156.188.238:1883 连续失败3次，停止重试
+07:31:29.542567Z  INFO [bootstrap] 分块请求触发清单重建（缓存缺失）: peer=89a5c03c repo=1 chunk_rows=2000 index=112
+07:32:32.554820Z  WARN [bootstrap] 回显式 NAK ×8（30s 限流汇总）: peer=89a5c03c repo=1 最近 index=105 reason=manifest rebuilding
+07:33:34.666482Z  WARN [bootstrap] 回显式 NAK ×8（30s 限流汇总）: peer=89a5c03c repo=1 最近 index=108 reason=manifest rebuilding
+07:35:27.907231Z  INFO [bootstrap] 清单缓存缺失，现场重建完成并要求请求方重新对齐: peer=89a5c03c, repo=1, 块数=3126, w0=10158984, 丢弃其 index=112, 重建耗时=238364ms

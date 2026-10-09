@@ -18,6 +18,21 @@ use crate::nat::NatManager;
 /// STUN 探测单次超时
 const STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// NAT 刷新单轮整体上限（DNS 解析 + STUN 探测 + 映射刷新）。
+///
+/// 2026-10-09 实证（.52）：refresh_tick 在异步上下文【同步】调用 stun_probe_with，
+/// STUN 服务器不可达时多服务器逐个超时（STUN_PROBE_TIMEOUT×2）且未包
+/// spawn_blocking，任务在飞 12s→43s→73s→103s→133s 持续不释放 → 占死 federation
+/// 槽 → 线程暴涨 180 → HTTP 饿死。整体兜底 20s：超时只 warn 降级放弃本轮，绝不
+/// panic、绝不占住 federation 槽，下轮重试。
+const REFRESH_TICK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// STUN 服务器 DNS 池预解析超时。
+///
+/// resolved_stun_servers() 此前 await 无显式超时，解析器滞留时会把整轮 refresh_tick
+/// 拖在异步侧。10s 兜底，超时跳过本轮 STUN 探测（映射刷新仍按既有结果继续）。
+const STUN_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// NAT 集成服务
 pub struct NatIntegration {
     /// NAT 管理器
@@ -313,28 +328,71 @@ impl NatIntegration {
     /// 执行一次 NAT 地址刷新 + STUN 探测（供 TaskScheduler 周期性调用）
     ///
     /// 包含：STUN 绑定请求 + NAT 类型检测、UPnP 端口映射刷新、公网地址变化检测。
-    /// STUN 探测内部有 5s 超时，单次 tick 最长阻塞约 10s。
-    pub async fn refresh_tick(&self) {
-        // 执行 STUN 探测：先用内置 DNS 池异步解析服务器（脱离系统 DNS），
-        // 再把 ip:port 字面量交给同步探测（内部不再解析，最长阻塞 STUN_PROBE_TIMEOUT）
-        let stun_servers = self.resolved_stun_servers().await;
-        let _ = self.stun_probe_with(&stun_servers);
+    ///
+    /// P2-fix（2026-10-09）：旧实现直接在异步上下文【同步】调用 stun_probe_with，
+    /// STUN 不可达时同步阻塞 tokio worker、占死 federation 槽。现对照
+    /// federation/mod.rs:526-531 启动期探测形态重构：
+    /// - 整轮包 REFRESH_TICK_TIMEOUT（20s）兜底，超时 warn 放弃本轮、绝不 panic；
+    /// - DNS 预解析包 STUN_RESOLVE_TIMEOUT（10s）；
+    /// - 同步 STUN 探测挪进 spawn_blocking，join 失败只 warn。
+    ///
+    /// self 取 Arc<Self> 接收者：TaskScheduler 调度处持 Arc<NatIntegration>，
+    /// 直接兼容（main.rs:2849 的 `n.refresh_tick().await` 无需改动）。
+    pub async fn refresh_tick(self: Arc<Self>) {
+        // 整轮超时兜底：到点只 warn 降级放弃本轮，绝不 panic、绝不占住 federation 槽。
+        let body =
+            async {
+                // 第一步：先用内置 DNS 池异步解析服务器（脱离系统 DNS），带 10s 超时。
+                let stun_servers =
+                    match tokio::time::timeout(STUN_RESOLVE_TIMEOUT, self.resolved_stun_servers())
+                        .await
+                    {
+                        Ok(servers) => servers,
+                        Err(_) => {
+                            warn!(
+                                "[federation] STUN 服务器解析超时（>{:?}），跳过本轮 STUN 探测",
+                                STUN_RESOLVE_TIMEOUT
+                            );
+                            Vec::new()
+                        }
+                    };
 
-        let old_addrs = self.identity.addresses_snapshot();
-        let old_public = old_addrs.iter().find_map(|a| a.ipv4_addr);
+                // 第二步：同步 STUN 探测挪进 spawn_blocking（其内部逐服务器 UDP 超时，
+                // 不可达时本会长时间阻塞——文档注释本就要求调用方包 spawn_blocking）。
+                let this = self.clone();
+                let probe =
+                    tokio::task::spawn_blocking(move || this.stun_probe_with(&stun_servers)).await;
+                if let Err(e) = probe {
+                    warn!("[federation] STUN 探测 spawn_blocking join 失败: {}", e);
+                }
 
-        self.setup_mapping();
+                // 后续为纯内存操作（identity 快照 + setup_mapping），无 SQLite，保持读写分离。
+                let old_addrs = self.identity.addresses_snapshot();
+                let old_public = old_addrs.iter().find_map(|a| a.ipv4_addr);
 
-        let new_addrs = self.identity.addresses_snapshot();
-        let new_public = new_addrs.iter().find_map(|a| a.ipv4_addr);
+                self.setup_mapping();
 
-        if old_public != new_public {
-            info!(
-                "[federation] 公网地址变化: {:?} -> {:?}",
-                old_public, new_public
+                let new_addrs = self.identity.addresses_snapshot();
+                let new_public = new_addrs.iter().find_map(|a| a.ipv4_addr);
+
+                if old_public != new_public {
+                    info!(
+                        "[federation] 公网地址变化: {:?} -> {:?}",
+                        old_public, new_public
+                    );
+                } else {
+                    debug!("[federation] 地址刷新完成，公网地址未变: {:?}", new_public);
+                }
+            };
+
+        if tokio::time::timeout(REFRESH_TICK_TIMEOUT, body)
+            .await
+            .is_err()
+        {
+            warn!(
+                "[federation] NAT 地址刷新任务超时（>{:?}），放弃本轮，下轮重试",
+                REFRESH_TICK_TIMEOUT
             );
-        } else {
-            debug!("[federation] 地址刷新完成，公网地址未变: {:?}", new_public);
         }
     }
 }

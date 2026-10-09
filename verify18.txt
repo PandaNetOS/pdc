@@ -1,0 +1,14 @@
+﻿18:01:04 http=59ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:09 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:14 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:19 http=4ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:24 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:29 http=4ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:34 http=3ms done=0/0 inflight=0 phase= pool=10 waits=0
+18:01:39 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:44 http=44ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:49 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:54 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:01:59 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:02:04 http=1ms done=0/0 inflight=0 phase= pool=12 waits=0
+18:02:09 http=3ms done=0/0 inflight=0 phase= pool=12 waits=0

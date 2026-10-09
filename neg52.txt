@@ -1,0 +1,43 @@
+total=360
+ 检测到自连接（入站），已拒绝: node_id=89a5c03c
+07:37:11.754467Z  INFO [negotiate] 策略裁定 repo=1 strategy=2 rate=8388608（对端行数 6267991）
+07:37:11.754484Z  INFO [negotiate] 策略裁定 repo=2 strategy=1 rate=0（对端行数 85687）
+07:37:11.754496Z  INFO [negotiate] 策略裁定 repo=3 strategy=1 rate=0（对端行数 438874）
+07:37:11.754507Z  INFO [negotiate] 策略裁定 repo=4 strategy=1 rate=0（对端行数 439）
+07:38:11.542196Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=111
+07:38:11.556657Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=112
+07:38:11.557215Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=107
+07:38:11.565176Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=105
+07:38:11.566509Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=108
+07:38:11.574593Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=106
+07:38:11.581238Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=110
+07:38:11.589452Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=109
+07:38:16.851547Z  INFO [negotiate] 策略裁定 repo=1 strategy=2 rate=8388608（对端行数 6268055）
+07:38:16.851574Z  INFO [negotiate] 策略裁定 repo=2 strategy=1 rate=0（对端行数 85687）
+07:38:16.851593Z  INFO [negotiate] 策略裁定 repo=3 strategy=1 rate=0（对端行数 438874）
+07:38:16.851611Z  INFO [negotiate] 策略裁定 repo=4 strategy=1 rate=0（对端行数 439）
+07:39:21.942880Z  INFO [negotiate] 策略裁定 repo=1 strategy=2 rate=8388608（对端行数 6268128）
+07:39:21.942982Z  INFO [negotiate] 策略裁定 repo=2 strategy=1 rate=0（对端行数 85687）
+07:39:21.942995Z  INFO [negotiate] 策略裁定 repo=3 strategy=1 rate=0（对端行数 438874）
+07:39:21.943006Z  INFO [negotiate] 策略裁定 repo=4 strategy=1 rate=0（对端行数 439）
+07:40:14.781057Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=112
+07:40:14.781802Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=111
+07:40:14.888199Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=108
+07:40:14.889248Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=105
+07:40:14.897015Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=106
+07:40:14.906664Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=109
+07:40:14.913262Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=107
+07:40:14.921123Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 60s 后重试: peer=22335aa9 repo=1 index=110
+07:40:20.151607Z  WARN [federation] 检测到自连接（入站），已拒绝: node_id=89a5c03c
+07:40:24.947918Z  INFO [negotiate] 策略裁定 repo=1 strategy=2 rate=8388608（对端行数 6268214）
+07:40:24.947937Z  INFO [negotiate] 策略裁定 repo=2 strategy=1 rate=0（对端行数 85687）
+07:40:24.947950Z  INFO [negotiate] 策略裁定 repo=3 strategy=1 rate=0（对端行数 438874）
+07:40:24.947964Z  INFO [negotiate] 策略裁定 repo=4 strategy=1 rate=0（对端行数 439）
+07:40:56.920345Z  WARN [federation] 检测到自连接（入站），已拒绝: node_id=89a5c03c
+07:41:30.053301Z  INFO [negotiate] 策略裁定 repo=1 strategy=2 rate=8388608（对端行数 6268332）
+07:41:30.053318Z  INFO [negotiate] 策略裁定 repo=2 strategy=1 rate=0（对端行数 85687）
+07:41:30.053331Z  INFO [negotiate] 策略裁定 repo=3 strategy=1 rate=0（对端行数 438874）
+07:41:30.053342Z  INFO [negotiate] 策略裁定 repo=4 strategy=1 rate=0（对端行数 439）
+07:41:32.012409Z  WARN [federation] 检测到自连接（入站），已拒绝: node_id=89a5c03c
+07:42:05.013759Z  WARN [federation] 检测到自连接（入站），已拒绝: node_id=89a5c03c
+07:42:25.942698Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=108

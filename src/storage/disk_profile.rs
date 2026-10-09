@@ -189,8 +189,10 @@ mod tests {
 
     #[test]
     fn test_probe_runs_on_temp_dir() {
-        // 用系统临时目录做一次真探测（预算短），不应 panic，失败回落 Unknown
-        let dir = std::env::temp_dir();
+        // 用测试临时目录做一次真探测（预算短），不应 panic，失败回落 Unknown。
+        // 测试临时根用 crate::test_tmp_dir()（构建目录 target/test-tmp）：本机安全策略
+        // 拒绝 target 构建目录进程写 %TEMP% 根与数据盘（PermissionDenied code 5）。
+        let dir = crate::test_tmp_dir();
         let r = DiskProbe::detect(&dir, Duration::from_millis(400));
         assert!(matches!(
             r.disk_class,

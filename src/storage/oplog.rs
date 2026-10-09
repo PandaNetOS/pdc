@@ -228,7 +228,8 @@ impl super::db::Storage {
             let shard = SHARD_ROWS.min(limit - out.len());
             // G1：分片读取改走读连接池（WAL 只读连接不抢全局写锁）。
             // 每片借一条读连接、闭包结束由 PoolReturn RAII 归还（panic 也归还）；
-            // 池空（内存库/极端耗尽）由 read() 回退写连接。片间 sleep 保留（见下）。
+            // 池空（内存库测试路径）由 read() 回退主连接；文件库池空只等待归还
+            // （超时 panic，P4-3 起绝不回退写锁）。片间 sleep 保留（见下）。
             let rows: Vec<OpRecord> = self.read(|conn| -> anyhow::Result<Vec<OpRecord>> {
                 let mut stmt = if repo == u8::MAX {
                     conn.prepare(

@@ -12,6 +12,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// v10(C2)：全爬虫统一发送门（进程级）——所有 UDP 请求发送路径共用同一限速器，
+/// 根治「仅链式采集节流、其余路径未限」导致的 112/s 风暴（.53 00:47 长查询门
+/// 被爬虫占满 → federation read_long 60s 超时 panic 崩溃的根因）。
+pub static GP_SEND_LAST: AtomicU64 = AtomicU64::new(0);
+/// 每秒发送轮数上限：100ms/轮 = ≤10/s（总门，覆盖 get_peers/scrape/announce 等全部路径）
+pub const GP_SEND_INTERVAL_MS: u64 = 100;
+
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rand::Rng;
@@ -769,6 +776,30 @@ impl CrawlerEngine {
             );
         }
 
+        {
+            let __nw = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+            let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+            if __w > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+            }
+            GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+        }
+        {
+            let __nw = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+            let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+            if __w > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+            }
+            GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+        }
         if socket.send_to(&msg, addr).await.is_ok() {
             self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
             let mut state = self.state.write();
@@ -1036,6 +1067,30 @@ impl CrawlerEngine {
                         },
                     );
                 }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+                }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+                }
                 if socket.send_to(&msg, *addr).await.is_ok() {
                     self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                     let mut s = self.state.write();
@@ -1071,6 +1126,30 @@ impl CrawlerEngine {
                         },
                     );
                 }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+                }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+                }
                 if socket.send_to(&msg, *addr).await.is_ok() {
                     self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                     let mut s = self.state.write();
@@ -1103,6 +1182,30 @@ impl CrawlerEngine {
                             layer: *layer,
                         },
                     );
+                }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+                }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
                 }
                 if socket.send_to(&msg, *addr).await.is_ok() {
                     self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
@@ -1137,6 +1240,30 @@ impl CrawlerEngine {
                             layer: *layer,
                         },
                     );
+                }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+                }
+                {
+                    let __nw = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                    let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                    if __w > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                    }
+                    GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
                 }
                 if socket.send_to(&msg, *addr).await.is_ok() {
                     self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
@@ -2199,6 +2326,24 @@ impl CrawlerEngine {
                     );
                 }
 
+                // L1-⑪：链式采集硬节流 —— 每秒 get_peers 轮数上限 20（根治 10 万轮风暴：
+                // 每响应 8-16 节点 × 每节点 DB 去重+写 ≈ 500 次/秒串行 DB 操作拖垮 SQLite
+                // 单写锁与调度器；40-60 轮/秒不是"这点速率"，放大链路才是瓶颈）。
+                {
+                    static LAST_GP_SEND: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    const GP_RATE_LIMIT_MS: u64 = 100; // 每秒 ≤10 轮（50ms 仍实测 112/s 超标，收紧一倍）
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let last = LAST_GP_SEND.load(Ordering::Relaxed);
+                    let wait = GP_RATE_LIMIT_MS.saturating_sub(now_ms.saturating_sub(last));
+                    if wait > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    }
+                    LAST_GP_SEND.store(now_ms.saturating_add(wait), Ordering::Relaxed);
+                }
                 if socket.send_to(&msg, node.addr).await.is_ok() {
                     self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                     let mut state = self.state.write();
@@ -2450,7 +2595,10 @@ impl CrawlerEngine {
 
         // 尝试解析 get_peers 响应
         if let Some((tid, resp)) = DhtMessage::parse_get_peers_response(data) {
-            info!(
+            // L1-⑨：响应日志降级 debug —— 线上实证 get_peers 风暴（累计 3.3 万轮/秒级数十条
+            // 响应）把 stdout.log 打到 89MB、tracing 全局写锁被占满 → 独立 api runtime 的
+            // HTTP handler 也被日志锁拖到超时。响应级观测移入采样（链式采集每 20 轮一条）。
+            debug!(
                 "[crawler] 收到 get_peers 响应 from {}, peers={}, nodes={}",
                 from,
                 resp.values.len(),
@@ -2878,6 +3026,30 @@ impl CrawlerEngine {
             );
         }
 
+        {
+            let __nw = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+            let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+            if __w > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+            }
+            GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+        }
+        {
+            let __nw = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+            let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+            if __w > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+            }
+            GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+        }
         if socket.send_to(&msg, addr).await.is_ok() {
             self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
             let mut state = self.state.write();
@@ -3141,6 +3313,30 @@ impl CrawlerEngine {
         for addr in &top_nodes {
             let tid = rand::random::<[u8; 4]>();
             let msg = DhtMessage::build_ping(&tid, &self.node_id);
+            {
+                let __nw = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                if __w > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                }
+                GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+            }
+            {
+                let __nw = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let __l = GP_SEND_LAST.load(Ordering::Relaxed);
+                let __w = GP_SEND_INTERVAL_MS.saturating_sub(__nw.saturating_sub(__l));
+                if __w > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(__w)).await;
+                }
+                GP_SEND_LAST.store(__nw.saturating_add(__w), Ordering::Relaxed);
+            }
             if socket.send_to(&msg, addr).await.is_ok() {
                 self.socket_send_total[socket_idx].fetch_add(1, Ordering::Relaxed);
                 // keepalive 成功发送计入限速器分母（19号 D1.3：其响应经 claim 计分子，

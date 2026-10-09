@@ -1230,8 +1230,63 @@ async fn io_status_handler(State(state): State<AppState>) -> Response {
 
 // 联邦同步通道状态轮询：GET /api/v1/sync/channels
 async fn sync_channels_handler(State(state): State<AppState>) -> Response {
+    Json(sync_channels_snapshot(&state)).into_response()
+}
+
+/// 三通道状态快照（四态派生：running/paused/failed/idle/done）。
+/// pub：REST `/api/v1/sync/channels` 与 WS `metrics` 推送共用（单一来源，L1-⑬ WS 实时化）。
+pub fn sync_channels_snapshot(
+    state: &AppState,
+) -> crate::federation::sync::channels_status::SyncChannelsStatus {
     // parking_lot 同步锁，read() 短时阻塞（与 io_status_handler 读法一致）。
-    Json(state.sync_channels.read().clone()).into_response()
+    let mut snap = state.sync_channels.read().clone();
+    // 三通道四态派生（观测侧，2026-10-08 监控面板需求）：
+    //   running=传输进行中（绿） / paused=非稳态或看门狗暂停止步（黄） /
+    //   failed=熔断/空洞/持续失败（红） / idle=闲置（灰）；bootstrap 另有 done（已完成）。
+    // 非稳态信息来自 SyncManager（AppState.federation → sync_manager），与业务侧
+    // in_nonsteady 同源，保证「暂停」判定与 delta/range 实际让路行为一致。
+    let any_ns = state
+        .federation
+        .as_ref()
+        .map(|f| f.sync_manager.nonsteady_active())
+        .unwrap_or(false);
+    // Bootstrap：phase 优先（circuit_open=熔断失效；active+phase=传输中；done=竣工）
+    {
+        let b = &mut snap.bootstrap;
+        b.state = match b.phase.as_str() {
+            "circuit_open" => "failed".to_string(),
+            _ if b.active && !b.phase.is_empty() => "running".to_string(),
+            "done" => "done".to_string(),
+            _ => "idle".to_string(),
+        };
+    }
+    // Delta：非稳态 → paused；oplog 空洞 → failed；有累计应用 → running；否则 idle
+    {
+        let d = &mut snap.delta;
+        d.state = if any_ns {
+            "paused".to_string()
+        } else if d.oplog_gap_detected {
+            "failed".to_string()
+        } else if d.sync_entries_applied > 0 || d.since_seq > 0 {
+            "running".to_string()
+        } else {
+            "idle".to_string()
+        };
+    }
+    // Range：非稳态 → paused；mode=idle → idle；有累计对账 → running；否则 idle
+    {
+        let r = &mut snap.range_reconcile;
+        r.state = if any_ns {
+            "paused".to_string()
+        } else if r.mode == "idle" {
+            "idle".to_string()
+        } else if r.leaf_compares > 0 || r.rounds_completed > 0 {
+            "running".to_string()
+        } else {
+            "idle".to_string()
+        };
+    }
+    snap
 }
 
 /// GET /api/v1/system：进程运行时信息（内存 / CPU / 线程 / fd）。

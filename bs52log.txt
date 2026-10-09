@@ -1,0 +1,28 @@
+total=665
+06:15:23.986559Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:15:23.990576Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:15:23.996568Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+06:16:26.093139Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:16:26.105480Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:16:26.118868Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+06:17:36.196637Z  INFO [crawler] 启动预热（加载最多 100000 节点，并行 bootstrap 8 个）...
+06:17:36.581759Z  INFO [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+06:18:26.297895Z  INFO [crawler] 预热: 向 2 个 bootstrap 地址发送了 find_node
+06:18:26.298384Z  INFO [crawler] 向 2 个 bootstrap 地址发送了 find_node
+06:19:06.685980Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:20:06.872868Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入260 − 释放258 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 26s)
+06:20:09.774749Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:20:09.778316Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:20:09.786636Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+06:20:25.586600Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+06:21:09.784422Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:21:09.787654Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:21:09.794001Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+06:22:11.882905Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:22:11.886242Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:22:11.894195Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+06:23:16.984936Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:23:16.988433Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9
+06:23:16.996524Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+06:24:21.081670Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=0，gap=false）
+06:24:21.131152Z  INFO [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=22335aa9

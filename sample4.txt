@@ -1,0 +1,5 @@
+13:52:57 avail=16 starved=0 longA=2 bs=0 inF=0
+13:53:05 avail=16 starved=0 longA=2 bs=0 inF=0
+13:53:13 avail=16 starved=0 longA=2 bs=0 inF=0
+53: avail=16 starved=0 longA=2 bs=0 inF=0
+WAL: 34735752 10/08/2026 13:53:01

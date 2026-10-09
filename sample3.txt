@@ -1,0 +1,7 @@
+13:48:15 avail=16 starved=0 longA=2 longW=361029 press=0.0 bs=0 inF=0
+13:48:25 avail=16 starved=0 longA=2 longW=377807 press=0.0 bs=0 inF=0
+13:48:35 avail=16 starved=0 longA=2 longW=395933 press=0.03463778 bs=0 inF=0
+13:48:45 avail=16 starved=0 longA=2 longW=414400 press=0.0 bs=0 inF=0
+13:48:55 avail=16 starved=0 longA=2 longW=431432 press=0.0 bs=0 inF=0
+13:49:05 avail=16 starved=0 longA=2 longW=449399 press=0.0 bs=0 inF=0
+WAL: 34735752 10/08/2026 13:48:34

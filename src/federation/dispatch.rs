@@ -101,6 +101,32 @@ impl PeerRuntime {
     }
 }
 
+/// 批次O(O11)：帧解码失败累计次数（进程级，观测用）。
+static FRAME_DECODE_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// 批次O(O11)：记录一次帧解码失败（**不再静默丢弃**）。
+///
+/// 背景：本文件 20 处 `if let Ok(msg) = bincode::deserialize(...)` 没有 `else` 分支 ——
+/// 帧**到达但无法反序列化**（长度错位/截断/类型错配）时完全静默：无日志、无计数。
+/// bootstrap 吞吐排查中因此无法区分「对端没发」与「发了但解码失败」（实测 .52 在
+/// 对端 `bootstrap_send_total` 增长的同时 `sync_entries_applied` 几乎不动），
+/// 只能靠猜。现在：计数 + 限流 WARN（首次与每 16 次各打一条，防风暴刷屏）。
+pub fn note_frame_decode_error(msg_type: MessageType, peer: &NodeId, payload_len: usize) {
+    let n = FRAME_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(16) {
+        warn!(
+            "[federation] 帧解码失败 ×{}: type={:?} from={} payload={}B（帧到达但无法反序列化）",
+            n, msg_type, peer, payload_len
+        );
+    }
+}
+
+/// 批次O(O11)：累计帧解码失败次数（观测：`/api/v1/io/status` 的
+/// `federation_frame_decode_errors`）。
+pub fn frame_decode_errors() -> u64 {
+    FRAME_DECODE_ERRORS.load(Ordering::Relaxed) as u64
+}
+
 /// 联邦业务分派器
 ///
 /// **零连接状态**：连接状态全在承载侧（`ConnectionManager` 或 SDK `SessionManager`）。
@@ -237,6 +263,10 @@ impl FederationDispatcher {
 
     /// 主动断连（`Goodbye` 等业务触发）；未注入钩子时为无操作
     fn disconnect_peer(&self, peer: NodeId, reason: DisconnectReason) {
+        // v10(C)：对端断连自愈 —— 清 bootstrap 窗口/攒批缓冲（防陈旧状态污染停滞判定）
+        if let Some(sm) = self.sync_manager.get() {
+            sm.peer_disconnected(&peer);
+        }
         // 先克隆再调用：不在持锁状态下执行外部代码
         let hook = self.disconnect.read().clone();
         match hook {
@@ -611,6 +641,48 @@ impl FederationDispatcher {
                 }
                 false
             }
+            MessageType::SpeedProbe => {
+                // P2-2：握手测速请求（应答方）—— 回测试载荷（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<SpeedProbeMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_speed_probe(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::SpeedProbeAck => {
+                // P2-2：握手测速响应（请求方）—— 算行速率 → 计算 T → 携 T 申请清单（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<SpeedProbeAckMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_speed_probe_ack(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
+            MessageType::BootstrapManifestNak => {
+                // v10：清单申请被拒绝（请求方）—— 不进非稳态、轻量退避（异步）
+                self.metrics.record_message_recv();
+                if let Some(sync_mgr) = self.sync_manager.get() {
+                    if let Ok(msg) = bincode::deserialize::<BootstrapManifestNakMessage>(&payload) {
+                        let sync_mgr = sync_mgr.clone();
+                        let conn = pc.clone();
+                        tokio::spawn(async move {
+                            sync_mgr.handle_bootstrap_manifest_nak(conn, msg).await;
+                        });
+                    }
+                }
+                false
+            }
             MessageType::RangeReconcileRequest => {
                 // P1-4：Range-based 反熵请求（应答方）—— 回该区间摘要 + 分界点/行指纹（异步）
                 self.metrics.record_message_recv();
@@ -709,14 +781,15 @@ impl FederationDispatcher {
                 // P2-1：bootstrap 清单请求（应答方）—— 建 w0 水位 + 有序逻辑分块清单（异步）
                 self.metrics.record_message_recv();
                 if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) =
-                        bincode::deserialize::<BootstrapManifestRequestMessage>(&payload)
-                    {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_bootstrap_manifest_request(conn, msg).await;
-                        });
+                    match bincode::deserialize::<BootstrapManifestRequestMessage>(&payload) {
+                        Ok(msg) => {
+                            let sync_mgr = sync_mgr.clone();
+                            let conn = pc.clone();
+                            tokio::spawn(async move {
+                                sync_mgr.handle_bootstrap_manifest_request(conn, msg).await;
+                            });
+                        }
+                        Err(_) => note_frame_decode_error(msg_type, &pc.node_id, payload.len()),
                     }
                 }
                 false
@@ -725,14 +798,15 @@ impl FederationDispatcher {
                 // P2-1：bootstrap 清单响应（请求方）—— 保存进度并开始拉第一块（异步）
                 self.metrics.record_message_recv();
                 if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) =
-                        bincode::deserialize::<BootstrapManifestResponseMessage>(&payload)
-                    {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_bootstrap_manifest_response(conn, msg).await;
-                        });
+                    match bincode::deserialize::<BootstrapManifestResponseMessage>(&payload) {
+                        Ok(msg) => {
+                            let sync_mgr = sync_mgr.clone();
+                            let conn = pc.clone();
+                            tokio::spawn(async move {
+                                sync_mgr.handle_bootstrap_manifest_response(conn, msg).await;
+                            });
+                        }
+                        Err(_) => note_frame_decode_error(msg_type, &pc.node_id, payload.len()),
                     }
                 }
                 false
@@ -741,13 +815,15 @@ impl FederationDispatcher {
                 // P2-1：bootstrap 分块请求（应答方）—— 按区间取条目回发（受令牌桶限流，异步）
                 self.metrics.record_message_recv();
                 if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<BootstrapChunkRequestMessage>(&payload)
-                    {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_bootstrap_chunk_request(conn, msg).await;
-                        });
+                    match bincode::deserialize::<BootstrapChunkRequestMessage>(&payload) {
+                        Ok(msg) => {
+                            let sync_mgr = sync_mgr.clone();
+                            let conn = pc.clone();
+                            tokio::spawn(async move {
+                                sync_mgr.handle_bootstrap_chunk_request(conn, msg).await;
+                            });
+                        }
+                        Err(_) => note_frame_decode_error(msg_type, &pc.node_id, payload.len()),
                     }
                 }
                 false
@@ -756,13 +832,15 @@ impl FederationDispatcher {
                 // P2-1：bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、续拉/切追尾（异步）
                 self.metrics.record_message_recv();
                 if let Some(sync_mgr) = self.sync_manager.get() {
-                    if let Ok(msg) = bincode::deserialize::<BootstrapChunkResponseMessage>(&payload)
-                    {
-                        let sync_mgr = sync_mgr.clone();
-                        let conn = pc.clone();
-                        tokio::spawn(async move {
-                            sync_mgr.handle_bootstrap_chunk_response(conn, msg).await;
-                        });
+                    match bincode::deserialize::<BootstrapChunkResponseMessage>(&payload) {
+                        Ok(msg) => {
+                            let sync_mgr = sync_mgr.clone();
+                            let conn = pc.clone();
+                            tokio::spawn(async move {
+                                sync_mgr.handle_bootstrap_chunk_response(conn, msg).await;
+                            });
+                        }
+                        Err(_) => note_frame_decode_error(msg_type, &pc.node_id, payload.len()),
                     }
                 }
                 false
@@ -888,11 +966,21 @@ impl FederationDispatcher {
                         return;
                     }
                 };
-                // 顺序处理本组 batch（纯内存操作，不经过 spawn_blocking）
-                if let Some(sync_mgr) = self_task.sync_manager.get().cloned() {
-                    for batch in group {
-                        sync_mgr.handle_gossip_batch(batch);
+                // P2-8：handle_gossip_batch → handle_sync_batch 含阻塞 DB（read_long_priority
+                // 查重 + self.conn upsert/墓碑仲裁），原在 tokio worker 上同步执行会阻塞
+                // 异步线程（旧注释"纯内存不经过 spawn_blocking"已过时）。挪进 spawn_blocking
+                // （SyncManager 为 Arc，Send+'static），permit 仍持有到 apply 结束。
+                let sm = self_task.sync_manager.get().cloned();
+                let res = tokio::task::spawn_blocking(move || {
+                    if let Some(sync_mgr) = sm {
+                        for batch in group {
+                            sync_mgr.handle_gossip_batch(batch);
+                        }
                     }
+                })
+                .await;
+                if let Err(e) = res {
+                    tracing::warn!(target: "pdcfed", "gossip apply spawn_blocking join 失败: {}", e);
                 }
                 drop(_permit);
                 conn_task

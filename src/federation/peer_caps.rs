@@ -83,9 +83,12 @@ impl PeerCaps {
         self.version >= 8
     }
 
-    /// 对端是否支持 bootstrap 专用通道（协议版本 >= 6）
+    /// 对端是否支持 bootstrap 专用通道（协议版本 >= 6）。
+    ///
+    /// 阈值是**能力引入版本**（v6 引入 bootstrap），不跟随线协议版本号
+    /// `BOOTSTRAP_PROTOCOL_VERSION`（v7 只是给块响应加可选压缩，v6 端仍支持通道）。
     pub fn supports_bootstrap(&self) -> bool {
-        self.version >= crate::federation::sync::bootstrap::BOOTSTRAP_PROTOCOL_VERSION
+        self.version >= 6
     }
 }
 

@@ -1,0 +1,10 @@
+15:57:59 52: bs=running done=115/3126 dir=recv
+53> 07:51:12.683842Z  INFO endpoint{[3mid[0m[2m=[0mf73553c6e3}: [bootstrap] 协商裁定 BOOTSTRAP repo=1，先测速再申请: peer=89a5c03c
+53> 07:51:12.696722Z  INFO [bootstrap] 清单申请被拒 Nak(reason=1) to=89a5c03c repo=1，不进非稳态，等下一轮协商/巡检重触发
+53> 07:51:57.334786Z  INFO [bootstrap] 分块请求触发清单重建（缓存缺失）: peer=89a5c03c repo=1 chunk_rows=2000 index=115
+53> 07:52:15.788254Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入268 − 释放266 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 26s)
+53> 07:52:34.606271Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+53> 07:53:00.486127Z  WARN [bootstrap] 回显式 NAK ×8（30s 限流汇总）: peer=89a5c03c repo=1 最近 index=115 reason=manifest rebuilding
+53> 07:54:09.545013Z  WARN [bootstrap] 回显式 NAK ×8（30s 限流汇总）: peer=89a5c03c repo=1 最近 index=119 reason=manifest rebuilding
+53> 07:55:10.449117Z  INFO [bootstrap] 清单缓存缺失，现场重建完成并要求请求方重新对齐: peer=89a5c03c, repo=1, 块数=3126, w0=10160368, 丢弃其 index=115, 重建耗时=193114ms
+53> 07:57:46.786798Z  INFO [task_scheduler] 调度器心跳: 队列待执行=53, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=0/4, federation=0/8, tracker=0/2], 在飞=1（准入860 − 释放859 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 9s)

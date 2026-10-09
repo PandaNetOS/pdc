@@ -799,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_federation_service_creation() {
-        let dir = std::env::temp_dir().join(format!("pdc_fed_svc_test_{}", std::process::id()));
+        let dir = crate::test_tmp_dir().join(format!("pdc_fed_svc_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -842,7 +842,7 @@ mod tests {
     #[ignore = "network-dependent, can hang on Windows; run manually with --ignored"]
     #[tokio::test]
     async fn test_federation_service_start_stop() {
-        let dir = std::env::temp_dir().join(format!("pdc_fed_start_test_{}", std::process::id()));
+        let dir = crate::test_tmp_dir().join(format!("pdc_fed_start_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -883,7 +883,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_federation_service_identity_persistence() {
-        let dir = std::env::temp_dir().join(format!("pdc_fed_persist_test_{}", std::process::id()));
+        let dir =
+            crate::test_tmp_dir().join(format!("pdc_fed_persist_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

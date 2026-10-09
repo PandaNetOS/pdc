@@ -24,6 +24,10 @@ use crate::storage::tiered_cache::TieredCacheConfig;
 use crate::storage::write_queue::WriteQueue;
 use crate::types::{Infohash, PeerInfo, PeerSource};
 
+/// 持久化 dirty 标脏阈值：last_active 变化超过该秒数才标脏。
+/// 防止高频活跃刷新（每轮爬虫都 touch 活跃 peer）把增量持久化退化成准全量。
+const PEER_DIRTY_ACTIVE_THRESHOLD_SECS: u64 = 60;
+
 pub struct PeerRepoImpl {
     /// infohash -> peer addr 闂嗗棗鎮?（分片锁）
     by_infohash: ShardedHashMap<Infohash, FxHashSet<SocketAddr>>,
@@ -35,7 +39,8 @@ pub struct PeerRepoImpl {
     /// peer_history 閸愭瑥鍙嗙紓鎾冲暱閸栫尨绱欓弨鎺撳閸愭瑥鍙嗛敍灞藉櫤鐏?fsync閿?
     history_buffer: RwLock<Vec<crate::storage::db::PeerHistoryEntry>>,
     /// 鑴?peer 闆嗗悎锛堢粺璁℃暟鎹凡鍙樺寲锛岄渶瑕侀噸绠楄瘎鍒?+ 澧為噺鎸佷箙鍖栵級
-    dirty: RwLock<FxHashSet<SocketAddr>>,
+    /// Arc 包装：save_dirty 落库闭包共享清脏（NodeRepo 同款）
+    dirty: Arc<RwLock<FxHashSet<SocketAddr>>>,
     /// 鑱旈偊寮曠敤锛圤nceLock 娉ㄥ叆锛涙湭璁剧疆鏃舵湰鍦板啓鍏ヤ笉瑙﹀彂 Merkle/Gossip锛宺epo 姝ｅ父宸ヤ綔锛?
     gossip: OnceLock<Arc<GossipEngine>>,
     /// 鍐欏叆闃熷垪锛堝彲閫夛紝Some 鏃?history flush 閫氳繃 WriteQueue/IOScheduler 鎻愪氦锛?
@@ -68,7 +73,7 @@ impl PeerRepoImpl {
             infohash_refs: ShardedHashMap::new(16),
             storage,
             history_buffer: RwLock::new(Vec::new()),
-            dirty: RwLock::new(FxHashSet::default()),
+            dirty: Arc::new(RwLock::new(FxHashSet::default())),
             gossip: OnceLock::new(),
             write_queue: None,
             active_1h: AtomicU64::new(0),
@@ -336,16 +341,29 @@ impl PeerRepoImpl {
         let mut ir = self.infohash_refs.write_all();
         let mut new_entries: Vec<(Infohash, SocketAddr, u64, String)> = Vec::new();
         let mut seen_keys: FxHashSet<(Infohash, SocketAddr)> = FxHashSet::default();
+        // P1-8：本批中需要持久化的 addr（新增 / 显著活跃变化），循环后统一写 dirty 锁
+        let mut dirty_addrs: Vec<SocketAddr> = Vec::new();
         for (infohash, peer) in items {
             let addr = peer.addr;
             if let Some(existing) = gl.get_mut(&addr) {
+                // 显著活跃变化（≥60s）才标脏，避免高频 touch 退化成准全量
+                let active_changed = peer
+                    .last_active
+                    .duration_since(existing.last_active)
+                    .map(|d| d.as_secs() >= PEER_DIRTY_ACTIVE_THRESHOLD_SECS)
+                    .unwrap_or(true);
                 existing.last_active = peer.last_active;
                 existing.source = peer.source;
                 if peer.peer_id.is_some() {
                     existing.peer_id = peer.peer_id;
                 }
+                if active_changed {
+                    dirty_addrs.push(addr);
+                }
             } else {
                 gl.insert(addr, peer.clone());
+                // 新增 peer：需要增量落库
+                dirty_addrs.push(addr);
             }
             // 活跃记账：新/更新后的 last_active 驱动（旧时间由 note_active 内部判窗跳过）
             self.note_active(addr, peer.last_active);
@@ -382,6 +400,15 @@ impl PeerRepoImpl {
         drop(ir);
         drop(bi);
         drop(gl);
+
+        // P1-8：新增/显著活跃变化的 peer 统一标持久化 dirty（增量落库；
+        // 反熵 dirty（update_incremental_batch）与本持久化 dirty 相互独立，入站 apply 不回推）
+        if !dirty_addrs.is_empty() {
+            let mut dirty = self.dirty.write();
+            for addr in dirty_addrs {
+                dirty.insert(addr);
+            }
+        }
 
         // 鍐欏叆 peer_history 缂撳啿鍖猴紙鎵归噺鑺傛祦锛屽噺灏?fsync锛?
         let now = chrono::Utc::now().timestamp();
@@ -667,10 +694,70 @@ impl PeerRepoImpl {
         }
     }
 
-    /// 娴?SQLite 閸旂姾娴囬崗銊╁劥 peer閿涘牐绻嶇悰灞炬濞叉槒绌?peer閿?
-    /// 澧為噺鎸佷箙鍖栵紙鍏ㄩ噺淇濆瓨妯″紡锛氭墍鏈夋暟鎹潎瑙嗕负 dirty锛岀洿鎺ュ叏閲忎繚瀛橈級
+    /// 增量持久化到 SQLite：只写 dirty 集合中的 peer（新增/显著活跃变化/评分更新），
+    /// 落库成功后才清 dirty（B3：先快照不清空，失败保留待重试）。
     pub async fn save_dirty(&self) -> anyhow::Result<()> {
-        self.save_all().await
+        let dirty_addrs = self.dirty_peers_sync();
+        if dirty_addrs.is_empty() {
+            return Ok(());
+        }
+        let batch = self.build_dirty_batch(&dirty_addrs);
+        if batch.is_empty() {
+            // 内存中已不存在的 dirty peer（可能已被删除），清理残留标记
+            self.clear_dirty_batch_sync(&dirty_addrs);
+            return Ok(());
+        }
+        if let Some(wq) = &self.write_queue {
+            let dirty_arc = self.dirty.clone();
+            let ack = dirty_addrs.clone();
+            wq.send_sized(batch.len(), move |conn| {
+                Storage::save_peers_batch_in_tx(conn, &batch)?;
+                // 落库（同事务）成功后才清 dirty；失败保留待重试
+                for a in &ack {
+                    dirty_arc.write().remove(a);
+                }
+                Ok(())
+            })?;
+        } else {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                storage.save_peers_batch(&batch)?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            self.clear_dirty_batch_sync(&dirty_addrs);
+        }
+        Ok(())
+    }
+
+    /// 构建 dirty 集合对应的 PeerRow 批次（仅遍历 dirty addr 的 infohash_refs 关联，
+    /// 避免 save_all 的全量遍历）
+    fn build_dirty_batch(&self, addrs: &[SocketAddr]) -> Vec<crate::storage::db::PeerRow> {
+        let gl = self.global.read_all();
+        let ir = self.infohash_refs.read_all();
+        let mut batch = Vec::new();
+        for addr in addrs {
+            let Some(peer) = gl.get(addr) else { continue };
+            let Some(ihs) = ir.get(addr) else { continue };
+            let last_active = peer
+                .last_active
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for ih in ihs {
+                batch.push(crate::storage::db::PeerRow {
+                    infohash: *ih,
+                    ip: addr.ip().to_string(),
+                    port: addr.port(),
+                    source: peer.source.as_str().to_string(),
+                    score: peer.priority_score,
+                    connection_attempts: peer.connection_attempts,
+                    connection_successes: peer.connection_successes,
+                    last_active,
+                });
+            }
+        }
+        batch
     }
 
     /// 启动时限量加载：按最近活跃降序加载最多 limit 个 peer。
@@ -799,6 +886,8 @@ impl PeerRepository for PeerRepoImpl {
         self.global.with_mut(addr, |peer| {
             peer.priority_score = score;
         });
+        // P1-8：评分更新需要增量落库（与 update_scores_batch 语义一致）
+        self.dirty.write().insert(*addr);
     }
 
     async fn update_scores_batch(&self, scores: &[(SocketAddr, f64)]) {
@@ -1032,5 +1121,66 @@ mod active_bookkeeping_tests {
         assert_eq!(repo.active_1h_count(), 1);
         repo.clear();
         assert_eq!(repo.active_1h_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn save_dirty_persists_new_peers_incrementally() {
+        // P1-8：增量 save_dirty 只写 dirty 集合，落库成功清脏，二次调用空转
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo = PeerRepoImpl::new(storage.clone());
+        let a1 = addr(20001);
+        let a2 = addr(20002);
+        repo.add_peers_sync(
+            &IH,
+            &[
+                PeerInfo::new(a1, PeerSource::Manual),
+                PeerInfo::new(a2, PeerSource::Manual),
+            ],
+        );
+        // 新增 peer 已标持久化 dirty
+        assert_eq!(repo.dirty_peers_sync().len(), 2);
+        repo.save_dirty().await.unwrap();
+        let rows: i64 = storage
+            .read(|c| -> anyhow::Result<i64> {
+                Ok(c.query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(rows, 2, "save_dirty 应落库 2 个新增 peer");
+        assert_eq!(repo.dirty_peers_sync().len(), 0, "落库成功后清脏");
+        // 再次 save_dirty：无 dirty，空转不写
+        repo.save_dirty().await.unwrap();
+        let rows2: i64 = storage
+            .read(|c| -> anyhow::Result<i64> {
+                Ok(c.query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(rows2, 2, "无 dirty 时不得重复写");
+    }
+
+    #[tokio::test]
+    async fn save_dirty_skips_frequent_active_refresh() {
+        // P1-8：同 peer 短时间重复活跃（<60s）不标脏，增量不会退化成准全量；
+        // 显著活跃变化（≥60s）才标脏
+        let storage = Arc::new(Storage::memory().unwrap());
+        let repo = PeerRepoImpl::new(storage.clone());
+        let a1 = addr(20003);
+        repo.add_peers_sync(&IH, &[PeerInfo::new(a1, PeerSource::Manual)]);
+        repo.save_dirty().await.unwrap();
+        assert_eq!(repo.dirty_peers_sync().len(), 0);
+        // 同一 peer 再次活跃（间隔 <60s）：不标脏
+        repo.add_peers_sync(&IH, &[PeerInfo::new(a1, PeerSource::Manual)]);
+        assert_eq!(repo.dirty_peers_sync().len(), 0);
+        // last_active 前进 61s（≥阈值）：标脏
+        let mut p = PeerInfo::new(a1, PeerSource::Manual);
+        p.last_active = SystemTime::now() + Duration::from_secs(61);
+        repo.add_peers_sync(&IH, &[p]);
+        assert_eq!(repo.dirty_peers_sync().len(), 1);
+        // 该 peer 在 DB 中仍只有 1 行（upsert 不新增）
+        let rows: i64 = storage
+            .read(|c| -> anyhow::Result<i64> {
+                Ok(c.query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }

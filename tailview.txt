@@ -1,0 +1,52 @@
+lines: 983
+---tail---
+2026-10-08T05:07:01.238844Z  INFO [crawler][probe] crawl 发送耗时 5ms（select 后总计 9ms）
+2026-10-08T05:07:01.238968Z  INFO [crawler] 分层响应率: L0已验证 0/7 L1新鲜 0/1065 探索 0/464（300s窗口 响应增量/选中）
+2026-10-08T05:07:01.243365Z  INFO [memory_monitor] 内存检测: 1435MB / 阈值 1800MB
+2026-10-08T05:07:01.540751Z  INFO [crawler] 开始 bucket 刷新，共 12 个非空 bucket
+2026-10-08T05:07:01.543456Z  INFO [crawler] bucket 刷新完成
+2026-10-08T05:07:02.240384Z  INFO [federation] Discovery 公网地址已更新: 115.194.148.245:6885
+2026-10-08T05:07:03.457578Z  INFO [dht_probe] 从 PeerRepo 拉取 100 个未探测 peer 加入队列（优先级最高的前 100 个）
+2026-10-08T05:07:05.244431Z  INFO [crawler][probe] get_peers select 耗时 6ms，选中 128
+2026-10-08T05:07:05.247823Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 9ms）
+2026-10-08T05:07:05.247846Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+2026-10-08T05:07:05.491270Z  WARN [storage] 读池空等待 60s 仍无连接归还，回退写连接（保底，starved=117916）
+2026-10-08T05:07:05.714466Z  WARN [storage] 读池空等待 60s 仍无连接归还，回退写连接（保底，starved=117981）
+2026-10-08T05:07:07.818078Z  WARN [federation] 入站连接走了次优路径（NAT 回环）：放行（降级标记），当前源=192.168.30.10:55412，对端局域网地址=192.168.30.53:6885
+2026-10-08T05:07:07.936005Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}:relay-actor: home is now relay https://usw1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://aps1-1.relay.n0.iroh.link./"))
+2026-10-08T05:07:11.600143Z  INFO [tracker] 发现完成: 8 个 peer (去重后)
+2026-10-08T05:07:11.600201Z  INFO [tracker_fetcher] ih=98bc269b 获取 8 peer, 存入 PeerRepo
+2026-10-08T05:07:11.611148Z  INFO [crawler] 收到 get_peers 响应 from 61.185.173.65:21607, peers=0, nodes=8
+2026-10-08T05:07:11.611179Z  INFO [crawler] 链式直接采集: 已对实时邻居累计发起 641 轮 get_peers
+2026-10-08T05:07:11.611277Z  INFO [crawler] 收到 get_peers 响应 from 112.222.24.205:40608, peers=0, nodes=8
+2026-10-08T05:07:12.937914Z  WARN [io] 背压升档（level=1.00 > 0.5），TaskScheduler 让路
+2026-10-08T05:07:13.025753Z  INFO [crawler] 收到 get_peers 响应 from 117.88.167.169:46091, peers=0, nodes=8
+2026-10-08T05:07:16.434118Z  INFO [checkpoint] 累计成功 160 次：mode=Passive wal_frames=36633 busy累计=1 本次耗时 0ms，EWMA 10ms
+2026-10-08T05:07:19.843691Z  INFO [crawler] 收到 get_peers 响应 from 223.109.90.96:6882, peers=0, nodes=8
+2026-10-08T05:07:20.244112Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=0/8, persistence=0/1, monitor=0/2, network=1/4, federation=1/8, tracker=0/2], 在飞=2（准入1935 − 释放1933 − 回收0）, 最老在飞=联邦bootstrap续传(Federation 169s)
+2026-10-08T05:07:21.919861Z  INFO [crawler] paced 消费者: 60s内消费 0 条, 队列=0, 累计丢弃=137, 预算=64/tick
+2026-10-08T05:07:21.920195Z  WARN [storage] 读池空等待 60s 仍无连接归还，回退写连接（保底，starved=121384）
+2026-10-08T05:07:24.665339Z  WARN [storage] 读池空等待 60s 仍无连接归还，回退写连接（保底，starved=121938）
+2026-10-08T05:07:25.159590Z  INFO [negotiate] 策略裁定 repo=1 strategy=2 rate=8388608（对端行数 6256240）
+2026-10-08T05:07:25.159609Z  INFO [negotiate] 策略裁定 repo=2 strategy=1 rate=0（对端行数 85384）
+2026-10-08T05:07:25.159827Z  INFO [negotiate] 策略裁定 repo=3 strategy=1 rate=0（对端行数 438828）
+2026-10-08T05:07:25.159872Z  INFO [negotiate] 策略裁定 repo=4 strategy=1 rate=0（对端行数 439）
+2026-10-08T05:07:25.561225Z  INFO [dht_probe] 从 PeerRepo 拉取 100 个未探测 peer 加入队列（优先级最高的前 100 个）
+2026-10-08T05:07:26.875163Z  INFO [tracker] 发现完成: 1 个 peer (去重后)
+2026-10-08T05:07:26.875199Z  INFO [tracker_fetcher] ih=7ef219ef 获取 1 peer, 存入 PeerRepo
+2026-10-08T05:07:28.504010Z  INFO [crawler] 收到 get_peers 响应 from 123.156.69.229:9944, peers=0, nodes=8
+2026-10-08T05:07:29.147948Z  INFO [crawler][probe] sample select 耗时 14ms，选中 128
+2026-10-08T05:07:29.150374Z  INFO [crawler][probe] sample 发送耗时 2ms
+2026-10-08T05:07:29.150437Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+2026-10-08T05:07:29.481674Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}:relay-actor:active-relay{[3murl[0m[2m=[0mhttps://usw1-1.relay.n0.iroh.link./}: Lost connection to relay server: Ping timeout
+2026-10-08T05:07:32.341256Z  INFO [crawler][probe] get_peers select 耗时 2ms，选中 128
+2026-10-08T05:07:32.346113Z  INFO [crawler][probe] get_peers 发送耗时 4ms（select 后总计 7ms）
+2026-10-08T05:07:32.346140Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 11 infohash 查询
+2026-10-08T05:07:33.163733Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}:relay-actor: home is now relay https://euc1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://usw1-1.relay.n0.iroh.link./"))
+2026-10-08T05:07:35.259019Z  INFO [memory_monitor] 内存检测: 1493MB / 阈值 1800MB
+2026-10-08T05:07:36.332586Z  INFO [crawler][probe] crawl select 耗时 3ms，选中 192
+2026-10-08T05:07:36.338778Z  INFO [crawler][probe] crawl 发送耗时 6ms（select 后总计 9ms）
+2026-10-08T05:07:36.338887Z  INFO [crawler] 分层响应率: L0已验证 0/7 L1新鲜 0/1199 探索 0/522（300s窗口 响应增量/选中）
+2026-10-08T05:07:37.657493Z  WARN [tracker] tracker_fetcher 执行超过 120s，本轮中止释放槽位
+2026-10-08T05:07:38.673726Z  WARN [storage] 读池空等待 60s 仍无连接归还，回退写连接（保底，starved=124710）
+2026-10-08T05:07:39.828356Z  INFO [crawler] 收到 get_peers 响应 from 97.113.220.52:6881, peers=0, nodes=8

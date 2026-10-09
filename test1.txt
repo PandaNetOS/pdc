@@ -1,0 +1,846 @@
+﻿cargo : warning: hard linking files in the incremental compilation cache failed. copying files instead. consider moving
+ the cache directory to a file system which supports hard linking in session dir `\\?\D:\PNOS\pdc\target\debug\incremen
+tal\pnos_net-0fbcnezfllo7u\s-hmzlbh4c2p-189ugxt-working`
+所在位置 行:1 字符: 27
++ Set-Location D:\PNOS\pdc; cargo test --lib 2>&1 | Out-File -Encoding  ...
++                           ~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: hard l...89ugxt-working`:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+
+warning: unused import: `EventLoop`
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\discovery\mqtt.rs:229:36
+    |
+229 |         use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
+    |                                    ^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `DiscoverySource`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\discovery\peer_cache.rs:16:20
+   |
+16 | use crate::types::{DiscoverySource, EndpointKind, NodeEndpoint};
+   |                    ^^^^^^^^^^^^^^^
+
+warning: unused import: `std::time::Duration`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\ipv6.rs:20:5
+   |
+20 | use std::time::Duration;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `warn`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\ipv6.rs:23:28
+   |
+23 | use tracing::{debug, info, warn};
+   |                            ^^^^
+
+warning: unused import: `Ipv6Addr`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\pcp.rs:14:26
+   |
+14 | use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+   |                          ^^^^^^^^
+
+warning: unused import: `warn`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\pcp.rs:17:22
+   |
+17 | use tracing::{debug, warn};
+   |                      ^^^^
+
+warning: unused import: `debug`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\state.rs:32:15
+   |
+32 | use tracing::{debug, info, warn};
+   |               ^^^^^
+
+warning: unused import: `UdpSocket`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\udp_hole_punch.rs:27:28
+   |
+27 | use std::net::{SocketAddr, UdpSocket};
+   |                            ^^^^^^^^^
+
+warning: unused import: `Instant`
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\mod.rs:36:27
+   |
+36 | use std::time::{Duration, Instant};
+   |                           ^^^^^^^
+
+warning: unused variable: `renew`
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\metrics.rs:305:13
+    |
+305 |         let renew = self.renew_latency();
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_renew`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `discover`
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\metrics.rs:306:13
+    |
+306 |         let discover = self.discover_latency();
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_discover`
+
+warning: variable does not need to be mutable
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\nat_pmp.rs:344:9
+    |
+344 |     let mut current_adapter_has_dhcp = false;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\state.rs:96:13
+   |
+92 |             (_, NatState::Released) | (_, NatState::Error) => true,
+   |             ---------------------------------------------- matches all the relevant values
+...
+96 |             (NatState::Initializing, NatState::Error) => true,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+   |
+   = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\state.rs:99:13
+   |
+92 |             (_, NatState::Released) | (_, NatState::Error) => true,
+   |             ---------------------------------------------- matches all the relevant values
+...
+99 |             (NatState::Mapping, NatState::Error) => true,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: unused variable: `from`
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\stun.rs:249:15
+    |
+249 |     let (len, from) = socket.recv_from(&mut buf)?;
+    |               ^^^^ help: if this is intentional, prefix it with an underscore: `_from`
+
+warning: fields `metrics`, `state_machine`, and `ipv6_manager` are never read
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\mod.rs:201:5
+    |
+190 | pub struct NatManager {
+    |            ---------- fields in this struct
+...
+201 |     metrics: Arc<RwLock<NatMetricsExt>>,
+    |     ^^^^^^^
+202 |     state_machine: NatStateMachine,
+    |     ^^^^^^^^^^^^^
+203 |     ipv6_manager: Arc<Ipv6Manager>,
+    |     ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `OP_PEER` is never used
+  --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\pcp.rs:29:7
+   |
+29 | const OP_PEER: u8 = 2;
+   |       ^^^^^^^
+
+warning: fields `peer_id`, `peer_addr`, and `start_time` are never read
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\nat\udp_hole_punch.rs:192:5
+    |
+190 | struct HolePunchSession {
+    |        ---------------- fields in this struct
+191 |     /// 对端 ID
+192 |     peer_id: String,
+    |     ^^^^^^^
+193 |     /// 对端地址
+194 |     peer_addr: SocketAddr,
+    |     ^^^^^^^^^
+195 |     /// 开始时间
+196 |     start_time: Instant,
+    |     ^^^^^^^^^^
+    |
+    = note: `HolePunchSession` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignore
+d during dead code analysis
+
+warning: field `hole_puncher` is never read
+   --> D:\PNOS\pnos-sdk\crates\pnos-net\src\net_agent.rs:127:5
+    |
+122 | pub struct NetAgent {
+    |            -------- field in this struct
+...
+127 |     hole_puncher: Option<Arc<HolePuncher>>,
+    |     ^^^^^^^^^^^^
+
+   Compiling PeerDiscoveryCenter v0.2.0 (D:\PNOS\pdc)
+   Compiling lz4_flex v0.11.6
+warning: `pnos-net` (lib) generated 20 warnings (run `cargo fix --lib -p pnos-net` to apply 13 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 09s
+     Running unittests src\lib.rs (target\debug\deps\PeerDiscoveryCenter-a5d7e90146d28c84.exe)
+
+running 643 tests
+test config::tests::test_classify_delta_policy_whitelist ... ok
+test config::tests::test_health_check_intervals_defaults ... ok
+test config::tests::test_scheduler_new_features_default_off ... ok
+test config::tests::test_default_config ... ok
+test config::tests::test_new_hot_reload_config_fields_have_defaults ... ok
+test config::tests::test_from_yaml_strips_utf8_bom ... ok
+test config::tests::test_parse_yaml ... ok
+test config::tests::test_removed_legacy_keys_are_ignored ... ok
+test config::tests::test_task_scheduler_intervals_default_consistent ... ok
+test config::tests::test_from_file_strips_utf8_bom ... ok
+test config::tests::test_from_file_without_bom_ok ... ok
+test control_plane::policy::tests::test_default_policy ... ok
+test control_plane::policy::tests::test_from_config ... ok
+test control_plane::policy::tests::test_should_trigger_discovery ... ok
+test config::tests::test_config_delta_summary_truncates_long_values ... ok
+test control_plane::tests::test_control_plane_creation ... ok
+test control_plane::tests::test_config_update ... ok
+test config::tests::test_diff_configs_detects_nested_and_map_changes ... ok
+test crawler::buffer_pool::tests::test_crawler_buffer_pool_clone_shares_pool ... ok
+test crawler::buffer_pool::tests::test_crawler_buffer_pool_acquire_release ... ok
+test crawler::engine::tests::test_crawler_state_default ... ok
+test control_plane::config_reload::tests::test_no_change_report_unchanged ... ok
+test crawler::engine::tests::test_paced_budget_math ... ok
+test control_plane::config_reload::tests::test_apply_updates_snapshot_and_skips_unavailable_targets ... ok
+test crawler::engine::tests::test_pending_shard_uniform ... ok
+test crawler::pex_receiver::tests::test_parse_compact_peers ... ok
+test crawler::pex_receiver::tests::test_extension_handshake_parse ... ok
+test crawler::pex_receiver::tests::test_pex_peer_flags ... ok
+test crawler::rate_limiter::tests::test_exit_threshold_releases_throttle ... ok
+test crawler::rate_limiter::tests::test_global_response_rate_no_requests ... ok
+test crawler::engine::tests::test_crawler_engine_creation ... ok
+test crawler::rate_limiter::tests::test_global_response_rate ... ok
+test crawler::engine::tests::test_crawler_start_disabled ... ok
+test crawler::engine::tests::test_round_feedback_layer_accounting ... ok
+test crawler::rate_limiter::tests::test_no_requests_rate_is_full ... ok
+test crawler::engine::tests::test_round_feedback_multi_account_aggregate ... ok
+test crawler::rate_limiter::tests::test_no_skip_when_not_throttled ... ok
+test crawler::rate_limiter::tests::test_no_throttle_before_sample_threshold ... ok
+test control_plane::tests::test_init_default_discoverers ... ok
+test crawler::rate_limiter::tests::test_rate_limiter_disabled ... ok
+test crawler::rate_limiter::tests::test_response_rate_calculation ... ok
+test crawler::rate_limiter::tests::test_throttle_when_rate_low ... ok
+test crawler::rate_limiter::tests::test_update_config_changes_skip_ratio ... ok
+test crawler::rate_limiter::tests::test_throttle_skips_by_ratio_half ... ok
+test crawler::rate_limiter::tests::test_rate_limiter_multi_socket ... ok
+test crawler::rate_limiter::tests::test_update_config_changes_thresholds ... ok
+test crawler::engine::tests::test_paced_enqueue_overflow ... ok
+test crawler::utp_server::tests::test_parse_bittorrent_handshake ... ok
+test crawler::utp_server::tests::test_utp_header_parse ... ok
+test data_plane::hole_punch_signaling::tests::test_cleanup_expired ... ok
+test data_plane::hole_punch_signaling::tests::test_session_expiry ... ok
+test data_plane::hole_punch_signaling::tests::test_stats ... ok
+test data_plane::hole_punch_signaling::tests::test_initiate_and_complete ... ok
+test data_plane::http_tracker::tests::test_parse_info_hash_hex ... ok
+test data_plane::http_tracker::tests::test_parse_info_hash_percent ... ok
+test data_plane::http_tracker::tests::test_error_response ... ok
+test data_plane::http_tracker::tests::test_parse_query_params_basic ... ok
+test data_plane::http_tracker::tests::test_parse_query_params_multiple_info_hash ... ok
+test data_plane::http_tracker::tests::test_parse_query_params_percent_encoded ... ok
+test data_plane::http_tracker::tests::test_percent_decode ... ok
+test data_plane::relay::tests::test_relay_magic ... ok
+test data_plane::relay::tests::test_relay_server_creation ... ok
+test data_plane::relay::tests::test_relay_stats_default ... ok
+test data_plane::rest_api::tests::repo_tier_cold_is_total_minus_hot_warm ... ok
+test data_plane::rest_api::tests::repo_tier_stats_serializes_to_panel_shape ... ok
+test data_plane::rest_api::tests::test_parse_infohash ... ok
+test data_plane::http_tracker::tests::test_scrape ... ok
+test data_plane::rest_api::tests::test_parse_infohash_invalid_hex ... ok
+test data_plane::rest_api::tests::test_parse_infohash_invalid_length ... ok
+test data_plane::stats_snapshot::tests::drift_threshold_judgement ... ok
+test data_plane::stats_snapshot::tests::empty_snapshot_gives_only_base_peer_score ... ok
+test data_plane::stats_snapshot::tests::full_marks_snapshot_is_100 ... ok
+test data_plane::stats_snapshot::tests::mixed_snapshot_matches_hand_calc ... ok
+test data_plane::stats_snapshot::tests::node_missing_means_zero_dht_layer ... ok
+test data_plane::stats_snapshot::tests::protocol_diversity_boundaries ... ok
+test data_plane::udp_tracker::tests::test_announce_request_parsing ... ok
+test data_plane::udp_tracker::tests::test_build_error ... ok
+test data_plane::udp_tracker::tests::test_connect_request_parsing ... ok
+test data_plane::udp_tracker::tests::test_protocol_constants ... ok
+test dht::kbucket::tests::test_bucket_overflow_bad_replaced ... ok
+test dht::kbucket::tests::test_bucket_overflow_good_rejected ... ok
+test dht::kbucket::tests::test_closest_sorting ... ok
+test dht::kbucket::tests::test_insert_and_dup ... ok
+test dht::kbucket::tests::test_decay_factor_math ... ok
+test dht::kbucket::tests::test_record_success_failure ... ok
+test dht::kbucket::tests::test_windowed_response_rate_decay_invariant ... ok
+test dht::probe::tests::test_parse_ping_response ... ok
+test dht::probe::tests::test_parse_ping_response_invalid ... ok
+test dht::routing_table::tests::test_bucket_capacity_k ... ok
+test dht::routing_table::tests::test_bucket_index ... ok
+test discoverers::dht::client::tests::test_dht_config_default ... ok
+test dht::routing_table::tests::test_add_and_find ... ok
+test discoverers::dht::client::tests::test_add_node ... ok
+test dht::probe::tests::test_probe_creation ... ok
+test dht::routing_table::tests::test_find_closest ... ok
+test discoverers::dht::client::tests::test_dht_discoverer_creation ... ok
+test discoverers::dht::client::tests::test_mark_node_failure ... ok
+test discoverers::dht::message::tests::test_build_get_peers ... ok
+test discoverers::dht::message::tests::test_build_ping ... ok
+test dht::routing_table::tests::test_json_roundtrip ... ok
+test discoverers::dht::message::tests::test_dht_node_from_compact ... ok
+test discoverers::dht::message::tests::test_distance_less ... ok
+test discoverers::dht::message::tests::test_parse_compact_peers ... ok
+test discoverers::dht::message::tests::test_tid_4byte_roundtrip ... ok
+test discoverers::dht::message::tests::test_xor_distance ... ok
+test discoverers::dht::client::tests::test_nearest_nodes ... ok
+test discoverers::lpd::client::tests::test_build_lpd_message ... ok
+test discoverers::lpd::client::tests::test_lpd_config_default ... ok
+test discoverers::lpd::client::tests::test_parse_lpd_message_invalid ... ok
+test discoverers::lpd::client::tests::test_parse_lpd_message ... ok
+test discoverers::lpd::client::tests::test_lpd_discoverer_creation ... ok
+test discoverers::lpd::client::tests::test_parse_lpd_message_own_cookie ... ok
+test discoverers::pex::client::tests::test_clone_shallow ... ok
+test discoverers::pex::client::tests::test_add_connected_peer ... ok
+test discoverers::pex::client::tests::test_add_known_peers ... ok
+test discoverers::pex::client::tests::test_peers_due_for_pex ... ok
+test discoverers::pex::client::tests::test_pex_config_default ... ok
+test discoverers::pex::client::tests::test_pex_discoverer_creation ... ok
+test discoverers::pex::message::tests::test_bt_handshake_build_parse ... ok
+test discoverers::pex::message::tests::test_bt_handshake_supports_extension ... ok
+test discoverers::pex::message::tests::test_compact_peers_encode_decode ... ok
+test discoverers::pex::message::tests::test_extended_message_build ... ok
+test discoverers::pex::message::tests::test_ut_pex_build_parse ... ok
+test discoverers::pex::message::tests::test_extension_handshake_build_request ... ok
+test discoverers::tests::test_enabled_filter ... ok
+test discoverers::tests::test_register_and_get ... ok
+test discoverers::tests::test_unregister ... ok
+test discoverers::tracker::client::tests::test_parse_compact_peers ... ok
+test discoverers::tests::test_discover_all ... ok
+test discoverers::tracker::client::tests::test_tracker_config_default ... ok
+test discoverers::tracker::udp::tests::test_build_connect_request ... ok
+test discoverers::tracker::udp::tests::test_build_announce_request ... ok
+test discoverers::tracker::client::tests::test_tracker_discoverer_creation ... ok
+test discoverers::tracker::udp::tests::test_parse_tracker_addr_invalid ... ok
+test discoverers::tracker::udp::tests::test_parse_tracker_addr_no_path ... ok
+test discoverers::webseed::client::tests::test_add_url ... ok
+test discoverers::webseed::client::tests::test_infohash_specific_urls ... ok
+test discoverers::webseed::client::tests::test_url_to_peer_info ... ok
+test discoverers::webseed::client::tests::test_webseed_config_default ... ok
+test discoverers::webseed::client::tests::test_discover_peers ... ok
+test discoverers::webseed::client::tests::test_discover_peers_with_limit ... ok
+test discoverers::webseed::client::tests::test_webseed_discoverer_creation ... ok
+test dns_pool::tests::test_global_lazy_defaults ... ok
+test dns_pool::tests::test_init_global_is_idempotent ... ok
+test dns_resolve::tests::test_apply_without_pool_keeps_builder ... ok
+test dns_resolve::tests::test_apply_with_pool_builds_client ... ok
+test dns_resolve::tests::test_resolve_literal_ip_via_adapter ... ok
+test event_bus::tests::test_subscriber_count ... ok
+test event_bus::tests::test_multiple_subscribers ... ok
+test event_bus::tests::test_publish_subscribe ... ok
+test federation::config::tests::test_bootstrap_livelock_fields_default_and_roundtrip ... ok
+test federation::config::tests::test_config_yaml_roundtrip ... ok
+test federation::config::tests::test_enabled_defaults_true_when_key_omitted ... ok
+test federation::config::tests::test_federation_lpd_multicast_port_default_and_alias ... ok
+test federation::config::tests::test_default_config ... FAILED
+test federation::config::tests::test_config_serialize ... ok
+test federation::discovery::tests::test_skip_self_in_nodes ... ok
+test federation::discovery::tests::test_handle_exchange_nodes ... ok
+test federation::discovery::tests::test_handle_nodes_received ... ok
+test federation::discovery::tests::test_strip_local_addrs_all_local_skipped ... ok
+test federation::discovery::tests::test_strip_local_addrs_no_address_entry_kept ... ok
+test federation::discovery::tests::test_bootstrap_no_seeds ... ok
+test federation::discovery::tests::test_strip_local_addrs_no_overlap_unchanged ... ok
+test federation::discovery::tests::test_strip_local_addrs_partial_keeps_lan ... ok
+test federation::dispatch::tests::business_objects_start_uninjected ... ok
+test federation::dispatch::tests::caps_table_is_shared_not_copied ... ok
+test federation::dispatch::tests::disconnect_without_hook_is_noop ... ok
+test federation::dispatch::tests::disconnector_is_replaceable ... ok
+test federation::dispatch::tests::forget_releases_runtime ... ok
+test federation::dispatch::tests::flush_on_empty_table_is_noop ... ok
+test federation::discovery::tests::test_sync_from_node_table ... ok
+test federation::dispatch::tests::peer_is_identity_stable ... ok
+test federation::dispatch::tests::flush_drains_same_peer_buffers_across_reallocation ... ok
+test federation::dispatch::tests::runtime_is_not_shared_between_peers ... ok
+test federation::dispatch::tests::runtime_starts_empty ... ok
+test federation::dispatch::tests::runtimes_snapshot_covers_all_peers ... ok
+test federation::metrics::tests::test_metrics_all_counters ... ok
+test federation::metrics::tests::test_metrics_arc_share ... ok
+test federation::metrics::tests::test_metrics_counters ... ok
+test federation::gossip::tests::test_submit_empty_entries ... ok
+test federation::metrics::tests::test_metrics_snapshot_serialize ... ok
+test federation::gossip::tests::test_msg_id_increment ... ok
+test federation::gossip::tests::test_submit_and_handle_gossip ... ok
+test federation::nat_integration::tests::test_detect_reachability_hole_punch ... ok
+test federation::nat_integration::tests::test_detect_reachability_mapped ... ok
+test federation::nat_integration::tests::test_detect_reachability_outbound_only ... ok
+test federation::nat_integration::tests::test_nat_integration_creation ... ok
+test federation::nat_integration::tests::test_stun_probe_no_servers ... ok
+test federation::nat_integration::tests::test_setup_mapping_disabled ... ok
+test federation::node_id::tests::test_node_address_preferred ... ok
+test federation::node_id::tests::test_node_id_display ... ok
+test federation::node_id::tests::test_node_id_from_hex_invalid ... ok
+test federation::node_id::tests::test_node_id_random_and_hex ... ok
+test federation::node_id::tests::test_node_id_serialize_roundtrip ... ok
+test federation::node_id::tests::test_node_identity_addresses ... ok
+test federation::node_id::tests::test_node_identity_generate ... ok
+test federation::node_id::tests::test_public_key_bytes ... ok
+test federation::node_id::tests::test_reachability_display ... ok
+test federation::node_id::tests::test_signing_key_persistence ... ok
+test federation::node_table::tests::test_activity_score ... ok
+test federation::node_table::tests::test_add_and_get ... ok
+test federation::node_table::tests::test_cleanup_expired ... ok
+test federation::node_table::tests::test_connected_nodes ... ok
+test federation::node_table::tests::test_mark_connected_failed ... ok
+test federation::node_table::tests::test_max_nodes_eviction ... ok
+test federation::node_table::tests::test_random_neighbors ... ok
+test federation::node_table::tests::test_remove ... ok
+test federation::node_table::tests::test_top_active_nodes ... ok
+test federation::peer_caps::tests::test_default_is_unknown ... ok
+test federation::peer_caps::tests::test_remove_and_len ... ok
+test federation::peer_caps::tests::test_set_and_of_roundtrip ... FAILED
+test federation::peer_caps::tests::test_threshold_boundaries ... ok
+test federation::peer_caps::tests::test_unknown_defaults_to_version_1 ... ok
+test federation::peer_conn::tests::capability_thresholds_match_legacy_semantics ... FAILED
+test federation::peer_conn::tests::view_delegates_caps_to_version ... ok
+test federation::peer_query_store::tests::test_clear_then_take_is_empty ... ok
+test federation::peer_query_store::tests::test_keys_are_isolated ... ok
+test federation::peer_query_store::tests::test_push_accumulates_and_take_drains ... ok
+test federation::protocol::tests::test_decode_frame_insufficient_data ... ok
+test federation::protocol::tests::test_decode_frame_invalid_length ... ok
+test federation::node_id::tests::test_node_identity_load_or_create ... ok
+test federation::protocol::tests::test_encode_decode_ping ... ok
+test federation::protocol::tests::test_encode_decode_sync_batch ... ok
+test federation::protocol::tests::test_frame_size_in_buffer ... ok
+test federation::protocol::tests::test_hello_identity_binding_rejects_spoof ... ok
+test aggregator::tests::test_discover_peers ... ok
+test aggregator::tests::test_dedup_across_discoverers ... ok
+test aggregator::tests::test_event_published ... ok
+test federation::protocol::tests::test_message_type_roundtrip ... ok
+test federation::protocol::tests::test_ops_batch_v2_roundtrip ... ok
+test federation::protocol::tests::test_hello_stale_timestamp_rejected ... ok
+test federation::protocol::tests::test_signaling_message_serde ... ok
+test federation::relay::tests::test_bandwidth_tracker_basic ... ok
+test federation::relay::tests::test_bandwidth_tracker_per_conn_limit ... ok
+test federation::relay::tests::test_bandwidth_tracker_total_limit ... ok
+test federation::relay::tests::test_relay_action_constants ... ok
+test federation::relay::tests::test_relay_bandwidth_tracker_limit ... ok
+test federation::relay::tests::test_relay_channel_idle_duration ... ok
+test federation::node_id::tests::test_ed25519_sign_verify ... ok
+test federation::relay::tests::test_relay_data_message_serde ... ok
+test federation::relay::tests::test_relay_close_all ... ok
+test data_plane::http_tracker::tests::test_super_tracker_store_and_get ... ok
+test federation::relay::tests::test_relay_data_unknown_channel ... ok
+test federation::relay::tests::test_relay_handle_accept_and_close ... ok
+test federation::relay::tests::test_relay_setup_message_serde ... ok
+test federation::relay::tests::test_relay_handle_reject ... ok
+test federation::relay::tests::test_relay_manager_creation ... ok
+test federation::relay::tests::test_relay_setup_relay_disabled ... ok
+test federation::session::tests::test_detect_suboptimal_path_flags_nat_loopback_from_gateway ... ok
+test federation::session::tests::test_heartbeat_interval_always_below_idle_timeout ... ok
+test federation::session::tests::test_detect_suboptimal_path_none_for_direct_lan_source ... ok
+test federation::session::tests::test_detect_suboptimal_path_none_for_public_source ... ok
+test federation::session::tests::test_heartbeat_interval_lower_bound_for_normal_timeout ... ok
+test federation::session::tests::test_idle_exempt_requires_inflight_work ... ok
+test federation::session::tests::test_idle_exempt_saturating_never_panics ... ok
+test federation::session::tests::test_idle_exempt_threshold_boundary ... ok
+test federation::session::tests::test_idle_exempt_zero_limit_is_noop ... ok
+test federation::session::tests::test_node_id_roundtrip ... ok
+test federation::session::tests::test_reachability_mapping_is_total ... ok
+test federation::session::tests::test_session_config_listen_true_binds_port ... ok
+test federation::session::tests::test_session_config_maps_ping_pong_kinds ... ok
+test federation::session::tests::test_sessions_handle_bind_once_is_idempotent ... ok
+test federation::session::tests::test_sessions_handle_starts_unbound ... ok
+test federation::session::tests::test_validate_heartbeat_pacing_10s_tick_30s_idle_passes ... ok
+test federation::session::tests::test_validate_heartbeat_pacing_30s_tick_30s_idle_rejected ... ok
+test federation::session::tests::test_validate_heartbeat_pacing_30s_tick_90s_idle_passes ... ok
+test federation::session::tests::test_validate_heartbeat_pacing_default_config_self_consistent ... ok
+test federation::session::tests::test_validate_heartbeat_pacing_rejects_large_probe_interval ... ok
+test federation::session::tests::test_version_metadata_missing_falls_back_to_1 ... ok
+test federation::session::tests::test_version_metadata_roundtrip ... ok
+test federation::signaling::tests::test_signaling_action_constants ... ok
+test federation::signaling::tests::test_signaling_message_serde ... ok
+test federation::sync::bootstrap::tests::test_backoff_delay_doubles_and_caps ... ok
+test federation::node_id::tests::test_legacy_identity_is_migrated_to_derived_node_id ... ok
+test federation::signaling::tests::test_signaling_service_creation ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_fully_inherited ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_idle_recoveries_reset_on_progress ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_idle_reap_requeues_inflight ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_pipeline ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_reap_timed_out ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_resume ... ok
+test federation::sync::bootstrap::tests::test_chunk_window_with_skip ... ok
+test federation::sync::bootstrap::tests::test_digests_cover_remote_rejects_deficit ... ok
+test federation::protocol::tests::test_encode_decode_hello ... ok
+test federation::sync::bootstrap::tests::test_manifest_bounds_fingerprint ... ok
+test federation::protocol::tests::test_hello_signature_tamper_detection ... ok
+test federation::discovery::tests::test_pex_send_timeout_does_not_panic ... ok
+test federation::sync::bootstrap::tests::test_bootstrap_state_isolated_per_peer ... ok
+test federation::sync::bootstrap::tests::test_manifest_drift_and_inheritance ... ok
+test federation::sync::bootstrap::tests::test_bootstrap_state_roundtrip ... ok
+test federation::sync::bootstrap::tests::test_manifest_fingerprint_eq ... ok
+test federation::sync::bootstrap::tests::test_local_digest_cache ... ok
+test federation::sync::bootstrap::tests::test_progress_stalled ... ok
+test discoverers::tracker::udp::tests::test_parse_tracker_addr ... ok
+test federation::sync::bootstrap::tests::test_token_bucket ... ok
+test federation::sync::bootstrap::tests::test_verify_transport_half_threshold ... ok
+test federation::sync::channels_status::tests::default_serializes_expected_keys ... ok
+test federation::sync::channels_status::tests::global_is_singleton ... ok
+test federation::sync::delta::tests::test_ops_to_sync_entries ... ok
+test federation::sync::delta::tests::test_ops_to_sync_entries_v2 ... ok
+test federation::sync::bootstrap::tests::test_manifest_empty_db ... ok
+test federation::sync::delta::tests::test_peer_seq_roundtrip ... ok
+test federation::sync::delta::tests::test_supports_delta_sync ... ok
+test federation::sync::delta::tests::test_supports_ops_batch_v2_version_selection ... ok
+test federation::sync::delta::tests::test_to_legacy_entries ... ok
+test control_plane::config_reload::tests::test_apply_scheduler_interval_unit_mismatch_skipped ... ok
+test federation::sync::infohash_sync::tests::test_infohash_sync_payload_serde ... ok
+test control_plane::config_reload::tests::test_apply_scheduler_interval_unit_inference ... ok
+test federation::sync::peer_sync::tests::test_peer_sync_payload_serde ... ok
+test control_plane::config_reload::tests::test_apply_interval_secs_updates_reloader_task ... ok
+test control_plane::config_reload::tests::test_apply_unregistered_task_skipped ... ok
+test federation::sync::range_reconcile::tests::test_decide ... ok
+test federation::sync::range_reconcile::tests::test_range_digest_stable_and_sensitive ... ok
+test federation::sync::range_reconcile::tests::test_key_diff ... ok
+test federation::sync::range_reconcile::tests::test_split_points_bounds_and_monotonic ... ok
+test control_plane::config_reload::tests::test_apply_concurrency_and_knobs ... ok
+test federation::sync::range_reconcile::tests::test_supports_range_reconcile ... ok
+test federation::sync::tests::a1_try_inc_bounded_caps_inflight_and_releases ... ok
+test federation::sync::tests::a3_send_circuit_threshold_open_then_half_open_and_reset ... ok
+test federation::sync::tests::a5_serving_entry_expired_boundary ... ok
+test federation::sync::tests::test_allow_direction_fallback ... ok
+test federation::sync::tests::test_bidir_bootstrap_by_volume_threshold ... ok
+test federation::sync::delta::tests::test_records_to_entries ... ok
+test federation::sync::bootstrap::tests::test_digest_local_by_remote_chunks_block_table_path ... ok
+test federation::sync::bootstrap::tests::test_manifest_chunking_covers_all_rows ... ok
+test federation::sync::bootstrap::tests::test_manifest_digests_path_equivalence ... ok
+test federation::sync::bootstrap::tests::test_manifest_digests_rebuild_on_chunk_rows_change ... ok
+test federation::sync::bootstrap::tests::test_manifest_hash_compare_detects_diff ... ok
+test federation::sync::infohash_sync::tests::test_apply_infohash_sync ... ok
+test federation::sync::tests::test_apply_node_sync ... ok
+test federation::sync::tests::test_direction_guard_blocks ... ok
+test federation::sync::peer_sync::tests::test_apply_peer_sync ... ok
+test federation::sync::tests::test_bootstrap_enable_repos_default_and_peer_pick ... ok
+test federation::sync::tests::test_bidirectional_bootstrap_yield_by_node_id ... ok
+test federation::sync::tests::test_bootstrap_chunk_spawn_blocking_entries_correctness ... ok
+test federation::sync::tests::test_locate_resume_index_survives_boundary_drift ... ok
+test federation::sync::tests::test_node_sync_payload_roundtrip ... ok
+test federation::sync::tests::test_bootstrap_inflight_mutex_and_range_yield ... ok
+test federation::sync::tests::test_chunk_transport_backoff_gate ... ok
+test federation::sync::tests::test_remote_exceeds_local_threshold ... ok
+test federation::sync::tests::test_bootstrap_transfer_stalled_breaks_range_yield ... ok
+test federation::sync::tests::test_resume_guard_terminates ... ok
+test federation::sync::tests::test_delta_v2_entries_update_existing_entry ... ok
+test federation::sync::tests::test_gate_fail_backoff_damps_direct_finish_loop ... ok
+test federation::sync::tests::test_delta_watchdog_pause_keeps_delta_negotiation ... ok
+test federation::sync::tests::test_handle_sync_batch_unknown_type ... ok
+test federation::sync::tracker_sync::tests::test_tracker_sync_payload_serde ... ok
+test federation::sync::tests::test_local_entry_counts_matches_manifest_scope ... ok
+test federation::sync::tests::test_rediff_candidate_direction_guard ... ok
+test federation::tests::test_federation_service_start_stop ... ignored, network-dependent, can hang on Windows; run manually with --ignored
+test federation::tests::test_federation_status_serialize ... ok
+test federation::tests::test_last_seen_ago_secs ... ok
+test federation::transport::tests::test_hole_punch_magic ... ok
+test federation::transport::tests::test_udp_send_recv ... ok
+test federation::transport::tests::test_udp_transport_bind ... ok
+test federation::sync::tests::test_repull_circuit_breaker ... ok
+test firewall::tests::test_dedup_ports ... ok
+test firewall::tests::test_disabled_manager ... ok
+test federation::sync::tests::test_snapshot_really_needed_watermark_gate ... ok
+test firewall::tests::test_firewall_manager_creation ... ok
+test firewall::tests::test_firewall_result_default ... ok
+test firewall::tests::test_empty_ports ... ok
+test firewall::tests::test_rule_name_format ... ok
+test firewall::tests::test_is_firewall_enabled ... ok
+test intelligence::adaptive_controller::tests::test_adaptive_config_default ... ok
+test intelligence::adaptive_controller::tests::test_controller_adjusts_multiplier ... ok
+test intelligence::adaptive_controller::tests::test_controller_cold_start_returns_one ... ok
+test intelligence::adaptive_controller::tests::test_controller_degraded_mode_caps_at_one ... ok
+test intelligence::adaptive_controller::tests::test_controller_disabled_returns_one ... ok
+test intelligence::adaptive_controller::tests::test_controller_managed_mode_target ... ok
+test intelligence::adaptive_controller::tests::test_prediction_divergence_fallback ... ok
+test intelligence::adaptive_controller::tests::test_smoothing_avoids_instant_crash ... ok
+test intelligence::adaptive_controller::tests::test_warmup_no_training ... ok
+test intelligence::adaptive_controller::tests::test_zero_sent_rounds_ignored ... ok
+test intelligence::availability::tests::test_availability_method_label ... ok
+test federation::sync::tracker_sync::tests::test_apply_tracker_sync ... ok
+test intelligence::availability::tests::test_cache ... ok
+test intelligence::availability::tests::test_estimate_no_peers ... ok
+test intelligence::availability::tests::test_estimate_without_seeders ... ok
+test intelligence::availability::tests::test_estimate_with_seeders ... ok
+test federation::sync::tracker_sync::tests::test_submit_tracker_change ... ok
+test intelligence::availability::tests::test_exact_calculation ... ok
+test intelligence::availability::tests::test_exact_calculation_missing_pieces ... ok
+test intelligence::availability::tests::test_piece_availability ... ok
+test intelligence::crawler_history::tests::test_crawler_history_record_and_len ... ok
+test intelligence::crawler_history::tests::test_extract_features_insufficient_data ... ok
+test intelligence::crawler_history::tests::test_extract_features_values ... ok
+test intelligence::crawler_history::tests::test_predictor_cold_start ... ok
+test intelligence::crawler_history::tests::test_prediction_features_to_vector ... ok
+test intelligence::crawler_history::tests::test_predictor_update_and_predict ... ok
+test intelligence::dht_activity::tests::test_active_infohash_count ... ok
+test intelligence::crawler_history::tests::test_predictor_confidence ... ok
+test intelligence::dht_activity::tests::test_last_active ... ok
+test intelligence::dht_activity::tests::test_record_and_query ... ok
+test intelligence::dht_activity::tests::test_total_events ... ok
+test intelligence::dht_activity::tests::test_top_active ... ok
+test intelligence::infohash_score::tests::test_data_completeness_calculation ... ok
+test intelligence::health_scorer::tests::test_health_scorer_creation ... ok
+test intelligence::infohash_score::tests::test_fused_seeders ... ok
+test intelligence::infohash_score::tests::test_hot_but_no_announce ... ok
+test intelligence::infohash_score::tests::test_growth_rate_negative ... ok
+test intelligence::infohash_score::tests::test_hotness_level ... ok
+test intelligence::infohash_score::tests::test_log_scale ... ok
+test intelligence::infohash_score::tests::test_medium_infohash_score ... ok
+test intelligence::infohash_score::tests::test_perfect_infohash_score ... ok
+test intelligence::infohash_score::tests::test_score_range ... ok
+test intelligence::infohash_score::tests::test_seeder_ratio_neutral ... ok
+test intelligence::infohash_score::tests::test_zero_infohash_score ... ok
+test intelligence::node_score::tests::test_bad_node_score ... ok
+test intelligence::node_score::tests::test_fresh_prior_ladder ... ok
+test intelligence::node_score::tests::test_perfect_node_score ... ok
+test intelligence::node_score::tests::test_windowed_rate_overrides_lifetime ... ok
+test intelligence::peer_history::tests::test_batch_record ... ok
+test intelligence::peer_history::tests::test_growth_rate_no_history ... ok
+test discoverers::dht::client::tests::test_dht_init ... ok
+test intelligence::peer_history::tests::test_growth_from_zero ... ok
+test intelligence::peer_history::tests::test_record_and_current ... ok
+test intelligence::peer_history::tests::test_tracked_count ... ok
+test intelligence::peer_score::tests::test_peer_score_pex_low ... ok
+test intelligence::peer_score::tests::test_peer_score_tracker_high ... ok
+test intelligence::score_maintainer::tests::test_score_maintainer_creation ... ok
+test intelligence::select_system::tests::test_layered_does_not_self_mark_hot ... ok
+test intelligence::select_system::tests::test_layered_excludes_inflight ... ok
+test intelligence::select_system::tests::test_legacy_mode_keeps_old_behavior ... ok
+test intelligence::select_system::tests::test_layered_exploit_shortfall_fills_from_top ... ok
+test intelligence::select_system::tests::test_layered_exploit_and_explore_budget ... ok
+test intelligence::select_system::tests::test_reprobe_cooldown_filter ... ok
+test intelligence::select_system::tests::test_select_diverse_nodes_empty ... ok
+test intelligence::select_system::tests::test_select_top_nodes ... ok
+test intelligence::task_scheduler::knobs_from_config_tests::test_knobs_from_config_field_by_field ... ok
+test intelligence::task_scheduler::knobs_from_config_tests::test_knobs_from_default_config_is_backward_compatible ... ok
+test intelligence::task_scheduler::tests::test_adaptive_interval_extends_in_high_load ... ok
+test intelligence::task_scheduler::tests::test_adaptive_interval_keepalive_excluded ... ok
+test intelligence::task_scheduler::tests::test_adaptive_interval_shrinks_in_low_load ... ok
+test intelligence::task_scheduler::tests::test_admission_delays_when_over_threshold_then_forces ... ok
+test intelligence::task_scheduler::tests::test_admission_disabled_always_allows ... ok
+test intelligence::task_scheduler::tests::test_admission_keepsalive_and_critical_bypass ... ok
+test federation::tests::test_federation_service_creation ... ok
+test intelligence::task_scheduler::tests::test_io_threshold_triggers_admission ... ok
+test intelligence::task_scheduler::tests::test_jitter_disabled_equals_fixed_interval ... ok
+test intelligence::task_scheduler::tests::test_jitter_enabled_produces_variation ... ok
+test intelligence::task_scheduler::tests::test_predictive_scheduling_defers_low_priority ... ok
+test intelligence::task_scheduler::tests::test_load_predictor_ewma ... ok
+test intelligence::task_scheduler::tests::test_profile_store_ewma_convergence ... ok
+test intelligence::task_scheduler::tests::test_profile_store_unknown_task ... ok
+test federation::sync::tests::test_align_bootstrap_seed_verifies_inherited_prefix ... ok
+test federation::tests::test_federation_service_identity_persistence ... ok
+test federation::sync::bootstrap::tests::test_range_alignment_is_boundary_independent ... ok
+test intelligence::task_scheduler::tests::test_resource_state ... ok
+test intelligence::task_scheduler::tests::test_scheduled_item_ordering ... ok
+test firewall::tests::test_add_rules_skips_when_firewall_disabled ... ok
+test intelligence::task_scheduler::tests::test_resource_monitor ... ok
+test intelligence::task_scheduler::tests::test_reclaim_stale_slots_releases_leaked_slot ... ok
+test intelligence::task_scheduler::tests::test_reclaim_stale_slots_is_per_category ... ok
+test intelligence::task_scheduler::tests::test_task_metadata_builder ... ok
+test intelligence::task_scheduler::tests::test_task_priority_ordering ... ok
+test intelligence::task_scheduler::tests::test_task_stats ... ok
+test intelligence::task_scheduler::tests::test_external_io_backpressure_injection ... ok
+test intelligence::task_scheduler::tests::test_reclaim_respects_disabled_knob ... ok
+test intelligence::tier_manager::tests::test_data_tier_ordering ... ok
+test intelligence::tier_manager::tests::test_tier_config_default ... ok
+test intelligence::tier_system::tests::test_classify_cold ... ok
+test intelligence::tier_system::tests::test_classify_hot ... ok
+test intelligence::tier_system::tests::test_classify_warm ... ok
+test intelligence::tier_system::tests::test_high_score_floor ... ok
+test intelligence::tier_system::tests::test_low_score_accelerated_demotion ... ok
+test intelligence::task_scheduler::tests::test_scheduler_register_and_summary ... ok
+test intelligence::tier_system::tests::test_should_persist ... ok
+test intelligence::tracker_score::tests::test_medium_score ... ok
+test intelligence::tracker_score::tests::test_perfect_score ... ok
+test intelligence::tracker_score::tests::test_zero_score ... ok
+test intelligence::task_scheduler::tests::test_scheduler_stagger_registration ... ok
+test port_allocator::tests::test_allocate_success ... ok
+test port_allocator::tests::test_allocate_with_offset ... ok
+test port_allocator::tests::test_apply_to_config ... ok
+test port_allocator::tests::test_max_attempts_exceeded ... ok
+test port_allocator::tests::test_port_group_from_config ... ok
+test port_allocator::tests::test_socket_count_ports ... ok
+test services::metadata_service::tests::test_find_bencode_dict_end ... ok
+test services::metadata_service::tests::test_metadata_cache ... ok
+test services::metadata_service::tests::test_parse_info_dict_multi_file ... ok
+test services::metadata_service::tests::test_parse_info_dict_single_file ... ok
+test services::metadata_service::tests::test_torrent_file ... ok
+test services::scrape_service::tests::test_parse_scrape_response ... ok
+test port_allocator::tests::test_release_all ... ok
+test services::scrape_service::tests::test_parse_scrape_response_failure ... ok
+test services::scrape_service::tests::test_rate_limit ... ok
+test services::scrape_service::tests::test_scrape_result_default ... ok
+test services::scrape_service::tests::test_urlencode_infohash ... ok
+test health_check::tests::test_health_check_creation ... ok
+test services::system_stats::tests::test_global_snapshot_returns_consistent_type ... ok
+test services::system_stats::tests::test_snapshot_fields_plausible ... ok
+test services::system_stats::tests::test_snapshot_second_call_hits_cache ... ok
+test storage::checkpoint_worker::tests::test_checkpoint_breaker_backoff ... ok
+test storage::checkpoint_worker::tests::test_checkpoint_tick_forces_above_hard ... ok
+test storage::checkpoint_worker::tests::test_checkpoint_tick_skips_below_soft ... ok
+test services::system_stats::tests::test_snapshot_staleness_grows_when_cached ... ok
+test intelligence::task_scheduler::tests::test_update_knobs_hot ... ok
+test intelligence::task_scheduler::tests::test_update_category_concurrency_hot ... ok
+test intelligence::task_scheduler::tests::test_slot_guard_does_not_double_release_after_reclaim ... ok
+test intelligence::task_scheduler::tests::test_update_interval_resets_adaptive_state ... ok
+test intelligence::task_scheduler::tests::test_admission_escape_valve_breaks_permanent_seal ... ok
+test storage::db::tests::test_checkpoint_once_memory_db_skips ... ok
+test storage::db::tests::test_chunk_digests_basic_crud ... ok
+test storage::db::tests::test_chunk_dirty_hook_on_peer_save ... ok
+test storage::db::tests::test_init_tables ... ok
+test storage::db::tests::test_dht_node_save_load ... ok
+test storage::db::tests::test_chunk_dirty_hook_on_node_soft_delete ... ok
+test storage::checkpoint_worker::tests::test_checkpoint_worker_single_flight ... ok
+test storage::db::tests::test_load_recent_nodes_orders_by_last_active ... ok
+test storage::db::tests::test_load_repo_key_hashes_peer_merges_archive ... ok
+test storage::db::tests::test_mark_chunks_dirty_empty_table_noop ... ok
+test storage::db::tests::test_mark_chunks_dirty_in_tx_locates_correct_blocks ... ok
+test storage::db::tests::test_peer_history ... ok
+test storage::db::tests::test_mark_repo_all_dirty ... ok
+test storage::db::tests::test_range_key_hashes_ordered_and_filtered ... ok
+test storage::db::tests::test_range_query_falls_back_without_index ... ok
+test storage::db::tests::test_read_pool_empty_on_memory ... ok
+test intelligence::task_scheduler::tests::test_in_flight_registry_balances_after_normal_run ... ok
+test storage::db::tests::test_read_pool_starved_counts_only_on_file_db_queue_wait ... ok
+test storage::db::tests::test_truncate_advisable_gate ... ok
+test storage::db::tests::test_stats_aggregate ... ok
+test storage::disk_profile::tests::test_classify_ssd ... ok
+test storage::disk_profile::tests::test_disk_probe_classifies_hdd ... ok
+test storage::db::tests::test_table_counts_dht_node_lifecycle ... ok
+test storage::db::tests::test_read_pool_size_on_open ... ok
+test storage::db::tests::test_read_pool_available_net_zero_after_borrow_return ... ok
+test federation::sync::tests::test_finish_bootstrap_alignment_gate ... ok
+test storage::db::tests::test_table_counts_peers_and_trackers ... ok
+test storage::io_scheduler::tests::test_acquire_partial_defers_remainder ... ok
+test storage::io_scheduler::tests::test_aimd_grows_when_stable ... ok
+test storage::io_scheduler::tests::test_aimd_respects_profile_clamp ... ok
+test storage::io_scheduler::tests::test_aimd_ring_buffer_keeps_recent ... ok
+test storage::io_scheduler::tests::test_aimd_shrinks_on_foreground_latency ... ok
+test storage::io_scheduler::tests::test_aimd_shrinks_on_slow ... ok
+test storage::db::tests::test_table_counts_reconcile_overwrites_drift ... ok
+test storage::io_scheduler::tests::test_backpressure_level ... ok
+test storage::db::tests::test_tracker_save_load ... ok
+test storage::io_scheduler::tests::test_backoff_gate_levels ... ok
+test storage::infohash_repo::tests::test_pending_batch ... ok
+test storage::io_scheduler::tests::test_deadline_starvation_prevention ... ok
+test storage::infohash_repo::tests::test_persistence ... ok
+test storage::infohash_repo::tests::test_register_and_count ... ok
+test storage::infohash_repo::tests::test_save_dirty_incremental_ref_count ... ok
+test storage::io_scheduler::tests::test_import_budget_floor_is_base ... ok
+test storage::io_scheduler::tests::test_import_budget_grows_when_fast ... ok
+test storage::io_scheduler::tests::test_import_budget_halves_on_slow ... ok
+test storage::io_scheduler::tests::test_import_window_expires ... ok
+test storage::io_scheduler::tests::test_idle_prediction ... ok
+test storage::io_scheduler::tests::test_io_status_serializes ... ok
+test storage::io_scheduler::tests::test_latency_ewma_decays_with_time ... ok
+test storage::io_scheduler::tests::test_latency_hysteresis_hold ... ok
+test storage::db::tests::test_wal_autocheckpoint_takeover ... ok
+test storage::io_scheduler::tests::test_priority_queue_ordering ... ok
+test storage::db::tests::test_drop_unused_indexes_disabled_by_config ... ok
+test federation::sync::tests::test_bootstrap_infohash_relaxed_finish ... ok
+test storage::io_scheduler::tests::test_token_bucket_acquire ... ok
+test storage::io_scheduler::tests::test_token_bucket_default_disabled_via_config ... ok
+test storage::io_scheduler::tests::test_token_bucket_refill ... ok
+test storage::io_scheduler::tests::test_critical_bypasses_token_bucket ... ok
+test storage::io_scheduler::tests::test_flush_and_wait_timeout ... ok
+test storage::io_scheduler::tests::test_write_queue_compatibility ... ok
+test storage::io_scheduler::tests::test_flush_and_wait_drains ... ok
+test storage::io_scheduler::tests::test_critical_immune_to_token_bucket ... ok
+test storage::node_repo::tests::test_bad_revival_via_mention ... ok
+test storage::node_repo::tests::test_bad_after_failures_configurable ... ok
+test storage::disk_profile::tests::test_probe_runs_on_temp_dir ... ok
+test storage::io_scheduler::tests::test_pressure_from_rows ... ok
+test storage::node_repo::tests::test_load_all_recalibrates_and_idempotent ... ok
+test storage::io_scheduler::tests::test_request_merging ... ok
+test storage::node_repo::tests::test_load_initial_restores_recency_and_state ... ok
+test storage::node_repo::tests::test_mixed_ops_match_full_scan ... ok
+test storage::node_repo::tests::test_recent_window_accumulates ... ok
+test storage::node_repo::tests::test_record_query_active_and_state_flip ... ok
+test storage::node_repo::tests::test_refresh_all_states_no_drift ... ok
+test storage::db::tests::test_drop_unused_indexes_idempotent ... ok
+test storage::io_scheduler::tests::test_send_sized_enqueues_and_counts_rows ... ok
+test storage::node_repo::tests::test_remove_cold_nodes_empty_when_nothing_cold ... ok
+test storage::io_scheduler::tests::test_pressure_takes_max ... ok
+test storage::node_repo::tests::test_remove_cold_nodes_removes_only_cold ... ok
+test storage::io_scheduler::tests::test_backpressure_rejects_background ... ok
+test storage::node_repo::tests::test_save_dirty_persists_real_last_active ... ok
+test storage::node_repo::tests::test_score_update_changes_avg ... ok
+test storage::node_repo::tests::test_set_node_state_transition ... ok
+test storage::node_repo::tests::test_stats_after_emergency_evict ... ok
+test storage::node_repo::tests::test_stats_after_insert ... ok
+test storage::node_repo::tests::test_stats_after_remove_node ... ok
+test storage::node_repo::tests::test_stats_empty_repo ... ok
+test storage::node_repo::tests::test_verify_consistency_clean ... ok
+test storage::node_repo::tests::test_stats_same_addr_id_update_no_double_count ... ok
+test storage::node_repo::tests::test_verify_consistency_detects_drift ... ok
+test storage::oplog::tests::test_guarded_trim_keeps_ops_after_floor ... ok
+test storage::oplog::tests::test_oplog_append_and_load_since ... ok
+test storage::oplog::tests::test_oplog_trim_by_retention ... ok
+test storage::tiered_cache::tests::test_clear ... ok
+test storage::tiered_cache::tests::test_contains ... ok
+test storage::tiered_cache::tests::test_emergency_evict ... ok
+test storage::tiered_cache::tests::test_get_miss ... ok
+test storage::tiered_cache::tests::test_get_or_load_hit ... ok
+test storage::tiered_cache::tests::test_get_or_load_miss_and_load ... ok
+test storage::tiered_cache::tests::test_get_or_load_miss_and_not_found ... ok
+test storage::tiered_cache::tests::test_hot_eviction_on_capacity ... ok
+test storage::tiered_cache::tests::test_put_and_get ... ok
+test storage::tiered_cache::tests::test_put_if_absent ... ok
+test storage::tiered_cache::tests::test_remove ... ok
+test storage::tiered_cache::tests::test_stats ... ok
+test storage::oplog::tests::test_peer_ack_floor_takes_min_and_only_advances ... ok
+test storage::oplog::tests::test_status_line_reflects_len_and_seq_range ... ok
+test storage::tiered_cache::tests::test_values_and_iter ... ok
+test storage::peer_repo::active_bookkeeping_tests::clear_resets_count ... ok
+test storage::peer_repo::active_bookkeeping_tests::insert_and_remove_maintains_count ... ok
+test storage::peer_repo::active_bookkeeping_tests::old_last_active_is_not_counted ... ok
+test storage::peer_repo::active_bookkeeping_tests::recalibrate_counts_only_recent_peers ... ok
+test storage::peer_repo::active_bookkeeping_tests::repeated_touch_does_not_double_count ... ok
+test tests::test_test_tmp_dir_writable ... ok
+test tests::test_version ... ok
+test types::tests::test_announce_event_from_str ... ok
+test types::tests::test_announce_response_bencode ... ok
+test types::tests::test_announce_response_failure ... ok
+test types::tests::test_scrape_response_bencode ... ok
+test utils::object_pool::tests::test_buffer_pool ... ok
+test utils::object_pool::tests::test_pool_overflow ... ok
+test utils::time::tests::test_cutoff_before_normal ... ok
+test utils::time::tests::test_cutoff_before_underflow_falls_back ... ok
+test utils::time::tests::test_unix_instant_round_trip ... ok
+test utils::time::tests::test_unix_secs_to_instant_future_clamps_to_now ... ok
+test utils::time::tests::test_unix_secs_to_instant_stale_falls_back_to_process_start ... ok
+test utils::time::tests::test_within ... ok
+test storage::peer_repo::active_bookkeeping_tests::save_dirty_persists_new_peers_incrementally ... ok
+test storage::peer_repo::active_bookkeeping_tests::save_dirty_skips_frequent_active_refresh ... ok
+test storage::peer_repo::active_bookkeeping_tests::sweep_removes_stale_entries_keeps_fresh ... ok
+test storage::peer_repo::active_bookkeeping_tests::touch_new_peer_counts_one ... ok
+test storage::tracker_repo::tests::test_cache_miss_load_from_db ... ok
+test storage::tracker_repo::tests::test_add_and_get ... ok
+test storage::tracker_repo::tests::test_persistence ... ok
+test storage::tracker_repo::tests::test_record_request ... ok
+test federation::protocol::tests::test_max_frame_size ... ok
+test storage::tiered_cache::tests::test_tier_check_demotion ... ok
+test storage::tiered_cache::tests::test_warm_promotion_on_get ... ok
+test storage::tiered_cache::tests::test_tier_check_eviction ... ok
+test federation::sync::bootstrap::tests::test_batched_manifest_build_matches_per_chunk_reference ... ok
+test federation::sync::tests::test_snapshot_cooldown_forces_delta ... ok
+test federation::sync::tests::test_rediff_candidate_threshold_and_cooldown ... ok
+
+failures:
+
+---- federation::config::tests::test_default_config stdout ----
+
+thread 'federation::config::tests::test_default_config' (37556) panicked at src\federation\config.rs:984:9:
+assertion `left == right` failed
+  left: 12
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- federation::peer_caps::tests::test_set_and_of_roundtrip stdout ----
+
+thread 'federation::peer_caps::tests::test_set_and_of_roundtrip' (17324) panicked at src\federation\peer_caps.rs:174:9:
+assertion failed: caps.supports_bootstrap()
+
+---- federation::peer_conn::tests::capability_thresholds_match_legacy_semantics stdout ----
+
+thread 'federation::peer_conn::tests::capability_thresholds_match_legacy_semantics' (34540) panicked at src\federation\peer_conn.rs:169:13:
+assertion `left == right` failed: v=6 bootstrap
+  left: false
+ right: true
+
+
+failures:
+    federation::config::tests::test_default_config
+    federation::peer_caps::tests::test_set_and_of_roundtrip
+    federation::peer_conn::tests::capability_thresholds_match_legacy_semantics
+
+test result: FAILED. 639 passed; 3 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.23s
+
+error: test failed, to rerun pass `--lib`

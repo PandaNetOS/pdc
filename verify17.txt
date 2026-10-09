@@ -1,0 +1,12 @@
+﻿17:40:26 done=0 total=0 inflight=0 phase= state=idle pool_avail=7 waits=3
+17:40:31 done=0 total=0 inflight=0 phase= state=idle pool_avail=7 waits=3
+17:40:36 done=0 total=0 inflight=0 phase= state=idle pool_avail=4 waits=3
+17:40:41 done=0 total=0 inflight=0 phase= state=idle pool_avail=4 waits=2442
+17:40:46 done=0 total=0 inflight=0 phase= state=idle pool_avail=4 waits=4708
+17:40:51 done=0 total=0 inflight=0 phase= state=idle pool_avail=4 waits=6988
+17:40:56 done=42 total=3126 inflight=0 phase=idle state=idle pool_avail=4 waits=9272
+17:41:01 done=42 total=3126 inflight=0 phase=idle state=idle pool_avail=4 waits=11566
+17:41:06 done=42 total=3126 inflight=0 phase=idle state=idle pool_avail=4 waits=13394
+17:41:11 done=42 total=3126 inflight=0 phase=idle state=idle pool_avail=4 waits=14928
+17:41:16 done=42 total=3126 inflight=0 phase=idle state=idle pool_avail=4 waits=15856
+17:41:21 done=42 total=3126 inflight=0 phase=idle state=idle pool_avail=4 waits=16463

@@ -106,6 +106,63 @@ static BOOTSTRAP_SEND_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// A4：内存反压联动 override —— >0 时在途上限取此值（内存超阈值时由 memory_monitor
 /// 置 1 把发送压到串行）；0 = 恢复使用配置值 `bootstrap_send_concurrency`。
 static BOOTSTRAP_SEND_CONCURRENCY_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+/// 批次O(O4)：因发送槽满而回 NAK 的累计次数（观测：/io/status 的 `bootstrap_busy_naks`）。
+///
+/// 该计数是「应答方被压满」的直接证据：旧实现下请求方会把这类 NAK 当传输失败立即
+/// 重发，形成自激风暴（实测 90 次/秒、对端发送槽长期钉在 16/16、bootstrap 零进展）。
+static BOOTSTRAP_BUSY_NAKS: AtomicU64 = AtomicU64::new(0);
+/// 批次O(O4)：等待发送槽时的轮询粒度（毫秒）。
+// [ALLOWED-HARDCODED: 轮询粒度，非业务可调参数]
+const BOOTSTRAP_PERMIT_POLL_MS: u64 = 20;
+
+/// P4-2：长查询（全表/大区间扫描）执行超时上限。38s 级全表扫描 + 调度让路
+/// 后可能远超租约；300s 覆盖「首填回填全扫 + 对齐扫描 + 爬虫长查询叠加竞争」
+/// （部署早期两端同时全扫时 121 批 read_long 排队实测超 120s），超时走失败/重试路径。
+const LONG_QUERY_TIMEOUT_SECS: u64 = 300;
+
+/// P2-2：bootstrap 申请时长安全系数（T = Δ行数 / 实测行/s × 系数，留余量防测速抖动）
+const BOOTSTRAP_TTL_SAFETY_FACTOR: f64 = 1.5;
+/// P2-2：bootstrap 申请时长封顶（4 小时）
+const BOOTSTRAP_TTL_MAX_SECS: u64 = 4 * 3600;
+/// P2-2：单轮测速测试行数上限（取 Δ 与上限的 min；2 万行足以测出稳定行速率）
+const SPEED_PROBE_MAX_ROWS: u32 = 20_000;
+/// P2-2：测速超时（秒）；应答方无响应则放弃测速，回退旧行为（直接申请无 T）
+const SPEED_PROBE_TIMEOUT_SECS: u64 = 30;
+/// P3：非稳态协商确认阈值（≥3 次：测速轮 1 + 每 64 块进度对账 + 竣工前最终对账）
+const NONSTEADY_CONFIRM_THRESHOLD: u32 = 3;
+/// P3：进度对账确认间隔（每 N 个块确认一次）
+const NONSTEADY_CONFIRM_CHUNK_INTERVAL: u32 = 64;
+/// P3：非稳态停滞逃生阈值——超 T 且无进展 ≥ 该秒数 → 兜底解除非稳态
+const NONSTEADY_STALL_EXIT_SECS: u64 = 300;
+/// v10：应答侧忙闲判定阈值——IO 延迟 EWMA（带衰减）≥ 此值（默认 slow 线 500ms
+/// = level 1.0）即视为过载，拒绝服务清单（回 Nak(busy)），避免快照服务加重
+/// 自身读写负载。
+const BOOTSTRAP_NAK_BUSY_EWMA_US: u64 = 500_000;
+
+/// P3：非稳态状态（bootstrap 传输期，连接/peer 级门控）。
+#[derive(Debug, Clone)]
+pub struct NonSteadyState {
+    /// 涉及非稳态的 repo（当前单 repo 传输，留 Vec 便于扩展）
+    pub repos: Vec<u8>,
+    /// 相位：1=测速中 2=传输中 3=确认中（竣工前最终对账）
+    pub phase: u8,
+    /// 申请 T 的截止时刻（逃生判定）
+    pub deadline: Instant,
+    /// 进入非稳态的时刻
+    pub started: Instant,
+    /// 最近一次传输进展时刻（逃生判定：超 T 且停滞超阈值 → 兜底解除）
+    pub last_progress: Instant,
+    /// 协商确认计数（≥3 次解除门）
+    pub confirmations: u32,
+}
+/// 批次O(O4)：NAK 原因限流日志状态（reason → (最近一次打印时刻, 期间累计次数)）。
+static NAK_LOG_STATE: std::sync::OnceLock<parking_lot::Mutex<FxHashMap<String, (Instant, u64)>>> =
+    std::sync::OnceLock::new();
+
+/// NAK 原因限流日志状态（单例）。
+fn nak_log_state() -> &'static parking_lot::Mutex<FxHashMap<String, (Instant, u64)>> {
+    NAK_LOG_STATE.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
+}
 /// D1：range handler 执行体超时累计次数（计数落点：模块静态，面板可经可观测性读取）。
 static RANGE_HANDLER_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
@@ -221,6 +278,10 @@ pub fn bootstrap_send_in_flight() -> usize {
 pub fn bootstrap_send_total() -> u64 {
     BOOTSTRAP_SEND_TOTAL.load(Ordering::Acquire)
 }
+/// 批次O(O4)：因发送槽满而回 NAK 的累计次数（应答方被压满的证据）。
+pub fn bootstrap_busy_naks() -> u64 {
+    BOOTSTRAP_BUSY_NAKS.load(Ordering::Acquire)
+}
 /// 发送失败累计。
 pub fn bootstrap_send_failures_total() -> u64 {
     BOOTSTRAP_SEND_FAILURES_TOTAL.load(Ordering::Acquire)
@@ -326,6 +387,27 @@ struct BootstrapBreakerState {
 }
 
 /// 同步管理器
+/// v7（L1-②）：bootstrap 攒批落库触发阈值（行）。攒够 5 万行一次性快速落库
+/// （内存 upsert + 标 dirty），落库吞吐不再受读池预查询与逐块进度写限制。
+const BOOTSTRAP_APPLY_BATCH_ROWS: usize = 20_000;
+
+/// v7（L1-①/②）：bootstrap 攒批队列条目（单条活跃 —— 全局窗口闸保证同一时刻
+/// 只有一个 (peer,repo) 在拉，故无需按 peer/repo 分键）。
+struct BootstrapPendingBatch {
+    peer: Vec<u8>,
+    repo: u8,
+    /// 累积待落库条目（攒批后一次性 apply_node_sync_fast）。
+    entries: Vec<SyncEntry>,
+    /// 累积块 index（乱序，落库成功后全部计入 applied）。
+    indices: Vec<u32>,
+    /// 字节累计（进度 bytes 用）。
+    bytes: u64,
+    /// 最近一块的上界 key（进度 last_key 游标，断点续传定位）。
+    last_key: Vec<u8>,
+    /// 最后一块已收到（窗口 complete）—— 落库完成后触发竣工检查。
+    final_received: bool,
+}
+
 pub struct SyncManager {
     sessions: Arc<SessionsHandle>,
     node_repo: Arc<NodeRepoImpl>,
@@ -350,6 +432,15 @@ pub struct SyncManager {
     bootstrap_manifests: RwLock<FxHashMap<(NodeId, u8), bootstrap::BootstrapManifest>>,
     /// P2-1：bootstrap 服务端带宽令牌桶（限流，铁律 1：低优先级、可抢占）。
     bootstrap_bucket: ParkingMutex<bootstrap::TokenBucket>,
+    /// v7（L1-①/②）：bootstrap 块落地攒批队列（单条 —— 全局窗口闸保证同一时刻
+    /// 只有一个 (peer,repo) 在拉）。收到块 → 立即推进窗口（不等落库），entries 入队，
+    /// 攒够阈值后 spawn_blocking 一次性快速落库（apply_node_sync_fast）。
+    bootstrap_pending: std::sync::Mutex<Option<BootstrapPendingBatch>>,
+    /// v7（L1-①）：已落库块集合 (peer, repo, index)。done 进度只按「已落库」的
+    /// 连续前缀推进（received 未落库的块不算进度，崩溃后断点继承会重拉它们）。
+    bootstrap_applied: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u8, u32)>>,
+    /// v7（L1-①）：攒批落库任务计数（防并发触发重复落库；0 = 无在途落库任务）。
+    bootstrap_apply_inflight: std::sync::atomic::AtomicU32,
     /// P1-4：range 反熵累计访问的区间数（可观测性）。
     range_ranges_visited: std::sync::atomic::AtomicU64,
     /// F3：range 叶级对账累计统计（区间数 / 本地多 / 对端多 / 触发修复次数）。
@@ -400,8 +491,7 @@ pub struct SyncManager {
     /// v9：分块请求的在途/失败跟踪 —— (peer, repo) → 退避重试状态。
     ///
     /// 活锁治理(任务1)重定义：旧结构 (index, 次数, 首次时刻) 按「无响应次数」计数并
-    /// 升级重拉清单，是三节点互拉活锁的第一环。现改为 [`bootstrap::ChunkRetryState`]：
-    /// 只记**传输类失败**（send 失败/超时/无会话），resume tick 按指数退避表决定何时重发，
+    /// 升级重拉清单，是三节点互拉活锁的第一环。现改为 [`bootstrap::ChunkRetryState`]：    /// 只记**传输类失败**（send 失败/超时/无会话），resume tick 按指数退避表决定何时重发，
     /// 永不因此重拉清单；成功收到任意响应即整条清零。
     bootstrap_chunk_attempt: RwLock<FxHashMap<(NodeId, u8), bootstrap::ChunkRetryState>>,
     /// v9：Range 修复去重 —— (peer, repo, lo, hi) → 上次修复时刻。
@@ -429,6 +519,11 @@ pub struct SyncManager {
     /// 60s 重触发捎回的清单响应会叠加多个对齐把读池耗尽（.52 2026-10-07 实证：
     /// applied 冻结、爬虫停摆、对端块发送/NAK 全部超时）。
     bootstrap_aligning: RwLock<FxHashSet<(NodeId, u8)>>,
+    /// 批次O(O2)：本地区间摘要缓存 —— 对齐所需的「按远端块区间的本地摘要」按
+    /// (repo, chunk_rows, 远端边界指纹) 复用，避免同一份边界重复扫描 6M 行
+    /// （旧路径每轮全表重建清单，实测 1-2 分钟/次，是大表快照吞吐第一瓶颈）。
+    /// 陈旧安全性见 bootstrap::LocalDigestCache 文档。
+    bootstrap_local_digests: std::sync::Arc<bootstrap::LocalDigestCache>,
     /// E1：运行时差异复检重触发冷却 —— (peer, repo) → 最近一次因运行时行数差超 D2 阈值
     /// 而重触发 bootstrap 的时刻。冷却期内不再重复点火（防抖），与 v10(F4) 的
     /// `bootstrap_cooldown`（竣工后防死循环）相互独立。
@@ -447,6 +542,18 @@ pub struct SyncManager {
     /// v9：检测到「对端 oplog 已被裁剪、中间段结构性缺失」的 (peer, repo)。
     /// 置位后该 repo 优先走 bootstrap/反熵，并在可观测性里暴露（旧实现是静默跳过 + lag 归零）。
     delta_gap: RwLock<FxHashSet<(NodeId, u8)>>,
+    /// P2-2：握手测速在途 —— (peer, repo) → (发起时刻, nonce, 双方行数差)。
+    /// 收到 SpeedProbeAck 后按行速率计算 T 并携 T 申请清单；超时无响应则回退旧行为。
+    speed_probe_pending: RwLock<FxHashMap<(NodeId, u8), (Instant, u64, u64)>>,
+    /// P2-2：测速算出的 bootstrap 申请时长 —— (peer, repo) → T 秒。
+    /// 请求方携 T 申请清单；收到清单（应答方同意）后据此进入非稳态，随即移除。
+    bootstrap_ttl_planned: RwLock<FxHashMap<(NodeId, u8), u64>>,
+    /// P3：非稳态（bootstrap 传输期，连接/peer 级门控）。
+    /// 进入：请求方按测速 T 申请 bootstrap、应答方同意 → 双侧进入；
+    /// 期间双侧暂停 delta/range/反熵（Gossip 独立不纳入）；
+    /// 确认：测速轮 1 + 每 64 块进度对账 + 竣工前最终对账（≥3 次）；
+    /// 解除：竣工 / 逃生（超 T 且无进展 ≥ NONSTEADY_STALL_EXIT_SECS）。
+    nonsteady: RwLock<FxHashMap<NodeId, NonSteadyState>>,
     /// P1-4：range 反熵全局并发闸（请求/响应/拉/推 handler 共用），削平突发帧风暴。
     range_gate: Arc<tokio::sync::Semaphore>,
     /// 活锁治理(任务2)：重拉熔断 —— (peer, repo) → (连续重拉次数, 冷却到点)。
@@ -547,6 +654,9 @@ impl SyncManager {
         let bootstrap_bucket = ParkingMutex::new(bootstrap::TokenBucket::new(
             config.bootstrap_rate_bytes_per_sec,
         ));
+        let bootstrap_pending = std::sync::Mutex::new(None);
+        let bootstrap_applied = std::sync::Mutex::new(std::collections::HashSet::new());
+        let bootstrap_apply_inflight = std::sync::atomic::AtomicU32::new(0);
 
         Self {
             sessions,
@@ -555,6 +665,9 @@ impl SyncManager {
             bootstrap_serving_at: RwLock::new(FxHashMap::default()),
             bootstrap_yield_until: RwLock::new(FxHashMap::default()),
             chunk_windows: RwLock::new(FxHashMap::default()),
+            bootstrap_pending,
+            bootstrap_applied,
+            bootstrap_apply_inflight,
             gossip_engine,
             peer_sync,
             infohash_sync,
@@ -593,9 +706,15 @@ impl SyncManager {
             bootstrap_breaker: RwLock::new(FxHashMap::default()),
             bootstrap_inflight: RwLock::new(FxHashMap::default()),
             bootstrap_aligning: RwLock::new(FxHashSet::default()),
+            bootstrap_local_digests: std::sync::Arc::new(bootstrap::LocalDigestCache::new(
+                Duration::from_secs(bootstrap::LOCAL_DIGEST_CACHE_TTL_SECS),
+            )),
             bootstrap_rediff_cooldown: RwLock::new(FxHashMap::default()),
             delta_has_more: RwLock::new(FxHashSet::default()),
             delta_gap: RwLock::new(FxHashSet::default()),
+            speed_probe_pending: RwLock::new(FxHashMap::default()),
+            bootstrap_ttl_planned: RwLock::new(FxHashMap::default()),
+            nonsteady: RwLock::new(FxHashMap::default()),
             range_gate: Arc::new(tokio::sync::Semaphore::new(RANGE_MAX_CONCURRENT_HANDLERS)),
             bootstrap_repull_circuit: RwLock::new(FxHashMap::default()),
             bootstrap_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -672,6 +791,17 @@ impl SyncManager {
 
     /// 应用 Node 同步数据
     pub fn apply_node_sync(&self, entries: &[SyncEntry]) {
+        self.apply_node_sync_impl(entries, false)
+    }
+
+    /// v7（L1-②）：bootstrap 攒批快速落库 —— 跳过 existing_node_keys 预查询
+    /// （每块 10000 行省 ~400ms 读池）。语义差异仅「DB 已知但冷驱逐出内存的节点」
+    /// 多标一次 dirty（幂等无害）。bootstrap 传输专用，其他入站路径仍走原版。
+    pub fn apply_node_sync_fast(&self, entries: &[SyncEntry]) {
+        self.apply_node_sync_impl(entries, true)
+    }
+
+    fn apply_node_sync_impl(&self, entries: &[SyncEntry], fast: bool) {
         debug!(
             "[federation][perf] apply_node_sync ENTER: entries_len={}",
             entries.len()
@@ -742,7 +872,12 @@ impl SyncManager {
             let mut idx = 0;
             while idx < items.len() {
                 let end = (idx + SYNC_BATCH_WRITE_LIMIT).min(items.len());
-                self.node_repo.add_nodes_batch_internal(&items[idx..end]);
+                if fast {
+                    self.node_repo
+                        .add_nodes_batch_internal_fast(&items[idx..end]);
+                } else {
+                    self.node_repo.add_nodes_batch_internal(&items[idx..end]);
+                }
                 idx = end;
             }
         }
@@ -1591,7 +1726,8 @@ impl SyncManager {
         false
     }
 
-    /// v10(A)：响应方活动标记入口（清单/块请求共用）。
+    /// v10(A)：响应方活动标记入口（**仅在分块请求**——真实数据拉取——上调用；
+    /// 见 `handle_bootstrap_manifest_request` 里批次O(O8) 的说明：清单请求不算）。
     fn mark_bootstrap_serving(&self, peer: &NodeId, repo: u8) {
         self.bootstrap_serving_at
             .write()
@@ -1651,6 +1787,19 @@ impl SyncManager {
         }
         st.fails = st.fails.saturating_add(1);
         st.last_fail_at = Instant::now();
+    }
+
+    /// 活锁治理(任务1)：成功落地某块后清退避状态 —— **仅当退避锚点就是该块**。
+    ///
+    /// 旧实现（`handle_bootstrap_chunk_response` 尾部）对**任意**块响应都整条清零，
+    /// 于是 NAK 风暴中失败块的退避永远无法生效：一次成功就把它抹掉，下一轮立即重发。
+    fn clear_chunk_transport_fail(&self, peer: &NodeId, repo: u8, index: u32) {
+        let mut m = self.bootstrap_chunk_attempt.write();
+        if let Some(st) = m.get(&(*peer, repo)) {
+            if st.index == index {
+                m.remove(&(*peer, repo));
+            }
+        }
     }
 
     /// 活锁治理(任务1)：该 (peer, repo) 的退避是否已到期（可重发）。
@@ -2039,14 +2188,38 @@ impl SyncManager {
                 if self.bootstrap_running_fresh(&running_rows, peer, s.repo) {
                     continue;
                 }
+                // P2-2：裁定 BOOTSTRAP 后先握手测速（放裁定前/拉取前），实测行速率，
+                // 据 Δ 行数计算申请时长 T 后携 T 申请清单；测速失败回退旧行为（直接拉取）。
                 info!(
-                    "[bootstrap] 协商裁定 BOOTSTRAP repo={}，立即发起（不等巡检）: peer={}",
+                    "[bootstrap] 协商裁定 BOOTSTRAP repo={}，先测速再申请: peer={}",
                     s.repo, peer
                 );
                 let sm = self.clone();
                 let repo = s.repo;
                 tokio::spawn(async move {
-                    sm.start_bootstrap(peer, repo).await;
+                    // Δ = 对端行数 - 本地行数（请求方是数据少的一方）
+                    let local_rows = sm.local_entry_counts();
+                    let idx = (repo - repo_type::NODE) as usize;
+                    let local = local_rows.get(idx).copied().unwrap_or(0) as u64;
+                    let remote = sm
+                        .peer_digests
+                        .read()
+                        .get(&peer)
+                        .and_then(|v| v.get(idx).copied())
+                        .map(|n| n as u64)
+                        .unwrap_or(local.max(1));
+                    let diff = remote.saturating_sub(local).max(1);
+                    let sm2 = sm.clone();
+                    if let Some(conn) = sm2.sessions.get_connection(&peer) {
+                        sm2.start_speed_probe(&conn, repo, diff).await;
+                    } else {
+                        // 无连接（已断开）：回退直接发起 bootstrap（旧行为）
+                        warn!(
+                            "[speed_probe] peer={} 连接已断开，回退直接 bootstrap repo={}",
+                            peer, repo
+                        );
+                        sm.start_bootstrap(peer, repo).await;
+                    }
                 });
             }
         }
@@ -2060,6 +2233,385 @@ impl SyncManager {
             .iter()
             .find(|s| s.repo == repo)
             .map(|s| s.strategy)
+    }
+
+    // ─── P2/P3：握手测速 + 非稳态门控（连接/peer 级）───
+
+    /// P2-2：发起握手测速（请求方）。裁定 BOOTSTRAP 后、申请清单前调用；
+    /// 记录在途 (peer, repo)，收到 SpeedProbeAck 后计算行速率并携 T 申请清单。
+    async fn start_speed_probe(self: &Arc<Self>, conn: &Arc<PeerConn>, repo: u8, diff_rows: u64) {
+        if self.in_nonsteady(&conn.node_id) {
+            debug!("[speed_probe] peer={} 已处于非稳态，跳过测速", conn.node_id);
+            return;
+        }
+        let nonce = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            (nanos)
+                ^ (conn.node_id.0[0..8]
+                    .iter()
+                    .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64)))
+        };
+        let rows = diff_rows.min(SPEED_PROBE_MAX_ROWS as u64).max(1) as u32;
+        let probe = SpeedProbeMessage { repo, rows, nonce };
+        self.speed_probe_pending
+            .write()
+            .insert((conn.node_id, repo), (Instant::now(), nonce, diff_rows));
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::SpeedProbe, &probe),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
+                self.metrics.record_message_sent();
+                debug!(
+                    "[speed_probe] 已发起测速 to={} repo={} rows={} nonce={}",
+                    conn.node_id, repo, rows, nonce
+                );
+                // 超时兜底：`SPEED_PROBE_TIMEOUT_SECS` 内无 Ack → 移除 pending 并
+                // 回退直接发起 bootstrap（旧行为，不携 T）。与 Ack 成功路径互斥：
+                // 谁先移除 pending，另一路径即失配。
+                let sm = self.clone();
+                let peer = conn.node_id;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(SPEED_PROBE_TIMEOUT_SECS)).await;
+                    let still_pending = sm
+                        .speed_probe_pending
+                        .write()
+                        .remove(&(peer, repo))
+                        .is_some();
+                    if still_pending {
+                        warn!(
+                            "[speed_probe] 测速超时（{}s）无响应，回退直接 bootstrap: peer={} repo={}",
+                            SPEED_PROBE_TIMEOUT_SECS, peer, repo
+                        );
+                        sm.start_bootstrap(peer, repo).await;
+                    }
+                });
+            }
+            Ok(Err(e)) => {
+                warn!("[speed_probe] 发送测速失败 to={}: {}", conn.node_id, e);
+                self.speed_probe_pending
+                    .write()
+                    .remove(&(conn.node_id, repo));
+            }
+            Err(_) => {
+                warn!(
+                    "[speed_probe] 发送测速超时 to={}（{}s）",
+                    conn.node_id, self.config.transport_write_timeout_secs
+                );
+                self.speed_probe_pending
+                    .write()
+                    .remove(&(conn.node_id, repo));
+            }
+        }
+    }
+
+    /// P2-2：收到测速请求（应答方）——回测试载荷（按 rows × ~200B 构造，测真实吞吐）。
+    pub async fn handle_speed_probe(self: Arc<Self>, conn: Arc<PeerConn>, msg: SpeedProbeMessage) {
+        let rows = msg.rows.max(1) as usize;
+        // 测试载荷：每行估算 ~200 字节（对齐真实 SyncEntry 平均大小量级）
+        let payload = vec![0u8; rows.saturating_mul(200).min(8 * 1024 * 1024)];
+        let started = Instant::now();
+        let ack = SpeedProbeAckMessage {
+            nonce: msg.nonce,
+            rows: rows as u32,
+            payload,
+            send_elapsed_us: 0,
+        };
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::SpeedProbeAck, &ack),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
+                self.metrics.record_message_sent();
+                info!(
+                    "[speed_probe] 测速响应完成 to={} repo={} rows={} 耗时={}ms",
+                    conn.node_id,
+                    msg.repo,
+                    rows,
+                    started.elapsed().as_millis()
+                );
+            }
+            Ok(Err(e)) => warn!("[speed_probe] 测速响应发送失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[speed_probe] 测速响应发送超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            ),
+        }
+    }
+
+    /// P2-2：收到测速响应（请求方）——算行速率 → 计算 T → 携 T 申请 bootstrap 清单。
+    pub async fn handle_speed_probe_ack(
+        self: Arc<Self>,
+        conn: Arc<PeerConn>,
+        msg: SpeedProbeAckMessage,
+    ) {
+        // Ack 未带 repo，按 (peer, nonce) 匹配在途测速
+        let pending = {
+            let mut w = self.speed_probe_pending.write();
+            let mut matched = None;
+            let mut to_remove = Vec::new();
+            for ((peer, repo), (t0, nonce, diff)) in w.iter() {
+                if *peer == conn.node_id && *nonce == msg.nonce {
+                    matched = Some((*repo, *t0, *diff));
+                    to_remove.push((*peer, *repo));
+                }
+            }
+            for k in to_remove {
+                w.remove(&k);
+            }
+            matched
+        };
+        let Some((repo, t0, diff_rows)) = pending else {
+            debug!(
+                "[speed_probe] 收到无匹配的测速响应 to={} nonce={}，忽略",
+                conn.node_id, msg.nonce
+            );
+            return;
+        };
+        let elapsed = t0.elapsed().as_secs_f64().max(0.001);
+        let rows = msg.rows.max(1) as f64;
+        let rate = rows / elapsed; // 行/秒（端到端，含 RTT 与发送耗时）
+                                   // T = Δ行数 / 行速率 × 安全系数，封顶 4h
+        let ttl =
+            ((diff_rows as f64 / rate.max(0.001)) * BOOTSTRAP_TTL_SAFETY_FACTOR).ceil() as u64;
+        let ttl = ttl.clamp(60, BOOTSTRAP_TTL_MAX_SECS);
+        info!(
+            "[speed_probe] 测速完成 to={} repo={}: {} 行 / {:.1}s ≈ {:.0} 行/s → Δ={} T={}s",
+            conn.node_id, repo, msg.rows, elapsed, rate, diff_rows, ttl
+        );
+        // 记录申请时长（请求方收到清单后据此进入非稳态）
+        self.bootstrap_ttl_planned
+            .write()
+            .insert((conn.node_id, repo), ttl);
+        // 携 T 申请清单（应答方据此进入非稳态；请求方收到清单后也进入）
+        let req = BootstrapManifestRequestMessage {
+            repo,
+            bootstrap_ttl_secs: Some(ttl),
+        };
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapManifestRequest, &req),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => self.metrics.record_message_sent(),
+            Ok(Err(e)) => warn!(
+                "[speed_probe] 携 T 申请清单发送失败 to={}: {}",
+                conn.node_id, e
+            ),
+            Err(_) => warn!(
+                "[speed_probe] 携 T 申请清单发送超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            ),
+        }
+    }
+
+    /// v10：收到清单申请拒绝帧（请求方）。协商未成功（应答方综合判断不通过），
+    /// 本端**不进非稳态**；清理在途测速与残留 T，轻量退避——由下一轮协商
+    /// （handle_sync_negotiate_ack）或巡检周期自然重触发，无死锁。
+    pub async fn handle_bootstrap_manifest_nak(
+        self: Arc<Self>,
+        conn: Arc<PeerConn>,
+        msg: BootstrapManifestNakMessage,
+    ) {
+        self.speed_probe_pending
+            .write()
+            .remove(&(conn.node_id, msg.repo));
+        self.bootstrap_ttl_planned
+            .write()
+            .remove(&(conn.node_id, msg.repo));
+        // 若此前已错误进入非稳态（重复响应竞态），一并解除：Nak 语义 = 协商未通过。
+        self.exit_nonsteady(
+            &conn.node_id,
+            &format!("清单申请被拒(reason={})", msg.reason),
+        );
+        info!(
+            "[bootstrap] 清单申请被拒 Nak(reason={}) to={} repo={}，不进非稳态，等下一轮协商/巡检重触发",
+            msg.reason, conn.node_id, msg.repo
+        );
+    }
+
+    // ─── P3：非稳态门控 ───
+
+    /// 进入非稳态（双侧：请求方收到清单 / 应答方同意申请时调用）。
+    /// `phase`：2=请求侧传输中，3=应答侧服务中。
+    fn enter_nonsteady(&self, peer: &NodeId, repos: Vec<u8>, ttl_secs: u64, phase: u8) {
+        let now = Instant::now();
+        let repos_desc = format!("{:?}", repos);
+        self.nonsteady.write().insert(
+            *peer,
+            NonSteadyState {
+                repos,
+                phase,
+                deadline: now + Duration::from_secs(ttl_secs),
+                started: now,
+                last_progress: now,
+                confirmations: 0,
+            },
+        );
+        info!(
+            "[nonsteady] 进入非稳态 peer={} repos={} ttl={}s phase={}（暂停 delta/range/反熵；Gossip 独立不受影响）",
+            peer, repos_desc, ttl_secs, phase
+        );
+    }
+
+    /// 是否处于非稳态（peer/连接粒度）——delta/range/反熵入口据此暂停。
+    pub fn in_nonsteady(&self, peer: &NodeId) -> bool {
+        self.nonsteady.read().contains_key(peer)
+    }
+
+    /// 是否存在任意非稳态连接（监控面板 /api/v1/sync/channels 派生 delta/range
+    /// 通道 `paused` 状态用；空 map 即无暂停）。
+    pub fn nonsteady_active(&self) -> bool {
+        !self.nonsteady.read().is_empty()
+    }
+
+    /// P4-5（v9，preP33）：本端 bootstrap 通道是否 active（正在 recv 拉取快照
+    /// 或 send 应答块）。range 反熵让路判定用：bootstrap 传输期间暂停 range
+    /// 应答/调度，避免 range 任务风暴占满长查询池饿死 apply（线上实证 .52
+    /// 07:38 done=105 卡死：.53 range 下钻触发 .52 应答风暴 → 池 8 条恒满 →
+    /// apply 查重等池 60s panic → 块全部失败）。
+    pub fn bootstrap_channel_active(&self) -> bool {
+        let s = crate::federation::sync::channels_status::global();
+        let g = s.read();
+        g.bootstrap.active
+    }
+
+    /// 解除非稳态（竣工 / 逃生兜底）。
+    pub fn exit_nonsteady(&self, peer: &NodeId, reason: &str) {
+        if self.nonsteady.write().remove(peer).is_some() {
+            info!("[nonsteady] 解除非稳态 peer={} 原因: {}", peer, reason);
+        }
+    }
+
+    /// P-C（L1-⑥）：启动后台回填块表——块表空的 repo 全扫一次回填 chunk_digests。
+    ///
+    /// 根治「每次重启/缓存缺失 → NODE 668 万行全扫重建 102s → NAK → 退避 → 停滞 →
+    /// 重协商 → 又重建」死循环（2026-10-08 双端实证：清单重建死循环致传输不启动、
+    /// HTTP 高峰卡死）。回填后 `build_repo_manifest_impl` 走块表优先（干净块零扫描、
+    /// 脏块只扫区间），清单重建从 102s 级降到秒级。
+    ///
+    /// - 串行逐 repo（NODE 全扫最久先行，后续 repo 排队，避免 4 个全扫并发互抢读池）。
+    /// - 全扫走长查询池（`load_repo_key_hashes_in_range` → `read_long_priority`），
+    ///   不占短读池，HTTP/爬虫短读不受影响。
+    /// - 回填写回是单事务 upsert 块表行（块数 45~669，秒级），不长期持写锁。
+    pub fn spawn_backfill_digests(self: Arc<Self>) {
+        let chunk_rows = self.config.bootstrap_chunk_rows.max(1);
+        tokio::spawn(async move {
+            // 延迟 5s：让网络/爬虫初始化先跑；回填只占长查询池，不抢启动期短读。
+            // [ALLOWED-HARDCODED: 启动回填延迟 5s，让网络/爬虫初始化先跑]
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let repos: Vec<u8> = (crate::federation::protocol::repo_type::NODE
+                ..=crate::federation::protocol::repo_type::TRACKER)
+                .collect();
+            for repo in repos {
+                // 块表已非空（此前回填过/已有增量维护）→ 跳过，避免每次启动重复全扫。
+                let storage = self.delta_storage();
+                let existing = storage.get_chunk_digests(repo).unwrap_or_default();
+                if !existing.is_empty() {
+                    info!(
+                        "[bootstrap] 启动回填跳过 repo={}（块表已存在 {} 块）",
+                        repo,
+                        existing.len()
+                    );
+                    continue;
+                }
+                let w0 = storage.oplog_max_seq_for_repo(repo).unwrap_or(0).max(0) as u64;
+                let version = w0.wrapping_add(1) as u32;
+                let st = storage.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    crate::federation::sync::bootstrap::build_repo_manifest_impl(
+                        &st, repo, chunk_rows, w0, version,
+                    )
+                })
+                .await;
+                match res {
+                    Ok(Ok(mf)) => info!(
+                        "[bootstrap] 启动回填块表完成 repo={} 块数={} 总行={}",
+                        repo,
+                        mf.chunks.len(),
+                        mf.total_rows
+                    ),
+                    Ok(Err(e)) => warn!(
+                        "[bootstrap] 启动回填失败 repo={}（下次清单构建时重试）: {}",
+                        repo, e
+                    ),
+                    Err(e) => warn!(
+                        "[bootstrap] 启动回填任务失败 repo={}（下次清单构建时重试）: {}",
+                        repo, e
+                    ),
+                }
+            }
+        });
+    }
+
+    /// 协商确认 +1（测速轮 / 进度对账 / 竣工前最终对账，≥NONSTEADY_CONFIRM_THRESHOLD）。
+    fn confirm_nonsteady(&self, peer: &NodeId, reason: &str) {
+        let mut w = self.nonsteady.write();
+        if let Some(st) = w.get_mut(peer) {
+            st.confirmations += 1;
+            info!(
+                "[nonsteady] 协商确认+1 peer={} ({}) 共 {} 次（阈值 {}）",
+                peer, reason, st.confirmations, NONSTEADY_CONFIRM_THRESHOLD
+            );
+        }
+    }
+
+    /// 传输进展触达（逃生判定：超 T 且无进展才兜底）。
+    fn touch_nonsteady_progress(&self, peer: &NodeId) {
+        if let Some(st) = self.nonsteady.write().get_mut(peer) {
+            st.last_progress = Instant::now();
+        }
+    }
+
+    /// P3：非稳态逃生检查——超 T 且无进展超阈值 → 兜底解除 + 冷却（防立即重进）。
+    /// P3：非稳态逃生检查。
+    /// 请求侧（phase=2）：超 T 且无进展 ≥ 阈值 → 兜底解除（传输卡死）。
+    /// 应答侧（phase=3）：无分块请求 ≥ 阈值 → 解除（传输已结束或卡死）。
+    /// 解除后写冷却，防立即重进循环。
+    fn nonsteady_escape_check(&self) {
+        let now = Instant::now();
+        let mut exited: Vec<(NodeId, Vec<u8>)> = Vec::new();
+        {
+            let mut w = self.nonsteady.write();
+            for (peer, st) in w.iter() {
+                let over_ttl = now >= st.deadline;
+                let stalled = now.saturating_duration_since(st.last_progress).as_secs()
+                    >= NONSTEADY_STALL_EXIT_SECS;
+                // 请求侧（phase=2）：严格按「超 T 且无进展」才兜底；
+                // 应答侧（phase=3）：传输结束（无新块请求）即解除，不必等 T 到期。
+                let should_exit = match st.phase {
+                    2 => over_ttl && stalled,
+                    _ => stalled,
+                };
+                if should_exit {
+                    exited.push((*peer, st.repos.clone()));
+                }
+            }
+            for (p, _) in &exited {
+                w.remove(p);
+            }
+        }
+        for (p, repos) in exited {
+            warn!(
+                "[nonsteady] 逃生兜底：解除非稳态 peer={} repos={:?}（停滞 ≥{}s）",
+                p, repos, NONSTEADY_STALL_EXIT_SECS
+            );
+            // 冷却：逃生后该 (peer, repo) 进入快照冷却，协商强制 DELTA，防立即重进循环
+            for repo in &repos {
+                self.bootstrap_cooldown
+                    .write()
+                    .insert((p, *repo), Instant::now());
+            }
+        }
     }
 
     /// 批次G(F1)：记录一次 bootstrap 竣工；窗口内竣工次数达阈值即熔断该 (peer, repo)。
@@ -2132,6 +2684,10 @@ impl SyncManager {
     /// v7+ 对端：需协商通过；协商发出 120s 仍无 Ack → 视为协商失败降级放行（防永久卡死）。
     /// < v7 对端：回落旧行为（true）。
     fn delta_channel_allowed(&self, conn: &Arc<PeerConn>, repo: u8) -> bool {
+        // P3：非稳态（bootstrap 传输期）双侧暂停 delta——快照拉取优先
+        if self.in_nonsteady(&conn.node_id) {
+            return false;
+        }
         if !self.config.negotiation_enabled
             || conn.protocol_version() < delta::NEGOTIATION_PROTOCOL_VERSION
         {
@@ -2296,6 +2852,10 @@ impl SyncManager {
         let bootstrap_rows = self.delta_storage().bootstrap_list().unwrap_or_default();
         let mut triggered = 0u32;
         for conn in conns {
+            // P3：非稳态（bootstrap 传输期）双侧暂停 delta——快照拉取优先
+            if self.in_nonsteady(&conn.node_id) {
+                continue;
+            }
             if !conn.supports_delta_sync() {
                 continue;
             }
@@ -2377,18 +2937,30 @@ impl SyncManager {
                     // 就让该 repo 对所有对端的 delta 永久停摆。
                     let running = self.bootstrap_running_fresh(&bootstrap_rows, conn.node_id, rt);
                     if !running {
-                        info!(
-                            "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}（协商裁定={}，欠账={}，gap={}）",
-                            conn.node_id,
-                            rt,
-                            self.strategy_for(&conn.node_id, rt)
-                                == Some(protocol::STRATEGY_BOOTSTRAP),
-                            lag,
-                            gap_flagged
-                        );
-                        let sm = self.clone();
-                        let peer = conn.node_id;
-                        tokio::spawn(async move { sm.start_bootstrap(peer, rt).await });
+                        // preP34（P4-7）：同端 bootstrap 并发限 1 个 repo —— .52 实测同时拉
+                        // repo=1/2/3（窗口 8×3=24 并发块请求）压爆 .53 发送槽（NAK busy），
+                        // 任务风暴拖垮双端 tokio（HTTP 全瘫、槽位泄漏 450s+、done 卡 131）。
+                        // 一次只拉一个 repo，竣工（bootstrap.active 复位）后下一轮协商再启动
+                        // 下一个；稳定传输优先于多 repo 吞吐。
+                        if self.bootstrap_channel_active() {
+                            debug!(
+                                "[negotiate] bootstrap 已在途（active），跳过启动 repo={} peer={}",
+                                rt, conn.node_id
+                            );
+                        } else {
+                            info!(
+                                "[negotiate] 执行快照策略：启动 bootstrap peer={} repo={}（协商裁定={}，欠账={}，gap={}）",
+                                conn.node_id,
+                                rt,
+                                self.strategy_for(&conn.node_id, rt)
+                                    == Some(protocol::STRATEGY_BOOTSTRAP),
+                                lag,
+                                gap_flagged
+                            );
+                            let sm = self.clone();
+                            let peer = conn.node_id;
+                            tokio::spawn(async move { sm.start_bootstrap(peer, rt).await });
+                        }
                     }
                     // v9：**不再无条件 `continue` 跳过 delta**。旧实现与「bootstrap 卡死」
                     // 构成互锁闭环：lag>1万 → 关 delta → bootstrap 永不完成 → delta 永不恢复
@@ -2451,6 +3023,14 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // P4-5（v9，preP33）：bootstrap 传输让路 —— 本端任一对端非稳态或本端
+        // bootstrap 通道 active 时，range 反熵应答直接忽略（不加载区间、不占
+        // 长查询池/并发闸），把 IO 让给 bootstrap。请求方收不到响应自然退避
+        // （range 有超时回收），不会无限重试。用户语义：bootstrap 期间暂停
+        // delta/range 反熵。
+        if self.nonsteady_active() || self.bootstrap_channel_active() {
+            return;
+        }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
         let permit = match self.range_gate.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -2476,23 +3056,34 @@ impl SyncManager {
             let req_lo = req.lo.clone();
             let req_hi = req.hi.clone();
             let req_repo = req.repo;
-            let loaded = tokio::task::spawn_blocking(move || {
-                storage.load_repo_key_hashes_in_range(
-                    req_repo,
-                    Self::range_bound(&req_lo),
-                    Self::range_bound(&req_hi),
-                    leaf_rows + 1,
-                )
-            })
+            let loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    storage.load_repo_key_hashes_in_range(
+                        req_repo,
+                        Self::range_bound(&req_lo),
+                        Self::range_bound(&req_hi),
+                        leaf_rows + 1,
+                    )
+                }),
+            )
             .await;
             let rows = match loaded {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(e))) => {
                     warn!("[range] 加载区间失败 repo={}: {}", req.repo, e);
                     return;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("[range] 加载区间任务异常 repo={}: {}", req.repo, e);
+                    return;
+                }
+                Err(_) => {
+                    // P4-2：长查询超时兜底——区间加载放弃本轮，反熵下轮重试
+                    warn!(
+                        "[range] 加载区间超时（>{}s）repo={} lo={:?} hi={:?}",
+                        LONG_QUERY_TIMEOUT_SECS, req.repo, req.lo, req.hi
+                    );
                     return;
                 }
             };
@@ -2540,7 +3131,11 @@ impl SyncManager {
             }
         };
         let join_handle = tokio::spawn(__range_body);
-        // D1：执行体超时兜底收尾。H3：超时只放闸，不 abort 后台任务。
+        // P4-2（B 方案）：先注册 abort 句柄（timeout 会 move join_handle），
+        // 超时后中止任务（range 幂等，下轮重试无害）——旧 H3"放闸后台继续"
+        // 会让任务继续循环抢读池/长查询门，与回填/对齐全扫叠加时读池持续被占。
+        let abort_h = join_handle.abort_handle();
+        // D1：执行体超时兜底收尾。
         match tokio::time::timeout(__range_deadline, join_handle).await {
             Ok(Ok(())) => {
                 // 正常完成，permit 在函数返回时自然 drop
@@ -2549,10 +3144,10 @@ impl SyncManager {
                 warn!("[range] reconcile_request 任务异常退出: {}", join_err);
             }
             Err(_) => {
-                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                abort_h.abort();
                 drop(permit);
                 warn!(
-                    "[range] reconcile_request 执行超过 {}s，释放并发闸（任务后台继续）",
+                    "[range] reconcile_request 执行超过 {}s，已中止任务（下轮重试）",
                     range_handler_timeout
                 );
                 RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
@@ -2571,6 +3166,11 @@ impl SyncManager {
         resp: RangeReconcileResponseMessage,
     ) {
         if !self.config.range_reconcile_enabled {
+            return;
+        }
+        // P4-5（v9，preP33）：同请求 handler —— 本端非稳态或 bootstrap 传输中，
+        // range 响应处理（含下钻/按键拉取）直接忽略，不占长查询池。
+        if self.nonsteady_active() || self.bootstrap_channel_active() {
             return;
         }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
@@ -2592,23 +3192,34 @@ impl SyncManager {
             let resp_repo = resp.repo;
             let resp_lo = resp.lo.clone();
             let resp_hi = resp.hi.clone();
-            let loaded = tokio::task::spawn_blocking(move || {
-                storage.load_repo_key_hashes_in_range(
-                    resp_repo,
-                    Self::range_bound(&resp_lo),
-                    Self::range_bound(&resp_hi),
-                    range_reconcile::MAX_LEAF_ENTRIES + 1,
-                )
-            })
+            let loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    storage.load_repo_key_hashes_in_range(
+                        resp_repo,
+                        Self::range_bound(&resp_lo),
+                        Self::range_bound(&resp_hi),
+                        range_reconcile::MAX_LEAF_ENTRIES + 1,
+                    )
+                }),
+            )
             .await;
             let local = match loaded {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(e))) => {
                     warn!("[range] 请求方加载区间失败: {}", e);
                     return;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("[range] 请求方加载区间任务异常: {}", e);
+                    return;
+                }
+                Err(_) => {
+                    // P4-2：长查询超时兜底——放弃本轮对账，下轮重试
+                    warn!(
+                        "[range] 请求方加载区间超时（>{}s）repo={}",
+                        LONG_QUERY_TIMEOUT_SECS, resp_repo
+                    );
                     return;
                 }
             };
@@ -2752,19 +3363,30 @@ impl SyncManager {
                         let d_repo = resp.repo;
                         let d_lo = sub_lo.clone();
                         let d_hi = sub_hi.clone();
-                        let loaded = tokio::task::spawn_blocking(move || {
-                            storage.load_repo_key_hashes_in_range(
-                                d_repo,
-                                Self::range_bound(&d_lo),
-                                Self::range_bound(&d_hi),
-                                leaf_rows + 1,
-                            )
-                        })
+                        let loaded = tokio::time::timeout(
+                            std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+                            tokio::task::spawn_blocking(move || {
+                                storage.load_repo_key_hashes_in_range(
+                                    d_repo,
+                                    Self::range_bound(&d_lo),
+                                    Self::range_bound(&d_hi),
+                                    leaf_rows + 1,
+                                )
+                            }),
+                        )
                         .await;
                         let rows = match loaded {
-                            Ok(Ok(r)) => r,
+                            Ok(Ok(Ok(r))) => r,
+                            Ok(Ok(Err(_))) => continue,
                             Ok(Err(_)) => continue,
-                            Err(_) => continue,
+                            Err(_) => {
+                                // P4-2：长查询超时——本轮下钻放弃，反熵下轮重试
+                                warn!(
+                                    "[range] 下钻加载区间超时（>{}s）repo={}",
+                                    LONG_QUERY_TIMEOUT_SECS, d_repo
+                                );
+                                continue;
+                            }
                         };
                         let digest = range_reconcile::range_digest(&rows);
                         let sub_req = RangeReconcileRequestMessage {
@@ -2788,7 +3410,9 @@ impl SyncManager {
             }
         };
         let join_handle = tokio::spawn(__range_body);
-        // H3：超时只放闸，不 abort 后台任务——对账继续跑完，存量差距持续补齐。
+        // P4-2（B 方案）：超时后 abort（range 幂等可重试），不再放闸后台继续。
+        let abort_h = join_handle.abort_handle();
+        // H3→B：执行体超时兜底收尾。
         match tokio::time::timeout(__range_deadline, join_handle).await {
             Ok(Ok(())) => {
                 // 正常完成，permit 在函数返回时自然 drop
@@ -2797,10 +3421,10 @@ impl SyncManager {
                 warn!("[range] reconcile_response 任务异常退出: {}", join_err);
             }
             Err(_) => {
-                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                abort_h.abort();
                 drop(permit);
                 warn!(
-                    "[range] reconcile_response 执行超过 {}s，释放并发闸（任务后台继续）",
+                    "[range] reconcile_response 执行超过 {}s，已中止任务（下轮重试）",
                     range_handler_timeout
                 );
                 RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
@@ -2929,6 +3553,12 @@ impl SyncManager {
         if !self.config.range_reconcile_enabled {
             return;
         }
+        // L1-⑧：非稳态/传输让路 —— bootstrap 快照期 range 按键拉取应答应让路，
+        // 否则与快照抢长查询 permit（线上实证：.53 应答拉取排队 >60s panic →
+        // 重试风暴 → 请求方 done 停滞死循环）。
+        if self.nonsteady_active() || self.bootstrap_channel_active() {
+            return;
+        }
         // P1-4：全局并发闸，限制同时在跑的 range handler 数，削平突发帧/IO 风暴。
         let permit = match self.range_gate.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -2984,7 +3614,9 @@ impl SyncManager {
             }
         };
         let join_handle = tokio::spawn(__range_body);
-        // H3：超时只放闸，不 abort 后台任务——对账继续跑完。
+        // P4-2（B 方案）：超时后 abort（range 幂等可重试），不再放闸后台继续。
+        let abort_h = join_handle.abort_handle();
+        // H3→B：执行体超时兜底收尾。
         match tokio::time::timeout(__range_deadline, join_handle).await {
             Ok(Ok(())) => {
                 // 正常完成，permit 在函数返回时自然 drop
@@ -2993,10 +3625,10 @@ impl SyncManager {
                 warn!("[range] reconcile_pull 任务异常退出: {}", join_err);
             }
             Err(_) => {
-                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                abort_h.abort();
                 drop(permit);
                 warn!(
-                    "[range] reconcile_pull 执行超过 {}s，释放并发闸（任务后台继续）",
+                    "[range] reconcile_pull 执行超过 {}s，已中止任务（下轮重试）",
                     range_handler_timeout
                 );
                 RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
@@ -3012,6 +3644,11 @@ impl SyncManager {
         msg: crate::federation::protocol::RangeReconcilePush2Message,
     ) {
         if !self.config.range_reconcile_enabled {
+            return;
+        }
+        // L1-⑧：非稳态/传输让路 —— bootstrap 快照期 range 推送处理让路（应用写库
+        // 与快照对齐/传输抢锁/抢 IO；线上实证 push2 120s 超时无限循环占 IO）。
+        if self.nonsteady_active() || self.bootstrap_channel_active() {
             return;
         }
         // fix17：联邦对账推送节流 —— 对端持续推送（每 2-3s 一条，每条数百-数千 entries）
@@ -3072,7 +3709,9 @@ impl SyncManager {
             }
         };
         let join_handle = tokio::spawn(__range_body);
-        // H3：超时只放闸，不 abort 后台任务——推送继续 apply 完，存量差距持续补齐。
+        // P4-2（B 方案）：超时后 abort（range 幂等可重试），不再放闸后台继续。
+        let abort_h = join_handle.abort_handle();
+        // H3→B：执行体超时兜底收尾。
         match tokio::time::timeout(__range_deadline, join_handle).await {
             Ok(Ok(())) => {
                 // 正常完成，permit 在函数返回时自然 drop
@@ -3081,10 +3720,10 @@ impl SyncManager {
                 warn!("[range] reconcile_push2 任务异常退出: {}", join_err);
             }
             Err(_) => {
-                // H3：超时只放闸、不中断对账——permit 立即归还，后台任务继续跑完
+                abort_h.abort();
                 drop(permit);
                 warn!(
-                    "[range] reconcile_push2 执行超过 {}s，释放并发闸（任务后台继续）",
+                    "[range] reconcile_push2 执行超过 {}s，已中止任务（下轮重试）",
                     range_handler_timeout
                 );
                 RANGE_HANDLER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
@@ -3102,6 +3741,12 @@ impl SyncManager {
     /// 默认 `range_reconcile_enabled=false` 时为 no-op（行为与改造前一致）。
     pub async fn range_reconcile_tick(self: Arc<Self>) {
         if !self.config.range_reconcile_enabled {
+            return;
+        }
+        // P3：非稳态（bootstrap 传输期）双侧暂停 range/反熵——快照拉取优先。
+        // 非稳态为稀有状态（仅 bootstrap 传输期存在），全量让路代价低、语义清晰。
+        if !self.nonsteady.read().is_empty() {
+            debug!("[range] 存在非稳态（bootstrap 传输期），本轮反熵让路");
             return;
         }
         // v10(F2b)：bootstrap 传输期让路 —— 快照是全量 IO（实测 NODE 128 块 × 2 万行），
@@ -3371,24 +4016,36 @@ impl SyncManager {
             let b_hi = hi.clone();
             let b_repo = repo;
             let b_leaf = prog.leaf_rows as usize + 1;
-            let loaded = tokio::task::spawn_blocking(move || {
-                st.load_repo_key_hashes_in_range(
-                    b_repo,
-                    Self::range_bound(&b_lo),
-                    Self::range_bound(&b_hi),
-                    b_leaf,
-                )
-            })
+            let loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    st.load_repo_key_hashes_in_range(
+                        b_repo,
+                        Self::range_bound(&b_lo),
+                        Self::range_bound(&b_hi),
+                        b_leaf,
+                    )
+                }),
+            )
             .await;
             let rows = match loaded {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) => {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(_))) => {
                     // 本地读失败：跳过该区间（与旧行为一致），游标照常推进。
                     advanced = i + 1;
                     continue;
                 }
-                Err(_) => {
+                Ok(Err(_)) => {
                     // 任务异常：同上跳过，游标照常推进。
+                    advanced = i + 1;
+                    continue;
+                }
+                Err(_) => {
+                    // P4-2：长查询超时——跳过该区间，游标照常推进
+                    warn!(
+                        "[range] 抽样加载区间超时（>{}s）repo={}",
+                        LONG_QUERY_TIMEOUT_SECS, b_repo
+                    );
                     advanced = i + 1;
                     continue;
                 }
@@ -3510,6 +4167,55 @@ impl SyncManager {
     // 漂移由阶段 ⑥ 校验发现并重拉该块（幂等）。
     // ========================================================================
 
+    /// v10：发送清单申请拒绝帧（53）——仅对 protocol_version >= 10 的对端。
+    async fn send_bootstrap_manifest_nak(&self, conn: &Arc<PeerConn>, repo: u8, reason: u8) {
+        let msg = BootstrapManifestNakMessage { repo, reason };
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapManifestNak, &msg),
+        )
+        .await;
+        match send_res {
+            Ok(Ok(())) => {
+                self.metrics.record_message_sent();
+                info!(
+                    "[bootstrap] 回拒绝帧 Nak(reason={}) to={} repo={}",
+                    reason, conn.node_id, repo
+                );
+            }
+            Ok(Err(e)) => warn!("[bootstrap] 发送拒绝帧失败 to={}: {}", conn.node_id, e),
+            Err(_) => warn!(
+                "[bootstrap] 发送拒绝帧超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            ),
+        }
+    }
+
+    /// v10：旧对端（<v10）不理解 53 帧——拒绝时回空清单保持字节级兼容。
+    async fn send_empty_manifest(&self, conn: &Arc<PeerConn>, repo: u8) {
+        let resp = BootstrapManifestResponseMessage {
+            manifest: bootstrap::BootstrapManifest {
+                repo,
+                ..Default::default()
+            },
+        };
+        let send_ok = tokio::time::timeout(
+            Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
+            conn.send_message(MessageType::BootstrapManifestResponse, &resp),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+        if send_ok {
+            self.metrics.record_message_sent();
+        } else {
+            warn!(
+                "[bootstrap] 发送空清单失败/超时 to={}（{}s）",
+                conn.node_id, self.config.transport_write_timeout_secs
+            );
+        }
+    }
+
     /// P2-1：处理对端的 bootstrap 清单请求（应答方）。
     ///
     /// 取水位 `w0 = oplog_max_seq()`，按有序 key 区间流式分块，缓存清单供后续分块请求使用。
@@ -3524,9 +4230,76 @@ impl SyncManager {
         if req.repo < repo_type::NODE || req.repo > repo_type::TRACKER {
             return;
         }
-        // v10(A)：标记「正在响应对方的 bootstrap 请求」—— 双向引导冲突让路的信号源。
-        self.mark_bootstrap_serving(&conn.node_id, req.repo);
+        // 批次O(O8)：**清单请求不再作为「对端在拉我快照」的信号**。
+        //
+        // 该信号（`mark_bootstrap_serving`）会被 `should_yield_bootstrap` 用来让
+        // node_id 较大的一方**持续让路**，而让路截止每次刷新为
+        // `BOOTSTRAP_YIELD_HOLD_SECS`（300s）。清单请求极廉价且带周期性重触发
+        // （发起互斥 TTL 60s），于是「对端每 60s 问一次清单」就能把较大 node_id 一侧
+        // 的拉取**永久冻结**（实测 .52(node_id 89a5…) 窗口 8 全满、inflight 冻结、
+        // 对端 handler 从未被调用）：对端那次拉取本身还常被方向守卫终止（本端行数更多），
+        // 属纯空转信号。真正的「正在被拉数据」证据是**分块请求**，标记只在那里做。
         let key = (conn.node_id, req.repo);
+        // v10（协商成功 = 双端进入非稳态；申请 ≠ 通过）：应答侧收到清单申请先
+        // **综合判断**，全部通过才进入非稳态（phase3）并回清单（= 同意）；
+        // 任一不通过回 `BootstrapManifestNak`（不进非稳态），请求方收到后轻量
+        // 退避、由下一轮协商/巡检重触发。判定标准：
+        //   ① 方向：本端该 repo 行数 > 对端自报行数（服务才有意义；本端空库冷启动例外）
+        //   ② 忙闲：本端 IO 延迟 EWMA（带衰减）未达 slow 线（默认 500ms = level 1.0）
+        //   ③ 单飞：清单缓存有 → 直接同意；无缓存且重建在途 → Nak(rebuilding)
+        // T 取请求方携测速算好的预算，缺省（无测速路径）用封顶值 4h。
+        // 旧对端（<v10）不理解 53 帧：拒绝时回空清单保持字节级兼容。
+        let can_nak = conn.protocol_version() >= protocol::HELLO_PROTOCOL_VERSION;
+        // ① 方向校验（与请求侧 start_bootstrap 方向守卫对称）
+        let remote_rows = self
+            .peer_negotiate_state
+            .read()
+            .get(&conn.node_id)
+            .and_then(|v| v.iter().find(|s| s.repo == req.repo).map(|s| s.row_count))
+            .unwrap_or(0);
+        let local_rows = self
+            .local_entry_counts()
+            .get((req.repo - repo_type::NODE) as usize)
+            .copied()
+            .unwrap_or(0) as u64;
+        if local_rows > 0 && remote_rows >= local_rows {
+            warn!(
+                "[bootstrap] 拒绝清单申请（方向：本端 {} ≤ 对端自报 {}，服务无意义）: peer={} repo={}",
+                local_rows, remote_rows, conn.node_id, req.repo
+            );
+            if can_nak {
+                self.send_bootstrap_manifest_nak(
+                    &conn,
+                    req.repo,
+                    protocol::BOOTSTRAP_NAK_DIRECTION,
+                )
+                .await;
+            } else {
+                self.send_empty_manifest(&conn, req.repo).await;
+            }
+            return;
+        }
+        // ② 忙闲校验：IO 延迟 EWMA（带衰减）达 slow 线（默认 500ms = level 1.0）即过载
+        let io_ewma_us = crate::storage::io_scheduler::io_batch_latency_ewma_us_fresh();
+        if io_ewma_us >= BOOTSTRAP_NAK_BUSY_EWMA_US {
+            warn!(
+                "[bootstrap] 拒绝清单申请（忙闲：IO EWMA {}ms ≥ {}ms 过载）: peer={} repo={}",
+                io_ewma_us / 1000,
+                BOOTSTRAP_NAK_BUSY_EWMA_US / 1000,
+                conn.node_id,
+                req.repo
+            );
+            if can_nak {
+                self.send_bootstrap_manifest_nak(&conn, req.repo, protocol::BOOTSTRAP_NAK_BUSY)
+                    .await;
+            } else {
+                self.send_empty_manifest(&conn, req.repo).await;
+            }
+            return;
+        }
+        // ③ 综合判断通过 —— 应答侧进入非稳态（phase3），协商成功的一半。
+        let ttl = req.bootstrap_ttl_secs.unwrap_or(BOOTSTRAP_TTL_MAX_SECS);
+        self.enter_nonsteady(&conn.node_id, vec![req.repo], ttl, 3);
         // v9：① 缓存复用 —— 重复到达的清单请求直接回缓存清单，不再全表重排。
         // v10(B2)：**缓存保活** —— 旧实现 lease 过期即重建（全表扫 38s），而请求方拉完
         // 全量需几十分钟 ≫ lease，每次重拉都触发重建 → 缓存边界漂移 → 断点归零死循环。
@@ -3556,19 +4329,26 @@ impl SyncManager {
         }
         // v9：② 单飞 —— 已有一次重建在途时不再并发铺开全表扫描；
         // 有旧缓存就回旧缓存（边界仍然自洽），没有就回空清单让请求方稍后重试。
-        let rebuild_lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
-        let rebuilding_age = {
-            let g = self.bootstrap_rebuild_at.read();
-            g.get(&key).map(|t| t.elapsed())
-        };
-        if let Some(age) = rebuilding_age {
-            if age < rebuild_lease {
-                warn!(
-                    "[bootstrap] 清单重建进行中（已 {}s），本轮回退旧缓存/空清单: peer={} repo={}",
-                    age.as_secs(),
-                    conn.node_id,
-                    req.repo
-                );
+        // 批次O(O5)：重建单飞（未取得则回退旧缓存/空清单，绝不并发起第二个全表扫描）
+        if !self.try_acquire_manifest_rebuild(&conn.node_id, req.repo) {
+            let age = {
+                let g = self.bootstrap_rebuild_at.read();
+                g.get(&key).map(|t| t.elapsed().as_secs()).unwrap_or(0)
+            };
+            warn!(
+                "[bootstrap] 清单重建进行中（已 {}s），拒绝本次申请: peer={} repo={}",
+                age, conn.node_id, req.repo
+            );
+            // v10：重建在途属「综合判断不通过」——v10+ 请求方回 Nak(rebuilding)；
+            // 旧对端（<v10）不理解 53 帧，回旧缓存/空清单保持兼容。
+            if conn.protocol_version() >= protocol::HELLO_PROTOCOL_VERSION {
+                self.send_bootstrap_manifest_nak(
+                    &conn,
+                    req.repo,
+                    protocol::BOOTSTRAP_NAK_REBUILDING,
+                )
+                .await;
+            } else {
                 let manifest = self
                     .bootstrap_manifests
                     .read()
@@ -3585,12 +4365,9 @@ impl SyncManager {
                     conn.send_message(MessageType::BootstrapManifestResponse, &resp),
                 )
                 .await;
-                return;
             }
+            return;
         }
-        self.bootstrap_rebuild_at
-            .write()
-            .insert(key, Instant::now());
         let storage = self.delta_storage();
         // v9：w0 必须取**该 repo** 的水位。旧实现用全局 `oplog_max_seq()`，而 delta 断点是
         // per-repo 空间 ⇒ 稀疏 repo（如 TRACKER）的游标会被一次性抬到全局水位，
@@ -3604,32 +4381,53 @@ impl SyncManager {
                                                  // rebuilding 标记），不受影响。
         let chunk_rows = self.config.bootstrap_chunk_rows;
         let repo = req.repo;
-        let manifest = match tokio::task::spawn_blocking(move || {
-            bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
-        })
+        // 批次O(O5)：重建耗时必须可观测 —— 旧实现只在成功后打一行，重建「卡住/超租约」
+        // 时生产日志里完全看不出它在跑，导致「块请求持续被 NAK」长期无法定位。
+        let rebuild_started = Instant::now();
+        info!(
+            "[bootstrap] 清单缓存缺失，开始现场重建: peer={} repo={} chunk_rows={}",
+            conn.node_id, req.repo, chunk_rows
+        );
+        let manifest = match tokio::time::timeout(
+            std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
+            }),
+        )
         .await
         {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => {
+            Ok(Ok(Ok(m))) => m,
+            Ok(Ok(Err(e))) => {
                 warn!("[bootstrap] 建清单失败 repo={}: {}", req.repo, e);
-                self.bootstrap_rebuild_at.write().remove(&key);
+                self.release_manifest_rebuild(&conn.node_id, req.repo);
                 return;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // blocking 任务 join 失败（panic/取消）按建清单失败同一路径处理，
                 // 释放重建标记让下一轮请求可重试
                 warn!("[bootstrap] 建清单任务 join 失败 repo={}: {}", req.repo, e);
-                self.bootstrap_rebuild_at.write().remove(&key);
+                self.release_manifest_rebuild(&conn.node_id, req.repo);
+                return;
+            }
+            Err(_) => {
+                // P4-2：长查询超时兜底（38s 级扫描 + 调度让路后可能远超租约）——
+                // 释放重建标记，让下一轮请求可重试；SQL 本身由 Semaphore(2) 限流，残留线程有界
+                warn!(
+                    "[bootstrap] 建清单超时（>{}s）repo={}: {}",
+                    LONG_QUERY_TIMEOUT_SECS, req.repo, conn.node_id
+                );
+                self.release_manifest_rebuild(&conn.node_id, req.repo);
                 return;
             }
         };
         info!(
-            "[bootstrap] 响应清单请求 from={}: repo={} 总行={}, 块数={}, w0={}",
+            "[bootstrap] 响应清单请求 from={}: repo={} 总行={}, 块数={}, w0={}, 重建耗时={}ms",
             conn.node_id,
             req.repo,
             manifest.total_rows,
             manifest.chunks.len(),
-            w0
+            w0,
+            rebuild_started.elapsed().as_millis()
         );
         self.bootstrap_manifests
             .write()
@@ -3637,7 +4435,7 @@ impl SyncManager {
         self.bootstrap_manifest_at
             .write()
             .insert(key, Instant::now());
-        self.bootstrap_rebuild_at.write().remove(&key);
+        self.release_manifest_rebuild(&conn.node_id, req.repo);
         let resp = BootstrapManifestResponseMessage { manifest };
         // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
         let send_res = tokio::time::timeout(
@@ -3657,6 +4455,46 @@ impl SyncManager {
         }
     }
 
+    /// 批次O(O5)：清单重建**单飞** —— 取得某 (peer, repo) 的重建权。
+    ///
+    /// - 无标记 → 取得（true）；
+    /// - 标记存在且未超 `bootstrap_rebuild_lease_secs` → 已有重建在跑，拒绝（false，
+    ///   调用方回 NAK "manifest rebuilding" 或回退旧缓存）；
+    /// - 标记超过租约 → 视为旧重建卡死/任务泄漏，夺取并告警（防「一次卡死永久拒服务」）。
+    ///
+    /// 背景：旧实现把「租约」当 TTL 用，而 6.2M 行全表重建在慢盘上远超 60s 租约
+    /// ⇒ 每 60s 再起一个全表扫描，多个重建互抢读池、谁都跑不完，所有块请求被
+    /// NAK "manifest rebuilding"（.53 2026-10-07 实测：`read_pool_starved` 上升、
+    /// bootstrap 零块落地）。现在**重建完成才释放**，配合分批切块（重建降到十秒级）。
+    fn try_acquire_manifest_rebuild(&self, peer: &NodeId, repo: u8) -> bool {
+        let key = (*peer, repo);
+        let lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
+        {
+            let g = self.bootstrap_rebuild_at.read();
+            if let Some(t) = g.get(&key) {
+                let age = t.elapsed();
+                if age < lease {
+                    return false;
+                }
+                warn!(
+                    "[bootstrap] 清单重建标记已超租约 {}s（旧重建疑似卡死），夺取重建权: peer={} repo={}",
+                    age.as_secs(),
+                    peer,
+                    repo
+                );
+            }
+        }
+        self.bootstrap_rebuild_at
+            .write()
+            .insert(key, Instant::now());
+        true
+    }
+
+    /// 批次O(O5)：释放清单重建权（成功与失败路径都必须调用，否则单飞标记泄漏）。
+    fn release_manifest_rebuild(&self, peer: &NodeId, repo: u8) {
+        self.bootstrap_rebuild_at.write().remove(&(*peer, repo));
+    }
+
     /// v9：回一个**显式空块**作为 NAK。
     ///
     /// 旧实现在「重建进行中 / index 越界 / DB 读失败」三条路径上直接 `return` 不回帧，
@@ -3664,14 +4502,41 @@ impl SyncManager {
     /// （实测 `phase=transfer, done=0` 卡死两天）。空块的 `entries.len() == 0`
     /// 会命中接收方 `verify_transport(expected>0, 0) == false`，从而进入可计数、可升级的失败路径。
     async fn send_bootstrap_nak(&self, conn: &PeerConn, repo: u8, index: u32, reason: &str) {
-        debug!(
-            "[bootstrap] 回显式 NAK: peer={}, repo={}, index={}, reason={}",
-            conn.node_id, repo, index, reason
-        );
+        // 批次O(O4)：NAK 原因此前只打在 debug 级别（生产 info 级看不到），是本次
+        // 「应答方回 0 条响应、请求方疯狂重试」长期未被识别的直接原因。改为**限流 WARN**：
+        // 每个原因每 `bootstrap_nak_log_interval_secs` 最多一条汇总（附期间累计次数与
+        // 最近一个 index），既不丢线索也不刷屏。
+        {
+            let interval = Duration::from_secs(self.config.bootstrap_nak_log_interval_secs.max(1));
+            let flood = {
+                let mut m = nak_log_state().lock();
+                let e = m.entry(reason.to_string()).or_insert((Instant::now(), 0));
+                e.1 = e.1.saturating_add(1);
+                if e.0.elapsed() >= interval {
+                    let n = e.1;
+                    *e = (Instant::now(), 0);
+                    Some(n)
+                } else {
+                    None
+                }
+            };
+            if let Some(n) = flood {
+                warn!(
+                    "[bootstrap] 回显式 NAK ×{}（{}s 限流汇总）: peer={} repo={} 最近 index={} reason={}",
+                    n,
+                    interval.as_secs(),
+                    conn.node_id,
+                    repo,
+                    index,
+                    reason
+                );
+            }
+        }
         let resp = BootstrapChunkResponseMessage {
             repo,
             index,
             entries: Vec::new(),
+            compressed_payload: None,
             hash: [0u8; 32],
             is_last: false,
         };
@@ -3762,10 +4627,11 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
-        // v10(A)：标记「正在响应对方的 bootstrap 请求」—— 双向引导冲突让路的信号源。
-        self.bootstrap_serving_at
-            .write()
-            .insert((conn.node_id, req.repo), Instant::now());
+        // v10(A)/批次O(O8)：只有**分块请求**（真实数据拉取）才标记「对端在拉我快照」，
+        // 作为双向引导冲突让路的信号源；清单请求不标记（见清单 handler 的说明）。
+        self.mark_bootstrap_serving(&conn.node_id, req.repo);
+        // P3：应答侧非稳态进度触达（有分块请求 = 传输进行中；无请求超阈值 → 逃生解除）
+        self.touch_nonsteady_progress(&conn.node_id);
         // A3：per-peer 发送熔断 —— 该对端连续发送失败达阈值且指数退避未到期时，
         // 直接 NAK("circuit open")，不加载 entries、不占内存（半开探测由成功/失败推进）。
         {
@@ -3803,21 +4669,13 @@ impl SyncManager {
                 // 当成第 i 块落地，造成静默空洞（实测双端 74 块 vs 82 块、done_chunks 照常 +1）。
                 // 因此这里**只回清单、令请求方以同一边界重新开始**，从根上消除 index↔区间错位。
                 // 重建中（租约内）回显式空 NAK，让请求方走可计数、可升级的失败路径。
-                let lease = Duration::from_secs(self.config.bootstrap_rebuild_lease_secs.max(1));
-                let rebuilding_age = {
-                    let g = self.bootstrap_rebuild_at.read();
-                    g.get(&key).map(|t| t.elapsed())
-                };
-                if let Some(age) = rebuilding_age {
-                    if age < lease {
-                        self.send_bootstrap_nak(&conn, req.repo, req.index, "manifest rebuilding")
-                            .await;
-                        return;
-                    }
+                // 批次O(O5)：重建单飞 —— 未取得重建权即回 NAK，绝不并发起第二个全表扫描
+                // （旧实现按 60s TTL 夺取，而重建耗时远超该值 ⇒ 重叠重建互抢读池）。
+                if !self.try_acquire_manifest_rebuild(&conn.node_id, req.repo) {
+                    self.send_bootstrap_nak(&conn, req.repo, req.index, "manifest rebuilding")
+                        .await;
+                    return;
                 }
-                self.bootstrap_rebuild_at
-                    .write()
-                    .insert(key, Instant::now());
                 let storage = self.delta_storage();
                 let w0 = storage.oplog_max_seq_for_repo(req.repo).unwrap_or(0).max(0) as u64;
                 let version = w0.wrapping_add(1) as u32;
@@ -3826,25 +4684,35 @@ impl SyncManager {
                 // 仍走上方租约 NAK 路径（rebuilding 标记已先行写入，不破坏）。
                 let chunk_rows = self.config.bootstrap_chunk_rows;
                 let repo = req.repo;
-                let rebuilt = tokio::task::spawn_blocking(move || {
-                    bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
-                })
+                // 批次O(O5)：重建耗时必须可观测（同清单请求路径）。
+                let rebuild_started = Instant::now();
+                info!(
+                    "[bootstrap] 分块请求触发清单重建（缓存缺失）: peer={} repo={} chunk_rows={} index={}",
+                    conn.node_id, req.repo, chunk_rows, req.index
+                );
+                let rebuilt = tokio::time::timeout(
+                    std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+                    tokio::task::spawn_blocking(move || {
+                        bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
+                    }),
+                )
                 .await;
                 match rebuilt {
-                    Ok(Ok(m)) => {
+                    Ok(Ok(Ok(m))) => {
                         info!(
-                            "[bootstrap] 清单缓存缺失，现场重建并要求请求方重新对齐: peer={}, repo={}, 块数={}, w0={}, 丢弃其 index={}",
+                            "[bootstrap] 清单缓存缺失，现场重建完成并要求请求方重新对齐: peer={}, repo={}, 块数={}, w0={}, 丢弃其 index={}, 重建耗时={}ms",
                             conn.node_id,
                             req.repo,
                             m.chunks.len(),
                             w0,
-                            req.index
+                            req.index,
+                            rebuild_started.elapsed().as_millis()
                         );
                         self.bootstrap_manifests.write().insert(key, m.clone());
                         self.bootstrap_manifest_at
                             .write()
                             .insert(key, Instant::now());
-                        self.bootstrap_rebuild_at.write().remove(&key);
+                        self.release_manifest_rebuild(&conn.node_id, req.repo);
                         let resp = BootstrapManifestResponseMessage { manifest: m };
                         // G2：发送超时兜底（复用 transport_write_timeout_secs）。
                         let send_ok = tokio::time::timeout(
@@ -3859,8 +4727,8 @@ impl SyncManager {
                         }
                         return;
                     }
-                    Ok(Err(e)) => {
-                        self.bootstrap_rebuild_at.write().remove(&key);
+                    Ok(Ok(Err(e))) => {
+                        self.release_manifest_rebuild(&conn.node_id, req.repo);
                         warn!(
                             "[bootstrap] 收到分块请求且清单重建失败 peer={}, repo={}: {}",
                             conn.node_id, req.repo, e
@@ -3874,10 +4742,10 @@ impl SyncManager {
                         .await;
                         return;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         // blocking 任务 join 失败（panic/取消）按重建失败同一路径处理，
                         // 回 NAK 让请求方走可计数、可升级的失败路径
-                        self.bootstrap_rebuild_at.write().remove(&key);
+                        self.release_manifest_rebuild(&conn.node_id, req.repo);
                         warn!(
                             "[bootstrap] 收到分块请求且清单重建任务 join 失败 peer={}, repo={}: {}",
                             conn.node_id, req.repo, e
@@ -3887,6 +4755,23 @@ impl SyncManager {
                             req.repo,
                             req.index,
                             "manifest rebuild failed",
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(_) => {
+                        // P4-2：长查询超时兜底——释放重建标记并回 NAK，下一轮可重试；
+                        // 残留 SQL 线程由 Semaphore(2) 限流，有界
+                        self.release_manifest_rebuild(&conn.node_id, req.repo);
+                        warn!(
+                            "[bootstrap] 收到分块请求且清单重建超时（>{}s）peer={}, repo={}",
+                            LONG_QUERY_TIMEOUT_SECS, conn.node_id, req.repo
+                        );
+                        self.send_bootstrap_nak(
+                            &conn,
+                            req.repo,
+                            req.index,
+                            "manifest rebuild timeout",
                         )
                         .await;
                         return;
@@ -3915,7 +4800,23 @@ impl SyncManager {
         // `_send_permit` 为 RAII：发送完成或中途任何 early-return（含取数失败的 NAK）都释放槽。
         BOOTSTRAP_SEND_TOTAL.fetch_add(1, Ordering::Relaxed);
         let send_limit = effective_send_limit(self.config.bootstrap_send_concurrency);
-        if !try_inc_bounded(&BOOTSTRAP_SEND_IN_FLIGHT, send_limit) {
+        // 批次O(O4)：拿不到发送槽时**先短暂等待再 NAK**。此处尚未加载 entries（permit 在
+        // 加载之前获取，内存上界不变），短暂排队可吸收突发；旧实现立即回 NAK，而请求方
+        // 把它当传输失败立即重发 → 90 次/秒自激风暴、对端发送槽长期钉在满载值。
+        let mut got_slot = try_inc_bounded(&BOOTSTRAP_SEND_IN_FLIGHT, send_limit);
+        if !got_slot {
+            let wait = Duration::from_millis(self.config.bootstrap_send_permit_wait_ms);
+            let deadline = Instant::now() + wait;
+            while Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(BOOTSTRAP_PERMIT_POLL_MS)).await;
+                if try_inc_bounded(&BOOTSTRAP_SEND_IN_FLIGHT, send_limit) {
+                    got_slot = true;
+                    break;
+                }
+            }
+        }
+        if !got_slot {
+            BOOTSTRAP_BUSY_NAKS.fetch_add(1, Ordering::Relaxed);
             self.send_bootstrap_nak(&conn, req.repo, req.index, "send concurrency limit")
                 .await;
             return;
@@ -3944,13 +4845,6 @@ impl SyncManager {
         // lo/hi 提升为 owned Vec（原 &[u8] 借用 chunk 非 'static，无法进 'static 闭包）。
         let max_rows = chunk.rows as usize;
         let repo = req.repo;
-        // P批临时诊断：在 move 前快照边界文本
-        let dbg_lo = lo
-            .as_deref()
-            .map(|b| String::from_utf8_lossy(b).into_owned());
-        let dbg_hi = hi
-            .as_deref()
-            .map(|b| String::from_utf8_lossy(b).into_owned());
         let entries: Vec<SyncEntry> = match tokio::task::spawn_blocking(move || {
             storage.load_repo_sync_entries_in_range(
                 repo,
@@ -3961,18 +4855,7 @@ impl SyncManager {
         })
         .await
         {
-            Ok(Ok(rows)) => {
-                // P批临时诊断：块取数结果观测（定位「实收 0 行」问题后移除）
-                info!(
-                    "[bootstrap][P-debug] 块 {} 取数: lo={:?} hi={:?} max_rows={} loaded={}",
-                    req.index,
-                    dbg_lo,
-                    dbg_hi,
-                    max_rows,
-                    rows.len()
-                );
-                rows.into_iter().take(max_rows).collect()
-            }
+            Ok(Ok(rows)) => rows.into_iter().take(max_rows).collect(),
             Ok(Err(e)) => {
                 warn!("[bootstrap] 取块条目失败 index={}: {}", req.index, e);
                 self.send_bootstrap_nak(&conn, req.repo, req.index, "load chunk entries failed")
@@ -4004,10 +4887,18 @@ impl SyncManager {
             tokio::time::sleep(wait).await;
         }
         let is_last = (req.index as usize + 1) >= manifest.chunks.len();
+        // v7：发送前 lz4 压缩 entries（bincode 序列化后压缩，~3:1）。
+        // 压缩不更小（小块/高随机载荷）时退回未压缩 entries，接收方两者皆可解。
+        let compressed_payload = bootstrap::compress_entries(&entries);
         let resp = BootstrapChunkResponseMessage {
             repo: req.repo,
             index: req.index,
-            entries,
+            entries: if compressed_payload.is_some() {
+                Vec::new()
+            } else {
+                entries
+            },
+            compressed_payload,
             hash,
             is_last,
         };
@@ -4040,6 +4931,57 @@ impl SyncManager {
         }
     }
 
+    /// 批次O(O2)：本端「按远端块区间」的摘要（缓存命中免扫描）。
+    ///
+    /// 单遍归并扫描在 `spawn_blocking` 内执行（顺序读 + 逐块增量哈希），既不阻塞
+    /// tokio worker，也不像旧路径那样逐块发 3108 次区间查询 / 每轮重建整份本地清单。
+    /// 同一份远端边界（对端频繁重建清单但表未增行、仅 w0/version 变化）在 TTL 内直接复用。
+    async fn local_range_digests(
+        &self,
+        repo: u8,
+        mf: &bootstrap::BootstrapManifest,
+    ) -> anyhow::Result<Vec<bootstrap::RangeDigest>> {
+        let fp = bootstrap::manifest_bounds_fingerprint(mf);
+        if let Some(d) = self.bootstrap_local_digests.get(repo, mf.chunk_rows, fp) {
+            debug!(
+                "[bootstrap] 本地区间摘要缓存命中（O2），跳过全表扫描: repo={} chunk_rows={} 块数={}",
+                repo,
+                mf.chunk_rows,
+                d.len()
+            );
+            return Ok(d);
+        }
+        let storage = self.delta_storage();
+        let chunks = mf.chunks.clone();
+        let chunk_rows = mf.chunk_rows;
+        let started = Instant::now();
+        let digests = tokio::time::timeout(
+            std::time::Duration::from_secs(LONG_QUERY_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                bootstrap::digest_local_by_remote_chunks(&storage, repo, chunk_rows, &chunks)
+            }),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "本地区间摘要扫描超时（>{}s）repo={}",
+                LONG_QUERY_TIMEOUT_SECS,
+                repo
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("本地区间摘要扫描任务 join 失败: {}", e))??;
+        debug!(
+            "[bootstrap] 本地区间摘要完成（O2）: repo={} chunk_rows={} 块数={} 耗时={}ms",
+            repo,
+            mf.chunk_rows,
+            digests.len(),
+            started.elapsed().as_millis()
+        );
+        self.bootstrap_local_digests
+            .insert(repo, mf.chunk_rows, fp, digests.clone());
+        Ok(digests)
+    }
+
     /// P2-1：处理对端的 bootstrap 清单响应（请求方）—— 落进度并开始拉第一块。
     pub async fn handle_bootstrap_manifest_response(
         self: Arc<Self>,
@@ -4065,6 +5007,39 @@ impl SyncManager {
             warn!(
                 "[bootstrap] 收到空清单（对端正在重建/无数据），忽略且不改本地状态: peer={} repo={}",
                 conn.node_id, mf.repo
+            );
+            // 批次O(O6)：对端明确「正在重建」时**必须退避**。旧实现只记录一行日志就返回，
+            // 请求方随后继续按窗口发块请求 → 对端在重建的分钟级窗口里持续被 NAK 淹没
+            // （实测每 30s ~110 次），重建本身也被拖慢。这里记入通道级退避并暂停现有窗口。
+            let mut progress_hint = 0u32;
+            if let Ok(Some((p, _))) = self
+                .delta_storage()
+                .bootstrap_load(&conn.node_id.0, mf.repo)
+            {
+                progress_hint = p.done_chunks.min(u32::MAX as u64) as u32;
+            }
+            self.record_chunk_transport_fail(&conn.node_id, mf.repo, progress_hint);
+            let delay = {
+                let base = Duration::from_secs(self.config.bootstrap_backoff_base_secs.max(1));
+                let max = Duration::from_secs(self.config.bootstrap_backoff_max_secs.max(1));
+                let fails = self
+                    .bootstrap_chunk_attempt
+                    .read()
+                    .get(&(conn.node_id, mf.repo))
+                    .map(|st| st.fails)
+                    .unwrap_or(1);
+                let delay = bootstrap::backoff_delay(base, max, fails);
+                let mut map = self.chunk_windows.write();
+                if let Some(cw) = map.get_mut(&(conn.node_id, mf.repo)) {
+                    cw.pause_for(delay);
+                }
+                delay
+            };
+            info!(
+                "[bootstrap] 空清单退避：{}s 内不再请求块/清单（等对端重建完成）: peer={} repo={}",
+                delay.as_secs(),
+                conn.node_id,
+                mf.repo
             );
             return;
         }
@@ -4126,6 +5101,23 @@ impl SyncManager {
             set: &self.bootstrap_aligning,
             key: (conn.node_id, mf.repo),
         };
+        // P3（v10 修复）：协商成功 = 双侧进入非稳态。应答方已同意（清单已回），
+        // 请求方无条件进入非稳态（phase2），暂停对该 peer 的 delta/range/反熵，
+        // 快照传输期稳定。T 为测速阶段算好的申请时长，无测速路径（巡检/重拉/
+        // 续传/测速回退）用封顶值 4h——非稳态是传输期的固有属性，不由「测速是否
+        // 成功」决定；超时由逃生（超 T 且无进展）兜底解除。
+        let planned_ttl = self
+            .bootstrap_ttl_planned
+            .write()
+            .remove(&(conn.node_id, mf.repo))
+            .unwrap_or(0);
+        self.enter_nonsteady(
+            &conn.node_id,
+            vec![mf.repo],
+            planned_ttl.max(BOOTSTRAP_TTL_MAX_SECS),
+            2,
+        );
+        self.confirm_nonsteady(&conn.node_id, "清单同意(第1次协商确认)");
         // v10(B2)：断点继承 —— version 相同（同一快照）直接继承 done_chunks；
         // version 不同（w0 漂移，对端 oplog 持续写则必然）时用 **key 游标** 在新清单
         // 中定位续传起点：块边界随活表写入漂移，边界比对必然失配 → 归零循环
@@ -4146,6 +5138,9 @@ impl SyncManager {
             }
             _ => (0, "none"),
         };
+        // P3：请求方进入非稳态已在上方（对齐单飞守卫后）无条件完成——若对齐失败
+        // 走重拉路径，非稳态仍在（重拉仍属 bootstrap 传输期），由逃生/竣工兜底解除。
+        // （旧版此处曾二次 remove+enter，因首次已移除必然取 0，属死代码，已删除。）
         // D批(D1)/D批(D3)：块级 hash 比较 + 断点继承前缀逐块验证。
         // skip=true 时按相同 chunk_rows 重建本地清单（全表扫描，spawn_blocking），用纯函数
         // `align_bootstrap_seed` 算出「全部 hash&rows 一致块集合」与「验证通过的连续前缀」：
@@ -4183,30 +5178,18 @@ impl SyncManager {
         }
         let do_verify = self.config.bootstrap_skip_identical_chunks;
         let (mut seed, done_chunks): (std::collections::HashSet<u32>, u64) = if do_verify {
-            let storage = self.delta_storage();
-            let w0 = storage.oplog_max_seq_for_repo(mf.repo).unwrap_or(0).max(0) as u64;
-            let version = w0.wrapping_add(1) as u32;
-            let chunk_rows = mf.chunk_rows;
-            let repo = mf.repo;
-            let built = tokio::task::spawn_blocking(move || {
-                bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
-            })
-            .await;
-            match built {
-                Ok(Ok(local_mf)) => {
-                    let (prefix, matching) = bootstrap::align_bootstrap_seed(&mf.chunks, &local_mf);
+            // 批次O(O2)：**按远端 key 区间**对齐（边界无关）。旧实现按 index 把两端各自
+            // 分块的结果逐块比对，而分块边界由各自行数推导 ⇒ 两端行集不同时边界整体错位、
+            // 只有首块能对上（实测 8/3108），97% 本端已有数据被判缺失重拉。
+            // 详见 bootstrap::digest_local_by_remote_chunks 文档。
+            match self.local_range_digests(mf.repo, &mf).await {
+                Ok(digests) => {
+                    let (prefix, matching) = bootstrap::align_seed_by_digests(&mf.chunks, &digests);
                     (matching, prefix as u64)
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "[bootstrap] 本地清单重建失败，不继承任何断点、退回全量拉取: repo={} peer={}: {}",
-                        mf.repo, conn.node_id, e
-                    );
-                    (std::collections::HashSet::new(), 0)
                 }
                 Err(e) => {
                     warn!(
-                        "[bootstrap] 本地清单重建任务 join 失败，不继承任何断点、退回全量拉取: repo={} peer={}: {}",
+                        "[bootstrap] 本地区间摘要扫描失败，不继承任何断点、退回全量拉取: repo={} peer={}: {}",
                         mf.repo, conn.node_id, e
                     );
                     (std::collections::HashSet::new(), 0)
@@ -4339,6 +5322,46 @@ impl SyncManager {
     }
 
     /// P2-1：处理对端的 bootstrap 分块响应（请求方）—— 批量 upsert 落块、校验、窗口续拉或切追尾。
+    ///
+    /// v7（L1-①/②）管道化语义：
+    /// - 收到块 → **立即**校验传输完整性 + 窗口 on_response + fill（下一批请求发出，
+    ///   不等落库）—— inflight 常满，吞吐由「逐块往返」变为「网络 + 落库并行」。
+    /// - entries 进入攒批队列（bootstrap_pending），攒够阈值或收到最后一块时，
+    ///   spawn_blocking 一次性快速落库（apply_node_sync_fast，单批多块）。
+    /// - done 进度只按「已落库」的连续前缀推进（bootstrap_applied 集合），
+    ///   未落库块不计进度 —— 崩溃后断点继承从 done 续传，未落库块自然重拉，安全。
+    /// v10(C)：对端断连自愈 —— 清该 peer 全部 bootstrap 窗口与攒批缓冲。
+    /// 防「对端崩溃 → 窗口残留 → done 前缀/停滞判定被陈旧状态污染」；
+    /// 进度行保留（bootstrap_state 表断点续传），重连后重新协商从断点续传。
+    #[allow(clippy::doc_lazy_continuation)]
+    pub fn peer_disconnected(&self, peer: &NodeId) {
+        let keys: Vec<(NodeId, u8)> = {
+            let w = self.chunk_windows.read();
+            w.keys().filter(|(p, _)| p == peer).cloned().collect()
+        };
+        if !keys.is_empty() {
+            self.chunk_windows.write().retain(|k, _| !keys.contains(k));
+            debug!(
+                "[bootstrap] 对端断连自愈：清 {} 个窗口（peer={})",
+                keys.len(),
+                peer
+            );
+        }
+        // 攒批缓冲：匹配该 peer 的 pending 清空（锁内瞬时操作）
+        {
+            let mut pend = self
+                .bootstrap_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(b) = pend.as_ref() {
+                if b.peer.as_slice() == peer.0.as_slice() {
+                    *pend = None;
+                    debug!("[bootstrap] 对端断连自愈：清攒批缓冲（peer={})", peer);
+                }
+            }
+        }
+    }
+
     pub async fn handle_bootstrap_chunk_response(
         self: Arc<Self>,
         conn: Arc<PeerConn>,
@@ -4373,151 +5396,204 @@ impl SyncManager {
             Some(c) => c.clone(),
             None => return,
         };
-        // v10(C)：窗口状态机 —— (peer,repo) 的 ChunkWindow 缺失（重启/首次响应）
-        // 时从进度重建（resume_from = 持久化的连续前缀 done_chunks）。
-        // 全程只取一次、驱动完状态迁移后回插，不再二次取出（旧代码两次 remove 导致在途状态丢失）。
-        let window_size = self.config.bootstrap_window_size.max(1);
-        let mut cw = self
-            .chunk_windows
-            .write()
-            .remove(&(conn.node_id, resp.repo))
-            .unwrap_or_else(|| {
-                bootstrap::ChunkWindow::new(
-                    mf.chunks.len() as u32,
-                    window_size,
-                    progress.done_chunks.min(mf.chunks.len() as u64) as u32,
-                )
-            });
         // ④ 批量 upsert（A4：走全 repo 通用 dispatch handle_sync_batch，按 resp.repo 分派到
         // apply_node/peer/infohash/tracker_sync，严禁逐条 INSERT，也严禁硬编码走 NODE 落地）
         // P批(P3)：spawn_blocking 化 —— handle_sync_batch 内部是同步 DB 写（写连接锁 +
         // 批量 upsert），2 万行的块在内联执行时会占死 federation runtime worker 数秒，
         // 读循环随之饿死（对端块发送/NAK 全部超时，.52 2026-10-07 实证）；对齐 J 批
         // 对 delta apply 的处理。join 失败视为收到 0 条 → 传输校验自然判失败。
-        let mut received = resp.entries.len();
-        if !resp.entries.is_empty() {
-            let sm = self.clone();
-            let repo = resp.repo;
-            let entries = std::mem::take(&mut resp.entries);
-            let applied =
-                tokio::task::spawn_blocking(move || sm.handle_sync_batch(repo, &entries)).await;
-            match applied {
-                Ok(()) => {
-                    // v10(C)：刷新快照导入窗口 —— 落库预算在窗口内解除时间片限速
-                    // （writes_per_tick ×200），窗口静默 30s 自动回落稳态平滑语义。
-                    crate::storage::io_scheduler::refresh_bootstrap_import_window(
-                        Duration::from_secs(
-                            crate::storage::io_scheduler::BOOTSTRAP_IMPORT_WINDOW_TTL_SECS,
-                        ),
-                    );
-                }
-                Err(e) => {
+        // v7（L1-③）：解压载荷（compressed_payload 优先；旧端/压缩退回时用未压缩 entries）。
+        let received_entries: Vec<SyncEntry> = if let Some(cp) = resp.compressed_payload.as_deref()
+        {
+            match bootstrap::decompress_entries(cp) {
+                Some(e) => e,
+                None => {
                     warn!(
-                        "[bootstrap] 块 {} apply 任务 join 失败（按空块处理）: {}",
-                        resp.index, e
+                        "[bootstrap] 块 {} 载荷解压失败（按空块处理）: repo={} peer={}",
+                        resp.index, resp.repo, conn.node_id
                     );
-                    received = 0;
+                    Vec::new()
                 }
             }
-        }
+        } else {
+            std::mem::take(&mut resp.entries)
+        };
+        let received = received_entries.len();
+        // 字节统计必须在 `received_entries` 被 move 进攒批队列**之前**取。
+        let batch_bytes: u64 = received_entries
+            .iter()
+            .map(|e| (e.key.len() + e.payload.len() + 16) as u64)
+            .sum();
         // ⑥ 校验（P0-4 语义修正）：只做「传输完整性」校验 —— 校验**对端发来的这一批条目**
         // 是否完整到达，不再重算本地 [lo,hi) 区间摘要与清单 hash 比对。
         let ok = bootstrap::verify_transport(chunk.rows, received);
+        // v10(C)：窗口状态机迁移 —— **单次临界区、无 await**。
+        //
+        // 旧实现在 `chunk_windows.remove()` 与 `insert()` 之间夹着 spawn_blocking（落库）
+        // 与 sleep 两个 await 点，而 dispatch 对每个入站帧都 `tokio::spawn` 一个 handler
+        // ⇒ 并发到达的多个块响应各自「取走 → 从 DB 进度重建 → 回插」，互相覆盖：
+        // received/attempts 丢更新（同一块被反复请求、失败计数归零、done 前缀倒退）。
+        // 实测 .52 2026-10-07：28 分钟内 143,886 个块响应里只有 218 个带数据，其余全是
+        // NAK 触发的立即重发（单块约 9000 次），bootstrap 零进展、done 卡在 9/3108。
+        // 现在改为在锁内 in-place 变更，且失败块按**逐块指数退避**推迟重发。
+        let backoff_base = Duration::from_secs(self.config.bootstrap_backoff_base_secs.max(1));
+        let backoff_max = Duration::from_secs(self.config.bootstrap_backoff_max_secs.max(1));
+        let window_size = self.config.bootstrap_window_size.max(1);
+        let total_chunks = mf.chunks.len() as u32;
+        // 批次O(O6)：显式 NAK（空 entries）是**通道级**过载信号 —— 对端要么在重建清单
+        // （分钟级），要么发送槽满。此时只退避「刚失败的那一块」不够：`fill()` 会继续
+        // 从清单取下 N 块发出去，等于以窗口速度把整张 3100+ 块清单走一遍（实测每 30s
+        // ~110 次 NAK 全无收益，还把对端压得更死）。按通道级退避**暂停整个窗口**。
+        let is_nak = !ok && received == 0;
+        let (complete, done_prefix, batch, inflight_len, attempts, pause_secs) = {
+            let mut map = self.chunk_windows.write();
+            let cw = map.entry((conn.node_id, resp.repo)).or_insert_with(|| {
+                bootstrap::ChunkWindow::new(
+                    total_chunks,
+                    window_size,
+                    progress.done_chunks.min(total_chunks as u64) as u32,
+                )
+            });
+            let mut attempts = 0u32;
+            let mut pause_secs = 0u64;
+            let complete = if ok {
+                cw.on_response(resp.index)
+            } else {
+                // 失败（对端 NAK / 空块 / 传输漂移）：累计失败并把该块的重发时刻按指数
+                // 退避推后。对端 NAK 的语义是「本端过载、稍后再来」，立即重发只会把对端
+                // 压得更死（实测自激循环到 90 次/秒）。
+                attempts = cw.on_failure(resp.index);
+                let delay = bootstrap::backoff_delay(backoff_base, backoff_max, attempts);
+                cw.defer_retry(resp.index, delay);
+                if is_nak {
+                    cw.pause_for(delay);
+                    pause_secs = delay.as_secs();
+                }
+                false
+            };
+            // 成功 → 立即补窗；失败 → 只补「不在退避/暂停期内」的块，其余未请求块照常推进。
+            let batch = cw.fill(0);
+            (
+                complete,
+                cw.done_prefix() as u64,
+                batch,
+                cw.inflight_len() as u32,
+                attempts,
+                pause_secs,
+            )
+        };
         if ok {
-            // D批(D3)：对端负载保护 —— 每收到一个完成块，按配置节流 sleep，避免 16 路窗口
-            // 满速回包把对端正常业务挤爆（工程约束「同步不能影响对端正常运行」）。
+            // D批(D3)：对端负载保护 —— 每收到一个完成块，按配置节流 sleep。fill 已先行
+            // （窗口临界区内），此 sleep 仅限速请求节奏，不阻塞下一批补发。
             let d = self.config.bootstrap_peer_protect_delay_ms;
             if d > 0 {
                 tokio::time::sleep(Duration::from_millis(d)).await;
             }
-            // 成功路径：统计字节、记录 key 游标、推进阶段。
-            // done_chunks 不在此处按链式语义 (index+1) 推进 —— 窗口化乱序到达，
-            // done_chunks 必须等于 cw.done_prefix()（最大连续前缀），否则持久化进度会跳号。
+            // 成功路径（内存操作，立即）：清退避 / touch / 清重拉熔断。
             self.bootstrap_verify_fails
                 .write()
                 .remove(&(conn.node_id, resp.repo));
-            // 停摆修复：成功响应同样清退避状态 —— 收到任何块响应都证明链路活着；
-            // 否则窗口竣工进入 finish_bootstrap 时可能带着陈旧失败计数，被
-            // 「退避期内跳过竣工校验」短路段误拦，快照永远差最后一块写不了 Done。
-            self.bootstrap_chunk_attempt
-                .write()
-                .remove(&(conn.node_id, resp.repo));
-            // 活锁治理(任务4)：块成功落地 → touch 停滞判定时钟；
-            // 活锁治理(任务2)：任一块成功落地 → 清零重拉熔断计数并解除冷却。
+            // 停摆修复：成功响应清退避状态 —— 但**只清通道级退避锚点就是本块**的那一条。
+            // 旧实现「任一块成功即整条清零」，使失败块的退避在 NAK 风暴中永远无法生效。
+            self.clear_chunk_transport_fail(&conn.node_id, resp.repo, resp.index);
+            // 活锁治理(任务4)：块成功到达 → touch 停滞判定时钟；
+            // 活锁治理(任务2)：任一块成功到达 → 清零重拉熔断计数并解除冷却。
             progress.last_progress_ms = chrono::Utc::now().timestamp_millis();
             self.clear_bootstrap_repull(&conn.node_id, resp.repo);
-            progress.last_key = Some(chunk.hi.clone());
-            progress.bytes += resp
-                .entries
-                .iter()
-                .map(|e| (e.key.len() + e.payload.len() + 16) as u64)
-                .sum::<u64>();
-            progress.phase = bootstrap::BootstrapPhase::Transfer;
-            // v10(C)：驱动窗口状态机。on_response 返回 true = 全部块收齐（竣工）。
-            if cw.on_response(resp.index) {
-                progress.done_chunks = cw.done_prefix() as u64;
-                progress.updated_ms = chrono::Utc::now().timestamp_millis();
-                let _ = self.delta_storage().bootstrap_save(&progress, None);
-                self.finish_bootstrap(&conn, resp.repo, mf.w0_seq).await;
-                return;
+            // v7（L1-①/②）：块入攒批队列（**不 await 落库**）—— 窗口已补发，网络侧不等磁盘。
+            let flush_now = {
+                let mut pend = self
+                    .bootstrap_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let b = pend.get_or_insert_with(|| BootstrapPendingBatch {
+                    peer: conn.node_id.0.to_vec(),
+                    repo: resp.repo,
+                    entries: Vec::new(),
+                    indices: Vec::new(),
+                    bytes: 0,
+                    last_key: chunk.hi.clone(),
+                    final_received: false,
+                });
+                b.entries.extend(received_entries);
+                b.indices.push(resp.index);
+                b.bytes = b.bytes.saturating_add(batch_bytes);
+                b.last_key = chunk.hi.clone();
+                if complete {
+                    b.final_received = true;
+                }
+                let rows = b.entries.len();
+                let _apply_inflight = self.bootstrap_apply_inflight.load(Ordering::SeqCst);
+                // v10(A) 收敛兜底：complete 时**无条件**触发 flush——原条件
+                // `(complete && apply_inflight == 0)` 在对端崩溃/落库任务卡死时恒假，
+                // pending 永不落库 → phase 永卡 transfer（实测 .52 done=669/669 停滞）。
+                // complete 意味着全部块已收，必须推进 verify；落库锁会串行化并发 flush，
+                // upsert 幂等，重复 flush 无害。
+                rows >= BOOTSTRAP_APPLY_BATCH_ROWS || complete
+            };
+            // P3：进度触达（逃生判定：超 T 且无进展才兜底）+ 每 64 块协商确认一次（内存操作）。
+            self.touch_nonsteady_progress(&conn.node_id);
+            if done_prefix > 0 && done_prefix % NONSTEADY_CONFIRM_CHUNK_INTERVAL as u64 == 0 {
+                self.confirm_nonsteady(&conn.node_id, "进度对账");
+            }
+            // 触发攒批落库（后台任务：apply_node_sync_fast → applied → 进度持久化 → 竣工检查）。
+            // complete 时若已有落库任务在跑，由该任务在取到 final_received 批后触发 finish。
+            if flush_now {
+                let sm = self.clone();
+                let peer = conn.node_id;
+                tokio::spawn(async move {
+                    sm.flush_bootstrap_pending(peer).await;
+                });
             }
         } else {
-            // 失败路径（对端 NAK / 空块 / 传输漂移）：不做字节统计，记录告警后驱动窗口重试。
+            // 失败路径（对端 NAK / 空块 / 传输漂移）：不做字节统计，记录告警后按退避重试。
+            // 注意实收条数取 `received`（`resp.entries` 此时已被 take → 恒 0，旧日志因此
+            // 把「NAK 空响应」与「已落库成功」两种情形打印成同一个「实收 0 行」）。
             warn!(
                 "[bootstrap] 块 {} 传输校验失败（声明 {} 行 / 实收 {} 行），保持进度 done={}/{}",
                 resp.index,
                 chunk.rows,
-                resp.entries.len(),
-                cw.done_prefix(),
+                received,
+                done_prefix,
                 mf.chunks.len()
             );
             // 活锁治理(任务1-a)：唯一保留的块级重拉触发 —— 对端回带**非零** hash 且与
             // 清单块 hash 不符 = 真实数据漂移证据（当前服务端恒填零占位，本分支为协议
-            // 预留；真漂移证据主走竣工前 D3 对齐校验路径，见 finish_bootstrap）。
+            // 预留；真漂移证据主走竣工前对齐校验路径，见 finish_bootstrap）。
             if resp.hash != [0u8; 32] && resp.hash != chunk.hash {
                 warn!(
                     "[bootstrap] 块 {} hash 校验失败（真实数据漂移证据），重拉清单: repo={} peer={}",
                     resp.index, resp.repo, conn.node_id
                 );
-                progress.done_chunks = cw.done_prefix() as u64;
+                progress.done_chunks = done_prefix;
                 progress.updated_ms = chrono::Utc::now().timestamp_millis();
                 let _ = self.delta_storage().bootstrap_save(&progress, None);
-                self.chunk_windows
-                    .write()
-                    .insert((conn.node_id, resp.repo), cw);
                 self.record_bootstrap_repull(&conn.node_id, resp.repo);
                 self.clone().start_bootstrap(conn.node_id, resp.repo).await;
                 return;
             }
-            let attempts = cw.on_failure(resp.index);
-            if attempts >= self.config.bootstrap_chunk_max_attempts.max(1) {
+            if is_nak {
+                // 批次O(O6)：显式 NAK → 记入通道级退避（resume tick 同样受它门控）并暂停窗口。
+                warn!(
+                    "[bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 {}s 后重试: peer={} repo={} index={}",
+                    pause_secs, conn.node_id, resp.repo, resp.index
+                );
+                self.record_chunk_transport_fail(&conn.node_id, resp.repo, resp.index);
+            } else if attempts >= self.config.bootstrap_chunk_max_attempts.max(1) {
                 // 活锁治理(任务1)：连续失败**不再升级重拉清单**（旧实现此处 start_bootstrap，
                 // 与会话闪断叠加形成「重拉→清零→再失败」死循环，单节点一天 1846 次）。
-                // 改为记入退避表：resume tick 按指数退避表（30s→…→600s 封顶）推迟重发；
-                // 一致性由 range 反熵兜底（v8/v9 基准）。
+                // 记入通道级退避表（resume tick 按 30s→…→600s 封顶推迟重发）；块级重发
+                // 时刻另由 ChunkWindow 的逐块退避（defer_retry）把关。一致性由 range 反熵兜底。
                 warn!(
                     "[bootstrap] 块 {} 连续 {} 次失败，转入指数退避重试（不重拉清单）: repo={} peer={}",
                     resp.index, attempts, resp.repo, conn.node_id
                 );
                 self.record_chunk_transport_fail(&conn.node_id, resp.repo, resp.index);
-                progress.done_chunks = cw.done_prefix() as u64;
-                progress.updated_ms = chrono::Utc::now().timestamp_millis();
-                let _ = self.delta_storage().bootstrap_save(&progress, None);
-                self.chunk_windows
-                    .write()
-                    .insert((conn.node_id, resp.repo), cw);
-                return;
             }
         }
-        // v10(C)：done_chunks = 最大连续前缀（乱序安全），保存进度后 fill 补发。
-        progress.done_chunks = cw.done_prefix() as u64;
-        progress.updated_ms = chrono::Utc::now().timestamp_millis();
-        let _ = self.delta_storage().bootstrap_save(&progress, None);
-        // 收到响应即清「无回帧」看门狗计数（该计数只用于识别完全无回帧的连接故障）。
-        self.bootstrap_chunk_attempt
-            .write()
-            .remove(&(conn.node_id, resp.repo));
-        // 联邦同步通道状态：刷新 done/inflight/phase
+        // 联邦同步通道状态：刷新 done/inflight/phase。
+        // v7：面板 done 展示**传输**进度（received 连续前缀）；进度表持久化由 flush
+        // 回调按**已落库**连续前缀写入（断点续传只认落库进度，安全）。
         {
             let s = crate::federation::sync::channels_status::global();
             let mut g = s.write();
@@ -4529,20 +5605,144 @@ impl SyncManager {
                 .map(|b| format!("{:02x}", b))
                 .collect();
             g.bootstrap.repo = resp.repo as u64;
-            g.bootstrap.done_chunks = progress.done_chunks;
+            g.bootstrap.done_chunks = done_prefix;
             g.bootstrap.total_chunks = mf.chunks.len() as u64;
-            g.bootstrap.inflight = cw.inflight_len() as u32;
-            g.bootstrap.phase = "transfer".to_string();
+            g.bootstrap.inflight = inflight_len;
+            g.bootstrap.phase = if complete { "flush" } else { "transfer" }.to_string();
             // E3：接收方块到达 → 方向 recv。
             g.bootstrap.direction = "recv".to_string();
         }
-        let batch = cw.fill(0);
-        self.chunk_windows
-            .write()
-            .insert((conn.node_id, resp.repo), cw);
         for idx in batch {
             self.request_bootstrap_chunk(&conn, resp.repo, idx, &mf)
                 .await;
+        }
+    }
+
+    /// v7（L1-①/②）：bootstrap 攒批落库任务 —— take 队列 → spawn_blocking 快速落库 →
+    /// 更新 applied → 按「已落库」连续前缀持久化进度 → 竣工检查（received 全 + applied 全 → finish）。
+    async fn flush_bootstrap_pending(self: Arc<Self>, peer: NodeId) {
+        // 在途计数 CAS：已有落库任务在跑则直接返回（其循环会取走后续新到批）。
+        if self.bootstrap_apply_inflight.fetch_add(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        // 攒批落库循环（L1-①/②/⑥）：PASSIVE 每批回收逻辑帧；TRUNCATE 每 4 批
+        // 独占压缩（PASSIVE 遇大量读者让步时兜底，防 WAL GB 级失控读慢卡 HTTP）。
+        let mut truncate_n: u32 = 0;
+        loop {
+            let batch = {
+                let mut pend = self
+                    .bootstrap_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                pend.take()
+            };
+            let Some(b) = batch else {
+                // WAL 治理（L1-⑥）：flush 结束（写锁短窗）尽力 TRUNCATE 压缩 WAL。
+                // 背景：PASSIVE autocheckpoint 遇大量读者（读池被爬虫读占满）持续让步，
+                // WAL 放任增长 → 读查询扫 WAL 变慢 → 读池槽被慢读占满 → HTTP/任务全卡
+                // （2026-10-08 双端实证 WAL 996MB、全进程 450s 卡死）。每批落库后的
+                // PASSIVE checkpoint 只回收逻辑帧；TRUNCATE 在此抢占独占窗口压缩文件。
+                // 拿不到独占锁则 busy 返回，由下一轮 flush 重试，不阻塞任何写者。
+                let storage = self.delta_storage();
+                let _ = tokio::task::spawn_blocking(move || storage.checkpoint_truncate()).await;
+                self.bootstrap_apply_inflight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            };
+            let repo = b.repo;
+            let sm = self.clone();
+            let res =
+                tokio::task::spawn_blocking(move || sm.apply_node_sync_fast(&b.entries)).await;
+            if res.is_err() {
+                // 落库任务 join 失败：块退回重发（unreceive → fill 重发），记通道级失败。
+                warn!(
+                    "[bootstrap] 攒批落库任务 join 失败（{} 块退回重发）: repo={}",
+                    b.indices.len(),
+                    repo
+                );
+                {
+                    let mut map = self.chunk_windows.write();
+                    if let Some(cw) = map.get_mut(&(peer, repo)) {
+                        for idx in &b.indices {
+                            cw.unreceive(*idx);
+                        }
+                    }
+                }
+                if let Some(first) = b.indices.first() {
+                    self.record_chunk_transport_fail(&peer, repo, *first);
+                }
+                continue;
+            }
+            // 落库成功：刷新快照导入窗口 + 作废区间摘要缓存（对齐旧逐块语义）。
+            crate::storage::io_scheduler::refresh_bootstrap_import_window(Duration::from_secs(
+                crate::storage::io_scheduler::BOOTSTRAP_IMPORT_WINDOW_TTL_SECS,
+            ));
+            let done_prefix: u32;
+            let mut w0_seq: u64 = 0;
+            {
+                let mut applied = self
+                    .bootstrap_applied
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for idx in &b.indices {
+                    applied.insert((b.peer.clone(), repo, *idx));
+                }
+                let mut n = 0u32;
+                while applied.contains(&(b.peer.clone(), repo, n)) {
+                    n += 1;
+                }
+                done_prefix = n;
+            }
+            // 进度持久化（每批一次，done = 已落库连续前缀；w0 供竣工后 finish 用）。
+            if let Ok(Some((mut p, Some(mf)))) = self.delta_storage().bootstrap_load(&b.peer, repo)
+            {
+                w0_seq = p.w0_seq;
+                self.bootstrap_local_digests.invalidate(repo, mf.chunk_rows);
+                p.done_chunks = done_prefix as u64;
+                p.last_key = Some(b.last_key);
+                p.bytes = p.bytes.saturating_add(b.bytes);
+                p.last_progress_ms = chrono::Utc::now().timestamp_millis();
+                p.phase = bootstrap::BootstrapPhase::Transfer;
+                p.updated_ms = chrono::Utc::now().timestamp_millis();
+                let _ = self.delta_storage().bootstrap_save(&p, None);
+            }
+            // WAL 治理（L1-⑥）：每批落库后 PASSIVE checkpoint 回收逻辑帧。
+            // 见循环退出处的 TRUNCATE 注释（WAL 失控根因链）。PASSIVE 不阻塞写者，
+            // 读者多时让步；配合 TRUNCATE 双管齐下，WAL 稳定在 MB 级而非 GB 级。
+            let storage = self.delta_storage();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = storage.checkpoint();
+            })
+            .await;
+            // WAL 治理（preP37+）：每 4 批做一次 TRUNCATE（独占压缩）。PASSIVE 遇
+            // 大量读者持续让步时（爬虫 get_peers 风暴 + 应答取块），逻辑帧回收不动，
+            // WAL 单轮传输可涨到 GB 级 → 读慢 → 读池占满 → HTTP 卡（18:26 双端实证）。
+            // TRUNCATE 在 flush 批间写锁短窗尽力抢独占：拿到即把 WAL 压到最小，
+            // 拿不到（busy）由下批/周期任务重试，不阻塞任何写者。
+            truncate_n += 1;
+            if truncate_n.is_multiple_of(4) {
+                let storage = self.delta_storage();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = storage.checkpoint_truncate();
+                })
+                .await;
+            }
+            // 竣工检查：最后一块已收 && 已落库前缀覆盖全部块 → finish。
+            if b.final_received {
+                let total = {
+                    let map = self.chunk_windows.read();
+                    map.get(&(peer, repo)).map(|cw| cw.total()).unwrap_or(0)
+                };
+                if total > 0 && done_prefix >= total {
+                    let sm = self.clone();
+                    if let Some(conn) = self.sessions.get_connection(&peer) {
+                        tokio::spawn(async move {
+                            sm.finish_bootstrap(&conn, repo, w0_seq).await;
+                        });
+                    }
+                    self.bootstrap_apply_inflight.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+            }
         }
     }
 
@@ -4603,6 +5803,7 @@ impl SyncManager {
     /// 活表（crawler 持续写入、键随机分布）：竣工校验不能要求逐块 hash&rows 全等。
     /// INFOHASH(3)/PEER(2) 的插入可落在任意块区间，传输期间本地表一直在变，严格全等
     /// 永远不成立 → 死循环。NODE(1)/TRACKER(4) 是静态表，保持严格全等校验。
+    #[allow(dead_code)]
     fn repo_is_live_for_relaxed_finish(repo: u8) -> bool {
         repo == repo_type::INFOHASH || repo == repo_type::PEER
     }
@@ -4623,43 +5824,46 @@ impl SyncManager {
         repo: u8,
         remote_mf: &bootstrap::BootstrapManifest,
     ) -> bool {
-        let storage = self.delta_storage();
-        let w0 = storage.oplog_max_seq_for_repo(repo).unwrap_or(0).max(0) as u64;
-        let version = w0.wrapping_add(1) as u32;
-        let chunk_rows = remote_mf.chunk_rows;
-        let remote_chunks = remote_mf.chunks.clone();
-        let remote_total = remote_mf.total_rows;
-        let built = tokio::task::spawn_blocking(move || {
-            bootstrap::build_repo_manifest_impl(&storage, repo, chunk_rows, w0, version)
-        })
-        .await;
-        match built {
-            Ok(Ok(local_mf)) => {
-                // 活表（INFOHASH/PEER）：键随机分布致块边界/hash 在传输期间漂移，逐块全等
-                // 永不成立。改用行数兜底 —— 本地行数已达远端快照 95% 即视为基本落地，放行
-                // 写 Done；不足则判假竣工（块返回极少行），不写 Done 交由 resume/watchdog。
-                if Self::repo_is_live_for_relaxed_finish(repo) {
-                    return Self::live_finish_rows_enough(local_mf.total_rows, remote_total);
-                }
-                // 静态表（NODE/TRACKER）：保持严格逐块 hash&rows 全等（空清单天然通过）。
-                let matched = bootstrap::align_bootstrap_seed(&remote_chunks, &local_mf).1;
-                matched.len() == remote_chunks.len()
+        // 批次O(O2)：竣工校验改为**边界无关**的区间覆盖判定。
+        //
+        // 旧实现按相同 chunk_rows 重建本地清单，再要求「远端每一块都能在本地找到
+        // index/hash/rows 全等的块」。但块边界由各自行数推导，而 NODE 在本端是**活表**
+        // （爬虫持续写入）且两端行集本就不同 ⇒ 边界整体错位 ⇒ 严格全等恒不成立
+        // ⇒ 「传完 → 竣工校验失败 → 重拉」死循环，done 永不为 Done。
+        //
+        // 新口径：远端每个块区间在本端的行数都不少于其声明行数（本端 ⊇ 远端区间），
+        // 既能拦住「块返回极少行」的假竣工，也不因本端多出行而误判失败；
+        // 「本端多出的行」由 delta 追尾与 Range 反熵处理（v8/v9 基准不变）。
+        // L1-⑦（2026-10-08）：竣工校验统一改「整表行数 vs 远端声明」——
+        // 不再依赖本地摘要逐块覆盖。原因：对齐摘要对 dirty 块输出占位（rows=0），
+        // 活表上 dirty 占比高（NODE 646/671、INFOHASH 34/45），旧口径「dirty 块重算
+        // 覆盖」在活表恒失败 ⇒ 「传完 → 校验失败 → 重拉」死循环且每次校验都全扫。
+        // count_repo_rows 走短读池、秒级、不持长连接锁；「本地行数 ≥ 远端×0.9」既能
+        // 拦住「块返回极少行」的假竣工，也不因本端多出行误判失败。
+        let local_total = match self.delta_storage().count_repo_rows(repo) {
+            Ok(n) => n as u64,
+            Err(e) => {
+                warn!(
+                    "[bootstrap] 竣工校验：整表行数查询失败，判未对齐（不写 Done）: repo={}: {}",
+                    repo, e
+                );
+                return false;
             }
-            _ => false,
-        }
+        };
+        Self::live_finish_rows_enough(local_total, remote_mf.total_rows)
     }
 
     /// 完成 ③④ 后进入 ⑤ 追尾（复用 P1-3 delta 通道拉 `seq > w0`）。
     async fn finish_bootstrap(self: &Arc<Self>, conn: &PeerConn, repo: u8, w0_seq: u64) {
         let now = chrono::Utc::now().timestamp_millis();
-        // 停摆修复（2026-09-30 第二轮）：退避期内跳过竣工前 D3 全表校验与重拉。
-        // 正常块落地路径收到**任何**块响应都会清退避状态（见 handle_bootstrap_chunk_response
-        // ok 分支），能带着活跃退避进入这里的只剩「继承全覆盖 → 直接竣工 → 校验失败 →
-        // 重拉」循环本身 —— 该循环每轮要跑两次全表扫描（清单对齐验证 + 本处竣工校验，
-        // spawn_blocking 但全程持有全局 SQLite 连接锁，259 万行实测 ~38s/次），把
-        // api_runtime 的 DB 只读 handler（sync-observability/stats 轮询）全部 park 在
-        // 连接锁上，4 个 worker 耗尽后连 /metrics、/health 都无 worker 可响应
-        // （现场实证：api 整体超时、IOScheduler 背压升档后 9 分钟不恢复、Monitor 饿死）。
+        // 停摆修复（2026-09-30 第二轮）：退避期内跳过竣工前对齐校验与重拉。
+        // 正常块落地路径收到块响应会清退避状态（见 handle_bootstrap_chunk_response
+        // ok 分支，且只清「锚点即本块」的那一条），能带着活跃退避进入这里的只剩
+        // 「继承全覆盖 → 直接竣工 → 校验失败 → 重拉」循环本身 —— 该循环每轮都要跑
+        // 一遍本地全表扫描，把 api_runtime 的 DB 只读 handler（sync-observability/stats
+        // 轮询）拖在连接锁上（现场实证：api 整体超时、IOScheduler 背压升档后 9 分钟不恢复）。
+        // 批次O(O2)：扫描已改为单遍归并（分批读取 + 增量哈希 + 边界指纹缓存），
+        // 不再是「逐块区间查询 + 整份清单重建」的分钟级全表扫。
         if !self.chunk_backoff_ready(&conn.node_id, repo) {
             debug!(
                 "[bootstrap] 传输退避期内跳过竣工校验与重拉（抑制全表扫描风暴）: peer={} repo={}",
@@ -4667,23 +5871,24 @@ impl SyncManager {
             );
             return;
         }
-        // D批(D3)：竣工前强制对齐校验 —— 防「假竣工」（块返回极少行、断点未真落库却写 Done）。
-        // skip=true 且本地存有清单时，按与断点继承相同方式重建本地清单，逐块 hash&rows 核对
-        // mf.chunks 全部块。任一不一致或重建失败 → warn 后直接 return：不写 Done、不抬水位、
-        // 不清尝试/失败计数、不插冷却、不 trigger_delta，交由现有 resume/watchdog 继续推进。
+        // D批(D3) + 批次O(O2)：竣工前强制覆盖校验 —— 防「假竣工」（块返回极少行、
+        // 断点未真落库却写 Done）。口径为「远端每个块区间在本端的行数 ≥ 其声明行数」
+        // （活表 PEER/INFOHASH 用整表行数兜底），与对齐同源、边界无关。
+        // 校验失败 → warn 后直接 return：不写 Done、不抬水位、不清尝试/失败计数、
+        // 不插冷却、不 trigger_delta，交由现有 resume/watchdog 继续推进。
         if self.config.bootstrap_skip_identical_chunks {
             if let Ok(Some((p, Some(mf)))) =
                 self.delta_storage().bootstrap_load(&conn.node_id.0, repo)
             {
                 if !self.bootstrap_manifest_aligned(repo, &mf).await {
-                    // 活锁治理(任务1-a)：D3 逐块对齐校验失败 = 真实数据漂移证据，
+                    // 活锁治理(任务1-a)：竣工覆盖校验失败 = 真实数据缺失证据，
                     // 是重拉清单的两个合法触发条件之一（另一为 total_rows 结构性漂移）。
                     // 停摆修复：校验失败同时计入退避表（锚点 = 当前 done_chunks）——
                     // 退避在清单响应入口与本入口双重拦截，扫描频率随退避指数衰减，
                     // 而不是按发起互斥 TTL（60s）固定节奏狂扫直到熔断。
                     // 熔断计数与冷却在 start_bootstrap 内统一记账，连续无进展会被熔断。
                     warn!(
-                        "[bootstrap] 竣工前对齐校验失败（块 hash/rows 与本地不一致或清单重建失败），不写 Done，重拉清单（计入退避）: peer={} repo={}",
+                        "[bootstrap] 竣工前覆盖校验失败（本端区间行数不足或摘要扫描失败），不写 Done，重拉清单（计入退避）: peer={} repo={}",
                         conn.node_id, repo
                     );
                     self.record_chunk_transport_fail(
@@ -4702,6 +5907,9 @@ impl SyncManager {
             p.updated_ms = now;
             let _ = self.delta_storage().bootstrap_save(&p, mf.as_ref());
         }
+        // P3：竣工前最终对账（第 3 次协商确认）+ 解除非稳态（快照传输完成，恢复 delta/range）
+        self.confirm_nonsteady(&conn.node_id, "竣工前最终对账");
+        self.exit_nonsteady(&conn.node_id, "bootstrap 竣工");
         // v9：追尾起点在这里落库。清单响应阶段不再提前推进游标（见
         // `handle_bootstrap_manifest_response`），保证「数据真正落地后才声明水位」。
         let _ = self
@@ -4823,13 +6031,21 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // P3：非稳态逃生检查 —— 超 T 且无进展（请求侧）/ 无块请求超阈值（应答侧）→
+        // 兜底解除非稳态并写冷却，防「非稳态永久悬挂 → delta/range 被长期暂停」。
+        self.nonsteady_escape_check();
         // A5：发送方 idle 看门狗 —— 每轮续传 tick 顺带清理过期的「正在服务」标记并复位方向。
         self.prune_idle_send_serving();
         let list = match self.delta_storage().bootstrap_list() {
             Ok(l) => l,
             Err(_) => return,
         };
-        let chunk_timeout = Duration::from_secs(self.config.bootstrap_chunk_timeout_secs.max(1));
+        // 批次O(O7)：在途块回收用**独立**的短超时（`bootstrap_chunk_wait_secs`，默认 60s）。
+        // 旧实现复用 `bootstrap_chunk_timeout_secs`（生产配 600s）⇒ 一个被丢弃的请求
+        // 要占住窗口槽 10 分钟才能回收，窗口 8 全满 + inflight 冻结 = 吞吐掉到
+        // ~8 块/2-3 分钟（.52/.53 2026-10-07 实测）。显式 NAK 已覆盖「对端忙」，
+        // 无回帧只可能是丢帧/会话卡顿，短超时回收重发是安全且必要的（幂等 upsert）。
+        let chunk_timeout = Duration::from_secs(self.config.bootstrap_chunk_wait_secs.max(1));
         for p in list {
             if p.phase == bootstrap::BootstrapPhase::Done || p.peer.len() != 20 {
                 continue;
@@ -4907,33 +6123,47 @@ impl SyncManager {
                     _ => continue,
                 };
                 if let Some(conn) = self.sessions.get_connection(&peer) {
-                    let mut cw = match self.chunk_windows.write().remove(&(peer, p.repo)) {
-                        Some(w) => w,
-                        None => continue,
-                    };
-                    let timed_out = cw.reap_timed_out(chunk_timeout);
-                    if !timed_out.is_empty() {
-                        warn!(
-                            "[bootstrap] 回收 {} 个超时在途块: peer={} repo={} blocks={:?}",
-                            timed_out.len(),
-                            peer,
-                            p.repo,
-                            timed_out
-                        );
-                    }
-                    // E2：窗口级空闲看门狗 —— 距最后一块落地超过阈值仍有在途块 → 回收重发。
+                    // 批次O(O3)：窗口状态在**单次临界区**内 in-place 变更（旧实现
+                    // `remove() → reap/fill → insert()` 中间夹着 `request_bootstrap_chunk().await`，
+                    // 与本 tick 并发到达的块响应互相覆盖状态，且同块被重复请求）。
                     let idle_timeout =
                         Duration::from_secs(self.config.bootstrap_window_idle_timeout_secs.max(1));
-                    let idle = cw.idle_reap(idle_timeout);
-                    if !idle.is_empty() {
+                    let (batch, timed_out_n, idle_n, idle_count, anchor, inflight_len) = {
+                        let mut map = self.chunk_windows.write();
+                        match map.get_mut(&(peer, p.repo)) {
+                            Some(cw) => {
+                                let timed_out = cw.reap_timed_out(chunk_timeout);
+                                let idle = cw.idle_reap(idle_timeout);
+                                let anchor = cw.first_inflight().unwrap_or(p.done_chunks as u32);
+                                // 批次O(O3)：退避未到期的块不会被 fill 重发（见 ChunkWindow::fill），
+                                // 参数 0 = 使用窗口自身的并发窗口配置。
+                                let batch = cw.fill(0);
+                                (
+                                    batch,
+                                    timed_out.len(),
+                                    idle.len(),
+                                    cw.idle_recovery_count(),
+                                    anchor,
+                                    cw.inflight_len() as u32,
+                                )
+                            }
+                            None => (Vec::new(), 0, 0, 0, p.done_chunks as u32, 0),
+                        }
+                    };
+                    if timed_out_n > 0 {
                         warn!(
-                            "[bootstrap] 窗口空闲看门狗：{}s 无新块落地，回收 {} 个在途块重发: peer={} repo={} blocks={:?} 恢复次数={}",
+                            "[bootstrap] 回收 {} 个超时在途块: peer={} repo={}",
+                            timed_out_n, peer, p.repo
+                        );
+                    }
+                    if idle_n > 0 {
+                        warn!(
+                            "[bootstrap] 窗口空闲看门狗：{}s 无新块落地，回收 {} 个在途块重发: peer={} repo={} 恢复次数={}",
                             self.config.bootstrap_window_idle_timeout_secs,
-                            idle.len(),
+                            idle_n,
                             peer,
                             p.repo,
-                            idle,
-                            cw.idle_recovery_count()
+                            idle_count
                         );
                     }
                     // 联邦同步通道状态：窗口空闲看门狗回收
@@ -4943,8 +6173,8 @@ impl SyncManager {
                         g.bootstrap.active = true;
                         g.bootstrap.peer_id = peer.0.iter().map(|b| format!("{:02x}", b)).collect();
                         g.bootstrap.repo = p.repo as u64;
-                        g.bootstrap.idle_recoveries = cw.idle_recovery_count();
-                        g.bootstrap.inflight = cw.inflight_len() as u32;
+                        g.bootstrap.idle_recoveries = idle_count;
+                        g.bootstrap.inflight = inflight_len;
                         g.bootstrap.phase = "transfer".to_string();
                         // E3：续传（我们在拉对端快照）→ 方向 recv。
                         g.bootstrap.direction = "recv".to_string();
@@ -4953,22 +6183,14 @@ impl SyncManager {
                     // **不再重拉清单**。旧实现此处 start_bootstrap，对端不可达时形成
                     // 重拉风暴；且空闲计数已在块成功落地（on_response）时归零，
                     // 能达到上限说明对端真不可达，重拉同清单毫无收益。
-                    if cw.idle_recovery_count()
-                        >= self.config.bootstrap_window_idle_max_retries.max(1)
-                    {
-                        let anchor = cw.first_inflight().unwrap_or(p.done_chunks as u32);
+                    if idle_count >= self.config.bootstrap_window_idle_max_retries.max(1) {
                         warn!(
                             "[bootstrap] 窗口连续 {} 次空闲无进展，按退避表推迟重发（不重拉清单）: peer={} repo={}",
-                            cw.idle_recovery_count(),
-                            peer,
-                            p.repo
+                            idle_count, peer, p.repo
                         );
                         self.record_chunk_transport_fail(&peer, p.repo, anchor);
-                        self.chunk_windows.write().insert((peer, p.repo), cw);
                         continue;
                     }
-                    let batch = cw.fill(0);
-                    self.chunk_windows.write().insert((peer, p.repo), cw);
                     for idx in batch {
                         self.request_bootstrap_chunk(&conn, p.repo, idx, &mf).await;
                     }
@@ -5241,6 +6463,24 @@ impl SyncManager {
         if !self.config.bootstrap_enabled {
             return;
         }
+        // preP35（P4-8）：同端 bootstrap 全局并发限 1 —— 任何 repo 已有进行中的
+        // 传输窗口时拒绝启动新 repo。实测 .52 在 repo=1 传输因 .53 重建清单而
+        // 超时/停滞时，active 标记被复位，协商每 ~60s 又启动 repo=2（每轮
+        // "向对端请求 repo=2 清单"），.53 同时服务两个 repo 的清单/块请求被
+        // 压爆（NAK busy、发送槽耗尽），done 卡 131 循环。chunk_windows 存在
+        // = 传输真实在途（不受 active 标记复位影响），竣工/窗口销毁后自然放行。
+        {
+            let map = self.chunk_windows.read();
+            if !map.is_empty() {
+                debug!(
+                    "[bootstrap] 已有在途传输窗口（{} 个），全局并发限 1，拒绝启动: peer={} repo={}",
+                    map.len(),
+                    peer,
+                    repo
+                );
+                return;
+            }
+        }
         // 活锁治理(任务2)：重拉熔断冷却期内拒绝发起 —— 所有触发路径（协商 / 巡检 /
         // resume 续传欠账 / 竣工对齐失败）的单点闸，冷却期内不产生任何清单请求。
         if self.bootstrap_repull_in_cooldown(&peer, repo) {
@@ -5318,7 +6558,12 @@ impl SyncManager {
         // 次且期间无任何块成功落地 → 熔断（error! + 置 inactive + 冷却）；任一块成功
         // 落地即清零。首次发起同样记账 ——「清单永远拉不回来」与「拉回来传不动」同属停滞。
         self.record_bootstrap_repull(&peer, repo);
-        let req = BootstrapManifestRequestMessage { repo };
+        // P2-2：此处为无测速路径（巡检触发/退避重拉），不携 T（None）——旧对端/旧行为兼容；
+        // 携 T 的申请由 handle_speed_probe_ack 完成。
+        let req = BootstrapManifestRequestMessage {
+            repo,
+            bootstrap_ttl_secs: None,
+        };
         // G2：发送超时兜底（复用 transport_write_timeout_secs）——绝不无限挂起。
         let send_res = tokio::time::timeout(
             Duration::from_secs(self.config.transport_write_timeout_secs.max(1)),
@@ -6543,8 +7788,8 @@ mod tests {
         );
     }
 
-    /// D批(D3)：竣工前对齐校验 `bootstrap_manifest_aligned`（finish_bootstrap 实际走的判定）——
-    /// 本地与远端清单同源 → true；本地表内容变化致远端末块 hash/rows 失配 → false。
+    /// D批(D3)/批次O(O2)：竣工前覆盖校验 `bootstrap_manifest_aligned`（finish_bootstrap 实际走的判定）——
+    /// 本端覆盖远端全部块区间（行数不少）→ true；本端在同区间内缺行（真缺失）→ false。
     /// false 时 finish_bootstrap 在写 phase=Done 之前 return（不抬水位/不清计数/不追尾）。
     #[tokio::test]
     async fn test_finish_bootstrap_alignment_gate() {
@@ -6575,7 +7820,7 @@ mod tests {
                 .await,
             "本地与远端清单同源时应判定对齐"
         );
-        // 再追加 300 行 → 末块(残块)边界/行数漂移，远端第 3 块与本地重建不一致 → 失配
+        // 再追加 300 行 → 本端在每个远端区间内的行数只增不减。
         {
             let conn = storage.connection();
             let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -6591,10 +7836,41 @@ mod tests {
                 .unwrap();
             }
         }
+        // 批次O(O2)：竣工口径改为「远端每个块区间在本端的行数 ≥ 其声明行数」，
+        // 因此本端**多出**行（NODE 是活表：爬虫持续写入、两端各自爬取）不再判为未对齐。
+        // 旧口径要求「按相同 chunk_rows 重建的本地清单逐块 hash/rows 全等」，边界漂移下
+        // 恒不成立 —— 正是「传完 → 竣工校验失败 → 重拉」死循环的根因。
+        // 作废摘要缓存（生产路径在块落地成功时自动作废）以强制重新扫描本端。
+        mgr.bootstrap_local_digests
+            .invalidate(repo_type::NODE, remote.chunk_rows);
         assert!(
-            !mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote)
+            mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote)
                 .await,
-            "本地表变化致远端末块 hash/rows 失配时应判定不对齐（finish_bootstrap 不写 Done）"
+            "本端多出行不得阻碍竣工（活表容忍），否则快照永远写不了 Done"
+        );
+        // 反向：远端快照取自更大的表（本端在同区间内缺行）→ 必须判未对齐。
+        let s_big = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = s_big.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..1250u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.0.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let remote_big =
+            bootstrap::build_repo_manifest_impl(&s_big, repo_type::NODE, 200, 1, 1).unwrap();
+        assert!(
+            !mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote_big)
+                .await,
+            "本端区间行数不足（真缺失）时必须判未对齐，防假竣工"
         );
     }
 
@@ -6603,7 +7879,8 @@ mod tests {
     ///     末块残 50 行），再追加 100 行使末块行数漂移 → 逐块全等必败，但本地行数已达
     ///     远端 95% → 宽松放行写 Done（不再死循环）。
     /// (ii) 假竣工兜底：远端清单 total_rows 远大于本地实际行数（本地仅 ~10%）→ 仍判 false。
-    /// (iii) NODE 静态表未被豁免：本地追加行致块漂移 → 严格全等仍判 false。
+    /// (iii) 批次O(O2)：NODE 也按「远端区间行数覆盖」判定 —— 本端多出行（活表写入）不判未对齐，
+    ///       本端区间缺行才判 false。
     #[tokio::test]
     async fn test_bootstrap_infohash_relaxed_finish() {
         use crate::federation::protocol::repo_type;
@@ -6669,7 +7946,7 @@ mod tests {
             "活表行数已达远端 95% → 宽松竣工应放行（不再死循环）"
         );
 
-        // (iii) NODE 静态表保持严格全等，未被宽松豁免。
+        // (iii) 批次O(O2)：NODE 亦按「远端区间行数覆盖」判定（边界无关），本端多出行不再判未对齐。
         {
             let conn = storage.connection();
             let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -6705,9 +7982,34 @@ mod tests {
             }
         }
         assert!(
-            !mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote_node)
+            mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote_node)
                 .await,
-            "NODE 静态表未被豁免：块漂移后严格全等必须 false"
+            "NODE 活表：本端多出行（爬虫持续写入）不得判未对齐，否则竣工校验死循环"
+        );
+        // 反向兜底：远端快照来自更大的表（本端区间缺行）→ 必须 false（防假竣工）
+        let s_big = Arc::new(crate::storage::Storage::memory().unwrap());
+        {
+            let conn = s_big.connection();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..1250u32 {
+                conn.execute(
+                    "INSERT INTO dht_nodes (id, ip, port, l2_shard, deleted_at) \
+                     VALUES (?1, ?2, ?3, 0, NULL)",
+                    rusqlite::params![
+                        vec![(i % 256) as u8; 20],
+                        format!("10.6.{}.{}", i / 256, i % 256),
+                        6881i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let remote_big =
+            bootstrap::build_repo_manifest_impl(&s_big, repo_type::NODE, 200, 0, 1).unwrap();
+        assert!(
+            !mgr.bootstrap_manifest_aligned(repo_type::NODE, &remote_big)
+                .await,
+            "本端区间缺行必须判未对齐"
         );
 
         // (ii) 假竣工兜底：独立 storage 仅 100 行，远端清单却报 1000 行（本地 ~10%）→ false。

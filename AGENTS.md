@@ -116,6 +116,43 @@ pdc/
 | 2026-10-05 | v1.6 | **选节点质量根治（20号方案批次1-4）**：预加载恒真过滤修复+真实 last_active 恢复；新近度分层选择+在飞去重+分层响应率观测；评分窗口化+mention 解耦+未验证先验分；判死阈值配置化+Bad 冷却复活。详见下节与 [20号文档](docs/architecture/20-crawler-node-selection-quality.md) |
 | 2026-10-05 | v1.7 | **发送链路重构落地（19号文档批次A-D）**：tid 扩宽 4 字节（分片路由改末字节）；paced 流式平滑发送默认启用（4 规划任务入队、消费者按预算出队，round 逃生）；响应率信号收尾（丢包窗口化+keepalive 分母）；/metrics 全量接线（17 个新指标族）+new_nodes_total+调度器真实指标。详见 [19号文档](docs/architecture/19-crawler-send-refactor.md) |
 | 2026-10-06 | v1.8 | **联邦风暴根治 + 遗留清单消化（批次G/I/J/K/M）**：bootstrap 熔断器；三 repo 重添加查 DB 守卫；同地址身份清退；PEER/INFOHASH DELETE 软删墓碑；RangePush2 分帧；优雅关闭 Goodbye；复探冷却+L0 窗口收窄；诊断计数器暴露；pnos-net 冷却粒度 (node_id,addr)+事件通道 1024。详见下节 |
+| 2026-10-07 | v1.9 | **bootstrap 通道修复（批次O，O2–O12）**：窗口状态并发丢失、NAK 立即重发风暴、按 index 对齐失效、清单重建重复触发/超租约、在途块回收超时过长、清单请求误触发 5 分钟让路、延迟 EWMA 永久节流闩锁、帧解码失败静默丢弃全部修复；RECLAIM 11.8GB 膨胀 WAL；修复测试环境配置编码。**未改线网格式**，两端可分别升级。详见下节与 [进度报告](artifacts/bootstrap-channel-fix-progress-2026-10-07.md) |
+
+## bootstrap 通道修复（2026-10-07，批次O 基准）
+
+> **完整进度报告（根因表 / 验证数据 / 运维发现 / 剩余瓶颈）**：[artifacts/bootstrap-channel-fix-progress-2026-10-07.md](artifacts/bootstrap-channel-fix-progress-2026-10-07.md)
+
+**故障形态（.52 ↔ .53 现网实测）**：`bootstrap` 长期停在 `done=9/3108`；28 分钟内 143,886 个块响应里**只有 218 个带数据**，其余全是对端 NAK（空 `entries`）；应答方 `bootstrap_send_in_flight` 钉在并发上限、请求方读池饥饿、`applied` 冻结。根因是**六条缺陷叠加**，逐条修复：
+
+1. **窗口状态并发丢失**（O3）：`handle_bootstrap_chunk_response` 旧实现在 `chunk_windows.remove()` 与 `insert()` 之间夹着落库 `spawn_blocking` 与 `sleep` 两个 await 点，而 dispatch 对每个入站帧都 `tokio::spawn` 一个 handler ⇒ 并发响应各自「取走→按 DB 进度重建→回插」，`received`/`attempts` 丢更新、同一块被反复请求、`done` 前缀倒退。现改为**单次无 await 临界区内 in-place 变更**（`bootstrap_resume_tick` 同步改造）。
+2. **NAK 立即重发 → 自激风暴**（O4/O6）：对端 NAK 的语义是「我忙/正在重建清单」，旧实现失败即 `fill()` 重发同一块，实测 ~90 次/秒、单块 ~9000 次。现在：失败块按**逐块指数退避**推迟（`ChunkWindow::defer_retry`），空 `entries`（显式 NAK）额外**暂停整个窗口**（`pause_for`，暂停期内 `fill` 不推进 `next_request`），并记入通道级退避；NAK 回落为**分原因限流 WARN** + `bootstrap_busy_naks` 计数（原为 debug 级，生产完全看不到，是本次长期无法定位的直接原因）。
+3. **按 index 对齐失效**（O2）：D批(D3) 的对齐把「两端各自按 chunk_rows 分块」的结果逐 index 比对，而块边界由**各自行数**推导 ⇒ 两端行集不同时边界整体错位，实测 6.02M vs 6.2M 只对上 **8/3108** 块（97% 本端已有数据被当缺失重拉）。现改为**按远端块声明的 `[lo,hi)` 区间**统计本端摘要（单遍归并扫描 + 逐块增量哈希），与边界漂移无关；竣工校验同步改为**区间行数覆盖**（本端每个远端区间行数 ≥ 其声明行数），活表（本端多出行）不再恒判失败。
+4. **清单重建重复触发/超租约**（O5）：应答方每次「缓存缺失」都要重建整份清单（6.2M 行），旧实现逐块发区间查询（3108 次）耗时 **192.8s**，远超 60s 重建租约 ⇒ 每 60s 再起一个全表扫描、互相抢读池、谁都跑不完，块请求持续被 NAK。现在：**分批读取 + 内存切块**（每 5 万行一次查询，~125 次；与逐块实现输出等价，有等价性单测）+ **真单飞**（重建完成才释放，仅超租约才夺取并告警），租约默认 60→300s。
+5. **在途块回收超时过长**（O7/O12）：回收复用 `bootstrap_chunk_timeout_secs`（生产配 600s）⇒ 一个丢帧请求占住窗口槽 10 分钟；新增独立 `bootstrap_chunk_wait_secs`，默认 **60→20s** —— 现网实测分块响应在高负载下会**成批丢失**（对端 `send_total` 增长而本端 `applied` 几乎不动），丢失成批时整窗要等回收才重发，故回收超时直接决定该场景吞吐（60→20s ≈ 3×）。
+6. **清单请求误触发 5 分钟让路**（O8）：`mark_bootstrap_serving` 原本在**清单请求**上也打标，而 `should_yield_bootstrap` 会让 node_id 较大的一方持续让路、截止每次刷新 `BOOTSTRAP_YIELD_HOLD_SECS=300s`；对端每 60s 问一次清单即可把该侧拉取**永久冻结**（且对端那次拉取常被方向守卫终止，属纯空转）。现在只在**分块请求**（真实数据拉取）上打标。
+7. **延迟 EWMA 闩锁 → 节点被永久节流**（O10，`storage/io_scheduler.rs`）：`pressure().level = max(队列压力, 延迟压力)`，延迟压力只看全局 `LATENCY_EWMA_US`，而该 EWMA **只在 writer 每批之后更新** ⇒ 一次慢突发（bootstrap 大块落库）把它抬到十几秒后，level 钉在 1.0 → `TaskScheduler 让路` → 写入变少 → 新样本变少 → EWMA 只能随样本缓慢回落，节点长时间停摆（实测 .52：`queue_rows=0`、`level=1.0`、`crawl=0/8`/`federation=0/8`、53 个任务排队无人在飞、API 15s 超时，**只能靠重启恢复**）。现在 EWMA 记录采样时刻并按「每 5s 折半」自行衰减（`io_batch_latency_ewma_us_fresh`，纯函数 `decay_ewma_us` 有单测）：真实突发仍会被新样本立刻抬高（保护不变），突发过后 level 能自行回落、调度器自愈。
+8. **帧解码失败静默丢弃**（O11，`federation/dispatch.rs`）：20 处 `if let Ok(msg) = bincode::deserialize(...)` 没有 `else` 分支 —— 帧**到达但无法反序列化**时无日志、无计数，排查时无法区分「对端没发」与「发了但解码失败」。现在 4 个 bootstrap 分支带 `Err` 分支 → 计数 + 限流 WARN（首次与每 16 次），并在 `/api/v1/io/status` 暴露 `federation_frame_decode_errors`。
+
+**新增/变更配置**（全部带 `#[serde(default)]`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `federation.bootstrap_window_size` | 16→**8** | 请求方并发窗口；必须 ≤ 应答方 `bootstrap_send_concurrency` 的一半 |
+| `federation.bootstrap_send_concurrency` | 4→**16** | 应答方同时在途发送数（旧配比 16 窗口 vs 4 并发必然打满并 NAK） |
+| `federation.bootstrap_send_permit_wait_ms` | 500 | 拿不到发送槽时的等待时长，超时才回 busy NAK（排队发生在加载 entries 之前，内存上界不变） |
+| `federation.bootstrap_nak_log_interval_secs` | 30 | NAK 原因限流汇总日志间隔 |
+| `federation.bootstrap_rebuild_lease_secs` | 60→**300** | 清单重建单飞租约（必须显著大于一次全表重建耗时） |
+| `federation.bootstrap_chunk_wait_secs` | 60→**20** | 在途块回收超时（与请求发送超时解耦）；丢帧场景下的吞吐开关（成批丢帧发生时整窗要等回收才重发） |
+
+**观测**：`/api/v1/io/status` 新增 `bootstrap_busy_naks`（应答方被压满的累计次数）与 `federation_frame_decode_errors`（帧解码失败累计）。
+
+**验证状态**：`cargo test --all` 629 passed；`cargo clippy --all-targets -- -D warnings` 零告警；新增单测覆盖「按区间对齐优于按 index 对齐」「区间覆盖校验拒假竣工」「边界指纹」「摘要缓存」「分批切块与逐块实现等价」「延迟 EWMA 时间衰减」。
+
+**遗留（下一轮）**：分块传输**端到端吞吐**仍偏慢且呈「突发—停顿」形态，未达一次性连续跑完。已定位三条叠加因素：① 首次收敛必须由应答方做一次全表重建（分批切块后仍 **~195s / 6.2M 行**）+ 请求方一次区间摘要扫描（缓存命中后不再重复）；② 请求方 `.52` 在 bootstrap 大块落库期间会把写延迟 EWMA 抬高（O10 已让 level 能自愈，但物理盘确实慢）；③ 分块响应在双端高负载下疑似被丢弃/排队（O11 已能区分「没发」与「解码失败」，下一次现网数据即可定性；若确为丢弃，根因在 pnos-net 会话层，见 v9 遗留 #6「接收端背压：`receive_pending_threshold` 无消费方」）。
+
+**运维发现（2026-10-07）**：`.52` 的 `pdc.db-wal` 曾涨到 **11.8GB**（DB 本体 1.19GB）。经离线 `wal_checkpoint(TRUNCATE)` 验证：WAL 内**待检查点帧为 0**（`0|0|0`），即纯粹是「PASSIVE 稳态检查点从不截断文件 + 每小时 TRUNCATE 任务被 Persistence 槽饥饿」造成的**文件长度膨胀**，不是积压数据；删除 WAL（节点已停时）安全且立即回收 11.8GB。另：`.52` 曾出现**全局停摆**（`crawl=0/8`/`federation=0/8`、53 个任务排队无人在飞、API 15s 超时、多数任务 `槽位泄漏 >450s`），重启即恢复 —— 与 O10 描述的节流闩锁同源。
+
+**配置编码是硬约束（2026-10-07 现场踩坑）**：`config/config.yaml` **必须是 UTF-8**。用 PowerShell `Set-Content`（默认 ANSI/GBK）编辑含中文注释的配置后，文件变成非 UTF-8 → 启动日志 `解析配置文件失败 … stream did not contain valid UTF-8` → **整份配置静默退回默认值**（现场 `.53` 因此以默认 `bootstrap_chunk_rows=20000` 起了 312 块清单、单块约 1.4MB，吞吐与预期完全不符）。改配置请用 `Set-Content -Encoding UTF8` 或 .NET `UTF8Encoding($false)`；测试环境配置文件已重写为纯 ASCII，并在启动日志中确认「已从 … 加载配置」。
 
 ## 联邦风暴根治与遗留消化（2026-10-06，批次G-M 基准）
 

@@ -1,0 +1,71 @@
+total=1802
+05:42:16.121834Z  INFO [main] C1 磁盘画像: class=SSD fsync_p50=0.89ms rand_seq_ratio=0.30
+05:42:19.002224Z  INFO [crawler] 启动预热（加载最多 100000 节点，并行 bootstrap 8 个）...
+05:42:21.340358Z  INFO [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+05:42:22.338381Z  INFO [dht] 初始化 DHT 节点，连接 8 个 bootstrap 节点
+05:43:09.093640Z  INFO [crawler] 预热: 向 2 个 bootstrap 地址发送了 find_node
+05:43:09.093671Z  INFO [crawler] 向 2 个 bootstrap 地址发送了 find_node
+05:43:33.444956Z  INFO [crawler] 分层响应率: L0已验证 0/0 L1新鲜 0/0 探索 0/192（300s窗口 响应增量/选中）
+05:43:45.434306Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 36s）
+05:43:45.438307Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:44:12.532685Z  INFO [crawler] 分层响应率: L0已验证 0/0 L1新鲜 0/0 探索 0/384（300s窗口 响应增量/选中）
+05:44:45.440523Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 96s）
+05:44:45.440631Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:44:45.441025Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:44:45.445846Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:44:49.532027Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入262 − 释放260 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 24s)
+05:44:50.631527Z  INFO [crawler] 分层响应率: L0已验证 0/3 L1新鲜 0/0 探索 0/573（300s窗口 响应增量/选中）
+05:45:10.341417Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:45:25.647719Z  INFO [crawler] 分层响应率: L0已验证 0/5 L1新鲜 0/0 探索 0/763（300s窗口 响应增量/选中）
+05:45:45.531285Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 156s）
+05:45:45.531421Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:45:45.531703Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:45:45.535090Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:45:45.538236Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+05:46:39.752142Z  INFO [crawler] 分层响应率: L0已验证 0/5 L1新鲜 0/134 探索 0/821（300s窗口 响应增量/选中）
+05:46:49.533320Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 220s）
+05:46:49.533456Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:46:49.533812Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:46:49.540795Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:46:49.545499Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+05:47:11.846083Z  INFO [crawler] 分层响应率: L0已验证 0/5 L1新鲜 0/134 探索 0/1013（300s窗口 响应增量/选中）
+05:47:43.946849Z  INFO [crawler] 分层响应率: L0已验证 0/5 L1新鲜 0/134 探索 0/1205（300s窗口 响应增量/选中）
+05:47:54.536930Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 285s）
+05:47:54.537205Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:47:54.537641Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:47:54.567361Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:47:54.570805Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+05:48:15.035753Z  INFO [crawler] 分层响应率: L0已验证 0/6 L1新鲜 0/147 探索 0/1205（300s窗口 响应增量/选中）
+05:48:54.054799Z  INFO [crawler] 分层响应率: L0已验证 0/6 L1新鲜 0/281 探索 0/1071（300s窗口 响应增量/选中）
+05:48:55.542641Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 346s）
+05:48:55.542736Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:48:55.543036Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:48:55.545666Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:48:55.549368Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+05:49:30.144788Z  INFO [crawler] 分层响应率: L0已验证 0/7 L1新鲜 0/308 探索 0/1043（300s窗口 响应增量/选中）
+05:49:44.643892Z  INFO [bootstrap] E1 运行时差异复检超 D2 阈值 local=6041736 remote=6259303 → 重触发 bootstrap: peer=22335aa9 repo=1
+05:50:00.633317Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 411s）
+05:50:00.633448Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:50:00.637957Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:50:04.241240Z  INFO [crawler] 分层响应率: L0已验证 0/4 L1新鲜 0/319 探索 0/1035（300s窗口 响应增量/选中）
+05:50:36.339101Z  INFO [crawler] 分层响应率: L0已验证 0/2 L1新鲜 0/320 探索 0/1015（300s窗口 响应增量/选中）
+05:50:57.447466Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+05:51:01.643980Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 472s）
+05:51:01.644148Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:51:01.644510Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:51:01.647827Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:51:10.350307Z  INFO [crawler] 分层响应率: L0已验证 0/4 L1新鲜 0/452 探索 0/1073（300s窗口 响应增量/选中）
+05:51:40.452191Z  INFO [crawler] 分层响应率: L0已验证 0/4 L1新鲜 0/349 探索 0/1176（300s窗口 响应增量/选中）
+05:52:01.647841Z  INFO [negotiate] 已发送协商请求 to=22335aa9（存活 532s）
+05:52:01.647972Z  INFO [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:52:01.648365Z  INFO [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:52:01.652859Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:52:01.655238Z  INFO [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+05:52:10.589432Z  INFO [crawler] 分层响应率: L0已验证 0/4 L1新鲜 0/352 探索 0/1176（300s窗口 响应增量/选中）
+05:52:47.648283Z  INFO [crawler] 分层响应率: L0已验证 0/4 L1新鲜 0/486 探索 0/850（300s窗口 响应增量/选中）
+05:53:02.739989Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [negotiate] 已发送协商请求 to=22335aa9（存活 594s）
+05:53:02.740340Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [negotiate] 执行快照策略：启动 bootstrap peer=22335aa9 repo=1（协商裁定=true，欠账=20392，gap=false）
+05:53:02.740812Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 向 22335aa9 请求 repo=1 清单
+05:53:02.746750Z  INFO [negotiate] 收到协商结果 from=22335aa9: r1=2 r2=1 r3=1 r4=1
+05:53:02.751436Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 清单申请被拒 Nak(reason=3) to=22335aa9 repo=1，不进非稳态，等下一轮协商/巡检重触发
+05:53:22.748881Z  INFO [crawler] 分层响应率: L0已验证 0/3 L1新鲜 0/473 探索 0/1042（300s窗口 响应增量/选中）

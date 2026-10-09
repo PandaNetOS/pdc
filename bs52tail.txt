@@ -1,0 +1,73 @@
+total=517
+06:35:32.254122Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 重拉进度继承（任务3）：旧进度 done=77 按 index 继承（新清单 3126 块，差异 ≤2%）: peer=22335aa9 repo=1
+06:35:32.254156Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 断点继承/对齐验证（来源 last_key）verified_done=77/3126 跳过/继承块=77: peer=22335aa9 repo=1
+06:35:32.269361Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 收到清单 from=22335aa9: 总行=6261313, 块数=3126, w0=10155807, 续传前缀=77, hash一致跳过块=77
+06:35:32.269425Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 窗口化传输启动: peer=22335aa9 repo=1 块数=3126 窗口=8 首批=8
+06:35:33.366779Z  INFO [task_scheduler] 调度器心跳: 队列待执行=52, 运行中[crawl=1/8, persistence=0/1, monitor=0/2, network=1/4, federation=0/8, tracker=0/2], 在飞=2（准入260 − 释放258 − 回收0）, 最老在飞=爬虫Bootstrap(Crawl 29s)
+06:35:40.661629Z  INFO [crawler][probe] get_peers 发送耗时 3ms（select 后总计 4ms）
+06:35:40.661648Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:35:49.159340Z  WARN [crawler] bootstrap 执行超过 45s，本轮中止释放槽位
+06:35:51.364944Z  INFO [crawler][probe] sample 发送耗时 2ms
+06:35:51.364963Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:35:58.561527Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 4ms）
+06:35:58.561548Z  INFO [crawler] 分层响应率: L0已验证 0/14 L1新鲜 0/13 探索 0/738（300s窗口 响应增量/选中）
+06:36:01.767252Z  INFO [crawler][probe] get_peers 发送耗时 0ms（select 后总计 1ms）
+06:36:01.767271Z  INFO [crawler] 主动 get_peers: 向 1 节点发送了 10 infohash 查询
+06:36:32.333219Z  WARN [bootstrap] 块 77 apply 任务 join 失败（按空块处理）: task 1949 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:814）"
+06:36:32.333254Z  WARN [bootstrap] 块 77 传输校验失败（声明 2001 行 / 实收 0 行），保持进度 done=77/3126
+06:36:32.333275Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=77
+06:36:32.419118Z  WARN [bootstrap] 块 80 apply 任务 join 失败（按空块处理）: task 1952 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:814）"
+06:36:32.419152Z  WARN [bootstrap] 块 80 传输校验失败（声明 2004 行 / 实收 0 行），保持进度 done=77/3126
+06:36:32.419172Z  WARN [bootstrap] 块 83 apply 任务 join 失败（按空块处理）: task 1955 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:814）"
+06:36:32.419191Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=80
+06:36:32.419201Z  WARN [bootstrap] 块 83 传输校验失败（声明 2008 行 / 实收 0 行），保持进度 done=77/3126
+06:36:32.419216Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=83
+06:36:32.440025Z  WARN [bootstrap] 块 81 apply 任务 join 失败（按空块处理）: task 1958 panicked with message "长查询并发门等待超时（>60s 无许可，疑似被常驻长查询占满），调用方按失败重试（caller=src\\storage\\db.rs:814）"
+06:36:32.440053Z  WARN [bootstrap] 块 81 传输校验失败（声明 2007 行 / 实收 0 行），保持进度 done=77/3126
+06:36:32.440067Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=81
+06:36:38.568370Z  INFO [crawler][probe] crawl 发送耗时 0ms（select 后总计 1ms）
+06:36:38.568558Z  INFO [crawler] 分层响应率: L0已验证 0/18 L1新鲜 0/13 探索 0/738（300s窗口 响应增量/选中）
+06:36:59.872884Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 10ms）
+06:36:59.872906Z  INFO [crawler] 主动 get_peers: 向 92 节点发送了 10 infohash 查询
+06:37:01.467721Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:37:01.467741Z  INFO [crawler] 主动 sample_infohashes: 向 91 节点发送了请求
+06:37:18.664654Z  INFO [crawler][probe] crawl 发送耗时 3ms（select 后总计 6ms）
+06:37:18.664681Z  INFO [crawler] 分层响应率: L0已验证 0/22 L1新鲜 0/143 探索 0/796（300s窗口 响应增量/选中）
+06:37:26.031383Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 65ms）
+06:37:26.031431Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:37:31.567352Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:37:31.567374Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:37:55.062401Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 4ms）
+06:37:55.062418Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:37:58.768925Z  INFO [crawler][probe] crawl 发送耗时 4ms（select 后总计 7ms）
+06:37:58.768948Z  INFO [crawler] 分层响应率: L0已验证 0/22 L1新鲜 0/277 探索 0/854（300s窗口 响应增量/选中）
+06:38:03.667081Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:38:03.667100Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:38:24.160897Z  INFO [crawler][probe] get_peers 发送耗时 4ms（select 后总计 6ms）
+06:38:24.160971Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:38:36.876392Z  INFO [crawler][probe] crawl 发送耗时 3ms（select 后总计 11ms）
+06:38:36.876412Z  INFO [crawler] 分层响应率: L0已验证 0/26 L1新鲜 0/407 探索 0/912（300s窗口 响应增量/选中）
+06:38:37.772384Z  INFO [crawler][probe] sample 发送耗时 2ms
+06:38:37.772406Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:38:47.169831Z  INFO [crawler][probe] get_peers 发送耗时 4ms（select 后总计 8ms）
+06:38:47.169860Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:39:10.876897Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:39:10.876923Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:39:13.268228Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 9ms）
+06:39:13.268259Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:39:14.965245Z  INFO [crawler][probe] crawl 发送耗时 3ms（select 后总计 6ms）
+06:39:14.965267Z  INFO [crawler] 分层响应率: L0已验证 0/26 L1新鲜 0/541 探索 0/970（300s窗口 响应增量/选中）
+06:39:40.428752Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 60ms）
+06:39:40.428775Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:39:46.068077Z  INFO [crawler][probe] crawl 发送耗时 2ms（select 后总计 4ms）
+06:39:46.068095Z  INFO [crawler] 分层响应率: L0已验证 0/59 L1新鲜 0/625 探索 0/661（300s窗口 响应增量/选中）
+06:39:46.964170Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:39:46.964184Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:40:08.459623Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 4ms）
+06:40:08.459645Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询
+06:40:18.974674Z  INFO [crawler][probe] sample 发送耗时 1ms
+06:40:18.974696Z  INFO [crawler] 主动 sample_infohashes: 向 128 节点发送了请求
+06:40:19.173586Z  INFO [crawler][probe] crawl 发送耗时 5ms（select 后总计 7ms）
+06:40:19.173611Z  INFO [crawler] 分层响应率: L0已验证 0/62 L1新鲜 0/756 探索 0/719（300s窗口 响应增量/选中）
+06:40:29.569505Z  INFO [crawler][probe] get_peers 发送耗时 2ms（select 后总计 4ms）
+06:40:29.569526Z  INFO [crawler] 主动 get_peers: 向 128 节点发送了 10 infohash 查询

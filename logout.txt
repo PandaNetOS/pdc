@@ -1,0 +1,11 @@
+02:27:16.894679Z  INFO [bootstrap] 收到清单 from=22335aa9: 总行=6231564, 块数=3116, w0=10134676, 续传前缀=31, hash一致跳过块=31
+02:28:15.641435Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=31
+02:28:15.649444Z  WARN endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=36
+02:28:15.657244Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=33
+02:28:15.664392Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=32
+02:28:15.672241Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=35
+02:28:15.679609Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=37
+02:28:15.687456Z  WARN [bootstrap] 对端 NAK（空块：busy 或正在重建清单），窗口暂停 30s 后重试: peer=22335aa9 repo=1 index=38
+02:31:34.375548Z  INFO [bootstrap] 收到清单 from=22335aa9: 总行=6241132, 块数=3121, w0=10143819, 续传前缀=31, hash一致跳过块=31
+04:16:34.081741Z  INFO [bootstrap] 收到清单 from=22335aa9: 总行=6250807, 块数=3126, w0=10149534, 续传前缀=53, hash一致跳过块=53
+04:52:09.814658Z  INFO endpoint{[3mid[0m[2m=[0m9669f68e82}: [bootstrap] 收到清单 from=22335aa9: 总行=6254170, 块数=3126, w0=10151772, 续传前缀=61, hash一致跳过块=61

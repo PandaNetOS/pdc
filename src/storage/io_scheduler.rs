@@ -168,8 +168,12 @@ static ADAPTIVE_CFG: OnceLock<AdaptiveCfg> = OnceLock::new();
 static IMPORT_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 /// 窗口内当前每 tick 预算上限（行；AIMD 动态调整，下限 = base）。
 static IMPORT_BUDGET: AtomicUsize = AtomicUsize::new(0);
-/// 每批实测耗时的 EWMA（微秒；仅用于观测 / 指标快照）。
+/// 每批实测耗时的 EWMA（微秒；仅用于观测 / 指标快照 / 背压）。
 static LATENCY_EWMA_US: AtomicU64 = AtomicU64::new(0);
+/// 批次O(O10)：最近一次延迟采样的**进程内单调时刻**（毫秒；0 = 从未采样）。
+///
+/// 用于让延迟 EWMA 随时间**自行衰减**，见 [`io_batch_latency_ewma_us_fresh`]。
+static LATENCY_EWMA_AT_MS: AtomicU64 = AtomicU64::new(0);
 /// 连续"足够快"批次数（加法增窗的门槛计数）。
 static FAST_STREAK: AtomicU32 = AtomicU32::new(0);
 /// writer_loop 公布的稳态每 tick 基准行数（refresh 时据此把预算重置为
@@ -241,6 +245,60 @@ pub fn io_batch_latency_ewma_us() -> u64 {
     LATENCY_EWMA_US.load(AtomicOrdering::Acquire)
 }
 
+/// 批次O(O10)：延迟 EWMA 的**时间衰减步长**（毫秒）——每过该时长未更新即折半。
+// [ALLOWED-HARDCODED: 衰减步长常量，非业务可调参数]
+const LATENCY_EWMA_DECAY_STEP_MS: u64 = 5_000;
+
+/// 进程内单调毫秒（EWMA 陈旧/衰减判定用，不受系统时钟调整影响）。
+fn mono_ms() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// 批次O(O10)：EWMA 按「每 `step_ms` 折半」衰减（纯函数，便于单测）。
+fn decay_ewma_us(cur_us: u64, elapsed_ms: u64) -> u64 {
+    if elapsed_ms < LATENCY_EWMA_DECAY_STEP_MS {
+        return cur_us;
+    }
+    let steps = (elapsed_ms / LATENCY_EWMA_DECAY_STEP_MS).min(32) as i32;
+    (cur_us as f64 * 0.5f64.powi(steps)) as u64
+}
+
+/// 批次O(O10)：供背压计算使用的延迟 EWMA —— **随时间自行衰减**。
+///
+/// 为什么必须衰减：`pressure().level = max(队列压力, 延迟压力)`，而延迟压力只看全局
+/// EWMA，EWMA 又只在 writer 每批之后更新 ⇒ 一次慢突发（如 bootstrap 大块落库）把它抬到
+/// 十几秒后，level 钉在 1.0 → TaskScheduler 让路 → **写入变少 → 新样本变少 → EWMA 只能
+/// 随样本缓慢回落**，节点被长时间节流（实测 .52 2026-10-07：队列为空、`level=1.0`、
+/// `crawl=0/8`/`federation=0/8`、53 个任务排队却无人在飞、API 15s 超时；重启才能恢复）。
+/// 现在：没有新样本时每 5s 折半 —— 真实突发仍会被新样本立刻抬高（保护不变），
+/// 突发过去后 level 能自行回落、调度器自愈。
+pub fn io_batch_latency_ewma_us_fresh() -> u64 {
+    let at = LATENCY_EWMA_AT_MS.load(AtomicOrdering::Acquire);
+    if at == 0 {
+        // 从未采样（测试/纯读场景）：维持原语义，不做衰减。
+        return LATENCY_EWMA_US.load(AtomicOrdering::Acquire);
+    }
+    let now = mono_ms();
+    let cur = LATENCY_EWMA_US.load(AtomicOrdering::Acquire);
+    let decayed = decay_ewma_us(cur, now.saturating_sub(at));
+    if decayed != cur {
+        let _ = LATENCY_EWMA_US.compare_exchange(
+            cur,
+            decayed,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+        let _ = LATENCY_EWMA_AT_MS.compare_exchange(
+            at,
+            now,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+    decayed
+}
+
 /// 观测一批耗时，按 α 做 EWMA（纯函数：返回新 EWMA，便于单测）。
 fn next_latency_ewma_us(prev_ewma_us: u64, sample_us: u64, alpha: f32) -> u64 {
     if prev_ewma_us == 0 {
@@ -296,6 +354,8 @@ fn observe_and_adaptive_tick(elapsed: Duration, window_active: bool) {
         next_latency_ewma_us(prev, sample_us, cfg.alpha),
         AtomicOrdering::Release,
     );
+    // 批次O(O10)：记录采样时刻，供背压做「无新样本则随时间衰减」判定。
+    LATENCY_EWMA_AT_MS.store(mono_ms(), AtomicOrdering::Release);
 
     if !window_active {
         return;
@@ -695,7 +755,9 @@ impl IoScheduler {
             (rows - low_r) / (high_r - low_r)
         };
 
-        let lat_us = io_batch_latency_ewma_us() as f32;
+        // 批次O(O10)：用**随时间衰减**的 EWMA 计算延迟压力，避免一次慢突发把 level
+        // 长期钉在 1.0（进而让 TaskScheduler 让路、写入进一步变少、EWMA 更难回落）。
+        let lat_us = io_batch_latency_ewma_us_fresh() as f32;
         let target = self.config.latency_target_us as f32;
         let slow = self.config.latency_slow_us as f32;
         let p_l = if slow <= target || target <= 0.0 || lat_us <= target {
@@ -950,8 +1012,15 @@ impl IoScheduler {
         samples.retain(|s| s.timestamp >= cutoff);
     }
 
-    /// 批量执行写入（单事务）
+    /// 批量执行写入（**分批事务**：FLUSH_BATCH_ROWS=5000 行/批，写锁持有毫秒级）。
+    ///
+    /// 原实现整批单事务（rows_per_tick 可达 1.8 万行）：一次 commit 全量 fsync、
+    /// 长持 SQLite 写锁（秒级），与读池/长查询池争锁时放大互锁窗口。
+    /// 拆 5000 行/批：单事务毫秒级完成、锁粒度小；本批失败只回滚本批，
+    /// 已提交批不受影响，避免大事务整批作废。
     fn execute_batch(&self, batch: &mut Vec<HeapEntry>, priority: IoPriority) {
+        const FLUSH_BATCH_ROWS: usize = 5000;
+
         let count = batch.len();
         if count == 0 {
             return;
@@ -966,54 +1035,68 @@ impl IoScheduler {
             }
         };
 
-        // 开启事务
-        let tx = match conn.unchecked_transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                tracing::warn!("[io_scheduler] 事务开启失败: {}", e);
-                return;
+        let mut executed = 0usize;
+        let mut batches = 0usize;
+        let mut max_slice = 0usize;
+        // 分批事务：每 FLUSH_BATCH_ROWS 行一个独立事务（锁持有毫秒级）
+        while !batch.is_empty() {
+            let slice_len = batch.len().min(FLUSH_BATCH_ROWS);
+            if slice_len > max_slice {
+                max_slice = slice_len;
             }
-        };
+            let slice: Vec<HeapEntry> = batch.drain(..slice_len).collect();
 
-        // 依次执行每个请求的 payload
-        // 单个 payload panic 不得穿出 writer_loop（否则该 task 终结、连接锁中毒），
-        // 也不得带着半提交状态继续 commit —— 出现 panic 时整批回滚。
-        let mut degraded = false;
-        for entry in batch.drain(..) {
-            let payload = entry.request.payload;
-            let tx_ref: &Connection = &tx;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| payload(tx_ref)));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!("[io_scheduler] 写入失败: {}", e),
-                Err(_) => {
-                    tracing::error!("[io_scheduler] payload panic，本批事务回滚");
-                    degraded = true;
+            // 开启事务
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::warn!("[io_scheduler] 事务开启失败: {}", e);
                     break;
                 }
-            }
-        }
+            };
 
-        // 提交事务
-        if degraded {
-            drop(tx); // Transaction 的 Drop 会回滚
-        } else if let Err(e) = tx.commit() {
-            tracing::warn!("[io_scheduler] 事务提交失败: {}", e);
+            // 依次执行本批 payload；panic 只回滚本批，不穿出 writer_loop
+            let mut degraded = false;
+            for entry in slice {
+                let payload = entry.request.payload;
+                let tx_ref: &Connection = &tx;
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| payload(tx_ref)));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("[io_scheduler] 写入失败: {}", e),
+                    Err(_) => {
+                        tracing::error!("[io_scheduler] payload panic，本批事务回滚");
+                        degraded = true;
+                        break;
+                    }
+                }
+            }
+
+            if degraded {
+                drop(tx); // Transaction 的 Drop 会回滚
+                break;
+            } else if let Err(e) = tx.commit() {
+                tracing::warn!("[io_scheduler] 事务提交失败: {}", e);
+                break;
+            }
+            executed += slice_len;
+            batches += 1;
         }
 
         // 更新统计
         let mut stats = self.stats.lock();
-        stats.total_executed += count as u64;
-        stats.total_batches += 1;
-        if count > stats.max_batch_size {
-            stats.max_batch_size = count;
+        stats.total_executed += executed as u64;
+        stats.total_batches += batches as u64;
+        if max_slice > stats.max_batch_size {
+            stats.max_batch_size = max_slice;
         }
         // 统一按“条数”口径统计，避免与 Normal/Background 量纲不一致
         match priority {
-            IoPriority::Critical => stats.critical_executed += count as u64,
-            IoPriority::Important => stats.important_executed += count as u64,
-            IoPriority::Normal => stats.normal_executed += count as u64,
-            IoPriority::Background => stats.background_executed += count as u64,
+            IoPriority::Critical => stats.critical_executed += executed as u64,
+            IoPriority::Important => stats.important_executed += executed as u64,
+            IoPriority::Normal => stats.normal_executed += executed as u64,
+            IoPriority::Background => stats.background_executed += executed as u64,
         }
     }
 
@@ -1241,13 +1324,29 @@ pub struct IoStatusSnapshot {
     pub bootstrap_send_total: u64,
     /// 触发熔断、暂停 bootstrap 发送的对端数。
     pub bootstrap_send_circuit_open_peers: usize,
+    /// 批次O(O4)：因发送槽满而回 busy NAK 的累计次数（应答方被压满的证据）。
+    pub bootstrap_busy_naks: u64,
+    /// 批次O(O11)：联邦帧解码失败累计次数（帧到达但无法反序列化；原为静默丢弃）。
+    pub federation_frame_decode_errors: u64,
     // ─── E6：读连接池观测（进程级静态，见 crate::storage::db）───
     /// 当前可用（未借出）的只读连接数。
     pub read_pool_available: usize,
     /// 读池配置大小（= READ_POOL_SIZE）。
     pub read_pool_total: usize,
-    /// 读池空、回退写连接取数的累计次数（池饥饿信号）。
+    /// 读池空、排队等待归还的累计次数（池饥饿信号）。
     pub read_pool_starved: u64,
+    /// P4-2：进行中的长查询数（全表扫描级）
+    pub long_query_active: usize,
+    /// P4-2：长查询等待限流许可的累计次数
+    pub long_query_waits: u64,
+    /// P4-2：长查询并发上限（= LONG_QUERY_CONCURRENCY，监控面板显示「活跃/上限」用）
+    pub long_query_total: usize,
+    /// P4-2：长查询独立连接池可用连接数（= LONG_POOL_SIZE - 已借出）
+    pub long_pool_available: usize,
+    /// L1-⑬：长查询累计执行次数（单调递增，面板看活跃度）
+    pub long_query_total_ops: u64,
+    /// L1-⑬：短查询累计执行次数（单调递增，面板看活跃度）
+    pub short_query_total_ops: u64,
 }
 
 /// B4：统计快照的可序列化投影。
@@ -1368,10 +1467,24 @@ pub fn io_status_snapshot(
         bootstrap_send_total: crate::federation::sync::bootstrap_send_total(),
         bootstrap_send_circuit_open_peers:
             crate::federation::sync::bootstrap_send_circuit_open_peers(),
+        bootstrap_busy_naks: crate::federation::sync::bootstrap_busy_naks(),
+        federation_frame_decode_errors: crate::federation::dispatch::frame_decode_errors(),
         // E6：读连接池进程级观测（见 crate::storage::db 的静态读取函数）。
+        // P4-3（B）：read_pool_available 内部顺带巡检借出登记表（抓泄漏现行）。
         read_pool_available: crate::storage::db::read_pool_available(),
         read_pool_total: crate::storage::db::read_pool_total(),
         read_pool_starved: crate::storage::db::read_pool_starved(),
+        // P4-3（B）：长查询池借出登记巡检（抓 long_pool 泄漏现行）。
+        long_query_active: {
+            crate::storage::db::long_pool_scan();
+            crate::storage::db::long_query_active()
+        },
+        long_query_waits: crate::storage::db::long_query_waits(),
+        long_query_total: crate::storage::db::long_query_total(),
+        long_pool_available: crate::storage::db::long_pool_available(),
+        // L1-⑬：查询累计执行次数（单调递增，面板看活跃度）
+        long_query_total_ops: crate::storage::db::long_query_total_ops(),
+        short_query_total_ops: crate::storage::db::short_query_total_ops(),
     }
 }
 
@@ -1861,6 +1974,29 @@ mod tests {
         );
     }
 
+    /// 批次O(O10)：延迟 EWMA 的时间衰减 —— 慢突发过后 level 必须能自行回落，
+    /// 否则 TaskScheduler 永久让路（写入变少 → 样本变少 → EWMA 更难回落）。
+    #[test]
+    fn test_latency_ewma_decays_with_time() {
+        // 未到步长：不动
+        assert_eq!(decay_ewma_us(14_000_000, 0), 14_000_000);
+        assert_eq!(decay_ewma_us(14_000_000, 4_999), 14_000_000);
+        // 一个步长：折半
+        assert_eq!(decay_ewma_us(14_000_000, 5_000), 7_000_000);
+        // 两个步长：四分之一
+        assert_eq!(decay_ewma_us(14_000_000, 10_000), 3_500_000);
+        // 五个步长：低于 0.5s 量级（14s → 0.4375s → 不再构成延迟压力）
+        assert_eq!(decay_ewma_us(14_000_000, 25_000), 437_500);
+        // 单调不增 + 收敛到 0（步数上限）
+        let mut prev = u64::MAX / 2;
+        for ms in (0..200_000).step_by(5_000) {
+            let cur = decay_ewma_us(14_000_000, ms);
+            assert!(cur <= prev, "衰减必须单调不增");
+            prev = cur;
+        }
+        assert_eq!(decay_ewma_us(14_000_000, 5_000 * 64), 0);
+    }
+
     #[tokio::test]
     async fn test_pressure_takes_max() {
         // 手动构造 queue_rows 与 latency 各一侧，验证 level = max
@@ -2085,6 +2221,8 @@ mod tests {
             "bootstrap_send_failures_total",
             "bootstrap_send_total",
             "bootstrap_send_circuit_open_peers",
+            "bootstrap_busy_naks",
+            "federation_frame_decode_errors",
         ] {
             assert!(v.get(k).is_some(), "缺少 E1 字段: {}", k);
         }

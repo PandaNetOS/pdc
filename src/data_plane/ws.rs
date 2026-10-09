@@ -23,8 +23,10 @@ const DEFAULT_UTP_REPORT_PORT: u16 = 6883;
 const DEFAULT_TCP_PEX_REPORT_PORT: u16 = 6884;
 /// WebSocket 连接心跳间隔
 const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-/// WebSocket 状态推送间隔
-const WS_STATUS_PUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// WebSocket 状态推送间隔（L1-⑩：5s → 30s —— 全量 status JSON 约 30MB/次，
+/// 5s 高频分配 + 慢消费者 send 挂起是 5.89GB 提交内存累积主源；30s 降频 6 倍，
+/// 监控面板轮询另有 REST 通道兜底）
+const WS_STATUS_PUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// status 组装超时上限：超时则回退上次成功快照，绝不让组装拖死 WS task。
 /// 快照化后组装仅为 serde JSON 构造（微秒级），500ms 是极宽松的兜底。
@@ -546,6 +548,88 @@ async fn collect_status_guarded(state: &AppState) -> serde_json::Value {
     }
 }
 
+/// L1-⑬：metrics 精简快照（1s 实时推送）——三通道 + IO + 爬虫核心指标。
+/// 与 REST `/api/v1/sync/channels`（sync_channels_snapshot）、`/api/v1/io/status`
+/// （io_scheduler.status_snapshot）同构；crawler 与 status.crawler 核心字段同构。
+/// 纯短读/原子读，无 DB、无全量克隆，微秒级组装，不会成为 WS 慢消费者。
+fn collect_metrics(state: &AppState) -> serde_json::Value {
+    // 三通道：复用 REST 同款派生逻辑（单一来源，避免双维护）
+    let channels = crate::data_plane::rest_api::sync_channels_snapshot(state);
+    // IO 调度器快照：与 /api/v1/io/status 同构
+    let io_status = state
+        .io_scheduler
+        .as_ref()
+        .map(|s| {
+            serde_json::to_value(s.status_snapshot())
+                .unwrap_or_else(|_| serde_json::json!({"enabled": false}))
+        })
+        .unwrap_or_else(|| serde_json::json!({"enabled": false}));
+    // 爬虫核心指标：与 status.crawler 同构（面板核心字段）
+    let crawler = state
+        .crawler_state
+        .as_ref()
+        .map(|cs| {
+            let s = cs.read();
+            serde_json::json!({
+                "enabled": true,
+                "running": s.running,
+                "known_nodes": s.known_nodes,
+                "messages_received": s.messages_received,
+                "requests_sent": s.requests_sent,
+                "errors": s.errors,
+                "infohashes_collected": s.infohashes_collected,
+                "peers_collected": s.peers_collected,
+                "nodes_crawled": s.nodes_crawled,
+                "concurrent_sockets_in_use": s.concurrent_sockets_in_use,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({"enabled": false}));
+    // L1-⑬：系统资源（全局缓存 1s 限频，高频安全）——与 /api/v1/system 的 memory_mb/cpu 同构
+    let sys = {
+        let s = crate::services::system_stats::snapshot();
+        serde_json::json!({
+            "memory_mb": s.mem_bytes as f64 / (1024.0 * 1024.0),
+            "cpu_usage_percent": s.cpu_usage_percent,
+        })
+    };
+    // L1-⑬：repo 计数（原子读/后台快照，无 DB）——趋势图 1s 实时数据源
+    let snap = state.stats_snapshot.get();
+    let (_cache_ih, cache_peers) = state.peer_repo.stats();
+    let repo = serde_json::json!({
+        "node": state.node_repo.as_ref().map(|r| r.stats_sync().total).unwrap_or(0),
+        "peer": cache_peers,
+        "infohash": snap.infohash_repo_metrics.as_ref().map(|m| m.tier.total).unwrap_or(0),
+        "tracker": snap.tracker_repo_metrics.as_ref().map(|m| m.tier.total).unwrap_or(0),
+    });
+    // L1-⑬：联邦状态（与 status.federation 同构，轻量）——面板 fedStatus 核心字段
+    let fed_status = state
+        .federation
+        .as_ref()
+        .map(|f| f.status())
+        .map(|st| {
+            serde_json::json!({
+                "enabled": st.enabled,
+                "node_id": st.node_id,
+                "connections": st.connections,
+                "known_nodes": st.known_nodes,
+                "reachability": st.reachability,
+                "uptime_secs": st.uptime_secs,
+                "gossip_queue_size": st.gossip_queue_size,
+                "relay_channels": st.relay_channels,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({"enabled": false}));
+    serde_json::json!({
+        "channels": channels,
+        "io_status": io_status,
+        "crawler": crawler,
+        "sys": sys,
+        "fed_status": fed_status,
+        "repo": repo,
+        "proto_version": crate::federation::protocol::HELLO_PROTOCOL_VERSION,
+    })
+}
+
 /// 处理单个 WebSocket 连接
 async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
@@ -583,6 +667,15 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
     // 状态推送间隔 5 秒（避免每秒克隆 60000+ 节点造成大量内存分配和磁盘 IO）
     let mut status_ticker = tokio::time::interval(WS_STATUS_PUSH_INTERVAL);
     status_ticker.tick().await;
+    // L1-⑬：metrics 实时推送（1s）——channels/io/crawler 精简快照，面板实时化主通道；
+    // HTTP 轮询降为 10s 保底。与 30s 全量 status 并存：metrics 仅 KB 级，分配可控。
+    // [ALLOWED-INTERVAL][ALLOWED-HARDCODED: WS metrics 推送间隔 1s，面板实时化主通道]
+    let mut metrics_ticker = tokio::time::interval(Duration::from_secs(1));
+    metrics_ticker.tick().await;
+    // L1-⑬：联邦连接列表推送（10s）——snapshot() clone 全量 node_table，低频避免开销
+    // [ALLOWED-INTERVAL][ALLOWED-HARDCODED: WS 联邦连接列表推送间隔 10s]
+    let mut fed_ticker = tokio::time::interval(Duration::from_secs(10));
+    fed_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -644,6 +737,38 @@ async fn handle_socket(socket: WebSocket, event_bus: EventBus, state: AppState) 
                 let json = build_message("status", data);
                 if sender.send(Message::Text(json)).await.is_err() {
                     debug!("[ws] 发送状态失败，客户端断开");
+                    break;
+                }
+            }
+
+            // L1-⑬：metrics 实时推送（1s 精简快照：三通道 + IO + 爬虫核心）
+            _ = metrics_ticker.tick() => {
+                let data = collect_metrics(&state);
+                let json = build_message("metrics", data);
+                if sender.send(Message::Text(json)).await.is_err() {
+                    debug!("[ws] 发送 metrics 失败，客户端断开");
+                    break;
+                }
+            }
+
+            // L1-⑬：联邦连接列表（10s，snapshot 放 blocking 线程避免撑开 ws worker）
+            _ = fed_ticker.tick() => {
+                let data = match &state.federation {
+                    Some(fed) => {
+                        let fed = fed.clone();
+                        match tokio::task::spawn_blocking(move || fed.snapshot()).await {
+                            Ok(s) => serde_json::json!({
+                                "count": s.connections.len(),
+                                "connections": s.connections,
+                            }),
+                            Err(e) => serde_json::json!({"error": format!("snapshot join failed: {}", e)}),
+                        }
+                    }
+                    None => serde_json::json!({"enabled": false}),
+                };
+                let json = build_message("fed_connections", data);
+                if sender.send(Message::Text(json)).await.is_err() {
+                    debug!("[ws] 发送 fed_connections 失败，客户端断开");
                     break;
                 }
             }

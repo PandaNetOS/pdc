@@ -55,6 +55,7 @@ pnos = { path = "../pnos-spec" }
 pnos-net = { path = "../pnos-sdk/crates/pnos-net" }
 sysinfo = "0.32"
 mimalloc = { version = "0.1", default-features = false }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

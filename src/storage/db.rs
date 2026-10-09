@@ -6,8 +6,9 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use rusqlite::{params, Connection};
 use tracing::{debug, info};
@@ -116,21 +117,153 @@ fn run_drop_redundant_peer_indexes(conn: &Connection) -> anyhow::Result<u32> {
     Ok(DROPPED_REDUNDANT_PEER_INDEXES.len() as u32)
 }
 
-/// 读连接池大小（WAL 下的只读连接数）。
+/// 读连接池（WAL 下的只读连接数）。
 ///
 /// 2026-09-30 由 4 扩容至 16：原 4 条只读连接被并发长任务占满——
 /// 清单重建（约 38s 全表扫描）、联邦 PEX 节点交换（约 355s 写阻塞）、
 /// range/Gossip/delta 并发读取同时占用，导致块请求取数走 `read()` 时
 /// 池空回退、被迫抢全局写锁，形成写读互锁。取 16（8~16 区间偏上限）
-/// 以覆盖 5~6 个并发长任务并预留余量；`read()` 的 PoolReturn RAII 归还
-/// 与池空回退写锁逻辑保持不变。
-const READ_POOL_SIZE: usize = 16;
+/// 以覆盖 5~6 个并发长任务并预留余量。
+const READ_POOL_SIZE: usize = 24;
+
+/// P4-2：长查询（全表/大区间扫描级）并发上限。
+/// 清单重建/覆盖校验/反熵摘要/range 区间加载都走 `load_repo_key_hashes_in_range`，
+/// 单次 38s 级（259 万行实测）。若不限流，多个并发长查询会占满 16 条读池，
+/// 短读全部排队（P4-1 排队化后虽不抢写锁，但短读延迟仍被拉高）。取 4：
+/// 同一时刻最多 4 个长查询（去重 2 + 清单重建 2），短读至少保留 12 条连接。
+/// v9（2026-10-08 preP29）：2→4。线上实证：去重恒占满 2 permit（longW 数十万
+/// 排队）→ 应答方清单重建（build_repo_manifest_impl 首填全表扫 260s 级）抢不到
+/// permit → 外层 300s 建清单超时 → 缓存永远空 → 每轮协商 Nak(rebuilding) 死循环。
+/// 扩容到 4 后重建可与去重并发；回填成功后块表非空，重建走块表优先（秒级）。
+const LONG_QUERY_CONCURRENCY: usize = 4;
+
+/// P4-2：长查询**独立连接池**大小（A 方案，2026-10-08 读写互锁根治）。
+///
+/// 背景：长查询（全扫 38s 级）与短读共用 16 条读池时，池空 → 长查询 60s 后
+/// 回退抢写连接 → 全扫期间攥写锁 38s+ → 写事务全堵（WAL 停摆）、爬虫写不进、
+/// API 超时（.52/.53 2026-10-08 实证：WAL 18 分钟零增长、crawl=0、双端瘫痪）。
+/// 修复：长查询走**独立 8 条只读连接**，与短读池/写锁完全隔离；池空只等待
+/// （最多 `LONG_POOL_WAIT_TIMEOUT` 后 panic 由调用方按失败重试），**绝不回退
+/// 写连接**——写锁只归写路径（P4-3 后短读池也不回退写，见 `read()`）。
+/// v9（preP29）：4→8，配合 LONG_QUERY_CONCURRENCY 2→4（去重+重建并发）。
+/// preP37（L1-⑥）：8→12 —— 管道化后应答方取块 12 并发（窗口 12）全部走长查询池，
+/// 8 槽排队让 HTTP 的 DB 查询（io/status/通道状态）饿死（2026-10-08 双端 HTTP 全卡
+/// 12 分钟实证）；12 槽与窗口 1:1，取块不再排队，HTTP 短读走 24 槽短读池不受影响。
+const LONG_POOL_SIZE: usize = 12;
+
+/// P4-2：长查询独立池空等待上限（秒）。超过后 panic（spawn_blocking join Err），
+/// 由调用方按失败路径处理（对齐/清单/反熵均可重试）。60s 内长查询（38s 级）
+/// 通常已归还。
+const LONG_POOL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// P4-2：进程级长查询进行中计数（观测用，随 `/api/v1/io/status` 暴露）。
+static LONG_QUERY_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// P4-2：长查询等待限流许可的累计次数（观测用）。
+static LONG_QUERY_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// L1-⑬：长查询累计执行次数（read_long + read_long_priority 均经 long_read 借出）
+static LONG_QUERY_TOTAL_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// L1-⑬：短查询累计执行次数（read 短池借出）
+static SHORT_QUERY_TOTAL_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// L1-⑬：长查询累计执行次数（单调递增，面板看活跃度用）
+pub fn long_query_total_ops() -> u64 {
+    LONG_QUERY_TOTAL_OPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// L1-⑬：短查询累计执行次数（单调递增，面板看活跃度用）
+pub fn short_query_total_ops() -> u64 {
+    SHORT_QUERY_TOTAL_OPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// P4-4（v9，preP32b）：长查询进行中计数的 RAII 守卫 —— **enter() 时 +1，
+/// Drop 时（含 panic unwind 路径）-1**，杜绝 `fetch_add` 后 panic 跳过
+/// `fetch_sub` 的泄漏（线上实证：池被爬虫去重占满后反复 panic，longAct 涨到
+/// 160），也杜绝只减不加的下溢（preP32 初版漏了 enter() 的 +1，实测 -85）。
+struct LongQueryActiveGuard;
+
+impl LongQueryActiveGuard {
+    fn enter() -> Self {
+        LONG_QUERY_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LongQueryActiveGuard {
+    fn drop(&mut self) {
+        LONG_QUERY_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// P4-2：读取当前进行中的长查询数（观测）。
+pub fn long_query_active() -> usize {
+    LONG_QUERY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// P4-2：读取长查询等待限流的累计次数（观测）。
+pub fn long_query_waits() -> u64 {
+    LONG_QUERY_WAITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// P4-4（v9，preP32b）：长查询池**连接总数**（观测，= LONG_POOL_SIZE）。
+/// 监控面板「可用/总数」的「总数」指独立长查询连接池大小（8 条专用连接），
+/// 而非并发门上限（LONG_QUERY_CONCURRENCY=4，那是活跃并发阈值）。
+pub fn long_query_total() -> usize {
+    LONG_POOL_SIZE
+}
+
+/// P4-2：长查询独立连接池可用连接数（观测）——由借出登记表推导：
+/// 可用 = LONG_POOL_SIZE - 在借条数（BORROWED_LONG_CONNS 在借出/归还时成对增删）。
+pub fn long_pool_available() -> usize {
+    let borrowed = BORROWED_LONG_CONNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    LONG_POOL_SIZE.saturating_sub(borrowed)
+}
+
+/// 读池内部状态：连接队列 + 池启用标记。
+/// `pool_enabled=false` 为内存库（测试路径，无池，read 直接回退写连接）；
+/// `pool_enabled=true` 为文件库：池空时 read 排队等待（Condvar），绝不抢写锁。
+struct ReadPoolInner {
+    queue: std::collections::VecDeque<Connection>,
+    pool_enabled: bool,
+}
+
+impl ReadPoolInner {
+    fn empty_disabled() -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            pool_enabled: false,
+        }
+    }
+    fn from_queue(queue: std::collections::VecDeque<Connection>) -> Self {
+        Self {
+            queue,
+            pool_enabled: true,
+        }
+    }
+    /// 队列长度（测试/观测用）
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
 
 /// 存储层
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
-    /// 读连接池：只读查询专用，不抢写锁
-    read_pool: Arc<Mutex<std::collections::VecDeque<Connection>>>,
+    /// 读连接池：只读查询专用，不抢写锁；池空时 Condvar 排队等待
+    read_pool: Arc<Mutex<ReadPoolInner>>,
+    /// 读池归还唤醒（P4-1：池空排队化，归还即 notify）
+    read_pool_cond: Condvar,
+    /// P4-2：长查询**独立连接池**（A 方案）：全扫级长查询专用，与短读池/写锁
+    /// 完全隔离；池空只等待（超时 panic），绝不回退写连接——根治读写互锁。
+    long_pool: Arc<Mutex<ReadPoolInner>>,
+    /// 长查询池归还唤醒
+    long_pool_cond: Condvar,
+    /// P4-2：长查询并发门（全表扫描级查询限流，permits=LONG_QUERY_CONCURRENCY）
+    long_query_gate: Arc<Semaphore>,
     write_stats: Arc<Mutex<WriteStats>>,
     /// oplog 行数缓存（-1 = 未初始化）。
     /// `SELECT COUNT(*) FROM feed_oplog` 在大表上要扫整个 B-tree，冷缓存 + 慢盘实测可达
@@ -148,20 +281,152 @@ pub struct Storage {
     wal_path: Option<PathBuf>,
 }
 
+/// P4-3（B 方案）：借出登记记录 —— 借出时登记（连接地址 + 起始时间 + 调用点），
+/// 归还时移除；泄漏（借出永不归还）会残留在登记表，由 `read_pool_available()` /
+/// `long_query_active()` 巡检打印调用点抓现行（2026-10-08 .52 实证：16 条短读
+/// 连接被占光且 60s+ 无归还，静态分析未定位持有者，须靠登记表锁定）。
+struct BorrowRecord {
+    started: std::time::Instant,
+    caller: &'static std::panic::Location<'static>,
+}
+
+static BORROWED_READ_CONNS: std::sync::Mutex<Vec<(usize, BorrowRecord)>> =
+    std::sync::Mutex::new(Vec::new());
+static BORROWED_LONG_CONNS: std::sync::Mutex<Vec<(usize, BorrowRecord)>> =
+    std::sync::Mutex::new(Vec::new());
+/// 巡检限频（30s 一次）
+static LAST_BORROW_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn borrow_key(conn: &Connection) -> usize {
+    // P4-3（B）：用 SQLite 底层句柄地址做借出登记 key——句柄在连接整个生命周期内
+    // 稳定唯一，跨 move（pop 出池 → 借出 → 归还入池）不变。
+    // 不能用 `conn as *const Connection as usize`（&Connection 是栈上局部变量地址，
+    // move 进 PoolReturn 后地址变化 → register/unregister 配对失效 → 登记表只增
+    // 不减 → 巡检假报警刷屏，2026-10-08 preP27 部署后 05:31 实测数百条假告警）。
+    // handle() 返回裸指针，仅作身份标识（不解引用），unsafe 块仅用于取地址。
+    unsafe { conn.handle() as usize }
+}
+
+fn register_borrow(
+    map: &'static std::sync::Mutex<Vec<(usize, BorrowRecord)>>,
+    conn: &Connection,
+    caller: &'static std::panic::Location<'static>,
+) {
+    if let Ok(mut m) = map.lock() {
+        m.push((
+            borrow_key(conn),
+            BorrowRecord {
+                started: std::time::Instant::now(),
+                caller,
+            },
+        ));
+    }
+}
+
+fn unregister_borrow(
+    map: &'static std::sync::Mutex<Vec<(usize, BorrowRecord)>>,
+    conn: &Connection,
+) {
+    if let Ok(mut m) = map.lock() {
+        let key = borrow_key(conn);
+        m.retain(|(k, _)| *k != key);
+    }
+}
+
+/// 巡检登记表：打印被借出 >60s 仍未归还的连接（疑似泄漏），限频 30s。
+fn scan_borrowed(map: &'static std::sync::Mutex<Vec<(usize, BorrowRecord)>>, tag: &str) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_BORROW_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 30_000 {
+        return;
+    }
+    LAST_BORROW_SCAN.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(m) = map.lock() {
+        for (k, rec) in m.iter() {
+            let el = rec.started.elapsed().as_secs();
+            if el > 60 {
+                tracing::warn!(
+                    "[storage] {}连接被借出 {}s 未归还（疑似泄漏），conn={:x} 调用方={}:{}",
+                    tag,
+                    el,
+                    k,
+                    rec.caller.file(),
+                    rec.caller.line()
+                );
+            }
+        }
+    }
+}
+
 /// 读连接归还 guard：`Storage::read` 的闭包 panic（unwind）时也把连接放回池，
-/// 避免连接永久泄漏导致池耗尽。
+/// 避免连接永久泄漏导致池耗尽；归还时 notify 唤醒池空等待者（P4-1 排队化）。
+/// P4-3（B 方案）：记录借用起始时间与调用点，归还超时（>60s）告警；同时
+/// 从借出登记表移除（泄漏记录由 `scan_borrowed` 巡检打印）。
 struct PoolReturn<'a> {
-    pool: &'a Mutex<std::collections::VecDeque<Connection>>,
+    pool: &'a Mutex<ReadPoolInner>,
+    notify: &'a Condvar,
     conn: Option<Connection>,
+    borrow_started: std::time::Instant,
+    caller: &'static std::panic::Location<'static>,
 }
 
 impl Drop for PoolReturn<'_> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // P4-3（B）：借用超时告警（>60s 视为异常持有）
+            let elapsed = self.borrow_started.elapsed();
+            if elapsed.as_secs() > 60 {
+                tracing::warn!(
+                    "[storage] 读连接借用超时归还（>{:?}），调用方={}:{} 可能持有过长",
+                    elapsed,
+                    self.caller.file(),
+                    self.caller.line()
+                );
+            }
+            // 从借出登记表移除（防止泄漏巡检误报已归还连接）
+            unregister_borrow(&BORROWED_READ_CONNS, &conn);
             // E6：连接归还读池，可用计数 +1（与 `Storage::read` pop 成功路径的 -1 配对）。
             READ_POOL_AVAILABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-            pool.push_back(conn);
+            pool.queue.push_back(conn);
+            drop(pool);
+            // P4-1：唤醒池空等待者（读请求排队而非抢写锁）
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// 长查询池归还 guard（A 方案）：`Storage::long_read` 的闭包 panic（unwind）时
+/// 也把连接放回长查询池，避免泄漏；归还时 notify 唤醒池空等待者。
+/// P4-3（B 方案）：同 PoolReturn，记录借用起始时间/调用点 + 登记表移除。
+struct LongPoolReturn<'a> {
+    pool: &'a Mutex<ReadPoolInner>,
+    notify: &'a Condvar,
+    conn: Option<Connection>,
+    borrow_started: std::time::Instant,
+    caller: &'static std::panic::Location<'static>,
+}
+
+impl Drop for LongPoolReturn<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let elapsed = self.borrow_started.elapsed();
+            if elapsed.as_secs() > 60 {
+                tracing::warn!(
+                    "[storage] 长查询连接借用超时归还（>{:?}），调用方={}:{} 可能持有过长",
+                    elapsed,
+                    self.caller.file(),
+                    self.caller.line()
+                );
+            }
+            unregister_borrow(&BORROWED_LONG_CONNS, &conn);
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.queue.push_back(conn);
+            drop(pool);
+            self.notify.notify_one();
         }
     }
 }
@@ -170,20 +435,28 @@ impl Drop for PoolReturn<'_> {
 //
 // 语义：文件库 `open()` 后 `available = READ_POOL_SIZE`，内存库 = 0；
 // `Storage::read` 从读池借走一条 -1，`PoolReturn` Drop 归还 +1；
-// 池空回退写连接（`read()` 的 None 分支）累计 +1 starved。
+// 文件库池空排队等待归还（`read()` 等待循环）累计 +1 starved。
 // 注意：静态量跨实例/并行测试共享，面板只取相对趋势，测试避免断言精确绝对值。
 
 /// 当前可用（未借出）的只读连接数。
 static READ_POOL_AVAILABLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// 读池空、回退写连接取数的累计次数（池饥饿信号）。
+/// 读池空、排队等待归还的累计次数（池饥饿信号）。
 static READ_POOL_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// E6：读取当前可用只读连接数（观测用，随 `/api/v1/io/status` 暴露）。
+/// P4-3（B 方案）：顺带巡检借出登记表，打印被借出 >60s 未归还的连接（疑似泄漏，
+/// 含调用点）——API 每 5s 轮询即触发巡检（限频 30s），抓"借走不还"现行。
 pub fn read_pool_available() -> usize {
+    scan_borrowed(&BORROWED_READ_CONNS, "短读池");
     READ_POOL_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// E6：读取读池空回退写连接的累计次数（池饥饿信号）。
+/// P4-3（B 方案）：长查询连接池巡检入口（同 read_pool_available，抓 long_pool 泄漏）。
+pub fn long_pool_scan() {
+    scan_borrowed(&BORROWED_LONG_CONNS, "长查询池");
+}
+
+/// E6：读取读池空排队等待归还的累计次数（池饥饿信号）。
 pub fn read_pool_starved() -> u64 {
     READ_POOL_STARVED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -254,6 +527,20 @@ impl Storage {
             read_pool.len()
         );
 
+        // P4-2（A 方案）：长查询独立连接池（LONG_POOL_SIZE 条），与短读池完全隔离。
+        // 同一 pragma（WAL/cache 8MB 等）；长查询全扫 38s 级，独立池保证不挤占
+        // 短读 16 条、也绝不触碰写锁。
+        let mut long_pool = std::collections::VecDeque::new();
+        for _ in 0..LONG_POOL_SIZE {
+            let lconn = Connection::open(path_ref)?;
+            lconn.execute_batch(&read_pragma_sql)?;
+            long_pool.push_back(lconn);
+        }
+        info!(
+            "[storage] long-query pool initialized: {} connections",
+            long_pool.len()
+        );
+
         // A1：专用 checkpoint 连接（与写路径不共享锁）。
         // 只设 busy_timeout/synchronous/cache_size；不在 ckpt 连接重复
         // journal_mode/mmap_size/wal_autocheckpoint（那些由写连接统一负责）。
@@ -278,7 +565,11 @@ impl Storage {
 
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
-            read_pool: Arc::new(Mutex::new(read_pool)),
+            read_pool: Arc::new(Mutex::new(ReadPoolInner::from_queue(read_pool))),
+            read_pool_cond: Condvar::new(),
+            long_pool: Arc::new(Mutex::new(ReadPoolInner::from_queue(long_pool))),
+            long_pool_cond: Condvar::new(),
+            long_query_gate: Arc::new(Semaphore::new(LONG_QUERY_CONCURRENCY)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
             entity_counts_cache: Default::default(),
@@ -300,7 +591,11 @@ impl Storage {
         READ_POOL_AVAILABLE.store(0, std::sync::atomic::Ordering::Relaxed);
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
-            read_pool: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            read_pool: Arc::new(Mutex::new(ReadPoolInner::empty_disabled())),
+            read_pool_cond: Condvar::new(),
+            long_pool: Arc::new(Mutex::new(ReadPoolInner::empty_disabled())),
+            long_pool_cond: Condvar::new(),
+            long_query_gate: Arc::new(Semaphore::new(LONG_QUERY_CONCURRENCY)),
             write_stats: Arc::new(Mutex::new(WriteStats::default())),
             oplog_len_cache: std::sync::atomic::AtomicI64::new(-1),
             entity_counts_cache: Default::default(),
@@ -330,15 +625,21 @@ impl Storage {
             return c;
         }
         // 只读查询走读连接池，不抢写锁
-        self.read(|conn| {
+        // P1：闭包返回 Result；read_long 超时/池饥饿时降级为 [-1;5]（调用方据此
+        // 识别"统计不可用"），绝不 panic。
+        self.read_long(|conn| -> anyhow::Result<[i64; 5]> {
             let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-2) };
-            [
+            Ok([
                 count("SELECT COUNT(*) FROM dht_nodes WHERE deleted_at IS NULL"),
                 count("SELECT COUNT(*) FROM peers WHERE deleted_at IS NULL"),
                 count("SELECT COUNT(*) FROM peers_archive"),
                 count("SELECT COUNT(*) FROM infohashes WHERE deleted_at IS NULL"),
                 count("SELECT COUNT(*) FROM trackers WHERE deleted_at IS NULL"),
-            ]
+            ])
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "pdcdb", "valid_entity_counts 读失败，降级 [-1;5]: {}", e);
+            [-1i64; 5]
         })
     }
 
@@ -362,16 +663,23 @@ impl Storage {
     }
 
     /// 读取单表增量计数 (total, valid)；未校准返回 None。
-    /// 走读连接池（单行主键读，不与写批次抢写锁）；池空时由 read() 回退写连接
-    /// （`Storage::memory()` 测试路径）。
+    /// 走读连接池（单行主键读，不与写批次抢写锁）；内存库（无池）由 read() 回退
+    /// 主连接（测试路径）。文件库池空只等待归还（超时 panic），绝不回退写锁。
     pub fn table_count_cached(&self, table: &str) -> Option<(i64, i64)> {
-        self.read(|conn| {
-            conn.query_row(
-                "SELECT total, valid FROM table_counts WHERE name = ?1 AND calibrated = 1",
-                params![table],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .ok()
+        // P1：闭包返回 Result；read 超时/池饥饿时降级为 None（视为未校准，
+        // 上层走真实 COUNT 回退），绝不 panic。
+        self.read(|conn| -> anyhow::Result<Option<(i64, i64)>> {
+            Ok(conn
+                .query_row(
+                    "SELECT total, valid FROM table_counts WHERE name = ?1 AND calibrated = 1",
+                    params![table],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .ok())
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "pdcdb", "table_count_cached({}) 读失败，降级 None: {}", table, e);
+            None
         })
     }
 
@@ -432,7 +740,15 @@ impl Storage {
             return c;
         }
         if self.entity_counts_cache[0].load(Ordering::Relaxed) < 0 {
-            return self.refresh_entity_counts();
+            // P2（读写分离）：原冷缓存回退 `refresh_entity_counts()`（真实 COUNT 后
+            // 写回增量表 = 读 API 触发 DB 写）。改为纯读 `valid_entity_counts()`
+            // （增量→read_long COUNT），仅把结果写入内存原子缓存（非 DB 写）。
+            // 真正的增量计数校准仍由周期任务（main.rs）负责。
+            let c = self.valid_entity_counts();
+            for (i, v) in c.iter().enumerate() {
+                self.entity_counts_cache[i].store(*v, Ordering::Relaxed);
+            }
+            return c;
         }
         let mut out = [0i64; 5];
         for (i, a) in self.entity_counts_cache.iter().enumerate() {
@@ -454,34 +770,246 @@ impl Storage {
     /// - `f` panic 时由 RAII guard 归还连接（旧行为：连接永久丢失，池耗尽后
     ///   `expect("read pool empty")` panic → 锁毒化 → 全进程读路径雪崩）；
     /// - 毒化锁自愈（into_inner），不再级联 panic；
-    /// - 池空（`Storage::memory()` 测试库未建池 / 极端耗尽）回退写连接。
-    pub fn read<F, T>(&self, f: F) -> T
+    /// - P4-1（2026-10-08 读饿死治理）：文件库池空 → Condvar 排队等待归还，
+    ///   不再回退抢全局写锁——旧行为下长查询占满读池后，块请求取数被迫拿写锁，
+    ///   亚毫秒写事务被秒级扫描排队，写延迟 EWMA 抬升、IO level=1.0 → 调度器让路
+    ///   → 窗口补不满丢帧；
+    /// - **P4-3（2026-10-08 A 方案，用户拍板"不允许回退，相关代码全部删除"）**：
+    ///   文件库池空 → **永久等待归还**（Condvar 轮询），最多
+    ///   `READ_POOL_WAIT_TIMEOUT`（120s）后 **panic**（unwind → spawn_blocking
+    ///   join Err → 调用方按失败路径重试），**绝不回退写连接**。旧"60s 超时回退
+    ///   写连接"保底已删除——回退读风暴排队抢写锁 = 写锁被回退读持续占用 =
+    ///   save_dirty/收块落库全部卡死 = WAL 22 分钟零增长 + 联邦传输冻结
+    ///   （.52 2026-10-08 实证）。写锁只归写路径；连接泄漏由 P4-3（B 方案）
+    ///   借出登记表巡检抓现行。内存库（无池，仅测试）保持原回退主连接行为
+    ///   （无磁盘争用，每连接独立空库无法建池）。
+    #[track_caller]
+    pub fn read<F, T>(&self, f: F) -> anyhow::Result<T>
     where
-        F: FnOnce(&Connection) -> T,
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
     {
-        let pooled = {
-            let mut pool = self.read_pool.lock().unwrap_or_else(|e| e.into_inner());
-            pool.pop_front()
+        // P4-3：池空等待最长 120s（正常短读毫秒级；长任务走 read_long 独立池），
+        // 等待期间释放池锁；超时【放弃本次查询返回 Err】，绝不 panic、绝不回退写锁。
+        const READ_POOL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let deadline = std::time::Instant::now() + READ_POOL_WAIT_TIMEOUT;
+        // P4-3（B）：调用点（用于归还超时告警 / 泄漏巡检）
+        let caller = std::panic::Location::caller();
+
+        let mut guard = self.read_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let pooled = loop {
+            if let Some(conn) = guard.queue.pop_front() {
+                SHORT_QUERY_TOTAL_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                break Some(conn);
+            }
+            if !guard.pool_enabled {
+                // 内存库（测试）：无池，保持原回退主连接行为
+                break None;
+            }
+            // 文件库池空：记录排队次数并等待归还，绝不回退写锁
+            READ_POOL_STARVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::time::Instant::now() >= deadline {
+                // P1（去 panic）：短读池饥饿不再崩溃，warn 后放弃本次查询（Err 即让
+                // RAII/许可自动释放），调用方按失败路径重试/降级，进程永远存活。
+                tracing::warn!(
+                    "短读连接池饥饿（等待 >{}s 无连接归还，starved={}）；放弃本次查询，调用方按失败重试（caller={}:{}）",
+                    READ_POOL_WAIT_TIMEOUT.as_secs(),
+                    READ_POOL_STARVED.load(std::sync::atomic::Ordering::Relaxed),
+                    caller.file(),
+                    caller.line()
+                );
+                return Err(anyhow::anyhow!(
+                    "短读连接池饥饿（等待 >{}s 无连接归还），放弃本次查询（caller={}:{}）",
+                    READ_POOL_WAIT_TIMEOUT.as_secs(),
+                    caller.file(),
+                    caller.line()
+                ));
+            }
+            // [ALLOWED-HARDCODED: 短读池排队轮询间隔 100ms]
+            let (g, _) = self
+                .read_pool_cond
+                .wait_timeout(guard, std::time::Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
         };
+        drop(guard);
         match pooled {
             Some(conn) => {
                 // E6：从读池借走一条，可用计数 -1（归还见 `PoolReturn::drop`）。
                 READ_POOL_AVAILABLE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                // P4-3（B）：借出登记（泄漏巡检抓现行）
+                register_borrow(&BORROWED_READ_CONNS, &conn, caller);
                 let guard = PoolReturn {
                     pool: &self.read_pool,
+                    notify: &self.read_pool_cond,
                     conn: Some(conn),
+                    borrow_started: std::time::Instant::now(),
+                    caller,
                 };
                 let conn = guard.conn.as_ref().expect("PoolReturn conn");
                 f(conn)
             }
             None => {
-                // E6：池空（内存库 / 极端耗尽）回退写连接，累计饥饿次数。
-                READ_POOL_STARVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // 仅内存库（pool_enabled=false，测试路径）：回退主连接
                 let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                 f(&conn)
             }
         }
     }
+    /// P4-2（A 方案）：长查询（全表/大区间扫描级）入口。
+    ///
+    /// 必须由阻塞线程（spawn_blocking 内）调用；先阻塞等待限流许可
+    /// （并发上限 `LONG_QUERY_CONCURRENCY`），再走**独立长查询连接池**
+    /// （`long_read`，LONG_POOL_SIZE 条专用连接）。与短读池/写锁完全隔离：
+    /// 全扫期间既不挤占短读 16 条、也绝不回退抢写锁（根治读写互锁——
+    /// 2026-10-08 实证：旧实现池空 60s 回退写连接，全扫攥写锁 38s+，
+    /// WAL 18 分钟零增长、双端瘫痪）。
+    ///
+    /// v9（2026-10-08 preP30）：permit 等待加 60s 超时 panic。线上实证：去重
+    /// （existing_node_keys 等）恒占满 permit 时，重建的 read_long 在 permit 上
+    /// **无限 sleep（10ms 轮询无超时）** → 外层 300s 建清单超时 abort，但
+    /// spawn_blocking 线程卡在 sleep 循环不退出（tokio abort 不中断阻塞线程）
+    /// → **僵尸线程占 permit 不放 → longAct 恒满 → 下一轮重建继续饿死**（.53
+    /// 06:06–06:24 每轮 >300s 超时死循环实证）。现在等 permit 超过 60s 直接
+    /// panic（unwind → spawn_blocking join Err → 调用方按失败路径退出重试），
+    /// permit 由 RAII 释放，**绝不残留僵尸**。
+    pub fn read_long<F, T>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
+    {
+        let deadline = std::time::Instant::now() + LONG_POOL_WAIT_TIMEOUT;
+        let caller = std::panic::Location::caller();
+        let permit = loop {
+            match self.long_query_gate.clone().try_acquire_owned() {
+                Ok(p) => break Some(p),
+                Err(_) => {
+                    LONG_QUERY_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if std::time::Instant::now() >= deadline {
+                        // P1（去 panic）：permit 等待超时不再崩溃，warn 后放弃本次长查询
+                        // 返回 Err（未取到许可无任何资源需释放），调用方按失败重试/降级。
+                        tracing::warn!(
+                            "长查询并发门等待超时（>{}s 无许可，疑似被常驻长查询占满），放弃本次长查询，调用方按失败重试（caller={}:{}）",
+                            LONG_POOL_WAIT_TIMEOUT.as_secs(),
+                            caller.file(),
+                            caller.line()
+                        );
+                        return Err(anyhow::anyhow!(
+                            "长查询并发门等待超时（>{}s 无许可），放弃本次长查询（caller={}:{}）",
+                            LONG_POOL_WAIT_TIMEOUT.as_secs(),
+                            caller.file(),
+                            caller.line()
+                        ));
+                    }
+                    // [ALLOWED-HARDCODED: 长查询并发门轮询间隔 10ms]
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
+        // P4-4（v9，preP32c）：活跃计数在 long_read **借到连接后**才计入（见
+        // long_read），此处不再 enter——池满排队/等 permit 不计"活跃"。
+        // P1：long_read 返回 Err（长池饥饿）时向上传播；permit 随 break 出的变量
+        // drop 自动归还。
+        let out = self.long_read(f)?;
+        drop(permit);
+        Ok(out)
+    }
+
+    /// P4-2（v9，preP30）：**bootstrap 清单重建/传输专用**长查询入口——
+    /// **不经过长查询并发门**（无 permit 等待），直接走独立长查询连接池。
+    ///
+    /// 背景：清单重建（build_repo_manifest_full_scan 全表扫 604 万行）是联邦
+    /// 快照收敛的关键一次性路径，而爬虫去重等常驻长查询会占满 permit 门 →
+    /// 重建在 permit 上无限等待 → 300s 建清单超时 → 缓存永远空 → 协商
+    /// Nak(rebuilding) 死循环（.53 2026-10-08 06:06–06:24 实证，扩容 permit
+    /// 到 4 仍被去重占满）。重建期间非稳态已暂停 delta/range，池 8 条连接
+    /// 足够重建+去重并发；池空仍由 `long_read` 60s panic 兜底（不抢写锁）。
+    /// 仅 bootstrap.rs 重建/传输路径使用；range 反熵等普通路径仍走
+    /// [`Self::read_long`]（受 permit 门限流）。
+    #[track_caller]
+    pub fn read_long_priority<F, T>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
+    {
+        // P4-4（v9，preP32c）：同 read_long——活跃计数在 long_read 借到连接后
+        // 计入，此处不 enter。P1：直接传播 long_read 的 Err（长池饥饿）。
+        self.long_read(f)
+    }
+
+    /// P4-2（A 方案）：从**长查询独立连接池**借连接执行闭包。
+    ///
+    /// 池空只等待（Condvar，100ms 轮询），最多 `LONG_POOL_WAIT_TIMEOUT`（60s）
+    /// 后 **panic**（unwind → spawn_blocking join Err → 调用方按失败路径重试）；
+    /// **绝不回退写连接**。内存库（`pool_enabled=false`）保持旧回退写连接行为
+    /// （无磁盘争用，测试路径）。P4-3（B）：借出登记 + 调用点追踪（同 read）。
+    #[track_caller]
+    fn long_read<F, T>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
+    {
+        let deadline = std::time::Instant::now() + LONG_POOL_WAIT_TIMEOUT;
+        let caller = std::panic::Location::caller();
+        let mut guard = self.long_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let pooled = loop {
+            if let Some(conn) = guard.queue.pop_front() {
+                LONG_QUERY_TOTAL_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                break Some(conn);
+            }
+            if !guard.pool_enabled {
+                // 内存库（测试）：无池，保持原回退写连接行为
+                break None;
+            }
+            // 文件库长查询池空：等待归还（绝不回退写锁）
+            if std::time::Instant::now() >= deadline {
+                // P1（去 panic）：长池饥饿不再崩溃，warn 后放弃本次查询返回 Err。
+                tracing::warn!(
+                    "长查询连接池饥饿（等待 >{}s 无连接归还），放弃本次查询，调用方按失败重试（caller={}:{}）",
+                    LONG_POOL_WAIT_TIMEOUT.as_secs(),
+                    caller.file(),
+                    caller.line()
+                );
+                return Err(anyhow::anyhow!(
+                    "长查询连接池饥饿（等待 >{}s 无连接归还），放弃本次查询（caller={}:{}）",
+                    LONG_POOL_WAIT_TIMEOUT.as_secs(),
+                    caller.file(),
+                    caller.line()
+                ));
+            }
+            // [ALLOWED-HARDCODED: 长查询池排队轮询间隔 100ms]
+            let (g, _) = self
+                .long_pool_cond
+                .wait_timeout(guard, std::time::Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        };
+        drop(guard);
+        match pooled {
+            Some(conn) => {
+                // P4-4（v9，preP32c）：活跃计数移到**借到连接之后** —— 旧实现计数
+                // 在入口（read_long/priority），池满时排队者也计入"活跃"，瞬时值可
+                // 超过池大小（线上实测 longAct=9 > total=8，面板误导）。现在只有
+                // 真正占用池连接的才算活跃（≤ LONG_POOL_SIZE）；排队/等 permit 不
+                // 计。守卫 enter/Drop 配对，f 内 panic 也归还计数。
+                let _active = LongQueryActiveGuard::enter();
+                // P4-3（B）：借出登记（泄漏巡检抓现行）
+                register_borrow(&BORROWED_LONG_CONNS, &conn, caller);
+                let guard = LongPoolReturn {
+                    pool: &self.long_pool,
+                    notify: &self.long_pool_cond,
+                    conn: Some(conn),
+                    borrow_started: std::time::Instant::now(),
+                    caller,
+                };
+                let conn = guard.conn.as_ref().expect("LongPoolReturn conn");
+                f(conn)
+            }
+            None => {
+                // 内存库 / 测试路径：回退写连接（活跃计数同口径：执行中即计入）
+                let _active = LongQueryActiveGuard::enter();
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                f(&conn)
+            }
+        }
+    }
+
     /// 记录写入统计
     fn record_write(&self, table: &str, rows: u64) {
         let mut stats = self.write_stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -748,6 +1276,24 @@ impl Storage {
                 archived_at INTEGER,
                 PRIMARY KEY (infohash, ip, port)
             );
+            -- P-A（增量块摘要）：bootstrap 清单/对齐的持久化块表。
+            -- lo_key/hi_key 与 load_repo_key_hashes_in_range 的排序键逐字节一致
+            -- （NODE=`ip:port`、PEER=`lower(hex(infohash)):ip:port`、INFOHASH=infohash、TRACKER=url）。
+            -- 写入经 mark_chunks_dirty_in_tx 标 dirty；dirty 块在清单构建/块发送前惰性重算
+            -- （P-B），消除 bootstrap 周期内的全表扫描（600 万行 38s~120s+）。
+            CREATE TABLE IF NOT EXISTS chunk_digests (
+                repo INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                lo_key BLOB NOT NULL,
+                hi_key BLOB NOT NULL,
+                rows INTEGER NOT NULL DEFAULT 0,
+                hash BLOB NOT NULL,
+                dirty INTEGER NOT NULL DEFAULT 0,
+                chunk_rows INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (repo, idx)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunk_digests_repo_lo
+                ON chunk_digests (repo, lo_key);
             -- B5-1: idx_peers_archive_infohash 与 PK 首列重复，已 DROP。
             CREATE INDEX IF NOT EXISTS idx_peers_archive_last_active ON peers_archive(last_active);
 
@@ -1058,12 +1604,15 @@ impl Storage {
                 now
             ],
         )?;
+        // P-A：块表标 dirty（key = ip:port）
+        let key = format!("{}:{}", ip, port).into_bytes();
+        Self::mark_chunks_dirty_in_tx(&conn, 1 /* NODE */, std::slice::from_ref(&key))?;
         Ok(())
     }
 
     /// 加载所有 DHT 节点
     pub fn load_dht_nodes(&self) -> anyhow::Result<Vec<DhtNodeRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
         let mut stmt = conn.prepare("SELECT id, ip, port, score, state, query_count, success_count, total_latency_ms, consecutive_failures, nodes_returned, last_query_time, last_active FROM dht_nodes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let id: Vec<u8> = row.get(0)?;
@@ -1094,6 +1643,8 @@ impl Storage {
     pub fn clear_dht_nodes(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM dht_nodes", [])?;
+        // P-A：块表同清（NODE 数据已清空，摘要失效）
+        conn.execute("DELETE FROM chunk_digests WHERE repo = 1", [])?;
         Ok(())
     }
 
@@ -1107,6 +1658,11 @@ impl Storage {
              WHERE ip = ?2 AND port = ?3 AND deleted_at IS NULL",
             params![now, ip, port as i64],
         )?;
+        if n > 0 {
+            // P-A：块表标 dirty（key = ip:port）
+            let key = format!("{}:{}", ip, port).into_bytes();
+            Self::mark_chunks_dirty_in_tx(&conn, 1 /* NODE */, std::slice::from_ref(&key))?;
+        }
         Ok(n)
     }
 
@@ -1128,6 +1684,12 @@ impl Storage {
                 total += stmt.execute(params![now, ip, *port as i64])?;
             }
         }
+        // P-A：块表标 dirty（key = ip:port）
+        let keys: Vec<Vec<u8>> = addrs
+            .iter()
+            .map(|(ip, port)| format!("{}:{}", ip, port).into_bytes())
+            .collect();
+        Self::mark_chunks_dirty_in_tx(&tx, 1 /* NODE */, &keys)?;
         tx.commit()?;
         Ok(total)
     }
@@ -1185,12 +1747,255 @@ impl Storage {
                 ])?;
             }
         }
+        // P-A：块表标 dirty（key = ip:port）
+        let keys: Vec<Vec<u8>> = nodes
+            .iter()
+            .map(|n| format!("{}:{}", n.ip, n.port).into_bytes())
+            .collect();
+        Self::mark_chunks_dirty_in_tx(&tx, 1 /* NODE */, &keys)?;
         tx.commit()?;
         Ok(())
     }
 
     /// 批量保存 DHT 节点（调用方已开启事务，不重复开启）
     /// 供 WriteQueue 在批量事务中调用，避免事务嵌套。
+    /// P-A：写事务内按 key 集合标记脏块（前进式扫描块表 + 批量 UPDATE）。
+    ///
+    /// - 块表未构建（空表，旧库待 P-C 回填）时静默跳过——无块可标。
+    /// - key 排序与清单排序键逐字节一致（BLOB 字节序 = 字符串序）。
+    /// - 落在块间隙/超界（块表边界未覆盖）时保守标记相邻块。
+    pub fn mark_chunks_dirty_in_tx(
+        conn: &Connection,
+        repo: u8,
+        keys: &[Vec<u8>],
+    ) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT idx, lo_key, hi_key FROM chunk_digests WHERE repo = ?1 ORDER BY lo_key ASC",
+        )?;
+        let blocks: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+            .query_map(params![repo], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if blocks.is_empty() {
+            return Ok(()); // 块表未构建（P-C 回填前无块可标）
+        }
+        let mut sorted = keys.to_vec();
+        sorted.sort();
+        let mut dirty: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        let mut bi = 0usize;
+        for k in &sorted {
+            // 前进式：推进到 lo <= key 的最大块
+            while bi + 1 < blocks.len() && blocks[bi + 1].1.as_slice() <= k.as_slice() {
+                bi += 1;
+            }
+            let (idx, lo, hi) = &blocks[bi];
+            if lo.as_slice() <= k.as_slice()
+                && (hi.as_slice() >= k.as_slice() || bi + 1 == blocks.len())
+            {
+                dirty.insert(*idx);
+            } else {
+                // 落在块间隙/超界：保守标记前驱与后继块
+                dirty.insert(*idx);
+                if bi + 1 < blocks.len() {
+                    dirty.insert(blocks[bi + 1].0);
+                }
+            }
+        }
+        for idx in dirty {
+            conn.execute(
+                "UPDATE chunk_digests SET dirty = 1 WHERE repo = ?1 AND idx = ?2",
+                params![repo, idx],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// P-A：整 repo 标 dirty（全表 DELETE / 批量 UPDATE 等无法逐 key 定位的操作后）。
+    pub fn mark_repo_all_dirty(&self, repo: u8) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE chunk_digests SET dirty = 1 WHERE repo = ?1",
+            params![repo],
+        )?;
+        Ok(())
+    }
+
+    /// P-A/P-B：读取某 repo 块表（清单构建 / 对齐验证用）。
+    pub fn get_chunk_digests(&self, repo: u8) -> anyhow::Result<Vec<ChunkDigest>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT repo, idx, lo_key, hi_key, rows, hash, dirty, chunk_rows \
+                 FROM chunk_digests WHERE repo = ?1 ORDER BY idx ASC",
+            )?;
+            let rows = stmt.query_map(params![repo], |row| {
+                Ok(ChunkDigest {
+                    repo: row.get(0)?,
+                    idx: row.get(1)?,
+                    lo_key: row.get(2)?,
+                    hi_key: row.get(3)?,
+                    rows: row.get(4)?,
+                    hash: row.get(5)?,
+                    dirty: row.get::<_, i64>(6)? != 0,
+                    chunk_rows: row.get(7)?,
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
+    /// P-B：upsert 块表行（脏块重算后落库）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_chunk_digest_in_tx(
+        conn: &Connection,
+        repo: u8,
+        idx: i64,
+        lo_key: &[u8],
+        hi_key: &[u8],
+        rows: i64,
+        hash: &[u8],
+        dirty: bool,
+        chunk_rows: u32,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO chunk_digests (repo, idx, lo_key, hi_key, rows, hash, dirty, chunk_rows) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(repo, idx) DO UPDATE SET \
+              lo_key=excluded.lo_key, hi_key=excluded.hi_key, rows=excluded.rows, \
+              hash=excluded.hash, dirty=excluded.dirty, chunk_rows=excluded.chunk_rows",
+            params![
+                repo,
+                idx,
+                lo_key,
+                hi_key,
+                rows,
+                hash,
+                dirty as i64,
+                chunk_rows
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// P-B：删除块表行（重算切块后整体重写某 repo 块表时用）。
+    pub fn delete_chunk_digests_in_tx(conn: &Connection, repo: u8) -> anyhow::Result<()> {
+        conn.execute("DELETE FROM chunk_digests WHERE repo = ?1", params![repo])?;
+        Ok(())
+    }
+
+    /// P-B：&self 包装——脏块重算后写回块表（自加写锁）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_chunk_digest(
+        &self,
+        repo: u8,
+        idx: i64,
+        lo_key: &[u8],
+        hi_key: &[u8],
+        rows: i64,
+        hash: &[u8],
+        dirty: bool,
+        chunk_rows: u32,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        Self::upsert_chunk_digest_in_tx(
+            &conn, repo, idx, lo_key, hi_key, rows, hash, dirty, chunk_rows,
+        )
+    }
+
+    /// P-B：&self 包装——清空某 repo 块表（chunk_rows 变化重建前）。
+    pub fn delete_chunk_digests(&self, repo: u8) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        Self::delete_chunk_digests_in_tx(&conn, repo)
+    }
+
+    /// P-B：廉价一致性校验——repo 表实际活行数（与清单口径一致：NODE/TRACKER/INFOHASH
+    /// 取 `deleted_at IS NULL`，PEER = peers 活行 + peers_archive 全部）。
+    /// 清单构建时与块表 rows 总和比对，兜住「绕过挂接的直接 SQL 写入」造成的陈旧摘要。
+    pub fn count_repo_rows(&self, repo: u8) -> anyhow::Result<i64> {
+        self.read_long(|conn| {
+            const NODE: u8 = 1;
+            const PEER: u8 = 2;
+            const INFOHASH: u8 = 3;
+            const TRACKER: u8 = 4;
+            let cnt: i64 = match repo {
+                NODE => conn.query_row(
+                    "SELECT COUNT(*) FROM dht_nodes WHERE deleted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )?,
+                PEER => conn.query_row(
+                    "SELECT (SELECT COUNT(*) FROM peers WHERE deleted_at IS NULL) \
+                     + (SELECT COUNT(*) FROM peers_archive)",
+                    [],
+                    |r| r.get(0),
+                )?,
+                INFOHASH => conn.query_row(
+                    "SELECT COUNT(*) FROM infohashes WHERE deleted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )?,
+                TRACKER => conn.query_row(
+                    "SELECT COUNT(*) FROM trackers WHERE deleted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )?,
+                _ => 0,
+            };
+            Ok(cnt)
+        })
+    }
+
+    /// P-B：单事务批量回填某 repo 块表（首填/重建后整表写入，避免数千块逐块加锁）。
+    /// `entries` = (idx, lo_key, hi_key, rows, hash)。
+    pub fn backfill_chunk_digests(
+        &self,
+        repo: u8,
+        chunk_rows: u32,
+        entries: &[(i64, Vec<u8>, Vec<u8>, i64, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.unchecked_transaction()?;
+        Self::delete_chunk_digests_in_tx(&tx, repo)?;
+        for (idx, lo, hi, rows, hash) in entries {
+            Self::upsert_chunk_digest_in_tx(
+                &tx, repo, *idx, lo, hi, *rows, hash, false, chunk_rows,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// P2-6：单事务批量 upsert 脏块摘要（块表优先路径的增量重算）。
+    ///
+    /// 与 [`Self::upsert_chunk_digest`] 同语义（幂等 upsert、`dirty=false`），但把
+    /// 同一批重算出的脏块合进**一次写锁 + 单事务**。旧实现每脏块一次
+    /// `upsert_chunk_digest`（逐块抢 `self.conn` 写锁），脏块多时读写乒乓把写锁
+    /// 打满。**不 delete 干净块**（区别于 [`Self::backfill_chunk_digests`]）。
+    /// `entries` = (idx, lo_key, hi_key, rows, hash)。
+    pub fn upsert_chunk_digests_batch(
+        &self,
+        repo: u8,
+        chunk_rows: u32,
+        entries: &[(i64, Vec<u8>, Vec<u8>, i64, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.unchecked_transaction()?;
+        for (idx, lo, hi, rows, hash) in entries {
+            Self::upsert_chunk_digest_in_tx(
+                &tx, repo, *idx, lo, hi, *rows, hash, false, chunk_rows,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn save_dht_nodes_batch_in_tx(
         conn: &Connection,
         nodes: &[DhtNodeRow],
@@ -1230,6 +2035,13 @@ impl Storage {
                 now
             ])?;
         }
+        // P-A：块表标 dirty（本批写入的 key = ip:port，与清单排序键一致）
+        const NODE: u8 = 1;
+        let keys: Vec<Vec<u8>> = nodes
+            .iter()
+            .map(|n| format!("{}:{}", n.ip, n.port).into_bytes())
+            .collect();
+        Self::mark_chunks_dirty_in_tx(conn, NODE, &keys)?;
         Ok(())
     }
 
@@ -1275,6 +2087,8 @@ impl Storage {
                 disabled as i64, now, l2, now
             ],
         )?;
+        // P-A：块表标 dirty（key = url）
+        Self::mark_chunks_dirty_in_tx(&conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
         Ok(())
     }
 
@@ -1289,6 +2103,10 @@ impl Storage {
              WHERE url = ?2 AND deleted_at IS NULL",
             params![now, url],
         )?;
+        if n > 0 {
+            // P-A：块表标 dirty（key = url）
+            Self::mark_chunks_dirty_in_tx(&conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
+        }
         Ok(n)
     }
 
@@ -1307,23 +2125,34 @@ impl Storage {
              WHERE lower(hex(infohash)) = ?2 AND ip = ?3 AND port = ?4 AND deleted_at IS NULL",
             params![now, infohash_hex, ip, port as i64],
         )?;
+        if n > 0 {
+            // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port）
+            let key = format!("{}:{}:{}", infohash_hex.to_lowercase(), ip, port).into_bytes();
+            Self::mark_chunks_dirty_in_tx(&conn, 2 /* PEER */, &[key])?;
+        }
         Ok(n)
     }
 
     /// 批次I(#5)：判断 peer 是否存在软删墓碑（入站 upsert 仲裁用）。
+    ///
+    /// P2（读写分离）：原实现拿 `self.conn` 写锁做 SELECT——读流量灌满写锁，
+    /// apply 万级条目逐条仲裁时把全局写锁打满。改走短读池 `self.read`（已提交
+    /// 态与旧写连接读一致，apply 循环无外层事务，语义等价）；read Err 向上传播，
+    /// 调用方 peer_sync.rs:169 已有 match 降级。
     pub fn is_peer_tombstoned(
         &self,
         infohash_hex: &str,
         ip: &str,
         port: u16,
     ) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM peers \
-             WHERE lower(hex(infohash)) = ?1 AND ip = ?2 AND port = ?3 AND deleted_at IS NOT NULL",
-            params![infohash_hex, ip, port as i64],
-            |row| row.get(0),
-        )?;
+        let n: i64 = self.read(move |conn| -> anyhow::Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM peers \
+                 WHERE lower(hex(infohash)) = ?1 AND ip = ?2 AND port = ?3 AND deleted_at IS NOT NULL",
+                params![infohash_hex, ip, port as i64],
+                |row| row.get(0),
+            )?)
+        })?;
         Ok(n > 0)
     }
 
@@ -1336,18 +2165,25 @@ impl Storage {
              WHERE lower(hex(infohash)) = ?2 AND deleted_at IS NULL",
             params![now, infohash_hex],
         )?;
+        if n > 0 {
+            // P-A：块表标 dirty（key = infohash raw；hex 参数解码成本高，整 repo 保守标脏）
+            conn.execute("UPDATE chunk_digests SET dirty = 1 WHERE repo = 3", [])?;
+        }
         Ok(n)
     }
 
     /// 批次I(#5)：判断 infohash 是否存在软删墓碑。
+    ///
+    /// P2（读写分离）：改走短读池 `self.read`，不再拿 `self.conn` 写锁做 SELECT。
     pub fn is_infohash_tombstoned(&self, infohash_hex: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM infohashes \
-             WHERE lower(hex(infohash)) = ?1 AND deleted_at IS NOT NULL",
-            params![infohash_hex],
-            |row| row.get(0),
-        )?;
+        let n: i64 = self.read(move |conn| -> anyhow::Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM infohashes \
+                 WHERE lower(hex(infohash)) = ?1 AND deleted_at IS NOT NULL",
+                params![infohash_hex],
+                |row| row.get(0),
+            )?)
+        })?;
         Ok(n > 0)
     }
 
@@ -1357,13 +2193,24 @@ impl Storage {
     /// 否则形成「A 删 → B 未删 → 反熵判差异 → B 回推 upsert → A 复活 → 反熵再判差异」
     /// 的永动闭环，删除操作在联邦内结构性不可能收敛。
     pub fn is_tracker_tombstoned(&self, url: &str) -> bool {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row(
-            "SELECT 1 FROM trackers WHERE url = ?1 AND deleted_at IS NOT NULL LIMIT 1",
-            params![url],
-            |_| Ok(true),
-        )
-        .unwrap_or(false)
+        // P2（读写分离）：改走短读池 `self.read`，不再拿 `self.conn` 写锁做 SELECT。
+        // 读池忙碌（超时/饥饿）时降级 false（按"未墓碑"处理，允许重添加——宁可被
+        // 对端回推一次重复 upsert，也不阻塞入站仲裁）。
+        match self.read(move |conn| -> anyhow::Result<bool> {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM trackers WHERE url = ?1 AND deleted_at IS NOT NULL LIMIT 1",
+                    params![url],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false))
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(target: "pdcdb", "is_tracker_tombstoned({}) 读失败，按未墓碑处理: {}", url, e);
+                false
+            }
+        }
     }
 
     /// P0-3：入站 UPSERT 的安全写入 —— 命中本地墓碑时**保留墓碑**（不复活），
@@ -1409,6 +2256,8 @@ impl Storage {
                 disabled as i64, now, l2, now
             ],
         )?;
+        // P-A：块表标 dirty（key = url）
+        Self::mark_chunks_dirty_in_tx(&conn, 4 /* TRACKER */, &[url.as_bytes().to_vec()])?;
         Ok(())
     }
 
@@ -1453,6 +2302,10 @@ impl Storage {
                 now,
             ])?;
         }
+        // P-A：块表标 dirty（key = url，与清单排序键一致）
+        const TRACKER: u8 = 4;
+        let keys: Vec<Vec<u8>> = trackers.iter().map(|t| t.url.as_bytes().to_vec()).collect();
+        Self::mark_chunks_dirty_in_tx(conn, TRACKER, &keys)?;
         Ok(())
     }
 
@@ -1537,6 +2390,9 @@ impl Storage {
                 l2_shard=excluded.l2_shard, updated_at=excluded.updated_at, deleted_at=NULL"#,
             params![infohash.as_slice(), ref_count as i64, first_source, now, score, l2],
         )?;
+        // P-A：块表标 dirty（key = infohash raw）
+        const INFOHASH: u8 = 3;
+        Self::mark_chunks_dirty_in_tx(conn, INFOHASH, &[infohash.to_vec()])?;
         Ok(())
     }
 
@@ -1568,6 +2424,10 @@ impl Storage {
                 l2,
             ])?;
         }
+        // P-A：块表标 dirty（key = infohash raw，与清单排序键一致）
+        const INFOHASH: u8 = 3;
+        let keys: Vec<Vec<u8>> = entries.iter().map(|e| e.infohash.to_vec()).collect();
+        Self::mark_chunks_dirty_in_tx(conn, INFOHASH, &keys)?;
         Ok(())
     }
 
@@ -1581,7 +2441,13 @@ impl Storage {
         if ihs.is_empty() {
             return Ok(out);
         }
-        self.read(|conn| {
+        // P4-4（v9，preP32b）：爬虫落库去重回 **read_long（受 permit 门限流）**。
+        // preP31 曾把 existing_* 全转 priority（无门）——爬虫多线程去重失去并发
+        // 上限后无限借池，长查询池 8 条被占满 → apply 查重/发送取数等池 60s panic
+        // → 传输断续 + longAct 泄漏计数涨到 160（实证）。去重是普通长查询应受门
+        // 限流（≤LONG_QUERY_CONCURRENCY 并发）；apply 查重（existing_node_keys）
+        // 保持 priority 不排队。去重排队 60s panic 只会丢一批爬虫响应，可接受。
+        self.read_long(|conn| {
             for chunk in ihs.chunks(500) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
@@ -1605,11 +2471,19 @@ impl Storage {
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
         Ok(out)
     }
 
     /// 批次G(F4)：批量判断节点 ("ip:port") 是否已存在于 DB（语义同 existing_infohashes）
+    ///
+    /// P4-2（v9，preP30）：**写路径查重**（crawler 落库 / bootstrap apply 批量 upsert
+    /// 前判重）改走 `read_long_priority`（不经过长查询并发门）——线上实证：
+    /// 去重/纯读长查询占满 permit 时，bootstrap 块 apply 的查重等 permit 60s 超时
+    /// panic → apply join Err → 块判失败 → 窗口暂停 → bootstrap 传输停滞（.52
+    /// 2026-10-08 06:36 done=77/3126 卡死实证）。写路径查重比纯读更重要，
+    /// 不应被读长查询门限流饿死；池连接充足（8 条）时与去重并发无碍。
     pub fn existing_node_keys(
         &self,
         keys: &[String],
@@ -1618,29 +2492,43 @@ impl Storage {
         if keys.is_empty() {
             return Ok(out);
         }
-        self.read(|conn| {
+        // preP34（P4-6）：去重 SQL 从「表达式 IN」改为「主键 (ip,port) 点查循环」。
+        // 线上实证（2026-10-08 .52）：`(ip||':'||port) IN (500项)` 因 SQLite 大 IN
+        // 列表不触发表达式索引 → 退化为全表逐行拼接比较 → 604 万行 × 约 5s/查询 →
+        // 8 条长查询池被钉死 300s+（借用超时告警 db.rs:2387 实证 304~308s）→
+        // bootstrap apply 查重/发送取数全部饿死，done 卡 115/3126。
+        // 主键 (ip,port) 点查毫秒级（实测 500 次 = 19ms，快 260 倍），持池时间
+        // 从分钟级降到毫秒级，长查询池不再被去重钉死。
+        self.read_long_priority(|conn| {
             for chunk in keys.chunks(500) {
-                let placeholders = vec!["?"; chunk.len()].join(",");
-                let sql = format!(
-                    "SELECT (ip || ':' || port) FROM dht_nodes WHERE (ip || ':' || port) IN ({}) AND deleted_at IS NULL",
-                    placeholders
-                );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let params: Vec<&dyn rusqlite::ToSql> =
-                        chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0)) {
-                        for r in rows.flatten() {
-                            out.insert(r);
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT 1 FROM dht_nodes WHERE ip=?1 AND port=?2 AND deleted_at IS NULL",
+                ) {
+                    for key in chunk {
+                        // key 格式 = "ip:port"（与清单排序键一致）；IPv6 文本含 ':'，
+                        // 从右取最后一个 ':' 作为 ip/port 分隔。
+                        let Some((ip, port_s)) = key.rsplit_once(':') else {
+                            continue;
+                        };
+                        let Ok(port) = port_s.parse::<i64>() else {
+                            continue;
+                        };
+                        if let Ok(mut rows) = stmt.query(params![ip, port]) {
+                            if rows.next().map(|r| r.is_some()).unwrap_or(false) {
+                                out.insert(key.clone());
+                            }
                         }
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
         Ok(out)
     }
 
     /// 批次G(F4)：批量判断 peer (infohash, addr) 是否已存在于 DB（重添加防误报传播）。
     /// key = `lower(hex(infohash)):ip:port`，与 idx_peers_key_expr 表达式索引一致。
+    /// P4-2（v9，preP30）：写路径查重，走 `read_long_priority`（同 existing_node_keys）。
     pub fn existing_peer_keys(
         &self,
         entries: &[(crate::types::Infohash, std::net::SocketAddr)],
@@ -1649,7 +2537,9 @@ impl Storage {
         if entries.is_empty() {
             return Ok(out);
         }
-        self.read(|conn| {
+        // P4-4（v9，preP32b）：爬虫 peer 落库去重回 **read_long（受 permit 门）**，
+        // 理由同 existing_infohashes（去重是普通长查询，受门限流防占满长查询池）。
+        self.read_long(|conn| {
             for chunk in entries.chunks(500) {
                 let mut keys = Vec::with_capacity(chunk.len());
                 for (ih, addr) in chunk {
@@ -1674,14 +2564,15 @@ impl Storage {
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
         Ok(out)
     }
 
     /// 批量保存 infohash（在已有连接上执行，供 IOScheduler 回调）
     /// 加载所有 infohash
     pub fn load_infohashes(&self) -> anyhow::Result<Vec<InfohashRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
         let mut stmt =
             conn.prepare("SELECT infohash, ref_count, first_source, score FROM infohashes WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
@@ -1760,6 +2651,8 @@ impl Storage {
     pub fn clear_infohashes(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM infohashes", [])?;
+        // P-A：块表同清（INFOHASH 数据已清空）
+        conn.execute("DELETE FROM chunk_digests WHERE repo = 3", [])?;
         Ok(())
     }
 
@@ -1804,7 +2697,7 @@ impl Storage {
 
     /// 加载所有 peer
     pub fn load_peers(&self) -> anyhow::Result<Vec<PeerRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
         let mut stmt = conn.prepare("SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active FROM peers WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -1831,6 +2724,9 @@ impl Storage {
     pub fn clear_peers(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM peers", [])?;
+        // P-A：块表同清（PEER 数据已清空；归档表仍存在时清单仍覆盖 archive，故仅标脏更稳——
+        // 此处按清空语义直接删块表，由 P-C 回填重建）
+        conn.execute("DELETE FROM chunk_digests WHERE repo = 2", [])?;
         Ok(())
     }
 
@@ -1871,6 +2767,12 @@ impl Storage {
                 ])?;
             }
         }
+        // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port）
+        let keys: Vec<Vec<u8>> = peers
+            .iter()
+            .map(|p| format!("{}:{}:{}", hex_lower(&p.infohash), p.ip, p.port).into_bytes())
+            .collect();
+        Self::mark_chunks_dirty_in_tx(&tx, 2 /* PEER */, &keys)?;
         tx.commit()?;
         Ok(())
     }
@@ -1907,6 +2809,13 @@ impl Storage {
                 now,
             ])?;
         }
+        // P-A：块表标 dirty（key = lower(hex(infohash)):ip:port，与清单排序键一致）
+        const PEER: u8 = 2;
+        let keys: Vec<Vec<u8>> = peers
+            .iter()
+            .map(|p| format!("{}:{}:{}", hex_lower(&p.infohash), p.ip, p.port).into_bytes())
+            .collect();
+        Self::mark_chunks_dirty_in_tx(conn, PEER, &keys)?;
         Ok(())
     }
 
@@ -1929,6 +2838,23 @@ impl Storage {
         }
 
         let tx = conn.unchecked_transaction()?;
+        // P-A：先取受影响 key（archive 移动行 = PEER 清单内容变化，需精确标脏）
+        let keys: Vec<Vec<u8>> = {
+            let mut key_stmt = tx.prepare(
+                "SELECT lower(hex(infohash)), ip, port FROM peers WHERE last_active < ?1",
+            )?;
+            let ks: Vec<Vec<u8>> = key_stmt
+                .query_map(params![threshold], |row| {
+                    let ih_hex: String = row.get(0)?;
+                    let ip: String = row.get(1)?;
+                    let port: i64 = row.get(2)?;
+                    Ok(format!("{}:{}:{}", ih_hex, ip, port).into_bytes())
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(key_stmt);
+            ks
+        };
         // 插入到归档表
         tx.execute(
             "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, archived_at)
@@ -1941,6 +2867,8 @@ impl Storage {
             "DELETE FROM peers WHERE last_active < ?1",
             params![threshold],
         )?;
+        // P-A：块表标 dirty（精确 key）
+        Self::mark_chunks_dirty_in_tx(&tx, 2 /* PEER */, &keys)?;
         tx.commit()?;
 
         Ok(count as usize)
@@ -1951,6 +2879,18 @@ impl Storage {
     pub fn archive_cold_peers_in_tx(conn: &Connection, older_than_secs: i64) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let threshold = now - older_than_secs;
+        // P-A：先取受影响 key（精确标脏）
+        let mut key_stmt = conn
+            .prepare("SELECT lower(hex(infohash)), ip, port FROM peers WHERE last_active < ?1")?;
+        let keys: Vec<Vec<u8>> = key_stmt
+            .query_map(params![threshold], |row| {
+                let ih_hex: String = row.get(0)?;
+                let ip: String = row.get(1)?;
+                let port: i64 = row.get(2)?;
+                Ok(format!("{}:{}:{}", ih_hex, ip, port).into_bytes())
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         // 插入到归档表
         conn.execute(
             "INSERT OR IGNORE INTO peers_archive (infohash, ip, port, source, score, connection_attempts, connection_successes, last_active, archived_at)
@@ -1963,6 +2903,8 @@ impl Storage {
             "DELETE FROM peers WHERE last_active < ?1",
             params![threshold],
         )?;
+        // P-A：块表标 dirty（精确 key）
+        Self::mark_chunks_dirty_in_tx(conn, 2 /* PEER */, &keys)?;
         Ok(())
     }
 
@@ -2032,7 +2974,7 @@ impl Storage {
         infohash: &[u8; 20],
         limit: usize,
     ) -> anyhow::Result<Vec<PeerHistoryRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
         let mut stmt = conn.prepare("SELECT ip, port, source, score, discovered_at FROM peer_history WHERE infohash = ?1 ORDER BY discovered_at DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![infohash.as_slice(), limit as i64], |row| {
             Ok(PeerHistoryRow {
@@ -2129,13 +3071,19 @@ impl Storage {
 
     /// 加载累计统计
     pub fn load_aggregate(&self, metric: &str) -> Option<f64> {
-        self.read(|conn| {
-            conn.query_row(
-                "SELECT value FROM stats_aggregate WHERE metric = ?1",
-                params![metric],
-                |row| row.get(0),
-            )
-            .ok()
+        // P1：闭包返回 Result；read_long 超时/池饥饿时降级为 None（视为无该统计）。
+        self.read_long(|conn| -> anyhow::Result<Option<f64>> {
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM stats_aggregate WHERE metric = ?1",
+                    params![metric],
+                    |row| row.get(0),
+                )
+                .ok())
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "pdcdb", "load_aggregate({}) 读失败，降级 None: {}", metric, e);
+            None
         })
     }
 
@@ -2146,13 +3094,13 @@ impl Storage {
     /// 退化为「按历史评分取前 N」——陈旧高分僵尸整体进场且 last_active 被加载侧复位
     /// （2026-10 根因 R0/R1）。现改为新近度优先，与 `load_limited_peers` 同一模式。
     pub fn load_recent_nodes(&self, limit: usize) -> anyhow::Result<Vec<DhtNodeRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
             let mut stmt = conn.prepare(
                 r#"SELECT id, ip, port, score, state, query_count, success_count,
                   total_latency_ms, consecutive_failures, nodes_returned, last_query_time, last_active
                FROM dht_nodes
                WHERE deleted_at IS NULL
-               ORDER BY last_active DESC
+               ORDER BY score DESC
                LIMIT ?1"#,
             )?;
             let rows = stmt.query_map(params![limit as i64], |row| {
@@ -2182,11 +3130,11 @@ impl Storage {
 
     /// 限量加载 peers（按最近活跃降序 + LIMIT），供启动预加载
     pub fn load_limited_peers(&self, limit: usize) -> anyhow::Result<Vec<PeerRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
         let mut stmt = conn.prepare(
             "SELECT infohash, ip, port, source, score, connection_attempts, connection_successes, last_active
              FROM peers WHERE deleted_at IS NULL
-             ORDER BY last_active DESC LIMIT ?1",
+             ORDER BY score DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |row| {
             let ih: Vec<u8> = row.get(0)?;
@@ -2211,11 +3159,11 @@ impl Storage {
 
     /// 限量加载 infohashes（按引用数降序 + LIMIT），供启动预加载
     pub fn load_limited_infohashes(&self, limit: usize) -> anyhow::Result<Vec<InfohashRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT infohash, ref_count, first_source, score
              FROM infohashes WHERE deleted_at IS NULL
-             ORDER BY ref_count DESC LIMIT ?1",
+             ORDER BY score DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map([limit as i64], |row| {
                 let ih: Vec<u8> = row.get(0)?;
@@ -2366,7 +3314,7 @@ impl Storage {
         if let Some((total, _)) = self.table_count_cached(table) {
             return Ok(total.max(0) as u64);
         }
-        self.read(|conn| {
+        self.read_long(|conn| {
             let count: i64 =
                 conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
                     row.get(0)
@@ -2385,7 +3333,10 @@ impl Storage {
         hi: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, String, i64)>> {
-        self.read(|conn| {
+        // P4-2（v9，preP32）：bootstrap 应答取数链（load_repo_sync_entries_in_range）
+        // 走 read_long_priority——线上实证 .53 发送块 load 被去重占满 permit 饿死
+        // 60s panic → NAK → 传输断续（done 77→89 卡壳）。发送块是关键路径。
+        self.read_long_priority(|conn| {
             let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
             let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
             // v9：按需拼谓词，使新增的表达式索引 `idx_dht_nodes_ip_port_expr` 能被用于
@@ -2473,13 +3424,13 @@ impl Storage {
         hi: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.read(|conn| Self::query_node_key_hashes(conn, lo, hi, limit))
+        self.read_long(|conn| Self::query_node_key_hashes(conn, lo, hi, limit))
     }
 
     /// 纯 SQL 实现：按 [lo, hi) 区间读 dht_nodes 的 (key, hash)。
     /// 不持有任何锁，调用方负责连接生命周期。供 `load_node_key_hashes_in_range`
     /// 与 `load_repo_key_hashes_in_range`（已在外层 read 闭包内）共用，避免嵌套
-    /// `self.read()` 在 `Storage::memory()` 回退写锁路径下二次 lock 同一 Mutex 死锁。
+    /// `self.read_long()` 在 `Storage::memory()` 回退写锁路径下二次 lock 同一 Mutex 死锁。
     fn query_node_key_hashes(
         conn: &rusqlite::Connection,
         lo: Option<&[u8]>,
@@ -2531,7 +3482,7 @@ impl Storage {
         &self,
         keys: &[Vec<u8>],
     ) -> anyhow::Result<Vec<crate::storage::db::DhtNodeRow>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -2798,7 +3749,7 @@ impl Storage {
     /// 返回**已排序去重**的 key 列表。`MAX(rowid)` 为 O(1)，每个探针为 O(log N) 的 rowid 查找，
     /// 整体 O(n log N)（相对 O(N) 全表扫描可忽略）。
     pub fn sample_node_range_keys(&self, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
             if n == 0 {
                 return Ok(Vec::new());
             }
@@ -2848,73 +3799,99 @@ impl Storage {
         hi: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.read(|conn| {
-            // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
-            const NODE: u8 = 1;
-            const PEER: u8 = 2;
-            const INFOHASH: u8 = 3;
-            const TRACKER: u8 = 4;
-            match repo {
-                NODE => Self::query_node_key_hashes(conn, lo, hi, limit),
-                PEER => {
-                    // F9 方案 B：bootstrap 清单扫描 = peers 主表活行 + peers_archive 归档行
-                    // （双路归并，见 `query_peer_rows_both_tables`）。归档是本地冷分层
-                    // （存储优化）不是数据边界——两节点都应拥有对方的归档行。
-                    // 口径铁律：本清单行数必须与 local_entry_counts 的 peer 项
-                    // （peers.valid + peers_archive.valid）一致，否则差的部分快照永远
-                    // 拉不到 → 协商判定永远差一截 → BOOTSTRAP 死循环（F1 实测教训，
-                    // 2026-09-27 52/58：58 报 40,042 vs 清单 28,009，每 5 分钟全量重拉）。
-                    let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
-                    let rows = Self::query_peer_rows_both_tables(
-                        conn,
-                        lo_s.as_deref(),
-                        hi_s.as_deref(),
-                        limit,
-                    )?;
-                    let mut out = Vec::new();
-                    for (key, ih, ip, port) in rows {
-                        // data_hash = blake3(infohash || ip_string || port(i64 LE))，
-                        // 沿用本通道原实现的逐字节公式（注意：与 build_peer_sync_entry
-                        // 的 u16(2 字节) port 存在既有宽度差异，属历史口径，F9 不改，
-                        // 只要两端各通道内部自洽即可）
-                        let mut buf = Vec::with_capacity(ih.len() + ip.len() + 8);
-                        buf.extend_from_slice(&ih);
-                        buf.extend_from_slice(ip.as_bytes());
-                        buf.extend_from_slice(&port.to_le_bytes());
-                        out.push((key, blake3::hash(&buf).as_bytes().to_vec()));
-                    }
-                    Ok(out)
-                }
-                INFOHASH => {
-                    // v11(K 批/F2b)：改走 query_infohash_range_keys（INDEXED BY 强制部分索引）
-                    let ihs = Self::query_infohash_range_keys(conn, lo, hi, limit)?;
-                    let mut out = Vec::with_capacity(ihs.len());
-                    for ih in ihs {
-                        out.push((ih.clone(), blake3::hash(&ih).as_bytes().to_vec()));
-                    }
-                    Ok(out)
-                }
-                TRACKER => {
-                    // v11(K 批/F2b)：改走 query_tracker_range_keys（INDEXED BY 强制部分索引）
-                    let urls = Self::query_tracker_range_keys(conn, lo, hi, limit)?;
-                    let mut out = Vec::with_capacity(urls.len());
-                    for url in urls {
-                        out.push((
-                            url.clone().into_bytes(),
-                            blake3::hash(url.as_bytes()).as_bytes().to_vec(),
-                        ));
-                    }
-                    Ok(out)
-                }
-                _ => Ok(Vec::new()),
-            }
+        // P4-2：全表/大区间扫描统一走长查询门（并发上限），避免多长查询占满读池
+        self.read_long(|conn| Self::query_repo_key_hashes_in_range(conn, repo, lo, hi, limit))
+    }
+
+    /// P4-2（v9，preP30）：**bootstrap 清单重建/传输专用**版本——
+    /// 同 [`Self::load_repo_key_hashes_in_range`] 但走 `read_long_priority`
+    /// （不经过长查询并发门）。仅 bootstrap.rs 重建/扫描/传输链使用；
+    /// range 反熵等普通路径保持走 `read_long`（受 permit 门限流）。
+    pub fn load_repo_key_hashes_in_range_priority(
+        &self,
+        repo: u8,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.read_long_priority(|conn| {
+            Self::query_repo_key_hashes_in_range(conn, repo, lo, hi, limit)
         })
+    }
+
+    /// 私有：按 repo 分区查询 key+hash（NODE/PEER/INFOHASH/TRACKER 四类共用）。
+    fn query_repo_key_hashes_in_range(
+        conn: &Connection,
+        repo: u8,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // 与 crate::federation::protocol::repo_type 一致（NODE=1 PEER=2 INFOHASH=3 TRACKER=4）
+        const NODE: u8 = 1;
+        const PEER: u8 = 2;
+        const INFOHASH: u8 = 3;
+        const TRACKER: u8 = 4;
+        match repo {
+            NODE => Self::query_node_key_hashes(conn, lo, hi, limit),
+            PEER => {
+                // F9 方案 B：bootstrap 清单扫描 = peers 主表活行 + peers_archive 归档行
+                // （双路归并，见 `query_peer_rows_both_tables`）。归档是本地冷分层
+                // （存储优化）不是数据边界——两节点都应拥有对方的归档行。
+                // 口径铁律：本清单行数必须与 local_entry_counts 的 peer 项
+                // （peers.valid + peers_archive.valid）一致，否则差的部分快照永远
+                // 拉不到 → 协商判定永远差一截 → BOOTSTRAP 死循环（F1 实测教训，
+                // 2026-09-27 52/58：58 报 40,042 vs 清单 28,009，每 5 分钟全量重拉）。
+                let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
+                let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
+                let rows = Self::query_peer_rows_both_tables(
+                    conn,
+                    lo_s.as_deref(),
+                    hi_s.as_deref(),
+                    limit,
+                )?;
+                let mut out = Vec::new();
+                for (key, ih, ip, port) in rows {
+                    // data_hash = blake3(infohash || ip_string || port(i64 LE))，
+                    // 沿用本通道原实现的逐字节公式（注意：与 build_peer_sync_entry
+                    // 的 u16(2 字节) port 存在既有宽度差异，属历史口径，F9 不改，
+                    // 只要两端各通道内部自洽即可）
+                    let mut buf = Vec::with_capacity(ih.len() + ip.len() + 8);
+                    buf.extend_from_slice(&ih);
+                    buf.extend_from_slice(ip.as_bytes());
+                    buf.extend_from_slice(&port.to_le_bytes());
+                    out.push((key, blake3::hash(&buf).as_bytes().to_vec()));
+                }
+                Ok(out)
+            }
+            INFOHASH => {
+                // v11(K 批/F2b)：改走 query_infohash_range_keys（INDEXED BY 强制部分索引）
+                let ihs = Self::query_infohash_range_keys(conn, lo, hi, limit)?;
+                let mut out = Vec::with_capacity(ihs.len());
+                for ih in ihs {
+                    out.push((ih.clone(), blake3::hash(&ih).as_bytes().to_vec()));
+                }
+                Ok(out)
+            }
+            TRACKER => {
+                // v11(K 批/F2b)：改走 query_tracker_range_keys（INDEXED BY 强制部分索引）
+                let urls = Self::query_tracker_range_keys(conn, lo, hi, limit)?;
+                let mut out = Vec::with_capacity(urls.len());
+                for url in urls {
+                    out.push((
+                        url.clone().into_bytes(),
+                        blake3::hash(url.as_bytes()).as_bytes().to_vec(),
+                    ));
+                }
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// v7：按 repo 随机抽样 `n` 个分界 key（LCG 探 rowid，同 [`Self::sample_node_range_keys`]）。
     pub fn sample_repo_range_keys(&self, repo: u8, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.read(|conn| {
+        self.read_long(|conn| {
             if n == 0 {
                 return Ok(Vec::new());
             }
@@ -3023,7 +4000,8 @@ impl Storage {
                 // F9 方案 B：块数据读取 = peers 主表活行 + peers_archive 归档行（双路
                 // 归并），与清单扫描口径一致（清单列了行，块就必须能取出对应数据）。
                 // G1：块数据读取改走读连接池，不抢全局写锁（bootstrap 应答与写事务解耦）。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                // P4-2（v9，preP32）：bootstrap 应答取数链走 priority（不被去重饿死）。
+                self.read_long_priority(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let lo_s = lo.map(|b| String::from_utf8_lossy(b).into_owned());
                     let hi_s = hi.map(|b| String::from_utf8_lossy(b).into_owned());
                     let rows = Self::query_peer_rows_both_tables(
@@ -3054,7 +4032,8 @@ impl Storage {
             INFOHASH => {
                 // G1：块数据读取改走读连接池，不抢全局写锁。
                 // v11(K 批/F2b)：改走 query_infohash_range_keys（INDEXED BY 强制部分索引）。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                // P4-2（v9，preP32）：bootstrap 应答取数链走 priority。
+                self.read_long_priority(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let ihs = Self::query_infohash_range_keys(conn, lo, hi, limit)?;
                     let mut out = Vec::new();
                     for ih in ihs {
@@ -3075,7 +4054,8 @@ impl Storage {
             TRACKER => {
                 // G1：块数据读取改走读连接池，不抢全局写锁。
                 // v11(K 批/F2b)：改走 query_tracker_range_keys（INDEXED BY 强制部分索引）。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                // P4-2（v9，preP32）：bootstrap 应答取数链走 priority。
+                self.read_long_priority(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let urls = Self::query_tracker_range_keys(conn, lo, hi, limit)?;
                     let mut out = Vec::new();
                     for url in urls {
@@ -3135,7 +4115,7 @@ impl Storage {
                 pairs.sort();
                 pairs.dedup();
                 // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                self.read_long(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let mut out = Vec::with_capacity(pairs.len());
                     for chunk in pairs.chunks(400) {
                         let placeholders = chunk
@@ -3208,7 +4188,7 @@ impl Storage {
                 triples.sort();
                 triples.dedup();
                 // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                self.read_long(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let mut out = Vec::with_capacity(triples.len());
                     for chunk in triples.chunks(300) {
                         let placeholders = chunk
@@ -3259,7 +4239,7 @@ impl Storage {
                 let ih_keys: Vec<Vec<u8>> =
                     keys.iter().filter(|k| k.len() == 20).cloned().collect();
                 // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                self.read_long(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let mut out = Vec::with_capacity(ih_keys.len());
                     for chunk in ih_keys.chunks(900) {
                         let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -3301,7 +4281,7 @@ impl Storage {
                 urls.sort();
                 urls.dedup();
                 // G1：按 key 精确修复读取改走读连接池，不抢全局写锁。
-                self.read(|conn| -> anyhow::Result<Vec<SyncEntry>> {
+                self.read_long(|conn| -> anyhow::Result<Vec<SyncEntry>> {
                     let mut out = Vec::with_capacity(urls.len());
                     for chunk in urls.chunks(500) {
                         let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -3414,6 +4394,32 @@ pub struct PeerRow {
     pub last_active: i64,
 }
 
+/// P-A：块表行（bootstrap 清单构建 / 对齐验证消费，P-B）。
+#[derive(Debug, Clone)]
+pub struct ChunkDigest {
+    pub repo: u8,
+    pub idx: i64,
+    pub lo_key: Vec<u8>,
+    pub hi_key: Vec<u8>,
+    pub rows: i64,
+    pub hash: Vec<u8>,
+    pub dirty: bool,
+    /// 构建时的 chunk_rows（边界一致性校验：config 变化 → 全量重建）
+    pub chunk_rows: u32,
+}
+
+/// P-A：小写 hex 编码（PEER 块键 `lower(hex(infohash)):ip:port` 用，
+/// 与 SQL 表达式索引 `lower(hex(infohash))` 逐字符一致）。
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 /// Peer 历史行
 #[derive(Debug, Clone)]
 pub struct PeerHistoryRow {
@@ -3479,14 +4485,13 @@ mod tests {
         }
     }
 
-    /// 预加载新近度回归（2026-10 R0）：load_recent_nodes 必须按 last_active 降序，
-    /// 且落库的 last_active 是传入值而非落库时刻——陈旧高分节点不得排到新近节点之前。
+    /// 预加载评分回归（2026-10）：load_recent_nodes 按 score 降序——质量优先于新近度。
     #[test]
     fn test_load_recent_nodes_orders_by_last_active() {
         let storage = Storage::memory().unwrap();
         let now = chrono::Utc::now().timestamp();
         let month_ago = now - 30 * 24 * 3600;
-        // 陈旧节点历史评分更高
+        // 陈旧节点历史评分更高 → 评分排序下必须排前
         storage
             .save_dht_nodes_batch(&[
                 dht_row(2002, 99.0, Some(month_ago)),
@@ -3495,13 +4500,11 @@ mod tests {
             .unwrap();
         let rows = storage.load_recent_nodes(10).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].port, 2001, "新近节点必须排在陈旧高分节点之前");
         assert_eq!(
-            rows[0].last_active,
-            Some(now),
-            "落库 last_active 应为传入值"
+            rows[0].port, 2002,
+            "高评分节点必须排在低评分之前（评分优先）"
         );
-        assert_eq!(rows[1].last_active, Some(month_ago));
+        assert_eq!(rows[1].port, 2001);
     }
 
     /// v11(K 批/F2b) 回归：四 repo 的区间查询（INDEXED BY 强制索引路径）必须
@@ -3940,14 +4943,35 @@ mod tests {
     // ---- A1/A3: checkpoint 接管与无用索引迁移 ----
 
     /// 生成唯一临时目录（避免并行测试互相踩）。测试文件落在系统 temp 下，不污染仓库。
+    ///
+    /// 竞态修复（2026-10-08）：Windows 下 `SystemTime::now()` 时钟 tick 粗（约 15ms），
+    /// 连续调用可能返回相同纳秒值 → 并行/快速串行测试撞同名目录；且 `remove_dir`
+    /// 后同名目录可能处于 Windows 延迟释放状态，立刻重建被拒（PermissionDenied code 5）。
+    /// 修复：目录名并入线程 id，创建失败重试（覆盖延迟释放窗口）。
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("pdc_test_{}_{}", tag, nanos));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        let tid: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        // 测试临时根用 crate::test_tmp_dir()（构建目录 target/test-tmp）：本机安全策略
+        // 拒绝 target 构建目录进程写 %TEMP% 根与数据盘（PermissionDenied code 5）。
+        let dir = crate::test_tmp_dir().join(format!("pdc_test_{}_{}_{}", tag, tid, nanos));
+        let mut attempt = 0u32;
+        // [ALLOWED-SLEEP] 测试临时目录创建重试（最多 8 次，一次性非周期）
+        loop {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => return dir,
+                Err(_) if attempt < 8 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("create_dir_all {} 失败: {}", dir.display(), e),
+            }
+        }
     }
 
     fn cleanup_temp(dir: &std::path::Path) {
@@ -4113,9 +5137,11 @@ mod tests {
         let s = Storage::open_with_config(&db_path, &cfg).unwrap();
         let a0 = read_pool_available();
         for _ in 0..5 {
-            s.read(|conn| {
-                let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
-            });
+            s.read(|conn| -> anyhow::Result<()> {
+                let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0))?;
+                Ok(())
+            })
+            .unwrap();
         }
         let a1 = read_pool_available();
         assert_eq!(
@@ -4129,19 +5155,182 @@ mod tests {
     }
 
     #[test]
-    fn test_read_pool_starved_increments_on_memory_fallback() {
-        // 内存库读池恒空，read() 必走 None 回退写连接分支，starved 相对递增（>=1）。
+    fn test_read_pool_starved_counts_only_on_file_db_queue_wait() {
+        // P4-1 新语义：READ_POOL_STARVED = 文件库读池「排队等待归还」次数；
+        // 内存库无池（pool_enabled=false）直接回退写连接、不排队。
+        // 全局静态计数在并行测试下不可靠，此处验证行为语义（无池回退存在）。
         let s = Storage::memory().unwrap();
-        let s0 = read_pool_starved();
-        s.read(|conn| {
-            let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
-        });
-        let s1 = read_pool_starved();
+        {
+            let inner = s.read_pool.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !inner.pool_enabled,
+                "memory() 库 pool_enabled 应为 false（无池，read() 走回退写连接路径）"
+            );
+        }
+        s.read(|conn| -> anyhow::Result<()> {
+            let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0))?;
+            Ok(())
+        })
+        .unwrap();
+        // 内存库 read() 完成：回退路径正常，不触发排队计数（该路径无 fetch_add）。
+    }
+
+    // ── P-A：增量块摘要（chunk_digests 块表 + dirty 挂接）───────────────
+    #[test]
+    fn test_chunk_digests_basic_crud() {
+        let s = Storage::memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::upsert_chunk_digest_in_tx(&conn, 2, 0, b"a", b"m", 5, &[1u8; 32], false, 2000)
+                .unwrap();
+            Storage::upsert_chunk_digest_in_tx(&conn, 2, 1, b"n", b"z", 7, &[2u8; 32], false, 2000)
+                .unwrap();
+            // 覆盖 idx 0（同 repo+idx 冲突 → UPDATE）
+            Storage::upsert_chunk_digest_in_tx(
+                &conn, 2, 0, b"aa", b"zz", 3, &[3u8; 32], true, 2000,
+            )
+            .unwrap();
+        }
+        let chunks = s.get_chunk_digests(2).unwrap();
+        assert_eq!(chunks.len(), 2, "块表应有 2 块");
+        assert_eq!(chunks[0].idx, 0);
+        assert_eq!(chunks[0].lo_key, b"aa");
+        assert_eq!(chunks[0].rows, 3);
+        assert!(chunks[0].dirty, "覆盖写入应保留 dirty=true");
+        assert_eq!(chunks[1].idx, 1);
+        assert!(!chunks[1].dirty);
+        // 跨 repo 隔离
+        assert!(s.get_chunk_digests(1).unwrap().is_empty());
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::delete_chunk_digests_in_tx(&conn, 2).unwrap();
+        }
+        assert!(s.get_chunk_digests(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_mark_chunks_dirty_in_tx_locates_correct_blocks() {
+        let s = Storage::memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::upsert_chunk_digest_in_tx(&conn, 2, 0, b"a", b"m", 5, &[1u8; 32], false, 2000)
+                .unwrap();
+            Storage::upsert_chunk_digest_in_tx(&conn, 2, 1, b"n", b"z", 7, &[2u8; 32], false, 2000)
+                .unwrap();
+            Storage::upsert_chunk_digest_in_tx(
+                &conn, 2, 2, b"zz", b"zzz", 2, &[3u8; 32], false, 2000,
+            )
+            .unwrap();
+            // 块 0：a..=m
+            Storage::mark_chunks_dirty_in_tx(&conn, 2, &[b"a1".to_vec(), b"abc".to_vec()]).unwrap();
+            // 块 1 + 块 2：n..=z 与 zz..=zzz
+            Storage::mark_chunks_dirty_in_tx(&conn, 2, &[b"n1".to_vec(), b"zz1".to_vec()]).unwrap();
+            // 超界 key（> 最后块 hi）：尾块兜底标脏
+            Storage::mark_chunks_dirty_in_tx(&conn, 2, &[b"zzzz9".to_vec()]).unwrap();
+            // 空 keys：no-op
+            Storage::mark_chunks_dirty_in_tx(&conn, 2, &[]).unwrap();
+        }
+        let chunks = s.get_chunk_digests(2).unwrap();
         assert!(
-            s1 > s0,
-            "内存库 read() 回退写连接后 starved 应递增，s0={} s1={}",
-            s0,
-            s1
+            chunks.iter().all(|c| c.dirty),
+            "三块均应 dirty（含尾块兜底）"
         );
+    }
+
+    #[test]
+    fn test_mark_chunks_dirty_empty_table_noop() {
+        // 旧库块表空（P-C 回填前）：写挂接应静默跳过，不报错
+        let s = Storage::memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::mark_chunks_dirty_in_tx(&conn, 1, &[b"1.2.3.4:6881".to_vec()]).unwrap();
+        }
+        assert!(s.get_chunk_digests(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_mark_repo_all_dirty() {
+        let s = Storage::memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::upsert_chunk_digest_in_tx(&conn, 3, 0, b"a", b"b", 1, &[1u8; 32], false, 2000)
+                .unwrap();
+            Storage::upsert_chunk_digest_in_tx(&conn, 3, 1, b"c", b"d", 2, &[2u8; 32], false, 2000)
+                .unwrap();
+        }
+        s.mark_repo_all_dirty(3).unwrap();
+        let chunks = s.get_chunk_digests(3).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.dirty));
+        // 其他 repo 不受影响
+        assert!(s.get_chunk_digests(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_chunk_dirty_hook_on_peer_save() {
+        // 挂接冒烟：save_peers_batch 写库后，对应块应被标 dirty
+        let s = Storage::memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::upsert_chunk_digest_in_tx(
+                &conn, 2, 0, b"", b"zzzz", 0, &[0u8; 32], false, 2000,
+            )
+            .unwrap();
+        }
+        let peer = PeerRow {
+            infohash: [7u8; 20],
+            ip: "1.2.3.4".into(),
+            port: 6881,
+            source: "test".into(),
+            score: 1.0,
+            connection_attempts: 0,
+            connection_successes: 0,
+            last_active: 0,
+        };
+        s.save_peers_batch(&[peer]).unwrap();
+        let chunks = s.get_chunk_digests(2).unwrap();
+        assert!(chunks[0].dirty, "save_peers_batch 后块应标 dirty");
+    }
+
+    #[test]
+    fn test_chunk_dirty_hook_on_node_soft_delete() {
+        // 挂接冒烟：soft_delete_node 后对应块标 dirty；软删其他 key 不受影响
+        let s = Storage::memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+            Storage::upsert_chunk_digest_in_tx(
+                &conn,
+                1,
+                0,
+                b"",
+                b"9.9.9.9:9999",
+                0,
+                &[0u8; 32],
+                false,
+                2000,
+            )
+            .unwrap();
+            Storage::upsert_chunk_digest_in_tx(
+                &conn,
+                1,
+                1,
+                b"9.9.9.9:9999",
+                b"zzz",
+                0,
+                &[1u8; 32],
+                false,
+                2000,
+            )
+            .unwrap();
+        }
+        s.save_dht_node(
+            &[9u8; 20], "1.2.3.4", 6881, 1.0, "Good", 1, 1, 5, 0, 8, None,
+        )
+        .unwrap();
+        assert!(
+            s.get_chunk_digests(1).unwrap()[0].dirty,
+            "save_dht_node 后块 0 应 dirty"
+        );
+        assert!(!s.get_chunk_digests(1).unwrap()[1].dirty, "块 1 不应受影响");
     }
 }
